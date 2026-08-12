@@ -1,0 +1,3 @@
+# Apply immutable failover route plans
+
+Editing a Failover Chain changes only a draft. `Apply Failover Chain` validates every member and atomically creates an immutable Activated Route Plan whose epoch is pinned for each request from start to completion. Runtime attempt order and non-sticky priority-first failback remain compatible with CC-Switch `v3.19.2`, but successful fallback does not rewrite the Current Target Provider; the separate Serving Provider reports which member actually served traffic. This prevents partial queue edits and removes the baseline's current-versus-routing ambiguity.

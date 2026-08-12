@@ -1,0 +1,5 @@
+# Pin the subscription bridge to derived CC-Switch behavior
+
+The Subscription Bridge will reproduce the Compatibility Baseline's device authorization, token refresh, internal Codex endpoint, protocol conversion, and request identity behavior, and will appear alongside ordinary Target Providers in the Control Plane. Public technical documentation must accurately state that this behavior depends on undocumented interfaces and is CC-Switch compatibility work rather than an officially supported OpenAI provider integration.
+
+New Subscription Accounts are acquired only through the baseline Device Authorization flow. Muxvia displays and attempts to copy the user code, attempts to open the remote verification URL without making browser launch a prerequisite, and polls at the baseline's effective interval. It uses the verifier returned by the remote device-token response and never opens a local callback listener. It does not turn native Codex `auth.json` material into a Subscription Account, accept a pasted refresh token, or offer an alternative local-PKCE login. Cancel stops local polling but does not claim to revoke the remote device code.

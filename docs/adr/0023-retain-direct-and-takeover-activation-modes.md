@@ -1,0 +1,3 @@
+# Retain direct and takeover activation modes
+
+Each Target CLI will expose an explicit Target Takeover switch. With takeover disabled, selecting a Direct-compatible Target Provider performs Direct Activation against Managed Configuration; with takeover enabled, the same selection hot-switches the Routing Service while native CLI configuration remains on the authenticated local endpoint. Muxvia blocks Direct Activation for a Routing-required Target Provider and offers the Operator the explicit choice to enable Target Takeover or cancel, intentionally rejecting CC-Switch `v3.19.2`'s warning-only behavior.

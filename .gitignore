@@ -1,0 +1,14 @@
+.DS_Store
+.playwright-cli/
+.worktrees/
+.superpowers/
+
+node_modules/
+dist/
+coverage/
+target/
+
+.env
+.env.*
+!.env.example
+*.log

@@ -1,0 +1,5 @@
+# Probe target capabilities and bound runtime effects
+
+Before its first managed write for a detected Codex CLI or Claude Code installation, Muxvia runs a Target Compatibility Probe. A tested version proceeds normally; an unknown version that still exposes the required configuration capabilities may proceed after a warning; a version missing or contradicting a required capability is blocked from Direct Activation and Target Takeover. Read-only Provider management remains available, avoiding both a brittle strict-version allowlist and unverified writes.
+
+Muxvia guarantees that a server-side Provider or Activated Route Plan switch inside an existing Target Takeover affects the next new model request, including requests from an already-running Target CLI. Changes that require Managed Configuration—including Direct Activation, takeover enablement or removal, endpoint relocation, and restore—are guaranteed only for newly started Target CLI processes. The Control Plane tells the Operator to restart already-running native CLI processes and does not claim universal hot reload.

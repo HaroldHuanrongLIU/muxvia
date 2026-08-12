@@ -1,0 +1,9 @@
+# Distribute versioned native bundles through four channels
+
+Every public installation channel delivers one Release Bundle containing `muxvia`, private `muxvia-routing`, and a manifest that binds their product version, RPC protocol version, and integrity hashes. The sidecar is never installed or upgraded separately, and startup rejects a mismatched or unverifiable pair before attempting the drain-and-handover protocol.
+
+The first-release channels are GitHub Release archives, an official Homebrew tap, an official verified-download installer, and npm. Package-managed installations are upgraded through their package manager; Muxvia never writes into a Homebrew Cellar or npm-owned package tree. Verified-download installations stage and verify a complete new Release Bundle before atomically changing the active version. The first Linux matrix is x86-64 and arm64 on glibc; musl/Alpine is deferred. macOS publishes arm64 and x86-64 bundles.
+
+The npm channel uses a small launcher package plus one exact-version, platform-selected package. Each platform package contains the complete Release Bundle, never one executable by itself. The launcher resolves that package relative to its own installation, validates product, target, build, and RPC metadata before starting anything, and passes an absolute bundle root to the TUI; neither executable is found through `PATH`. npm lifecycle scripts do not download binaries, and omitting or failing an optional platform package produces a deterministic repair message rather than a partial activation. Release automation publishes and verifies every platform artifact before moving the launcher package's public distribution tag.
+
+The initial macOS release may be unsigned and unnotarized. Installation documentation and diagnostics will state the resulting Gatekeeper behavior accurately rather than imply Apple verification. Signing both executables and notarizing the complete archive remains a later release-hardening step.

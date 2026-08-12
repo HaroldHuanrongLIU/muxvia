@@ -1,0 +1,3 @@
+# Keep the noninteractive CLI diagnostic
+
+Running `muxvia` without a subcommand opens the Control Plane. The first release also exposes only `status`, `doctor`, `paths`, `version`, and `service start|stop`; it does not duplicate Provider, model, account, routing, or configuration CRUD as a headless scripting interface. `service start` recovers and resumes configured Target Takeovers but does not keep an otherwise idle service alive. `service stop` uses the intentional safe-stop contract: it disables all takeovers and restores Managed Configuration unless the Operator explicitly invokes the separately guarded dangerous force path.

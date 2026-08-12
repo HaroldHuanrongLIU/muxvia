@@ -1,0 +1,3 @@
+# Activate immutable provider snapshots explicitly
+
+Provider edits and Provider Synchronization change saved records but never change current traffic or Managed Configuration implicitly. An explicit Apply or Activate operation creates an immutable Activated Snapshot. Direct Activation first prepares a Recovery Snapshot, then writes Managed Configuration, and commits the Current Target Provider and Activated Snapshot only after the write succeeds; any failure restores both database and configuration state. This intentionally improves on CC-Switch `v3.19.2`'s current-pointer-first direct switch ordering.

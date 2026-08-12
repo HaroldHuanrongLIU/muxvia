@@ -1,0 +1,3 @@
+# Bound and clear local usage data
+
+Detailed Request Records and Native Usage Records default to 30 days of retention, with an Operator-configurable period; completed older days become Daily Usage Rollups. The Control Plane provides one atomic operation to clear all details, retained upstream errors, rollups, and import cursors. Failed upstream error payloads are stored up to 64 KiB with an explicit truncation marker, and headers, successful request bodies, and successful response bodies are never persisted. These are intentional privacy and storage Compatibility Deviations from CC-Switch `v3.19.2`.

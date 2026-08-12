@@ -1,0 +1,3 @@
+# Retire OpenSwitch and adopt Muxvia as the public name
+
+The public product and executable name will be `Muxvia` / `muxvia`. The coined name combines multiplexing with a route or path and passed a preliminary exact-name screen across GitHub, npm, crates.io, PyPI, Homebrew, and the USPTO search as of 2026-08-12; that screen is not legal clearance. `OpenSwitch` is retired because it is already used by several provider-management tools, a historical network operating system, and other software brands, and remains only as the current local workspace directory name until that directory is renamed separately.

@@ -1,0 +1,3 @@
+# Synchronize universal providers transactionally
+
+Provider Synchronization will materialize every enabled Target Provider in one Routing Service database transaction and roll back all targets if any materialization or deletion fails. Universal Provider fields remain owned by that source and read-only in generated Target Providers, while target-specific fields remain editable on each child. Synchronization changes provider records only and never changes an Activated Snapshot or Managed Configuration. This is an intentional Compatibility Deviation from CC-Switch `v3.19.2`'s sequential partial updates and silent merge behavior.

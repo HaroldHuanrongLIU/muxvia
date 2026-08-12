@@ -361,6 +361,114 @@ fn identity_change_before_rename_does_not_overwrite_changed_target() {
 }
 
 #[test]
+fn exchange_mismatch_with_successful_rollback_preserves_operator_target() {
+    let (_home, plain) = fixture();
+    let before = plain.inspect().unwrap();
+    let codec = CodexConfigCodec::for_user_home_with_exchange_hook(
+        plain.config_path().parent().unwrap().parent().unwrap(),
+        Arc::new(|temporary, target| {
+            fs::write(temporary, "operator-displaced = true\n")?;
+            fs::write(target, "muxvia-transient = true\n")?;
+            Ok(false)
+        }),
+    )
+    .unwrap();
+
+    let error = codec.atomic_apply(&before, &desired(&codec)).unwrap_err();
+
+    assert_eq!(error.code(), "configuration-write-failed");
+    assert_eq!(
+        fs::read_to_string(codec.config_path()).unwrap(),
+        "operator-displaced = true\n"
+    );
+    assert_eq!(
+        fs::read_dir(codec.config_path().parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".muxvia-"))
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn exchange_mismatch_with_failed_rollback_retains_displaced_operator_artifact() {
+    let (_home, plain) = fixture();
+    let before = plain.inspect().unwrap();
+    let codec = CodexConfigCodec::for_user_home_with_exchange_hook(
+        plain.config_path().parent().unwrap().parent().unwrap(),
+        Arc::new(|temporary, _target| {
+            fs::write(temporary, "operator-displaced = true\n")?;
+            Ok(true)
+        }),
+    )
+    .unwrap();
+
+    let error = codec.atomic_apply(&before, &desired(&codec)).unwrap_err();
+
+    assert_eq!(error.code(), "recovery-required");
+    assert!(!format!("{error:?}\n{error}").contains("route-secret"));
+    let artifacts = fs::read_dir(codec.config_path().parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".muxvia-"))
+        .collect::<Vec<_>>();
+    assert!(artifacts.iter().any(|entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_file())
+            && fs::read_to_string(entry.path())
+                .is_ok_and(|contents| contents == "operator-displaced = true\n")
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_mode_is_preserved_even_under_restrictive_umask() {
+    let home = TempDir::new().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("umask_subprocess_helper")
+        .env("MUXVIA_UMASK_TEST_HOME", home.path())
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    assert_eq!(
+        fs::metadata(home.path().join(".codex/config.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "invoked in an isolated subprocess by the umask regression test"]
+fn umask_subprocess_helper() {
+    static UMASK_LOCK: Mutex<()> = Mutex::new(());
+    struct RestoreUmask(libc::mode_t);
+    impl Drop for RestoreUmask {
+        fn drop(&mut self) {
+            unsafe { libc::umask(self.0) };
+        }
+    }
+
+    let _guard = UMASK_LOCK.lock().unwrap();
+    let home = Path::new(&std::env::var_os("MUXVIA_UMASK_TEST_HOME").unwrap()).to_owned();
+    let codec = CodexConfigCodec::for_user_home(&home).unwrap();
+    fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+    fs::write(codec.config_path(), ORIGINAL).unwrap();
+    fs::set_permissions(codec.config_path(), fs::Permissions::from_mode(0o640)).unwrap();
+    let before = codec.inspect().unwrap();
+    let previous = unsafe { libc::umask(0o077) };
+    let _restore = RestoreUmask(previous);
+
+    codec.atomic_apply(&before, &desired(&codec)).unwrap();
+}
+
+#[test]
 fn absent_target_created_at_commit_is_not_replaced() {
     let home = TempDir::new().unwrap();
     let plain = CodexConfigCodec::for_user_home(home.path()).unwrap();

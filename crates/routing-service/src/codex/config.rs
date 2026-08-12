@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     fmt,
     fs::{self, File},
     io::{self, Read, Write},
@@ -17,6 +18,7 @@ use super::CodexProblem;
 use crate::state::{RecoveryIntent, RecoveryState, StateStore};
 
 type PreRenameHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+type ExchangeHook = Arc<dyn Fn(&Path, &Path) -> io::Result<bool> + Send + Sync>;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OwnedCodexState {
@@ -109,21 +111,33 @@ impl ConfigSnapshot {
 pub struct CodexConfigCodec {
     config_path: PathBuf,
     pre_rename_hook: Option<PreRenameHook>,
+    exchange_hook: Option<ExchangeHook>,
 }
 
 impl CodexConfigCodec {
     pub fn for_user_home(user_home: &Path) -> Result<Self, CodexProblem> {
-        Self::build(user_home, None)
+        Self::build(user_home, None, None)
     }
 
     pub fn for_user_home_with_pre_rename_hook(
         user_home: &Path,
         hook: PreRenameHook,
     ) -> Result<Self, CodexProblem> {
-        Self::build(user_home, Some(hook))
+        Self::build(user_home, Some(hook), None)
     }
 
-    fn build(user_home: &Path, hook: Option<PreRenameHook>) -> Result<Self, CodexProblem> {
+    pub fn for_user_home_with_exchange_hook(
+        user_home: &Path,
+        hook: ExchangeHook,
+    ) -> Result<Self, CodexProblem> {
+        Self::build(user_home, None, Some(hook))
+    }
+
+    fn build(
+        user_home: &Path,
+        hook: Option<PreRenameHook>,
+        exchange_hook: Option<ExchangeHook>,
+    ) -> Result<Self, CodexProblem> {
         let configured_home = user_home.join(".codex");
         let config_home = match fs::symlink_metadata(&configured_home) {
             Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(&configured_home)
@@ -142,6 +156,7 @@ impl CodexConfigCodec {
         Ok(Self {
             config_path: config_home.join("config.toml"),
             pre_rename_hook: hook,
+            exchange_hook,
         })
     }
 
@@ -376,6 +391,12 @@ impl CodexConfigCodec {
         )
         .map_err(|_| CodexProblem::new("configuration-write-failed", Some(&self.config_path)))?;
         let mut temporary = File::from(temporary_fd);
+        rustix::fs::fchmod(
+            &temporary,
+            Mode::from_raw_mode(expected.identity.mode.unwrap_or(0o600) as _),
+        )
+        .map_err(|_| CodexProblem::new("configuration-write-failed", Some(&self.config_path)))?;
+        let retain_temporary = Cell::new(false);
         let result = (|| -> Result<(), CodexProblem> {
             temporary
                 .write_all(document.to_string().as_bytes())
@@ -408,19 +429,42 @@ impl CodexConfigCodec {
                 .map_err(|_| {
                     CodexProblem::new("configuration-write-failed", Some(&self.config_path))
                 })?;
-                if file_identity_at(&directory, temporary_name.as_str())? != expected.identity {
-                    let _ = rustix::fs::renameat_with(
-                        &directory,
-                        temporary_name.as_str(),
-                        &directory,
-                        target_name,
-                        RenameFlags::EXCHANGE,
-                    );
+                retain_temporary.set(true);
+                let inject_rollback_failure = self
+                    .exchange_hook
+                    .as_ref()
+                    .map(|hook| hook(&parent.join(&temporary_name), &self.config_path))
+                    .transpose()
+                    .map_err(|_| {
+                        retain_temporary.set(true);
+                        CodexProblem::new("recovery-required", Some(&self.config_path))
+                    })?
+                    .unwrap_or(false);
+                let displaced_matches = file_identity_at(&directory, temporary_name.as_str())
+                    .is_ok_and(|identity| identity == expected.identity);
+                if !displaced_matches {
+                    let rolled_back = !inject_rollback_failure
+                        && rustix::fs::renameat_with(
+                            &directory,
+                            temporary_name.as_str(),
+                            &directory,
+                            target_name,
+                            RenameFlags::EXCHANGE,
+                        )
+                        .is_ok();
+                    if !rolled_back {
+                        return Err(CodexProblem::new(
+                            "recovery-required",
+                            Some(&self.config_path),
+                        ));
+                    }
+                    retain_temporary.set(false);
                     return Err(CodexProblem::new(
                         "configuration-write-failed",
                         Some(&self.config_path),
                     ));
                 }
+                retain_temporary.set(false);
                 if remove_file {
                     rustix::fs::unlinkat(&directory, target_name, AtFlags::empty()).map_err(
                         |_| {
@@ -444,7 +488,9 @@ impl CodexConfigCodec {
                 CodexProblem::new("configuration-write-failed", Some(&self.config_path))
             })
         })();
-        let _ = rustix::fs::unlinkat(&directory, temporary_name.as_str(), AtFlags::empty());
+        if !retain_temporary.get() {
+            let _ = rustix::fs::unlinkat(&directory, temporary_name.as_str(), AtFlags::empty());
+        }
         result
     }
 

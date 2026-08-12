@@ -17,6 +17,12 @@ pub enum RecoveryState {
     RecoveryRequired,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedWriteStatus {
+    Allowed,
+    RecoveryRequired,
+}
+
 impl RecoveryState {
     fn as_str(self) -> &'static str {
         match self {
@@ -206,23 +212,30 @@ impl StateStore {
     }
 
     pub async fn ensure_managed_writes_allowed(&self) -> Result<(), crate::codex::CodexProblem> {
-        let blocked = self
-            .connection
-            .call(|connection| {
-                connection.query_row(
-                    "SELECT recovery_state = 'recovery-required'
-                     FROM target_route_state WHERE target = 'codex'",
+        match self.managed_write_status().await {
+            Ok(ManagedWriteStatus::Allowed) => Ok(()),
+            Ok(ManagedWriteStatus::RecoveryRequired) | Err(_) => {
+                Err(crate::codex::CodexProblem::new("recovery-required", None))
+            }
+        }
+    }
+
+    pub async fn managed_write_status(&self) -> Result<ManagedWriteStatus, StateError> {
+        self.connection
+            .call(|connection| -> Result<ManagedWriteStatus, StateError> {
+                let state: String = connection.query_row(
+                    "SELECT recovery_state FROM target_route_state WHERE target = 'codex'",
                     [],
-                    |row| row.get::<_, bool>(0),
-                )
+                    |row| row.get(0),
+                )?;
+                match state.as_str() {
+                    "clean" => Ok(ManagedWriteStatus::Allowed),
+                    "recovery-required" => Ok(ManagedWriteStatus::RecoveryRequired),
+                    _ => Err(StateError::InvalidRecoveryState),
+                }
             })
             .await
-            .map_err(|_| crate::codex::CodexProblem::new("recovery-required", None))?;
-        if blocked {
-            Err(crate::codex::CodexProblem::new("recovery-required", None))
-        } else {
-            Ok(())
-        }
+            .map_err(super::store::map_state_call_error)
     }
 }
 

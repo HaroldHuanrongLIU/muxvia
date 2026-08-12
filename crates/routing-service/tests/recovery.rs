@@ -262,6 +262,61 @@ async fn recovery_required_startup_opens_read_only_control_without_resuming_comm
     }
     drop(unbound);
     handle.shutdown().await.unwrap();
+
+    let second_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+    let second_handle = ControlServer::bind(&fixture.home, Arc::clone(&second_store), "test-2")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        second_store.target_view().await.unwrap().recovery.state,
+        "recovery-required"
+    );
+    let second_epoch_unbound = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .await
+        .expect("persisted recovery-required must remain control-only in a new service epoch");
+    let mut second_stream = tokio::net::UnixStream::connect(second_handle.socket_path())
+        .await
+        .unwrap();
+    write_frame(
+        &mut second_stream,
+        &serde_json::json!({
+            "type":"hello", "rpc":{"major":1,"minor":0}, "release":"test-2"
+        }),
+    )
+    .await
+    .unwrap();
+    read_frame(&mut second_stream).await.unwrap();
+    for (request_id, action) in [
+        (
+            "save-2",
+            serde_json::json!({
+                "kind":"save-provider", "name":"blocked", "baseUrl":"https://blocked.test/v1",
+                "model":"gpt", "credential":"blocked-secret"
+            }),
+        ),
+        (
+            "activate-2",
+            serde_json::json!({
+                "kind":"activate-provider", "providerId":provider_id, "mode":"takeover"
+            }),
+        ),
+    ] {
+        write_frame(
+            &mut second_stream,
+            &serde_json::json!({
+                "type":"request", "requestId":request_id,
+                "operation":{"kind":"act","target":"codex","actionId":Uuid::new_v4(),
+                  "expectedRevision":1,"action":action}
+            }),
+        )
+        .await
+        .unwrap();
+        let response = read_frame(&mut second_stream).await.unwrap();
+        assert_eq!(response["problem"]["code"], "recovery-required");
+    }
+    drop(second_epoch_unbound);
+    second_handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]

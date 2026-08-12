@@ -25,7 +25,7 @@ use crate::{
     home::MuxviaHome,
     model::ReqwestUpstream,
     service::activate::ActivationService,
-    state::StateStore,
+    state::{ManagedWriteStatus, StateStore},
 };
 
 #[derive(Debug, Error)]
@@ -77,20 +77,18 @@ impl ControlServer {
     ) -> Result<ControlServerHandle, ControlServerError> {
         let codec = CodexConfigCodec::for_user_home(home.user_home())
             .map_err(|_| ControlServerError::State)?;
-        match codec.reconcile_pending(&store).await {
-            Ok(()) => activation
+        let reconciliation = codec.reconcile_pending(&store).await;
+        match store
+            .managed_write_status()
+            .await
+            .map_err(|_| ControlServerError::State)?
+        {
+            ManagedWriteStatus::Allowed if reconciliation.is_ok() => activation
                 .bootstrap_committed_takeover()
                 .await
                 .map_err(|_| ControlServerError::State)?,
-            Err(_) => {
-                let view = store
-                    .target_view()
-                    .await
-                    .map_err(|_| ControlServerError::State)?;
-                if view.recovery.state != "recovery-required" {
-                    return Err(ControlServerError::State);
-                }
-            }
+            ManagedWriteStatus::RecoveryRequired => {}
+            ManagedWriteStatus::Allowed => return Err(ControlServerError::State),
         }
 
         let run_dir = home.root().join("run");

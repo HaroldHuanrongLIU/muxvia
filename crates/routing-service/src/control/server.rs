@@ -14,7 +14,7 @@ use tokio::{
 };
 
 use crate::{
-    codex::CodexConfigCodec,
+    codex::{CodexConfigCodec, CommandCodexProbe},
     control::{
         framing::{read_frame, write_frame},
         protocol::{
@@ -23,6 +23,8 @@ use crate::{
         },
     },
     home::MuxviaHome,
+    model::ReqwestUpstream,
+    service::activate::ActivationService,
     state::StateStore,
 };
 
@@ -51,6 +53,27 @@ impl ControlServer {
         home: &MuxviaHome,
         store: Arc<StateStore>,
         release: impl Into<String>,
+    ) -> Result<ControlServerHandle, ControlServerError> {
+        let upstream = ReqwestUpstream::new().map_err(|_| ControlServerError::State)?;
+        let executable = find_codex_executable();
+        let activation = Arc::new(
+            ActivationService::new(
+                Arc::clone(&store),
+                home.clone(),
+                Arc::new(CommandCodexProbe),
+                executable,
+                Arc::new(upstream),
+            )
+            .with_configuration_home_override(std::env::var_os("CODEX_HOME").map(PathBuf::from)),
+        );
+        Self::bind_with_activation(home, store, release, activation).await
+    }
+
+    pub async fn bind_with_activation(
+        home: &MuxviaHome,
+        store: Arc<StateStore>,
+        release: impl Into<String>,
+        activation: Arc<ActivationService>,
     ) -> Result<ControlServerHandle, ControlServerError> {
         let codec = CodexConfigCodec::for_user_home(home.user_home())
             .map_err(|_| ControlServerError::State)?;
@@ -88,9 +111,10 @@ impl ControlServer {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break };
                         let store = Arc::clone(&store);
+                        let activation = Arc::clone(&activation);
                         let release = release.clone();
                         sessions.spawn(async move {
-                            serve_authorized(stream, store, release).await;
+                            serve_authorized(stream, store, activation, release).await;
                         });
                     }
                 }
@@ -152,7 +176,12 @@ fn remove_socket_if_present(path: &Path) {
     }
 }
 
-async fn serve_authorized(mut stream: UnixStream, store: Arc<StateStore>, release: String) {
+async fn serve_authorized(
+    mut stream: UnixStream,
+    store: Arc<StateStore>,
+    activation: Arc<ActivationService>,
+    release: String,
+) {
     let authorized = stream.peer_cred().is_ok_and(|credentials| {
         // SAFETY: geteuid has no preconditions and only reads the process credential.
         peer_uid_matches(credentials.uid(), unsafe { libc::geteuid() })
@@ -169,10 +198,15 @@ async fn serve_authorized(mut stream: UnixStream, store: Arc<StateStore>, releas
         return;
     }
 
-    serve_session(&mut stream, store, release).await;
+    serve_session(&mut stream, store, activation, release).await;
 }
 
-async fn serve_session(stream: &mut UnixStream, store: Arc<StateStore>, release: String) {
+async fn serve_session(
+    stream: &mut UnixStream,
+    store: Arc<StateStore>,
+    activation: Arc<ActivationService>,
+    release: String,
+) {
     let Ok(first) = read_frame(stream).await else {
         return;
     };
@@ -279,15 +313,13 @@ async fn serve_session(stream: &mut UnixStream, store: Arc<StateStore>, release:
                         if write_frame(stream, &response).await.is_err() { return; }
                     }
                     ControlOperation::Act { action_id, expected_revision, action, .. } => {
-                        match store.apply_save_provider_action(action_id, expected_revision, action).await {
+                        match activation.apply_raw(action_id, expected_revision, action).await {
                             Ok(outcome) => {
-                                let view = outcome.view.clone();
                                 let response = ServerFrame::Response {
                                     request_id,
                                     result: ControlResult::ActionOutcome { outcome },
                                 };
                                 if write_frame(stream, &response).await.is_err() { return; }
-                                store.publish_target_view(view);
                             }
                             Err(failure) => {
                                 if write_problem(
@@ -316,6 +348,17 @@ async fn serve_session(stream: &mut UnixStream, store: Arc<StateStore>, release:
             }
         }
     }
+}
+
+fn find_codex_executable() -> PathBuf {
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("codex"))
+                .find(|candidate| candidate.is_file())
+        })
+        .and_then(|path| fs::canonicalize(path).ok())
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/codex"))
 }
 
 fn compatible_hello(value: &Value) -> bool {

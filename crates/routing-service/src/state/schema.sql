@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS target_route_state (
   route_port INTEGER,
   routing_credential TEXT,
   activated_snapshot_id TEXT,
+  managed_config_path TEXT,
   recovery_state TEXT NOT NULL
 );
 

@@ -115,7 +115,16 @@ impl StateStore {
                     "INSERT INTO activation_recovery
                      (id, target, action_id, config_path, file_identity_json,
                       before_owned_json, desired_owned_json, state, created_revision)
-                     VALUES (?1, 'codex', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     VALUES (?1, 'codex', ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(action_id) DO UPDATE SET
+                       id = excluded.id,
+                       config_path = excluded.config_path,
+                       file_identity_json = excluded.file_identity_json,
+                       before_owned_json = excluded.before_owned_json,
+                       desired_owned_json = excluded.desired_owned_json,
+                       state = excluded.state,
+                       created_revision = excluded.created_revision
+                     WHERE activation_recovery.state = 'rolled-back'",
                     params![
                         intent.id.to_string(),
                         intent.action_id.to_string(),
@@ -127,6 +136,14 @@ impl StateStore {
                         intent.created_revision,
                     ],
                 )?;
+                let stored_id: String = connection.query_row(
+                    "SELECT id FROM activation_recovery WHERE action_id = ?1",
+                    [intent.action_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                if stored_id != intent.id.to_string() {
+                    return Err(StateError::MissingRecoveryIntent);
+                }
                 Ok(())
             })
             .await

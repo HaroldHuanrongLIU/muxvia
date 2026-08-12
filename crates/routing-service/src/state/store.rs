@@ -1,11 +1,15 @@
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::broadcast;
-use tokio_rusqlite::{Connection, rusqlite::params};
+use tokio_rusqlite::{
+    Connection,
+    rusqlite::{OptionalExtension, params},
+};
 use uuid::Uuid;
 
 use crate::{
     control::protocol::{ActionOutcome, ActionStatus, ControlProblem, TargetAction, TargetView},
     domain::{
+        activation::ActivatedSnapshot,
         provider::normalize_provider_base_url,
         view::{empty_target_view, project_target_view},
     },
@@ -52,6 +56,23 @@ pub struct StateStore {
     pub(super) connection: Connection,
     service_epoch: String,
     target_views: broadcast::Sender<TargetView>,
+}
+
+pub struct ActivationPreparation {
+    pub provider_id: Uuid,
+    pub base_url: String,
+    pub model: String,
+    pub provider_credential: SecretString,
+    pub route_port: Option<u16>,
+    pub routing_credential: Option<SecretString>,
+    pub active_model: Option<String>,
+}
+
+pub enum ActivationCommit {
+    Applied(ActionOutcome),
+    Replayed(ActionOutcome),
+    Stale(TargetView),
+    RecoveryRequired(TargetView),
 }
 
 pub struct RoutingSnapshot {
@@ -119,6 +140,163 @@ impl StateStore {
 
     pub fn subscribe_target_views(&self) -> broadcast::Receiver<TargetView> {
         self.target_views.subscribe()
+    }
+
+    pub fn service_epoch(&self) -> Uuid {
+        Uuid::parse_str(&self.service_epoch).expect("service epoch is generated as a UUID")
+    }
+
+    pub async fn prepare_activation(
+        &self,
+        provider_id: Uuid,
+        expected_revision: u64,
+    ) -> Result<Result<ActivationPreparation, ActionFailure>, StateError> {
+        let service_epoch = self.service_epoch.clone();
+        self.connection
+            .call(move |connection| -> Result<Result<ActivationPreparation, ActionFailure>, StateError> {
+                let (revision, recovery_state, route_port, routing_credential):
+                    (u64, String, Option<u16>, Option<String>) = connection.query_row(
+                        "SELECT management_revision, recovery_state, route_port, routing_credential
+                         FROM target_route_state WHERE target = 'codex'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )?;
+                let failure = |code: &str, message: &str| -> ActionFailure {
+                    ActionFailure {
+                        problem: ControlProblem { code: code.to_owned(), message: message.to_owned() },
+                        authoritative_view: project_target_view(connection, &service_epoch)
+                            .unwrap_or_else(|_| empty_target_view(&service_epoch)),
+                    }
+                };
+                if recovery_state == "recovery-required" {
+                    return Ok(Err(failure("recovery-required", "Managed writes are blocked until recovery is resolved")));
+                }
+                if revision != expected_revision {
+                    return Ok(Err(failure("stale-revision", "Target state changed; refresh and retry")));
+                }
+                let provider = connection.query_row(
+                    "SELECT p.base_url, p.model, c.bearer_token
+                     FROM providers p LEFT JOIN provider_credentials c ON c.provider_id = p.id
+                     WHERE p.id = ?1 AND p.target = 'codex'",
+                    [provider_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
+                );
+                let (base_url, model, credential) = match provider {
+                    Ok(values) => values,
+                    Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => {
+                        return Ok(Err(failure("incomplete-provider", "Provider is missing or incomplete")));
+                    }
+                    Err(error) => return Err(StateError::Sqlite(error)),
+                };
+                let Some(credential) = credential.filter(|value| !value.trim().is_empty()) else {
+                    return Ok(Err(failure("incomplete-provider", "Provider is missing or incomplete")));
+                };
+                if model.trim().is_empty() || base_url.trim().is_empty() {
+                    return Ok(Err(failure("incomplete-provider", "Provider is missing or incomplete")));
+                }
+                let active_model = connection.query_row(
+                    "SELECT s.model FROM target_route_state r
+                     JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
+                     WHERE r.target = 'codex'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ).optional()?;
+                Ok(Ok(ActivationPreparation {
+                    provider_id,
+                    base_url,
+                    model,
+                    provider_credential: SecretString::from(credential),
+                    route_port,
+                    routing_credential: routing_credential.map(SecretString::from),
+                    active_model,
+                }))
+            })
+            .await
+            .map_err(map_state_call_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_activation(
+        &self,
+        action_id: Uuid,
+        expected_revision: u64,
+        snapshot: ActivatedSnapshot,
+        route_port: u16,
+        routing_credential: SecretString,
+        recovery_id: Uuid,
+        config_path: String,
+    ) -> Result<ActivationCommit, StateError> {
+        let service_epoch = self.service_epoch.clone();
+        let routing_credential = routing_credential.expose_secret().to_owned();
+        let provider_credential = snapshot.provider_credential.expose_secret().to_owned();
+        self.connection.call(move |connection| -> Result<ActivationCommit, StateError> {
+            let transaction = connection.transaction_with_behavior(
+                tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let recorded = transaction.query_row(
+                "SELECT outcome_json FROM action_receipts WHERE action_id = ?1",
+                [action_id.to_string()],
+                |row| row.get::<_, String>(0),
+            );
+            match recorded {
+                Ok(json) => {
+                    let mut outcome: ActionOutcome = serde_json::from_str(&json)?;
+                    outcome.status = ActionStatus::Replayed;
+                    return Ok(ActivationCommit::Replayed(outcome));
+                }
+                Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => {}
+                Err(error) => return Err(StateError::Sqlite(error)),
+            }
+            let (revision, recovery_state): (u64, String) = transaction.query_row(
+                "SELECT management_revision, recovery_state FROM target_route_state WHERE target = 'codex'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if recovery_state == "recovery-required" {
+                return Ok(ActivationCommit::RecoveryRequired(project_target_view(&transaction, &service_epoch)?));
+            }
+            if revision != expected_revision {
+                return Ok(ActivationCommit::Stale(project_target_view(&transaction, &service_epoch)?));
+            }
+            transaction.execute(
+                "INSERT INTO activated_snapshots
+                 (id, target, provider_id, base_url, model, provider_bearer_token, epoch)
+                 VALUES (?1, 'codex', ?2, ?3, ?4, ?5, ?6)",
+                params![snapshot.id.to_string(), snapshot.provider_id.to_string(), snapshot.base_url,
+                    snapshot.model, provider_credential, snapshot.epoch.to_string()],
+            )?;
+            let changed = transaction.execute(
+                "UPDATE activation_recovery SET state = 'committed'
+                 WHERE id = ?1 AND state = 'pending'",
+                [recovery_id.to_string()],
+            )?;
+            if changed != 1 {
+                return Err(StateError::MissingRecoveryIntent);
+            }
+            transaction.execute(
+                "UPDATE target_route_state SET
+                    management_revision = management_revision + 1,
+                    view_sequence = view_sequence + 1,
+                    current_provider_id = ?1,
+                    serving_provider_id = NULL,
+                    takeover_state = 'active', route_port = ?2,
+                    routing_credential = ?3, activated_snapshot_id = ?4,
+                    managed_config_path = ?5, recovery_state = 'clean'
+                 WHERE target = 'codex'",
+                params![snapshot.provider_id.to_string(), route_port, routing_credential,
+                    snapshot.id.to_string(), config_path],
+            )?;
+            let view = project_target_view(&transaction, &service_epoch)?;
+            let outcome = ActionOutcome { status: ActionStatus::Applied, view };
+            let json = serde_json::to_string(&outcome)?;
+            transaction.execute(
+                "INSERT INTO action_receipts (action_id, action_kind, committed_revision, outcome_json)
+                 VALUES (?1, 'activate-provider', ?2, ?3)",
+                params![action_id.to_string(), outcome.view.management_revision, json],
+            )?;
+            transaction.commit()?;
+            Ok(ActivationCommit::Applied(outcome))
+        }).await.map_err(map_state_call_error)
     }
 
     pub(crate) fn publish_target_view(&self, view: TargetView) {
@@ -419,7 +597,7 @@ impl StateStore {
         }
     }
 
-    async fn failure(&self, code: &str, message: &str) -> ActionFailure {
+    pub(crate) async fn failure(&self, code: &str, message: &str) -> ActionFailure {
         let authoritative_view = self
             .target_view()
             .await

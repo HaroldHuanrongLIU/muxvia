@@ -179,6 +179,20 @@ impl CodexConfigCodec {
         Ok(snapshot)
     }
 
+    pub fn inspect_managed(
+        &self,
+        expected: &DesiredCodexState,
+    ) -> Result<ConfigSnapshot, CodexProblem> {
+        let (snapshot, _) = self.read_snapshot()?;
+        if !owned_semantically_matches(&snapshot.owned, &expected.0) {
+            return Err(CodexProblem::new(
+                "configuration-collision",
+                Some(&self.config_path),
+            ));
+        }
+        Ok(snapshot)
+    }
+
     pub fn desired(
         &self,
         model: &str,
@@ -235,6 +249,25 @@ impl CodexConfigCodec {
             ));
         }
         Ok(())
+    }
+
+    pub fn restore_or_confirm_before(
+        &self,
+        before: &ConfigSnapshot,
+        expected_current: &DesiredCodexState,
+    ) -> Result<(), CodexProblem> {
+        if self.matches_before(before) {
+            return Ok(());
+        }
+        self.restore(before, expected_current)?;
+        if self.matches_before(before) {
+            Ok(())
+        } else {
+            Err(CodexProblem::new(
+                "recovery-required",
+                Some(&self.config_path),
+            ))
+        }
     }
 
     pub fn verify(

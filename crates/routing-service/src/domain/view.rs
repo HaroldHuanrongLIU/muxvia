@@ -5,6 +5,17 @@ use crate::control::protocol::{
     RecoveryView, ServiceView, TakeoverView, Target, TargetView,
 };
 
+type RouteProjectionRow = (
+    u64,
+    u64,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<u16>,
+    String,
+    Option<String>,
+);
+
 pub(crate) fn project_target_view(
     connection: &Connection,
     service_epoch: &str,
@@ -17,8 +28,9 @@ pub(crate) fn project_target_view(
         takeover_state,
         route_port,
         recovery_state,
-    ): (u64, u64, Option<String>, Option<String>, String, Option<u16>, String) = connection.query_row(
-        "SELECT management_revision, view_sequence, current_provider_id, serving_provider_id, takeover_state, route_port, recovery_state
+        managed_config_path,
+    ): RouteProjectionRow = connection.query_row(
+        "SELECT management_revision, view_sequence, current_provider_id, serving_provider_id, takeover_state, route_port, recovery_state, managed_config_path
          FROM target_route_state WHERE target = 'codex'",
         [],
         |row| {
@@ -30,6 +42,7 @@ pub(crate) fn project_target_view(
                 row.get(4)?,
                 row.get(5)?,
                 row.get(6)?,
+                row.get(7)?,
             ))
         },
     )?;
@@ -104,7 +117,7 @@ pub(crate) fn project_target_view(
         },
         mode: mode.to_owned(),
         takeover: TakeoverView {
-            state: takeover_state,
+            state: takeover_state.clone(),
             endpoint,
         },
         providers,
@@ -113,11 +126,13 @@ pub(crate) fn project_target_view(
         managed_configuration: ManagedConfigurationView {
             state: if recovery_state == "recovery-required" {
                 recovery_state.clone()
+            } else if takeover_state == "active" {
+                "applied".to_owned()
             } else {
                 "unmanaged".to_owned()
             },
-            path: None,
-            restart_required: false,
+            path: managed_config_path,
+            restart_required: takeover_state == "active",
         },
         recovery: RecoveryView {
             intent_id: recovery.0,

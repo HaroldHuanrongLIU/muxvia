@@ -371,7 +371,15 @@ async fn stale_revision_and_replayed_malformed_action_use_authoritative_boundary
     )
     .await;
     assert_eq!(replay["result"]["outcome"]["status"], "replayed");
-    let _push = read_frame(&mut stream).await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            read_frame(&mut stream),
+        )
+        .await
+        .is_err(),
+        "a replay must not publish a duplicate Target View",
+    );
 
     let stale = request(
         &mut stream,

@@ -16,6 +16,8 @@ type Pending = {
   reject: (error: ControlError) => void
 }
 
+type SocketFactory = (socketPath: string) => Socket
+
 export class ControlError extends Error {
   readonly code: string
   readonly retryable: boolean
@@ -68,20 +70,46 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     socket.on("close", () => this.#fail(new ControlError("connection-closed", "Control socket closed")))
   }
 
-  static async connect(socketPath: string, release: string): Promise<RpcClient> {
-    const socket = createConnection({ path: socketPath })
+  static async connect(
+    socketPath: string,
+    release: string,
+    signal?: AbortSignal,
+    createSocket: SocketFactory = (path) => createConnection({ path }),
+  ): Promise<RpcClient> {
+    if (signal?.aborted) {
+      throw new ControlError("service-unavailable", "Control connection was cancelled")
+    }
+    const socket = createSocket(socketPath)
     const client = new RpcClient(socket)
-    await new Promise<void>((resolve, reject) => {
-      client.#handshake = { resolve, reject }
-      socket.once("connect", () => {
-        socket.write(encodeFrame({
-          type: "hello",
-          rpc: { major: 1, minor: 0 },
-          release,
-        }))
+    const cancelled = new ControlError("service-unavailable", "Control connection was cancelled")
+    const onAbort = () => {
+      socket.destroy()
+      client.#fail(cancelled)
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        client.#handshake = { resolve, reject }
+        socket.once("connect", () => {
+          socket.write(encodeFrame({
+            type: "hello",
+            rpc: { major: 1, minor: 0 },
+            release,
+          }))
+        })
       })
-    })
-    return client
+      if (signal?.aborted) throw cancelled
+      return client
+    } catch (error) {
+      const failure = asControlError(error)
+      if (!client.#closed) {
+        socket.destroy()
+        client.#fail(failure)
+      }
+      throw failure
+    } finally {
+      signal?.removeEventListener("abort", onAbort)
+    }
   }
 
   async openTarget(target: "codex"): Promise<TargetSession> {
@@ -118,10 +146,9 @@ export class RpcClient implements RpcTransport, MuxviaControl {
 
   async close(): Promise<void> {
     if (this.#closed) return
-    await new Promise<void>((resolve) => {
-      this.#socket.once("close", resolve)
-      this.#socket.end()
-    })
+    this.#socket.destroy()
+    this.#fail(new ControlError("connection-closed", "Control socket closed"))
+    await this.#closedPromise
   }
 
   #receive(chunk: Uint8Array): void {

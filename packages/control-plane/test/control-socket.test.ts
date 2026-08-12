@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createServer, type Server, type Socket } from "node:net"
+import { EventEmitter } from "node:events"
 
 import { encodeFrame, FrameDecoder } from "../src/control/framing"
 import { RpcClient } from "../src/control/rpc-client"
@@ -15,6 +16,28 @@ test("a missing control socket is classified as service-unavailable", async () =
   await expect(RpcClient.connect(join(root, "missing.sock"), "control-test")).rejects.toMatchObject({
     code: "service-unavailable",
   })
+})
+
+test("aborting a stalled handshake destroys the underlying socket", async () => {
+  class StalledSocket extends EventEmitter {
+    destroyCalls = 0
+    write(): boolean { return true }
+    destroy(): this {
+      this.destroyCalls++
+      return this
+    }
+  }
+  const socket = new StalledSocket()
+  const controller = new AbortController()
+  const connecting = RpcClient.connect(
+    "/tmp/stalled.sock",
+    "control-test",
+    controller.signal,
+    () => socket as unknown as Socket,
+  )
+  controller.abort()
+  await expect(connecting).rejects.toMatchObject({ code: "service-unavailable" })
+  expect(socket.destroyCalls).toBe(1)
 })
 const servers: Server[] = []
 

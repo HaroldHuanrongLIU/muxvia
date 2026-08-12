@@ -24,7 +24,7 @@ interface SpawnOptions {
 }
 
 export interface RunPorts {
-  connect(socketPath: string, release: string): Promise<TargetSession>
+  connect(socketPath: string, release: string, signal: AbortSignal): Promise<TargetSession>
   spawn(path: string, args: string[], options: SpawnOptions): void
   createRenderer(): Promise<CliRenderer>
   render(node: () => JSX.Element, renderer: CliRenderer): Promise<void>
@@ -39,23 +39,57 @@ interface TargetControl {
   close(): Promise<void>
 }
 
-type ControlConnector = (socketPath: string, release: string) => Promise<TargetControl>
+type ControlConnector = (
+  socketPath: string,
+  release: string,
+  signal: AbortSignal,
+) => Promise<TargetControl>
 
 export async function connectTargetSession(
   socketPath: string,
   release: string,
+  signal: AbortSignal,
   connect: ControlConnector = RpcClient.connect,
 ): Promise<TargetSession> {
-  const control = await connect(socketPath, release)
+  if (signal.aborted) throw new ConnectionDeadlineError()
+
+  let control: TargetControl | undefined
+  let closing: Promise<void> | undefined
+  const closeControl = (): Promise<void> => {
+    if (!control) return Promise.resolve()
+    closing ??= control.close().catch(() => {})
+    return closing
+  }
+  let rejectAborted!: (error: ConnectionDeadlineError) => void
+  const aborted = new Promise<never>((_, reject) => {
+    rejectAborted = reject
+  })
+  const onAbort = () => {
+    void closeControl()
+    rejectAborted(new ConnectionDeadlineError())
+  }
+  signal.addEventListener("abort", onAbort, { once: true })
+
+  const connected = connect(socketPath, release, signal).then(async (next) => {
+    control = next
+    if (!signal.aborted) return next
+    await closeControl()
+    throw new ConnectionDeadlineError()
+  })
+
   try {
-    return await control.openTarget("codex")
+    control = await Promise.race([connected, aborted])
+    const opening = control.openTarget("codex").then(async (session) => {
+      if (!signal.aborted) return session
+      await closeControl()
+      throw new ConnectionDeadlineError()
+    })
+    return await Promise.race([opening, aborted])
   } catch (error) {
-    try {
-      await control.close()
-    } catch {
-      // Preserve the structured open-target failure that explains why startup failed.
-    }
+    await closeControl()
     throw error
+  } finally {
+    signal.removeEventListener("abort", onAbort)
   }
 }
 
@@ -105,15 +139,17 @@ async function connectBeforeDeadline(
   if (remaining <= 0) throw new ConnectionDeadlineError()
 
   let expired = false
+  const controller = new AbortController()
   let cancelTimeout = () => {}
   const timeout = new Promise<never>((_, reject) => {
     cancelTimeout = ports.clock.timeout(remaining, () => {
       expired = true
+      controller.abort()
       reject(new ConnectionDeadlineError())
     })
   })
   const connection = Promise.resolve()
-    .then(() => ports.connect(options.socketPath, options.release))
+    .then(() => ports.connect(options.socketPath, options.release, controller.signal))
     .then(async (session) => {
       if (!expired) return session
       try {

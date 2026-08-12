@@ -293,7 +293,41 @@ test("the production connector closes its control client when opening the Target
     },
   }
 
-  await expect(connectTargetSession("/tmp/control.sock", "test", async () => control)).rejects.toBe(failure)
+  await expect(connectTargetSession("/tmp/control.sock", "test", new AbortController().signal, async () => control)).rejects.toBe(failure)
+  expect(closeCalls).toBe(1)
+})
+
+test("the production connector aborts a control whose open Target never settles", async () => {
+  const controller = new AbortController()
+  const opening = deferred<TargetSession>()
+  const lateSession = new LifecycleSession()
+  let closeCalls = 0
+  let openCalls = 0
+  const control = {
+    openTarget: () => {
+      openCalls++
+      return opening.promise
+    },
+    close: async () => { closeCalls++ },
+  }
+
+  const connecting = connectTargetSession(
+    "/tmp/control.sock",
+    "test",
+    controller.signal,
+    async (_socketPath, _release, signal) => {
+      expect(signal).toBe(controller.signal)
+      return control
+    },
+  )
+  await flushMicrotasks()
+  expect(openCalls).toBe(1)
+  controller.abort()
+  await expect(connecting).rejects.toMatchObject({ code: "service-unavailable" })
+  expect(closeCalls).toBe(1)
+
+  opening.resolve(lateSession)
+  await flushMicrotasks()
   expect(closeCalls).toBe(1)
 })
 

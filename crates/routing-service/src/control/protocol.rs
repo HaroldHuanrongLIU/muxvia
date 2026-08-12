@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::SerializeStruct};
 use serde_json::Value;
 use uuid::Uuid;
@@ -122,7 +124,7 @@ pub enum ServerFrame {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(
     tag = "kind",
     rename_all = "kebab-case",
@@ -140,7 +142,30 @@ pub enum ControlOperation {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+impl fmt::Debug for ControlOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OpenTarget { target } => formatter
+                .debug_struct("OpenTarget")
+                .field("target", target)
+                .finish(),
+            Self::Act {
+                target,
+                action_id,
+                expected_revision,
+                ..
+            } => formatter
+                .debug_struct("Act")
+                .field("target", target)
+                .field("action_id", action_id)
+                .field("expected_revision", expected_revision)
+                .field("action", &Redacted)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(
     tag = "kind",
     rename_all = "kebab-case",
@@ -157,6 +182,38 @@ pub enum TargetAction {
         provider_id: String,
         mode: TakeoverMode,
     },
+}
+
+impl fmt::Debug for TargetAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SaveProvider {
+                name,
+                base_url,
+                model,
+                ..
+            } => formatter
+                .debug_struct("SaveProvider")
+                .field("name", name)
+                .field("base_url", base_url)
+                .field("model", model)
+                .field("credential", &Redacted)
+                .finish(),
+            Self::ActivateProvider { provider_id, mode } => formatter
+                .debug_struct("ActivateProvider")
+                .field("provider_id", provider_id)
+                .field("mode", mode)
+                .finish(),
+        }
+    }
+}
+
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

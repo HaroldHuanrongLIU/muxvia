@@ -1,0 +1,68 @@
+use std::{
+    fs::{self, OpenOptions},
+    io,
+    path::{Path, PathBuf},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+#[derive(Clone)]
+pub struct MuxviaHome {
+    root: PathBuf,
+    state: PathBuf,
+    database: PathBuf,
+}
+
+impl MuxviaHome {
+    pub fn from_user_home(user_home: &Path) -> Self {
+        let root = user_home.join(".muxvia");
+        let state = root.join("state");
+        let database = state.join("muxvia.db");
+        Self {
+            root,
+            state,
+            database,
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state
+    }
+
+    pub fn database_path(&self) -> &Path {
+        &self.database
+    }
+
+    pub(crate) fn prepare_database(&self) -> io::Result<()> {
+        create_private_dir(&self.root)?;
+        create_private_dir(&self.state)?;
+
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        options.mode((libc::S_IRUSR | libc::S_IWUSR) as u32);
+        options.open(&self.database)?;
+        set_private_file_permissions(&self.database)
+    }
+}
+
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(libc::S_IRWXU as u32))?;
+    Ok(())
+}
+
+fn set_private_file_permissions(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(
+        path,
+        fs::Permissions::from_mode((libc::S_IRUSR | libc::S_IWUSR) as u32),
+    )?;
+    Ok(())
+}

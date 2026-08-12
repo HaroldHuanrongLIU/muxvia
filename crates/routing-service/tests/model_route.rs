@@ -22,7 +22,7 @@ use futures_util::{Stream, StreamExt, stream};
 use muxvia_routing::{
     home::MuxviaHome,
     model::{
-        ModelServer, ReqwestUpstream, ReservedListener,
+        ModelServer, ModelServerStatus, ReqwestUpstream, ReservedListener,
         auth::{ROUTING_CREDENTIAL_LEN, routing_credential_matches},
         headers::{forward_request_headers, forward_response_headers},
     },
@@ -240,6 +240,21 @@ async fn start_model(fixture: &StoreFixture) -> muxvia_routing::model::ModelServ
     )
     .await
     .unwrap()
+}
+
+#[tokio::test]
+async fn model_handle_reports_readiness_and_durable_unexpected_task_exit() {
+    let fixture = StoreFixture::new().await;
+    let mut handle = start_model(&fixture).await;
+    assert_eq!(handle.status(), ModelServerStatus::Running);
+    assert!(handle.is_running());
+
+    handle.abort();
+    tokio::task::yield_now().await;
+
+    assert_eq!(handle.status(), ModelServerStatus::Failed);
+    assert!(!handle.is_running());
+    assert!(handle.shutdown().await.is_err());
 }
 
 fn route_client() -> reqwest::Client {

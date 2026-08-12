@@ -12,7 +12,9 @@ use crate::{
     control::protocol::{ActionOutcome, ActionStatus, TakeoverMode, Target, TargetAction},
     domain::activation::ActivatedSnapshot,
     home::MuxviaHome,
-    model::{ModelServer, ModelServerHandle, ReservedListener, UpstreamTransport},
+    model::{
+        ModelServer, ModelServerError, ModelServerHandle, ReservedListener, UpstreamTransport,
+    },
     state::{
         ActionFailure, ActivationCommit, ActivationPreparation, RecoveryIntent, RecoveryState,
         StateStore,
@@ -428,7 +430,63 @@ impl ActivationService {
             .lock()
             .await
             .as_ref()
-            .map(ModelServerHandle::endpoint)
+            .and_then(|handle| handle.is_running().then_some(handle.endpoint()))
+    }
+
+    pub async fn bootstrap_committed_takeover(&self) -> Result<(), ModelServerError> {
+        let _gate = self.gate.lock().await;
+        let takeover = self
+            .store
+            .committed_takeover()
+            .await
+            .map_err(|_| ModelServerError::State)?;
+        let Some(takeover) = takeover else {
+            return Ok(());
+        };
+        let mut model = self.model.lock().await;
+        if model.as_ref().is_some_and(ModelServerHandle::is_running) {
+            return if model
+                .as_ref()
+                .is_some_and(|handle| handle.endpoint().port() == takeover.route_port)
+            {
+                Ok(())
+            } else {
+                Err(ModelServerError::Task)
+            };
+        }
+        if model.is_some() {
+            return Err(ModelServerError::Task);
+        }
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, takeover.route_port)).await?;
+        let reserved = ReservedListener::new(listener)?;
+        let handle = ModelServer::bind_reserved(
+            reserved,
+            Arc::clone(&self.store),
+            Arc::clone(&self.upstream),
+        )
+        .await?;
+        if handle.endpoint().port() != takeover.route_port || !handle.is_running() {
+            return Err(ModelServerError::Task);
+        }
+        *model = Some(handle);
+        Ok(())
+    }
+
+    pub async fn shutdown_model(&self) -> Result<(), ModelServerError> {
+        let model = self.model.lock().await.take();
+        if let Some(model) = model {
+            model.shutdown().await
+        } else {
+            Ok(())
+        }
+    }
+
+    #[doc(hidden)]
+    pub async fn abort_model(&self) {
+        if let Some(model) = self.model.lock().await.as_mut() {
+            model.abort();
+        }
+        tokio::task::yield_now().await;
     }
 
     fn inspect_config(
@@ -462,6 +520,9 @@ impl ActivationService {
         persisted_port: Option<u16>,
     ) -> Result<(u16, bool), ()> {
         if let Some(handle) = slot.as_ref() {
+            if !handle.is_running() {
+                return Err(());
+            }
             let port = handle.endpoint().port();
             return if persisted_port.is_none_or(|expected| expected == port) {
                 Ok((port, false))

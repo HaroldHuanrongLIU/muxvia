@@ -8,6 +8,11 @@ use std::{
 };
 
 use async_trait::async_trait;
+use axum::{
+    body::Bytes,
+    http::{HeaderMap, StatusCode},
+};
+use futures_util::stream;
 use muxvia_routing::{
     codex::{CodexCapability, CodexProbe, CodexProblem, CommandCodexProbe},
     control::{
@@ -51,6 +56,19 @@ struct NoopUpstream;
 impl UpstreamTransport for NoopUpstream {
     async fn send(&self, _: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
         Err(UpstreamError)
+    }
+}
+
+struct SuccessfulUpstream;
+
+#[async_trait]
+impl UpstreamTransport for SuccessfulUpstream {
+    async fn send(&self, _: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
+        Ok(UpstreamResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Box::pin(stream::once(async { Ok(Bytes::from_static(b"ok")) })),
+        })
     }
 }
 
@@ -658,4 +676,113 @@ async fn uds_activate_returns_then_pushes_one_complete_secret_free_view() {
         .is_err()
     );
     handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn committed_takeover_bootstraps_exact_endpoint_in_a_new_service_epoch_without_activate() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture.save("First", "gpt", "provider-secret").await;
+    let first = fixture.service(ActivationHooks::default());
+    let activated = first
+        .activate(command(provider_id, revision, Uuid::new_v4()))
+        .await
+        .unwrap();
+    let endpoint: std::net::SocketAddr = activated
+        .view
+        .takeover
+        .endpoint
+        .unwrap()
+        .trim_start_matches("http://")
+        .parse()
+        .unwrap();
+    first.shutdown_model().await.unwrap();
+    drop(first);
+
+    let second_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+    assert_ne!(second_store.service_epoch(), fixture.store.service_epoch());
+    let second = ActivationService::new(
+        Arc::clone(&second_store),
+        fixture.home.clone(),
+        fixture.probe.clone(),
+        "/usr/bin/codex".into(),
+        Arc::new(SuccessfulUpstream),
+    );
+    second.bootstrap_committed_takeover().await.unwrap();
+    assert_eq!(second.model_endpoint().await, Some(endpoint));
+    let credential = second_store.routing_credential().await.unwrap().unwrap();
+
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{endpoint}/v1/responses"))
+        .header(
+            "X-Muxvia-Routing-Credential",
+            secrecy::ExposeSecret::expose_secret(&credential),
+        )
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.bytes().await.unwrap(), "ok");
+}
+
+#[tokio::test]
+async fn occupied_committed_port_blocks_production_bootstrap_before_control_socket_opens() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture.save("First", "gpt", "secret").await;
+    let first = fixture.service(ActivationHooks::default());
+    let activated = first
+        .activate(command(provider_id, revision, Uuid::new_v4()))
+        .await
+        .unwrap();
+    let endpoint: std::net::SocketAddr = activated
+        .view
+        .takeover
+        .endpoint
+        .unwrap()
+        .trim_start_matches("http://")
+        .parse()
+        .unwrap();
+    first.shutdown_model().await.unwrap();
+    let occupied = tokio::net::TcpListener::bind(endpoint).await.unwrap();
+    let second_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+    let second = Arc::new(ActivationService::new(
+        Arc::clone(&second_store),
+        fixture.home.clone(),
+        fixture.probe.clone(),
+        "/usr/bin/codex".into(),
+        Arc::new(NoopUpstream),
+    ));
+
+    assert!(
+        ControlServer::bind_with_activation(&fixture.home, second_store, "test", second,)
+            .await
+            .is_err()
+    );
+    assert!(!fixture.home.root().join("run/control.sock").exists());
+    drop(occupied);
+}
+
+#[tokio::test]
+async fn dead_model_handle_is_not_reused_or_silently_rebound_before_activation_intent() {
+    let fixture = Fixture::new().await;
+    let (first_id, revision) = fixture.save("First", "gpt-1", "secret-1").await;
+    let service = fixture.service(ActivationHooks::default());
+    service
+        .activate(command(first_id, revision, Uuid::new_v4()))
+        .await
+        .unwrap();
+    let (second_id, second_revision) = fixture.save("Second", "gpt-2", "secret-2").await;
+    let intent_count = fixture.count("activation_recovery").await;
+    service.abort_model().await;
+
+    let failure = service
+        .activate(command(second_id, second_revision, Uuid::new_v4()))
+        .await
+        .unwrap_err();
+    assert_eq!(failure.problem.code, "configuration-write-failed");
+    assert_eq!(fixture.count("activation_recovery").await, intent_count);
+    assert!(service.model_endpoint().await.is_none());
 }

@@ -75,6 +75,10 @@ pub enum ActivationCommit {
     RecoveryRequired(TargetView),
 }
 
+pub struct CommittedTakeover {
+    pub route_port: u16,
+}
+
 pub struct RoutingSnapshot {
     id: Uuid,
     provider_id: Uuid,
@@ -144,6 +148,48 @@ impl StateStore {
 
     pub fn service_epoch(&self) -> Uuid {
         Uuid::parse_str(&self.service_epoch).expect("service epoch is generated as a UUID")
+    }
+
+    pub async fn committed_takeover(&self) -> Result<Option<CommittedTakeover>, StateError> {
+        self.connection
+            .call(
+                |connection| -> Result<Option<CommittedTakeover>, StateError> {
+                    let row = connection.query_row(
+                        "SELECT route_port, routing_credential, activated_snapshot_id
+                     FROM target_route_state
+                     WHERE target = 'codex' AND takeover_state = 'active'",
+                        [],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<u16>>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        },
+                    );
+                    match row {
+                        Ok((Some(route_port), Some(credential), Some(snapshot)))
+                            if !credential.is_empty() && !snapshot.is_empty() =>
+                        {
+                            let exists: bool = connection.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM activated_snapshots WHERE id = ?1)",
+                                [snapshot],
+                                |row| row.get(0),
+                            )?;
+                            if exists {
+                                Ok(Some(CommittedTakeover { route_port }))
+                            } else {
+                                Err(StateError::InvalidActivatedSnapshot)
+                            }
+                        }
+                        Ok(_) => Err(StateError::InvalidActivatedSnapshot),
+                        Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                        Err(error) => Err(StateError::Sqlite(error)),
+                    }
+                },
+            )
+            .await
+            .map_err(map_state_call_error)
     }
 
     pub async fn prepare_activation(

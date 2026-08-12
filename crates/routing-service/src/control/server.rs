@@ -88,6 +88,10 @@ impl ControlServer {
         {
             return Err(ControlServerError::State);
         }
+        activation
+            .bootstrap_committed_takeover()
+            .await
+            .map_err(|_| ControlServerError::State)?;
 
         let run_dir = home.root().join("run");
         fs::create_dir_all(&run_dir)?;

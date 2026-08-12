@@ -190,11 +190,17 @@ export class RpcClient implements RpcTransport, MuxviaControl {
       pending.resolve(frame.result)
       return
     }
-    if (frame.type === "error" && frame.requestId !== null) {
+    if (frame.type === "error") {
+      const failure = new ControlError(frame.problem.code, frame.problem.message, frame.authoritativeView)
+      if (frame.requestId === null) {
+        this.#socket.destroy()
+        this.#fail(failure)
+        return
+      }
       const pending = this.#pending.get(frame.requestId)
       if (!pending) return
       this.#pending.delete(frame.requestId)
-      pending.reject(new ControlError(frame.problem.code, frame.problem.message, frame.authoritativeView))
+      pending.reject(failure)
     }
   }
 

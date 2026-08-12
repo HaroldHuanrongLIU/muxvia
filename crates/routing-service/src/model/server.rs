@@ -261,8 +261,8 @@ async fn route_responses(
         Err(_) => return local_response(StatusCode::BAD_GATEWAY),
     };
 
-    if upstream.status.is_success() && state.store.record_serving(snapshot.id()).await.is_err() {
-        return local_response(StatusCode::BAD_GATEWAY);
+    if upstream.status.is_success() {
+        let _ = state.store.record_serving(snapshot.id()).await;
     }
 
     let mut response = Response::builder()

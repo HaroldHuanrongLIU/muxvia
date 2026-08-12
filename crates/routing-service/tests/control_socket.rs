@@ -262,19 +262,89 @@ async fn requests_before_hello_and_second_hello_are_rejected() {
 }
 
 #[tokio::test]
-async fn malformed_oversized_and_unknown_frames_execute_no_action() {
+async fn malformed_pre_hello_frames_return_a_generic_error_then_close() {
     let fixture = ControlFixture::start().await;
 
-    let mut malformed = fixture.connect().await;
-    malformed.write_all(&[0, 0, 0, 1, b'{']).await.unwrap();
-    malformed.shutdown().await.unwrap();
+    let invalid_json = br#"{"credential":"do-not-echo",}"#;
+    let cases = [
+        vec![0, 0],
+        vec![0, 0, 0, 4, b'{', b'}'],
+        (1_048_577_u32).to_be_bytes().to_vec(),
+        vec![0, 0, 0, 1, 0xff],
+        [
+            (invalid_json.len() as u32).to_be_bytes().as_slice(),
+            invalid_json.as_slice(),
+        ]
+        .concat(),
+    ];
 
-    let mut oversized = fixture.connect().await;
-    oversized
-        .write_all(&(1_048_577_u32).to_be_bytes())
-        .await
-        .unwrap();
-    oversized.shutdown().await.unwrap();
+    for bytes in cases {
+        let mut stream = fixture.connect().await;
+        stream.write_all(&bytes).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let reply = read_frame(&mut stream).await.unwrap();
+        assert_eq!(reply["type"], "error");
+        assert_eq!(reply["requestId"], Value::Null);
+        assert_eq!(reply["problem"]["code"], "frame-invalid");
+        assert!(!reply.to_string().contains("do-not-echo"));
+        assert!(read_frame(&mut stream).await.is_err());
+    }
+
+    assert_eq!(
+        fixture
+            .store
+            .target_view()
+            .await
+            .unwrap()
+            .management_revision,
+        0
+    );
+}
+
+#[tokio::test]
+async fn malformed_post_handshake_frame_returns_a_generic_error_and_executes_no_action() {
+    let fixture = ControlFixture::start().await;
+    let invalid_json = br#"{"credential":"do-not-echo",}"#;
+    let cases = [
+        vec![0, 0],
+        vec![0, 0, 0, 4, b'{', b'}'],
+        (1_048_577_u32).to_be_bytes().to_vec(),
+        vec![0, 0, 0, 1, 0xff],
+        [
+            (invalid_json.len() as u32).to_be_bytes().as_slice(),
+            invalid_json.as_slice(),
+        ]
+        .concat(),
+    ];
+
+    for bytes in cases {
+        let mut malformed = fixture.connect().await;
+        hello(&mut malformed).await;
+        malformed.write_all(&bytes).await.unwrap();
+        malformed.shutdown().await.unwrap();
+
+        let reply = read_frame(&mut malformed).await.unwrap();
+        assert_eq!(reply["type"], "error");
+        assert_eq!(reply["requestId"], Value::Null);
+        assert_eq!(reply["problem"]["code"], "frame-invalid");
+        assert!(!reply.to_string().contains("do-not-echo"));
+        assert!(read_frame(&mut malformed).await.is_err());
+    }
+
+    assert_eq!(
+        fixture
+            .store
+            .target_view()
+            .await
+            .unwrap()
+            .management_revision,
+        0
+    );
+}
+
+#[tokio::test]
+async fn unknown_frames_execute_no_action_without_echoing_input() {
+    let fixture = ControlFixture::start().await;
 
     let mut unknown = fixture.connect().await;
     hello(&mut unknown).await;

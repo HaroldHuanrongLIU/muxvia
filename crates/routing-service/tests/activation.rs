@@ -42,6 +42,17 @@ impl CodexProbe for GoodProbe {
     }
 }
 
+struct UnknownCompatibleProbe;
+
+impl CodexProbe for UnknownCompatibleProbe {
+    fn probe(&self, _: &Path) -> Result<CodexCapability, CodexProblem> {
+        Ok(CodexCapability::UnknownCompatible {
+            version: "99.0.0".into(),
+            warning: "Codex CLI 99.0.0 is untested; required capabilities were detected".into(),
+        })
+    }
+}
+
 struct BadProbe;
 
 impl CodexProbe for BadProbe {
@@ -238,6 +249,7 @@ async fn activation_commits_one_complete_view_in_exact_observer_order_and_replay
     assert_eq!(outcome.view.takeover.state, "active");
     assert_eq!(outcome.view.managed_configuration.state, "applied");
     assert!(outcome.view.managed_configuration.restart_required);
+    assert!(outcome.view.problems.is_empty());
     assert_eq!(
         observer.0.lock().unwrap().as_slice(),
         &[
@@ -273,6 +285,48 @@ async fn activation_commits_one_complete_view_in_exact_observer_order_and_replay
     assert_eq!(replay.status, ActionStatus::Replayed);
     assert_eq!(observer.0.lock().unwrap().len(), steps_before);
     assert_eq!(fixture.probe.0.load(Ordering::SeqCst), probe_before);
+}
+
+#[tokio::test]
+async fn unknown_compatible_warning_is_committed_replayed_and_projected_after_reopen() {
+    let fixture = Fixture::new().await;
+    let provider_secret = "provider-secret-must-not-appear-in-warning";
+    let (provider_id, revision) = fixture.save("First", "gpt", provider_secret).await;
+    let service = ActivationService::new(
+        Arc::clone(&fixture.store),
+        fixture.home.clone(),
+        Arc::new(UnknownCompatibleProbe),
+        "/usr/bin/codex".into(),
+        Arc::new(NoopUpstream),
+    );
+    let action_id = Uuid::new_v4();
+
+    let applied = service
+        .activate(command(provider_id, revision, action_id))
+        .await
+        .unwrap();
+
+    assert_eq!(applied.view.problems.len(), 1);
+    assert_eq!(applied.view.problems[0].code, "untested-target-cli");
+    assert!(applied.view.problems[0].message.contains("99.0.0"));
+    assert!(
+        !serde_json::to_string(&applied)
+            .unwrap()
+            .contains(provider_secret)
+    );
+
+    let replayed = service
+        .activate(command(Uuid::new_v4(), u64::MAX, action_id))
+        .await
+        .unwrap();
+    assert_eq!(replayed.status, ActionStatus::Replayed);
+    assert_eq!(replayed.view.problems, applied.view.problems);
+
+    let reopened = StateStore::open(&fixture.home).await.unwrap();
+    assert_eq!(
+        reopened.target_view().await.unwrap().problems,
+        applied.view.problems
+    );
 }
 
 #[tokio::test]

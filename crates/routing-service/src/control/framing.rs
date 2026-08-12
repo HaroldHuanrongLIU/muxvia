@@ -9,6 +9,8 @@ use super::protocol::FRAME_LIMIT;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FrameError {
+    #[error("end-of-stream")]
+    EndOfStream,
     #[error("frame-too-large")]
     FrameTooLarge,
     #[error("invalid-utf8")]
@@ -26,7 +28,7 @@ where
     R: AsyncRead + Unpin,
 {
     let mut prefix = [0; 4];
-    read_exact(reader, &mut prefix).await?;
+    read_prefix(reader, &mut prefix).await?;
     let length = u32::from_be_bytes(prefix);
     if length > FRAME_LIMIT {
         return Err(FrameError::FrameTooLarge);
@@ -36,6 +38,17 @@ where
     read_exact(reader, &mut body).await?;
     let text = str::from_utf8(&body).map_err(|_| FrameError::InvalidUtf8)?;
     serde_json::from_str(text).map_err(|_| FrameError::InvalidJson)
+}
+
+async fn read_prefix<R>(reader: &mut R, prefix: &mut [u8; 4]) -> Result<(), FrameError>
+where
+    R: AsyncRead + Unpin,
+{
+    let first = reader.read(prefix).await.map_err(|_| FrameError::Io)?;
+    if first == 0 {
+        return Err(FrameError::EndOfStream);
+    }
+    read_exact(reader, &mut prefix[first..]).await
 }
 
 pub async fn write_frame<W, T>(writer: &mut W, value: &T) -> Result<(), FrameError>

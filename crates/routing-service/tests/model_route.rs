@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use axum::{
     Router,
     body::Body,
@@ -22,7 +23,8 @@ use futures_util::{Stream, StreamExt, stream};
 use muxvia_routing::{
     home::MuxviaHome,
     model::{
-        ModelServer, ModelServerStatus, ReqwestUpstream, ReservedListener,
+        ModelServer, ModelServerStatus, ReqwestUpstream, ReservedListener, UpstreamError,
+        UpstreamRequest, UpstreamResponse, UpstreamTransport,
         auth::{ROUTING_CREDENTIAL_LEN, routing_credential_matches},
         headers::{forward_request_headers, forward_response_headers},
     },
@@ -766,6 +768,75 @@ async fn successful_route_appends_path_forwards_bytes_and_streams_sse_in_order()
 
     server.shutdown().await.unwrap();
     upstream.shutdown().await;
+}
+
+struct InvalidatingObservationUpstream {
+    database_path: std::path::PathBuf,
+}
+
+#[async_trait]
+impl UpstreamTransport for InvalidatingObservationUpstream {
+    async fn send(&self, _: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
+        let database = tokio_rusqlite::Connection::open(&self.database_path)
+            .await
+            .unwrap();
+        database
+            .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                connection.execute("DELETE FROM activated_snapshots", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("x-upstream", HeaderValue::from_static("observation-failed"));
+        Ok(UpstreamResponse {
+            status: StatusCode::OK,
+            headers,
+            body: Box::pin(stream::once(async {
+                Ok(axum::body::Bytes::from_static(b"data: [DONE]\n\n"))
+            })),
+        })
+    }
+}
+
+#[tokio::test]
+async fn successful_upstream_response_survives_serving_observation_failure() {
+    let fixture = StoreFixture::new().await;
+    fixture
+        .seed_snapshot("https://unused.example/api/v1/")
+        .await;
+    let before = fixture.store.target_view().await.unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let reserved = ReservedListener::new(listener).unwrap();
+    let server = ModelServer::bind_reserved(
+        reserved,
+        Arc::clone(&fixture.store),
+        Arc::new(InvalidatingObservationUpstream {
+            database_path: fixture.muxvia_home.database_path().to_path_buf(),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let response = post_route(
+        server.endpoint(),
+        Some(HeaderValue::from_static(ROUTING_CREDENTIAL)),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    assert_eq!(response.headers()["x-upstream"], "observation-failed");
+    assert_eq!(response.text().await.unwrap(), "data: [DONE]\n\n");
+    let after = fixture.store.target_view().await.unwrap();
+    assert_eq!(after.serving_provider_id, None);
+    assert_eq!(after.view_sequence, before.view_sequence);
+
+    server.shutdown().await.unwrap();
 }
 
 #[tokio::test]

@@ -138,6 +138,25 @@ test("renders one Codex context without dashboard navigation", async () => {
   }
 })
 
+test("renders a persisted compatibility warning without exposing Provider credentials", async () => {
+  const session = new MemoryTargetSession(view({
+    problems: [{
+      code: "untested-target-cli",
+      message: "Codex CLI 99.0.0 is untested; required capabilities were detected",
+    }],
+  }))
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
+  try {
+    await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("Codex CLI 99.0.0 is untested")
+    expect(frame).toContain("target-cli")
+    expect(frame).not.toContain(credentialSentinel)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
 test("Ctrl+C exits even while the Provider form owns input focus", async () => {
   const session = new MemoryTargetSession(view())
   const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })

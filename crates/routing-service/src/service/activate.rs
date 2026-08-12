@@ -8,8 +8,10 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    codex::{CodexConfigCodec, CodexProbe},
-    control::protocol::{ActionOutcome, ActionStatus, TakeoverMode, Target, TargetAction},
+    codex::{CodexCapability, CodexConfigCodec, CodexProbe},
+    control::protocol::{
+        ActionOutcome, ActionStatus, ControlProblem, TakeoverMode, Target, TargetAction,
+    },
     domain::activation::ActivatedSnapshot,
     home::MuxviaHome,
     model::{
@@ -270,12 +272,19 @@ impl ActivationService {
                     .await);
             }
         };
-        if self.probe.probe(&self.codex_executable).is_err() {
-            return Err(self
-                .store
-                .failure("incompatible-target-cli", "Codex CLI is not compatible")
-                .await);
-        }
+        let capability_problem = match self.probe.probe(&self.codex_executable) {
+            Ok(CodexCapability::Tested { .. }) => None,
+            Ok(CodexCapability::UnknownCompatible { warning, .. }) => Some(ControlProblem {
+                code: "untested-target-cli".into(),
+                message: warning,
+            }),
+            Err(_) => {
+                return Err(self
+                    .store
+                    .failure("incompatible-target-cli", "Codex CLI is not compatible")
+                    .await);
+            }
+        };
         let codec = match CodexConfigCodec::for_user_home(self.home.user_home()) {
             Ok(codec) => codec,
             Err(problem) => return Err(self.codex_failure(problem.code()).await),
@@ -379,6 +388,7 @@ impl ActivationService {
                     routing_credential,
                     recovery_id,
                     codec.config_path().to_string_lossy().into_owned(),
+                    capability_problem,
                 )
                 .await
                 .map_err(|_| "internal-failure")

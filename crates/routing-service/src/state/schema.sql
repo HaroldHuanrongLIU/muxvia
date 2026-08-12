@@ -30,6 +30,13 @@ CREATE TABLE IF NOT EXISTS target_route_state (
   recovery_state TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS target_problems (
+  target TEXT NOT NULL CHECK (target = 'codex'),
+  code TEXT NOT NULL,
+  message TEXT NOT NULL,
+  PRIMARY KEY (target, code)
+);
+
 CREATE TABLE IF NOT EXISTS activated_snapshots (
   id TEXT PRIMARY KEY,
   target TEXT NOT NULL CHECK (target = 'codex'),

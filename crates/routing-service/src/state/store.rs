@@ -271,6 +271,7 @@ impl StateStore {
         routing_credential: SecretString,
         recovery_id: Uuid,
         config_path: String,
+        capability_problem: Option<ControlProblem>,
     ) -> Result<ActivationCommit, StateError> {
         let service_epoch = self.service_epoch.clone();
         let routing_credential = routing_credential.expose_secret().to_owned();
@@ -332,6 +333,18 @@ impl StateStore {
                 params![snapshot.provider_id.to_string(), route_port, routing_credential,
                     snapshot.id.to_string(), config_path],
             )?;
+            transaction.execute(
+                "DELETE FROM target_problems
+                 WHERE target = 'codex' AND code = 'untested-target-cli'",
+                [],
+            )?;
+            if let Some(problem) = capability_problem {
+                transaction.execute(
+                    "INSERT INTO target_problems (target, code, message)
+                     VALUES ('codex', ?1, ?2)",
+                    params![problem.code, problem.message],
+                )?;
+            }
             let view = project_target_view(&transaction, &service_epoch)?;
             let outcome = ActionOutcome { status: ActionStatus::Applied, view };
             let json = serde_json::to_string(&outcome)?;

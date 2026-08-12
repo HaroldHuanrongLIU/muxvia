@@ -101,3 +101,47 @@ test("connect rejects a bounded-decoder violation", async () => {
     code: "frame-too-large",
   })
 })
+
+test("a generic server frame error rejects pending operations before socket close", async () => {
+  const path = await listen((socket) => {
+    const decoder = new FrameDecoder()
+    socket.on("data", (chunk) => {
+      if (typeof chunk === "string") throw new Error("unexpected text chunk")
+      for (const value of decoder.push(chunk)) {
+        const frame = value as { type: string }
+        if (frame.type === "hello") {
+          socket.write(encodeFrame({
+            type: "hello-ack",
+            rpc: { major: 1, minor: 0 },
+            release: "routing-test",
+            serviceEpoch: "00000000-0000-4000-8000-000000000001",
+            frameLimit: 1_048_576,
+          }))
+        } else {
+          socket.end(encodeFrame({
+            type: "error",
+            requestId: null,
+            problem: { code: "frame-invalid", message: "Control frame is invalid" },
+          }))
+        }
+      }
+    })
+  })
+
+  const client = await RpcClient.connect(path, "control-test")
+  await expect(client.openTarget("codex")).rejects.toMatchObject({ code: "frame-invalid" })
+})
+
+test("a generic server frame error rejects the handshake before socket close", async () => {
+  const path = await listen((socket) => {
+    socket.once("data", () => socket.end(encodeFrame({
+      type: "error",
+      requestId: null,
+      problem: { code: "frame-invalid", message: "Control frame is invalid" },
+    })))
+  })
+
+  await expect(RpcClient.connect(path, "control-test")).rejects.toMatchObject({
+    code: "frame-invalid",
+  })
+})

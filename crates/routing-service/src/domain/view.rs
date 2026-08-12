@@ -1,8 +1,8 @@
 use tokio_rusqlite::rusqlite::{Connection, Result};
 
 use crate::control::protocol::{
-    ActivatedSnapshotView, CredentialPresence, ManagedConfigurationView, ProviderView,
-    RecoveryView, ServiceView, TakeoverView, Target, TargetView,
+    ActivatedSnapshotView, ControlProblem, CredentialPresence, ManagedConfigurationView,
+    ProviderView, RecoveryView, ServiceView, TakeoverView, Target, TargetView,
 };
 
 type RouteProjectionRow = (
@@ -106,6 +106,17 @@ pub(crate) fn project_target_view(
         Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => None,
         Err(error) => return Err(error),
     };
+    let mut problem_statement = connection.prepare(
+        "SELECT code, message FROM target_problems WHERE target = 'codex' ORDER BY code",
+    )?;
+    let problems = problem_statement
+        .query_map([], |row| {
+            Ok(ControlProblem {
+                code: row.get(0)?,
+                message: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(TargetView {
         target: Target::Codex,
@@ -139,7 +150,7 @@ pub(crate) fn project_target_view(
             state: recovery.1,
         },
         activated_snapshot,
-        problems: Vec::new(),
+        problems,
     })
 }
 

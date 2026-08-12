@@ -19,7 +19,7 @@ use tokio::{
 use crate::{
     codex::{CodexConfigCodec, CommandCodexProbe},
     control::{
-        framing::{read_frame, write_frame},
+        framing::{FrameError, read_frame, write_frame},
         protocol::{
             ClientFrame, ControlOperation, ControlProblem, ControlResult, FrameLimit, RpcVersion,
             ServerFrame, TargetView,
@@ -298,8 +298,13 @@ async fn serve_session(
     lifecycle: Arc<ServerLifecycle>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let Ok(first) = read_frame(stream).await else {
-        return;
+    let first = match read_frame(stream).await {
+        Ok(first) => first,
+        Err(FrameError::EndOfStream | FrameError::Io) => return,
+        Err(_) => {
+            let _ = write_frame_invalid(stream).await;
+            return;
+        }
     };
     if first.get("type").and_then(Value::as_str) != Some("hello") {
         let request_id = request_id(&first);
@@ -365,7 +370,14 @@ async fn serve_session(
                 if changed.is_err() || *shutdown.borrow() { return; }
             }
             incoming = read_frame(stream) => {
-                let Ok(raw) = incoming else { return };
+                let raw = match incoming {
+                    Ok(raw) => raw,
+                    Err(FrameError::EndOfStream | FrameError::Io) => return,
+                    Err(_) => {
+                        let _ = write_frame_invalid(stream).await;
+                        return;
+                    }
+                };
                 if raw.get("type").and_then(Value::as_str) == Some("hello") {
                     if write_problem(stream, None, "unexpected-hello", "Hello was already negotiated", None).await.is_err() {
                         return;
@@ -502,6 +514,19 @@ async fn write_problem(
             },
             authoritative_view,
         },
+    )
+    .await
+}
+
+async fn write_frame_invalid(
+    stream: &mut UnixStream,
+) -> Result<(), crate::control::framing::FrameError> {
+    write_problem(
+        stream,
+        None,
+        "frame-invalid",
+        "Control frame is invalid",
+        None,
     )
     .await
 }

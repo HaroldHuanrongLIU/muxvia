@@ -1,0 +1,3 @@
+# Expose target-scoped control sessions
+
+The Control Plane will consume a target-scoped use-case interface built around a current Target View, named actions, and state subscriptions rather than database-shaped CRUD or transport-shaped RPC methods. The versioned Unix-socket protocol will carry complete secret-free Target Views, idempotent action identifiers, and expected revisions, while the Routing Service hides configuration transactions, recovery, persistence, and model routing behind that contract; this keeps TUI and test callers simple without committing v1 to a plugin ABI, generic LLM schema, or repository layer.

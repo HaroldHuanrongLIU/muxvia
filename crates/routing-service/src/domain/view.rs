@@ -58,7 +58,7 @@ pub(crate) fn project_target_view(
     let mode = if takeover_state == "active" {
         "takeover"
     } else {
-        "direct"
+        "unmanaged"
     };
 
     Ok(TargetView {
@@ -67,7 +67,7 @@ pub(crate) fn project_target_view(
         view_sequence,
         service: ServiceView {
             epoch: service_epoch.to_owned(),
-            state: "ready".to_owned(),
+            state: "running".to_owned(),
         },
         mode: mode.to_owned(),
         takeover: TakeoverView {
@@ -94,9 +94,9 @@ pub(crate) fn empty_target_view(service_epoch: &str) -> TargetView {
         view_sequence: 0,
         service: ServiceView {
             epoch: service_epoch.to_owned(),
-            state: "ready".to_owned(),
+            state: "running".to_owned(),
         },
-        mode: "direct".to_owned(),
+        mode: "unmanaged".to_owned(),
         takeover: TakeoverView {
             state: "inactive".to_owned(),
             endpoint: None,

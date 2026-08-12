@@ -1,3 +1,3 @@
 mod store;
 
-pub use store::{ActionFailure, SaveProviderCommand, StateError, StateStore};
+pub use store::{ActionFailure, StateError, StateStore};

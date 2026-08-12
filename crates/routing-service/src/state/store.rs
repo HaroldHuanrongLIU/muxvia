@@ -3,7 +3,7 @@ use tokio_rusqlite::{Connection, rusqlite::params};
 use uuid::Uuid;
 
 use crate::{
-    control::protocol::{ActionOutcome, ActionStatus, ControlProblem, TargetView},
+    control::protocol::{ActionOutcome, ActionStatus, ControlProblem, TargetAction, TargetView},
     domain::{
         provider::normalize_provider_base_url,
         view::{empty_target_view, project_target_view},
@@ -13,7 +13,7 @@ use crate::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub struct SaveProviderCommand {
+struct SaveProviderCommand {
     pub action_id: Uuid,
     pub expected_revision: u64,
     pub name: String,
@@ -94,7 +94,52 @@ impl StateStore {
             .map_err(map_state_call_error)
     }
 
-    pub async fn save_provider(
+    pub async fn apply_save_provider_action(
+        &self,
+        action_id: Uuid,
+        expected_revision: u64,
+        raw_action: serde_json::Value,
+    ) -> Result<ActionOutcome, ActionFailure> {
+        match self.receipt(action_id).await {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => {}
+            Err(_) => {
+                return Err(self
+                    .failure("state-store-error", "State store operation failed")
+                    .await);
+            }
+        }
+
+        match serde_json::from_value(raw_action) {
+            Ok(TargetAction::SaveProvider {
+                name,
+                base_url,
+                model,
+                credential,
+            }) => {
+                self.save_provider(SaveProviderCommand {
+                    action_id,
+                    expected_revision,
+                    name,
+                    base_url,
+                    model,
+                    credential: SecretString::from(credential),
+                })
+                .await
+            }
+            Ok(TargetAction::ActivateProvider { .. }) => Err(self
+                .failure(
+                    "unsupported-operation",
+                    "Provider activation is not supported yet",
+                )
+                .await),
+            Err(_) => Err(self
+                .failure("invalid-provider", "Provider action is malformed")
+                .await),
+        }
+    }
+
+    async fn save_provider(
         &self,
         command: SaveProviderCommand,
     ) -> Result<ActionOutcome, ActionFailure> {

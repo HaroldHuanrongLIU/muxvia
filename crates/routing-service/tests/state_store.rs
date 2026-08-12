@@ -6,9 +6,8 @@ use muxvia_routing::{
     },
     domain::provider::normalize_provider_base_url,
     home::MuxviaHome,
-    state::{SaveProviderCommand, StateStore},
+    state::StateStore,
 };
-use secrecy::SecretString;
 use uuid::Uuid;
 
 struct StoreFixture {
@@ -40,19 +39,49 @@ fn fixed_uuid(last_byte: u8) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+fn raw_save_provider(
+    name: &str,
+    base_url: &str,
+    model: &str,
+    credential: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "save-provider",
+        "name": name,
+        "baseUrl": base_url,
+        "model": model,
+        "credential": credential
+    })
+}
+
+#[tokio::test]
+async fn new_database_target_view_matches_the_canonical_protocol_fixture() {
+    let fixture = StoreFixture::new().await;
+    let view = fixture.store.target_view().await.unwrap();
+    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../protocol/fixtures/initial-target-view.json");
+    let mut expected: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture_path).unwrap()).unwrap();
+    expected["service"]["epoch"] = serde_json::json!(view.service.epoch);
+
+    assert_eq!(serde_json::to_value(view).unwrap(), expected);
+}
+
 #[tokio::test]
 async fn save_provider_persists_secret_separately_and_projects_no_secret() {
     let fixture = StoreFixture::new().await;
     let result = fixture
         .store
-        .save_provider(SaveProviderCommand {
-            action_id: fixed_uuid(10),
-            expected_revision: 0,
-            name: "Local test".into(),
-            base_url: "http://127.0.0.1:4567/v1/".into(),
-            model: "gpt-test".into(),
-            credential: SecretString::from("provider-secret-must-not-escape"),
-        })
+        .apply_save_provider_action(
+            fixed_uuid(10),
+            0,
+            raw_save_provider(
+                "Local test",
+                "http://127.0.0.1:4567/v1/",
+                "gpt-test",
+                "provider-secret-must-not-escape",
+            ),
+        )
         .await
         .unwrap();
 
@@ -104,14 +133,16 @@ async fn receipt_lookup_replays_before_a_malformed_second_payload_is_examined() 
     let action_id = fixed_uuid(10);
     fixture
         .store
-        .save_provider(SaveProviderCommand {
+        .apply_save_provider_action(
             action_id,
-            expected_revision: 0,
-            name: "Local test".into(),
-            base_url: "https://api.example.com/v1".into(),
-            model: "gpt-test".into(),
-            credential: SecretString::from("first-secret"),
-        })
+            0,
+            raw_save_provider(
+                "Local test",
+                "https://api.example.com/v1",
+                "gpt-test",
+                "first-secret",
+            ),
+        )
         .await
         .unwrap();
     let malformed_second_payload = serde_json::json!({
@@ -119,14 +150,11 @@ async fn receipt_lookup_replays_before_a_malformed_second_payload_is_examined() 
         "name": 42,
         "expectedRevision": 999
     });
-    assert!(
-        serde_json::from_value::<muxvia_routing::control::protocol::TargetAction>(
-            malformed_second_payload
-        )
-        .is_err()
-    );
-
-    let replayed = fixture.store.receipt(action_id).await.unwrap().unwrap();
+    let replayed = fixture
+        .store
+        .apply_save_provider_action(action_id, 999, malformed_second_payload)
+        .await
+        .unwrap();
 
     assert_eq!(replayed.status, ActionStatus::Replayed);
     assert_eq!(replayed.view.management_revision, 1);
@@ -142,28 +170,32 @@ async fn stale_revision_returns_authoritative_view_without_mutating_or_receiptin
     let fixture = StoreFixture::new().await;
     fixture
         .store
-        .save_provider(SaveProviderCommand {
-            action_id: fixed_uuid(20),
-            expected_revision: 0,
-            name: "First".into(),
-            base_url: "https://first.example/v1".into(),
-            model: "gpt-first".into(),
-            credential: SecretString::from("first-secret"),
-        })
+        .apply_save_provider_action(
+            fixed_uuid(20),
+            0,
+            raw_save_provider(
+                "First",
+                "https://first.example/v1",
+                "gpt-first",
+                "first-secret",
+            ),
+        )
         .await
         .unwrap();
     let stale_action_id = fixed_uuid(21);
 
     let failure = fixture
         .store
-        .save_provider(SaveProviderCommand {
-            action_id: stale_action_id,
-            expected_revision: 0,
-            name: "Stale".into(),
-            base_url: "https://stale.example/v1".into(),
-            model: "gpt-stale".into(),
-            credential: SecretString::from("stale-secret"),
-        })
+        .apply_save_provider_action(
+            stale_action_id,
+            0,
+            raw_save_provider(
+                "Stale",
+                "https://stale.example/v1",
+                "gpt-stale",
+                "stale-secret",
+            ),
+        )
         .await
         .unwrap_err();
 
@@ -182,6 +214,65 @@ async fn stale_revision_returns_authoritative_view_without_mutating_or_receiptin
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn new_malformed_raw_action_rejects_without_receipt_or_secret_echo() {
+    let fixture = StoreFixture::new().await;
+    let action_id = fixed_uuid(22);
+    let secret = "malformed-secret-must-not-escape";
+    let failure = fixture
+        .store
+        .apply_save_provider_action(
+            action_id,
+            0,
+            serde_json::json!({
+                "kind": "save-provider",
+                "name": 42,
+                "credential": secret
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.problem.code, "invalid-provider");
+    assert_eq!(failure.authoritative_view.management_revision, 0);
+    assert!(fixture.store.receipt(action_id).await.unwrap().is_none());
+    assert!(!format!("{failure:?}\n{failure}").contains(secret));
+}
+
+#[tokio::test]
+async fn non_save_raw_actions_reject_without_consuming_action_ids() {
+    let fixture = StoreFixture::new().await;
+    let activate_id = fixed_uuid(23);
+    let activate = fixture
+        .store
+        .apply_save_provider_action(
+            activate_id,
+            0,
+            serde_json::json!({
+                "kind": "activate-provider",
+                "providerId": "00000000-0000-4000-8000-000000000001",
+                "mode": "takeover"
+            }),
+        )
+        .await
+        .unwrap_err();
+    let unknown_id = fixed_uuid(24);
+    let unknown = fixture
+        .store
+        .apply_save_provider_action(
+            unknown_id,
+            0,
+            serde_json::json!({ "kind": "delete-provider" }),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(activate.problem.code, "unsupported-operation");
+    assert_eq!(unknown.problem.code, "invalid-provider");
+    assert!(fixture.store.receipt(activate_id).await.unwrap().is_none());
+    assert!(fixture.store.receipt(unknown_id).await.unwrap().is_none());
 }
 
 #[test]
@@ -215,14 +306,11 @@ async fn unsafe_provider_urls_reject_without_consuming_action_ids() {
         let action_id = fixed_uuid(30 + index as u8);
         let failure = fixture
             .store
-            .save_provider(SaveProviderCommand {
+            .apply_save_provider_action(
                 action_id,
-                expected_revision: 0,
-                name: "Unsafe".into(),
-                base_url: base_url.into(),
-                model: "gpt-test".into(),
-                credential: SecretString::from("unsafe-secret"),
-            })
+                0,
+                raw_save_provider("Unsafe", base_url, "gpt-test", "unsafe-secret"),
+            )
             .await
             .unwrap_err();
 
@@ -253,14 +341,11 @@ async fn incomplete_provider_fields_reject_without_consuming_action_ids() {
         let action_id = fixed_uuid(40 + index as u8);
         let failure = fixture
             .store
-            .save_provider(SaveProviderCommand {
+            .apply_save_provider_action(
                 action_id,
-                expected_revision: 0,
-                name: name.into(),
-                base_url: "https://api.example.com/v1".into(),
-                model: model.into(),
-                credential: SecretString::from(credential),
-            })
+                0,
+                raw_save_provider(name, "https://api.example.com/v1", model, credential),
+            )
             .await
             .unwrap_err();
 
@@ -283,14 +368,16 @@ async fn opening_is_read_only_and_saving_increments_revision_and_sequence_togeth
 
     let saved = fixture
         .store
-        .save_provider(SaveProviderCommand {
-            action_id: fixed_uuid(50),
-            expected_revision: 0,
-            name: "Local".into(),
-            base_url: "https://api.example.com/v1".into(),
-            model: "gpt-test".into(),
-            credential: SecretString::from("counter-secret"),
-        })
+        .apply_save_provider_action(
+            fixed_uuid(50),
+            0,
+            raw_save_provider(
+                "Local",
+                "https://api.example.com/v1",
+                "gpt-test",
+                "counter-secret",
+            ),
+        )
         .await
         .unwrap();
 
@@ -320,27 +407,31 @@ async fn target_views_receipts_and_failures_never_render_persisted_secrets() {
     {
         fixture
             .store
-            .save_provider(SaveProviderCommand {
-                action_id: fixed_uuid(60 + index as u8),
-                expected_revision: index as u64,
-                name: format!("Provider {index}"),
-                base_url: format!("https://api{index}.example.com/v1"),
-                model: format!("gpt-{index}"),
-                credential: SecretString::from(secret),
-            })
+            .apply_save_provider_action(
+                fixed_uuid(60 + index as u8),
+                index as u64,
+                raw_save_provider(
+                    &format!("Provider {index}"),
+                    &format!("https://api{index}.example.com/v1"),
+                    &format!("gpt-{index}"),
+                    secret,
+                ),
+            )
             .await
             .unwrap();
     }
     let failure = fixture
         .store
-        .save_provider(SaveProviderCommand {
-            action_id: fixed_uuid(62),
-            expected_revision: 0,
-            name: "Stale".into(),
-            base_url: "https://stale.example.com/v1".into(),
-            model: "gpt-stale".into(),
-            credential: SecretString::from("not-persisted-secret"),
-        })
+        .apply_save_provider_action(
+            fixed_uuid(62),
+            0,
+            raw_save_provider(
+                "Stale",
+                "https://stale.example.com/v1",
+                "gpt-stale",
+                "not-persisted-secret",
+            ),
+        )
         .await
         .unwrap_err();
     let view = fixture.store.target_view().await.unwrap();
@@ -369,22 +460,26 @@ async fn concurrent_duplicate_action_ids_apply_once_and_replay_once() {
     let fixture = StoreFixture::new().await;
     let store = fixture.store.clone();
     let action_id = fixed_uuid(70);
-    let first = store.save_provider(SaveProviderCommand {
+    let first = store.apply_save_provider_action(
         action_id,
-        expected_revision: 0,
-        name: "First arrival".into(),
-        base_url: "https://first.example.com/v1".into(),
-        model: "gpt-first".into(),
-        credential: SecretString::from("concurrent-secret-one"),
-    });
-    let second = store.save_provider(SaveProviderCommand {
+        0,
+        raw_save_provider(
+            "First arrival",
+            "https://first.example.com/v1",
+            "gpt-first",
+            "concurrent-secret-one",
+        ),
+    );
+    let second = store.apply_save_provider_action(
         action_id,
-        expected_revision: 0,
-        name: "Second arrival".into(),
-        base_url: "https://second.example.com/v1".into(),
-        model: "gpt-second".into(),
-        credential: SecretString::from("concurrent-secret-two"),
-    });
+        0,
+        raw_save_provider(
+            "Second arrival",
+            "https://second.example.com/v1",
+            "gpt-second",
+            "concurrent-secret-two",
+        ),
+    );
 
     let (first, second) = tokio::join!(first, second);
     let statuses = [first.unwrap().status, second.unwrap().status];

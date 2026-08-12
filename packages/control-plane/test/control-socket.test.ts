@@ -8,6 +8,14 @@ import { encodeFrame, FrameDecoder } from "../src/control/framing"
 import { RpcClient } from "../src/control/rpc-client"
 
 const roots: string[] = []
+
+test("a missing control socket is classified as service-unavailable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "muxvia-missing-control-"))
+  roots.push(root)
+  await expect(RpcClient.connect(join(root, "missing.sock"), "control-test")).rejects.toMatchObject({
+    code: "service-unavailable",
+  })
+})
 const servers: Server[] = []
 
 afterEach(async () => {

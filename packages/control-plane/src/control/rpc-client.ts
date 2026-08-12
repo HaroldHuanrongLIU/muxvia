@@ -33,6 +33,7 @@ export class ControlError extends Error {
 export interface RpcTransport {
   request(operation: ControlOperation): Promise<ControlResult>
   onTargetView(listener: (view: TargetView) => void): () => void
+  whenClosed(): Promise<void>
   close(): Promise<void>
 }
 
@@ -46,9 +47,16 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     reject: (error: ControlError) => void
   }
   #closed = false
+  readonly #closedPromise: Promise<void>
+  readonly #resolveClosed: () => void
 
   private constructor(socket: Socket) {
     this.#socket = socket
+    let resolveClosed!: () => void
+    this.#closedPromise = new Promise<void>((resolve) => {
+      resolveClosed = resolve
+    })
+    this.#resolveClosed = resolveClosed
     socket.on("data", (chunk) => {
       if (typeof chunk === "string") {
         this.#fail(new ControlError("invalid-response", "Control socket returned text data"))
@@ -102,6 +110,10 @@ export class RpcClient implements RpcTransport, MuxviaControl {
   onTargetView(listener: (view: TargetView) => void): () => void {
     this.#viewListeners.add(listener)
     return () => this.#viewListeners.delete(listener)
+  }
+
+  whenClosed(): Promise<void> {
+    return this.#closedPromise
   }
 
   async close(): Promise<void> {
@@ -169,12 +181,19 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     for (const pending of this.#pending.values()) pending.reject(failure)
     this.#pending.clear()
     this.#viewListeners.clear()
+    this.#resolveClosed()
   }
 }
 
 function asControlError(error: unknown): ControlError {
   if (error instanceof ControlError) return error
   const message = error instanceof Error ? error.message : "Control socket failed"
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String(error.code)
+    : undefined
+  if (code === "ENOENT" || code === "ECONNREFUSED") {
+    return new ControlError("service-unavailable", message)
+  }
   if (message === "frame-too-large" || message === "invalid-json" || message === "invalid-utf8") {
     return new ControlError(message, message)
   }

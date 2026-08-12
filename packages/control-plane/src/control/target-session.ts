@@ -11,6 +11,7 @@ export interface TargetSession {
   get(): Readonly<TargetView>
   act(action: TargetAction): Promise<ActionOutcome>
   subscribe(listener: (next: TargetView) => void): () => void
+  whenClosed(): Promise<void>
   close(): Promise<void>
 }
 
@@ -69,6 +70,10 @@ class TargetSessionImpl implements TargetSession {
     if (this.#closed) return () => {}
     this.#listeners.add(listener)
     return () => this.#listeners.delete(listener)
+  }
+
+  whenClosed(): Promise<void> {
+    return this.#rpc.whenClosed()
   }
 
   async close(): Promise<void> {

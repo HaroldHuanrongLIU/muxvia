@@ -1,0 +1,14 @@
+{
+  "target": "codex",
+  "managementRevision": 0,
+  "viewSequence": 0,
+  "service": { "epoch": "00000000-0000-4000-8000-000000000001", "state": "running" },
+  "mode": "unmanaged",
+  "takeover": { "state": "inactive", "endpoint": null },
+  "providers": [],
+  "currentProviderId": null,
+  "servingProviderId": null,
+  "managedConfiguration": { "state": "unmanaged", "path": null, "restartRequired": false },
+  "activatedSnapshot": null,
+  "problems": []
+}

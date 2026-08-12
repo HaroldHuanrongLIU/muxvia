@@ -1,0 +1,7 @@
+{
+  "kind": "save-provider",
+  "name": "Fixture Provider",
+  "baseUrl": "https://provider.example/v1",
+  "model": "gpt-test",
+  "credential": "provider-secret-must-not-escape"
+}

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://muxvia.dev/protocol/control-v1.schema.json",
+  "title": "Muxvia control protocol v1",
+  "oneOf": [
+    { "$ref": "#/$defs/clientFrame" },
+    { "$ref": "#/$defs/serverFrame" },
+    { "$ref": "#/$defs/targetView" },
+    { "$ref": "#/$defs/targetAction" }
+  ],
+  "$defs": {
+    "rpc": {
+      "type": "object",
+      "properties": { "major": { "const": 1 }, "minor": { "const": 0 } },
+      "required": ["major", "minor"]
+    },
+    "clientFrame": {
+      "oneOf": [
+        { "type": "object", "properties": { "type": { "const": "hello" }, "rpc": { "$ref": "#/$defs/rpc" }, "release": { "type": "string" } }, "required": ["type", "rpc", "release"] },
+        { "type": "object", "properties": { "type": { "const": "request" }, "requestId": { "type": "string" }, "operation": { "$ref": "#/$defs/controlOperation" } }, "required": ["type", "requestId", "operation"] }
+      ]
+    },
+    "serverFrame": {
+      "oneOf": [
+        { "type": "object", "properties": { "type": { "const": "hello-ack" }, "rpc": { "$ref": "#/$defs/rpc" }, "release": { "type": "string" }, "serviceEpoch": { "type": "string", "format": "uuid" }, "frameLimit": { "const": 1048576 } }, "required": ["type", "rpc", "release", "serviceEpoch", "frameLimit"] },
+        { "type": "object", "properties": { "type": { "const": "response" }, "requestId": { "type": "string" }, "result": {} }, "required": ["type", "requestId", "result"] },
+        { "type": "object", "properties": { "type": { "const": "error" }, "requestId": { "type": ["string", "null"] }, "problem": { "$ref": "#/$defs/controlProblem" }, "authoritativeView": { "$ref": "#/$defs/targetView" } }, "required": ["type", "requestId", "problem"] },
+        { "type": "object", "properties": { "type": { "const": "target-view" }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["type", "view"] }
+      ]
+    },
+    "controlOperation": {
+      "oneOf": [
+        { "type": "object", "properties": { "kind": { "const": "open-target" }, "target": { "const": "codex" } }, "required": ["kind", "target"] },
+        { "type": "object", "properties": { "kind": { "const": "act" }, "target": { "const": "codex" }, "actionId": { "type": "string" }, "expectedRevision": { "type": "integer", "minimum": 0 }, "action": {} }, "required": ["kind", "target", "actionId", "expectedRevision", "action"] }
+      ]
+    },
+    "targetAction": {
+      "oneOf": [
+        { "type": "object", "properties": { "kind": { "const": "save-provider" }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "type": "string" } }, "required": ["kind", "name", "baseUrl", "model", "credential"] },
+        { "type": "object", "properties": { "kind": { "const": "activate-provider" }, "providerId": { "type": "string" }, "mode": { "const": "takeover" } }, "required": ["kind", "providerId", "mode"] }
+      ]
+    },
+    "targetView": {
+      "type": "object",
+      "properties": {
+        "target": { "const": "codex" },
+        "managementRevision": { "type": "integer", "minimum": 0 },
+        "viewSequence": { "type": "integer", "minimum": 0 },
+        "service": { "type": "object", "properties": { "epoch": { "type": "string", "format": "uuid" }, "state": { "type": "string" } }, "required": ["epoch", "state"] },
+        "mode": { "type": "string" },
+        "takeover": { "type": "object" },
+        "providers": { "type": "array" },
+        "currentProviderId": { "type": ["string", "null"] },
+        "servingProviderId": { "type": ["string", "null"] },
+        "managedConfiguration": { "type": "object" },
+        "activatedSnapshot": { "type": ["object", "null"] },
+        "problems": { "type": "array", "items": { "$ref": "#/$defs/controlProblem" } }
+      },
+      "required": ["target", "managementRevision", "viewSequence", "service", "mode", "takeover", "providers", "currentProviderId", "servingProviderId", "managedConfiguration", "activatedSnapshot", "problems"]
+    },
+    "controlProblem": {
+      "type": "object",
+      "properties": { "code": { "type": "string" }, "message": { "type": "string" } },
+      "required": ["code", "message"]
+    }
+  }
+}

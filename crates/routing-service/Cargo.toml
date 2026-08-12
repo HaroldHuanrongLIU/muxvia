@@ -5,14 +5,18 @@ edition.workspace = true
 
 [dependencies]
 async-trait = "0.1.89"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+futures-util = "0.3.34"
 libc = "0.2.189"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
 secrecy = "0.10.3"
 serde.workspace = true
 serde_json.workspace = true
 rustix = { version = "1.1.4", features = ["fs"] }
+subtle = "2.6.1"
 tempfile = "3.27.0"
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-rusqlite = { version = "0.7.0", features = ["bundled"] }
 toml_edit = { version = "0.25.13", features = ["serde"] }
 url = "2.5.8"

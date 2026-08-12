@@ -76,7 +76,6 @@ impl ControlServer {
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
 
         let release = release.into();
-        let (updates, _) = broadcast::channel(32);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let task_path = socket_path.clone();
         let task = tokio::spawn(async move {
@@ -90,9 +89,8 @@ impl ControlServer {
                         let Ok((stream, _)) = accepted else { break };
                         let store = Arc::clone(&store);
                         let release = release.clone();
-                        let updates = updates.clone();
                         sessions.spawn(async move {
-                            serve_authorized(stream, store, release, updates).await;
+                            serve_authorized(stream, store, release).await;
                         });
                     }
                 }
@@ -154,12 +152,7 @@ fn remove_socket_if_present(path: &Path) {
     }
 }
 
-async fn serve_authorized(
-    mut stream: UnixStream,
-    store: Arc<StateStore>,
-    release: String,
-    updates: broadcast::Sender<TargetView>,
-) {
+async fn serve_authorized(mut stream: UnixStream, store: Arc<StateStore>, release: String) {
     let authorized = stream.peer_cred().is_ok_and(|credentials| {
         // SAFETY: geteuid has no preconditions and only reads the process credential.
         peer_uid_matches(credentials.uid(), unsafe { libc::geteuid() })
@@ -176,15 +169,10 @@ async fn serve_authorized(
         return;
     }
 
-    serve_session(&mut stream, store, release, updates).await;
+    serve_session(&mut stream, store, release).await;
 }
 
-async fn serve_session(
-    stream: &mut UnixStream,
-    store: Arc<StateStore>,
-    release: String,
-    updates: broadcast::Sender<TargetView>,
-) {
+async fn serve_session(stream: &mut UnixStream, store: Arc<StateStore>, release: String) {
     let Ok(first) = read_frame(stream).await else {
         return;
     };
@@ -245,7 +233,7 @@ async fn serve_session(
     }
 
     let mut subscribed = false;
-    let mut update_rx = updates.subscribe();
+    let mut update_rx = store.subscribe_target_views();
     loop {
         tokio::select! {
             incoming = read_frame(stream) => {
@@ -299,7 +287,7 @@ async fn serve_session(
                                     result: ControlResult::ActionOutcome { outcome },
                                 };
                                 if write_frame(stream, &response).await.is_err() { return; }
-                                let _ = updates.send(view);
+                                store.publish_target_view(view);
                             }
                             Err(failure) => {
                                 if write_problem(

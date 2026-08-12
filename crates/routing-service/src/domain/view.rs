@@ -1,8 +1,8 @@
 use tokio_rusqlite::rusqlite::{Connection, Result};
 
 use crate::control::protocol::{
-    CredentialPresence, ManagedConfigurationView, ProviderView, RecoveryView, ServiceView,
-    TakeoverView, Target, TargetView,
+    ActivatedSnapshotView, CredentialPresence, ManagedConfigurationView, ProviderView,
+    RecoveryView, ServiceView, TakeoverView, Target, TargetView,
 };
 
 pub(crate) fn project_target_view(
@@ -69,6 +69,30 @@ pub(crate) fn project_target_view(
             |row| Ok((Some(row.get::<_, String>(0)?), row.get::<_, String>(1)?)),
         )
         .unwrap_or((None, recovery_state.clone()));
+    let activated_snapshot = match connection.query_row(
+        "SELECT s.id, s.provider_id, s.model, s.epoch
+             FROM target_route_state r
+             JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
+             WHERE r.target = 'codex'",
+        [],
+        |row| {
+            let id = uuid::Uuid::parse_str(&row.get::<_, String>(0)?).map_err(conversion_error)?;
+            let provider_id =
+                uuid::Uuid::parse_str(&row.get::<_, String>(1)?).map_err(conversion_error)?;
+            let epoch =
+                uuid::Uuid::parse_str(&row.get::<_, String>(3)?).map_err(conversion_error)?;
+            Ok(ActivatedSnapshotView {
+                id,
+                provider_id,
+                model: row.get(2)?,
+                epoch,
+            })
+        },
+    ) {
+        Ok(snapshot) => Some(snapshot),
+        Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => return Err(error),
+    };
 
     Ok(TargetView {
         target: Target::Codex,
@@ -99,9 +123,19 @@ pub(crate) fn project_target_view(
             intent_id: recovery.0,
             state: recovery.1,
         },
-        activated_snapshot: None,
+        activated_snapshot,
         problems: Vec::new(),
     })
+}
+
+fn conversion_error(
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> tokio_rusqlite::rusqlite::Error {
+    tokio_rusqlite::rusqlite::Error::FromSqlConversionFailure(
+        0,
+        tokio_rusqlite::rusqlite::types::Type::Text,
+        Box::new(error),
+    )
 }
 
 pub(crate) fn empty_target_view(service_epoch: &str) -> TargetView {

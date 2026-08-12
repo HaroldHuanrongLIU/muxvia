@@ -1,4 +1,5 @@
 use secrecy::{ExposeSecret, SecretString};
+use tokio::sync::broadcast;
 use tokio_rusqlite::{Connection, rusqlite::params};
 use uuid::Uuid;
 
@@ -43,11 +44,49 @@ pub enum StateError {
     InvalidRecoveryState,
     #[error("recovery intent does not exist")]
     MissingRecoveryIntent,
+    #[error("state store contains an invalid activated snapshot")]
+    InvalidActivatedSnapshot,
 }
 
 pub struct StateStore {
     pub(super) connection: Connection,
     service_epoch: String,
+    target_views: broadcast::Sender<TargetView>,
+}
+
+pub struct RoutingSnapshot {
+    id: Uuid,
+    provider_id: Uuid,
+    base_url: String,
+    model: String,
+    provider_credential: SecretString,
+    epoch: Uuid,
+}
+
+impl RoutingSnapshot {
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn provider_id(&self) -> Uuid {
+        self.provider_id
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn provider_credential(&self) -> &SecretString {
+        &self.provider_credential
+    }
+
+    pub fn epoch(&self) -> Uuid {
+        self.epoch
+    }
 }
 
 impl StateStore {
@@ -62,9 +101,11 @@ impl StateStore {
             .await
             .map_err(map_call_error)?;
 
+        let (target_views, _) = broadcast::channel(32);
         Ok(Self {
             connection,
             service_epoch: Uuid::new_v4().to_string(),
+            target_views,
         })
     }
 
@@ -74,6 +115,111 @@ impl StateStore {
             .call(move |connection| project_target_view(connection, &service_epoch))
             .await
             .map_err(map_call_error)
+    }
+
+    pub fn subscribe_target_views(&self) -> broadcast::Receiver<TargetView> {
+        self.target_views.subscribe()
+    }
+
+    pub(crate) fn publish_target_view(&self, view: TargetView) {
+        let _ = self.target_views.send(view);
+    }
+
+    pub async fn routing_credential(&self) -> Result<Option<SecretString>, StateError> {
+        self.connection
+            .call(|connection| {
+                let credential = connection.query_row(
+                    "SELECT routing_credential FROM target_route_state WHERE target = 'codex'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )?;
+                Ok(credential.map(SecretString::from))
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    pub async fn activated_snapshot(&self) -> Result<Option<RoutingSnapshot>, StateError> {
+        self.connection
+            .call(|connection| {
+                let row = connection.query_row(
+                    "SELECT s.id, s.provider_id, s.base_url, s.model,
+                            s.provider_bearer_token, s.epoch
+                     FROM target_route_state r
+                     JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
+                     WHERE r.target = 'codex'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    },
+                );
+                match row {
+                    Ok((id, provider_id, base_url, model, credential, epoch)) => {
+                        let id = Uuid::parse_str(&id)
+                            .map_err(|_| StateError::InvalidActivatedSnapshot)?;
+                        let provider_id = Uuid::parse_str(&provider_id)
+                            .map_err(|_| StateError::InvalidActivatedSnapshot)?;
+                        let epoch = Uuid::parse_str(&epoch)
+                            .map_err(|_| StateError::InvalidActivatedSnapshot)?;
+                        Ok(Some(RoutingSnapshot {
+                            id,
+                            provider_id,
+                            base_url,
+                            model,
+                            provider_credential: SecretString::from(credential),
+                            epoch,
+                        }))
+                    }
+                    Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(error) => Err(StateError::Sqlite(error)),
+                }
+            })
+            .await
+            .map_err(map_state_call_error)
+    }
+
+    pub async fn record_serving(&self, snapshot_id: Uuid) -> Result<TargetView, StateError> {
+        let service_epoch = self.service_epoch.clone();
+        let view = self
+            .connection
+            .call(move |connection| -> Result<TargetView, StateError> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let provider_id = transaction
+                    .query_row(
+                        "SELECT provider_id FROM activated_snapshots WHERE id = ?1",
+                        [snapshot_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|error| match error {
+                        tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows => {
+                            StateError::InvalidActivatedSnapshot
+                        }
+                        error => StateError::Sqlite(error),
+                    })?;
+                transaction.execute(
+                    "UPDATE target_route_state
+                     SET serving_provider_id = ?1,
+                         view_sequence = view_sequence + 1
+                     WHERE target = 'codex'",
+                    [provider_id],
+                )?;
+                let view = project_target_view(&transaction, &service_epoch)?;
+                transaction.commit()?;
+                Ok(view)
+            })
+            .await
+            .map_err(map_state_call_error)?;
+        self.publish_target_view(view.clone());
+        Ok(view)
     }
 
     pub async fn receipt(&self, action_id: Uuid) -> Result<Option<ActionOutcome>, StateError> {

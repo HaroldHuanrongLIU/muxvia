@@ -29,6 +29,16 @@ CREATE TABLE IF NOT EXISTS target_route_state (
   recovery_state TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS activated_snapshots (
+  id TEXT PRIMARY KEY,
+  target TEXT NOT NULL CHECK (target = 'codex'),
+  provider_id TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  model TEXT NOT NULL,
+  provider_bearer_token TEXT NOT NULL,
+  epoch TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS action_receipts (
   action_id TEXT PRIMARY KEY,
   action_kind TEXT NOT NULL,

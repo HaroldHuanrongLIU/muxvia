@@ -718,7 +718,7 @@ Expected: compilation fails because `ActivationService` and snapshot/recovery co
 
 - [ ] **Step 4: Implement the serialized activation transaction**
 
-Guard activation with one per-target async mutex. Before parsing a new action, check the receipt by action ID. Then validate revision/Provider/home/file/probe, bind the first or persisted port to `127.0.0.1`, generate a 32-byte random credential encoded as 64 lowercase hex characters only if absent, create the immutable snapshot, and persist the pending recovery intent in its own committed transaction.
+Guard activation with one per-target async mutex. Before parsing a new action, check the receipt by action ID. Then validate revision/Provider/home/file/probe, bind the first or persisted port to `127.0.0.1`, use `getrandom=0.4.3` to generate a 32-byte operating-system random credential encoded as 64 lowercase hex characters only if absent, create the immutable snapshot, and persist the pending recovery intent in its own committed transaction.
 
 Apply and verify the file through Task 4. In one subsequent `BEGIN IMMEDIATE` transaction insert the snapshot, set Current/Snapshot/Takeover/port/routing credential, increment both counters once, mark recovery committed, and write the secret-free receipt. Publish only after commit.
 
@@ -901,7 +901,7 @@ git commit -m "feat: add codex takeover terminal flow"
 - Consumes every prior public seam; adds no second state/configuration path.
 - Produces `muxvia-routing --home <absolute-path> [--test-shutdown-file <absolute-path>]` and `bun run packages/control-plane/src/index.tsx --service <absolute-path> --socket <absolute-path>`.
 - One exclusive service lock is acquired before SQLite open/migration and held for process lifetime.
-- Production lifetime: active takeover survives zero control sessions; zero takeover exits after last session and pending action. Test-only shutdown is available only in test builds/integration invocation.
+- Production lifetime: active takeover survives zero control sessions; after the service has accepted at least one control session, zero takeover exits after its last session and pending action. A freshly spawned service remains available for its first bounded connection attempt. Test-only shutdown is available only in test builds/integration invocation.
 
 - [ ] **Step 1: Write failing process-lifecycle tests**
 
@@ -918,7 +918,7 @@ async fn second_service_exits_before_opening_the_database() {
 }
 ```
 
-Also prove runtime dir/database permissions, stale safe socket cleanup, active takeover surviving the last UDS disconnect, no-takeover service exiting only after the last control session and pending action, and the explicit test shutdown draining listeners before exit. A lock collision must happen before SQLite migrations or mutation.
+Also prove runtime dir/database permissions, stale safe socket cleanup, a freshly spawned service waiting for its first bounded control connection, active takeover surviving the last UDS disconnect, no-takeover service exiting only after an accepted last control session and pending action, and the explicit test shutdown draining listeners before exit. A lock collision must happen before SQLite migrations or mutation.
 
 - [ ] **Step 2: Write the failing cross-process Bun test**
 
@@ -960,7 +960,7 @@ resolve/validate home -> create restrictive dirs -> acquire service lock
 -> start model server -> bind private UDS -> accept control sessions
 ```
 
-If takeover is inactive, do not start a model listener until activation reserves it. Track active control sessions and pending actions. When both reach zero and takeover is inactive, close UDS and exit cleanly. When takeover is active, control disconnect has no effect on model serving. The test-only shutdown trigger closes accept loops, waits for in-flight tasks, removes its own socket, and exits without altering managed configuration.
+If takeover is inactive, do not start a model listener until activation reserves it. Track whether a control session has ever been accepted, active sessions, and pending actions. Only after at least one accepted session, when active sessions and pending actions both reach zero and takeover is inactive, close UDS and exit cleanly. When takeover is active, control disconnect has no effect on model serving. The test-only shutdown trigger closes accept loops, waits for in-flight tasks, removes its own socket, and exits without altering managed configuration.
 
 Use structured logs that include only target/provider/action IDs and opaque correlation IDs. Redact command payloads, headers, recovery values, and secret wrapper Debug output.
 

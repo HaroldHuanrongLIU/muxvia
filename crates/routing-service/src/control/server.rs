@@ -2,14 +2,17 @@ use std::{
     fs, io,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::{broadcast, oneshot},
+    sync::{broadcast, oneshot, watch},
     task::{JoinHandle, JoinSet},
 };
 
@@ -46,6 +49,30 @@ pub struct ControlServerHandle {
     socket_path: PathBuf,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
+    completed: watch::Receiver<bool>,
+}
+
+#[derive(Default)]
+struct ServerLifecycle {
+    accepted: AtomicBool,
+    active_sessions: AtomicUsize,
+    pending_actions: AtomicUsize,
+}
+
+struct SessionGuard(Arc<ServerLifecycle>);
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.0.active_sessions.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct ActionGuard(Arc<ServerLifecycle>);
+
+impl Drop for ActionGuard {
+    fn drop(&mut self) {
+        self.0.pending_actions.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ControlServer {
@@ -66,7 +93,7 @@ impl ControlServer {
             )
             .with_configuration_home_override(std::env::var_os("CODEX_HOME").map(PathBuf::from)),
         );
-        Self::bind_with_activation(home, store, release, activation).await
+        Self::bind_configured(home, store, release, activation, false).await
     }
 
     pub async fn bind_with_activation(
@@ -74,6 +101,25 @@ impl ControlServer {
         store: Arc<StateStore>,
         release: impl Into<String>,
         activation: Arc<ActivationService>,
+    ) -> Result<ControlServerHandle, ControlServerError> {
+        Self::bind_configured(home, store, release, activation, false).await
+    }
+
+    pub async fn bind_process(
+        home: &MuxviaHome,
+        store: Arc<StateStore>,
+        release: impl Into<String>,
+        activation: Arc<ActivationService>,
+    ) -> Result<ControlServerHandle, ControlServerError> {
+        Self::bind_configured(home, store, release, activation, true).await
+    }
+
+    async fn bind_configured(
+        home: &MuxviaHome,
+        store: Arc<StateStore>,
+        release: impl Into<String>,
+        activation: Arc<ActivationService>,
+        exit_when_idle: bool,
     ) -> Result<ControlServerHandle, ControlServerError> {
         let codec = CodexConfigCodec::for_user_home(home.user_home())
             .map_err(|_| ControlServerError::State)?;
@@ -102,34 +148,59 @@ impl ControlServer {
 
         let release = release.into();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
+        let (completed_tx, completed) = watch::channel(false);
+        let lifecycle = Arc::new(ServerLifecycle::default());
         let task_path = socket_path.clone();
         let task = tokio::spawn(async move {
             let mut sessions = JoinSet::new();
             loop {
                 tokio::select! {
                     biased;
-                    _ = &mut shutdown_rx => break,
-                    _ = sessions.join_next(), if !sessions.is_empty() => {}
+                    _ = &mut shutdown_rx => {
+                        let _ = session_shutdown_tx.send(true);
+                        break;
+                    }
+                    _ = sessions.join_next(), if !sessions.is_empty() => {
+                        if exit_when_idle && should_exit_idle(&store, &lifecycle).await {
+                            let _ = session_shutdown_tx.send(true);
+                            break;
+                        }
+                    }
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break };
+                        lifecycle.accepted.store(true, Ordering::Release);
+                        lifecycle.active_sessions.fetch_add(1, Ordering::AcqRel);
                         let store = Arc::clone(&store);
                         let activation = Arc::clone(&activation);
                         let release = release.clone();
+                        let lifecycle = Arc::clone(&lifecycle);
+                        let session_shutdown = session_shutdown_rx.clone();
                         sessions.spawn(async move {
-                            serve_authorized(stream, store, activation, release).await;
+                            let _guard = SessionGuard(Arc::clone(&lifecycle));
+                            serve_authorized(
+                                stream,
+                                store,
+                                activation,
+                                release,
+                                lifecycle,
+                                session_shutdown,
+                            ).await;
                         });
                     }
                 }
             }
-            sessions.abort_all();
+            drop(listener);
             while sessions.join_next().await.is_some() {}
             remove_socket_if_present(&task_path);
+            let _ = completed_tx.send(true);
         });
 
         Ok(ControlServerHandle {
             socket_path,
             shutdown: Some(shutdown_tx),
             task: Some(task),
+            completed,
         })
     }
 }
@@ -139,10 +210,24 @@ impl ControlServerHandle {
         &self.socket_path
     }
 
-    pub async fn shutdown(mut self) -> Result<(), ControlServerError> {
+    pub fn request_shutdown(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
+    }
+
+    pub async fn wait_for_exit(&mut self) -> Result<(), ControlServerError> {
+        while !*self.completed.borrow() {
+            self.completed
+                .changed()
+                .await
+                .map_err(|_| ControlServerError::Task)?;
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown(mut self) -> Result<(), ControlServerError> {
+        self.request_shutdown();
         if let Some(task) = self.task.take() {
             task.await.map_err(|_| ControlServerError::Task)?;
         }
@@ -183,6 +268,8 @@ async fn serve_authorized(
     store: Arc<StateStore>,
     activation: Arc<ActivationService>,
     release: String,
+    lifecycle: Arc<ServerLifecycle>,
+    shutdown: watch::Receiver<bool>,
 ) {
     let authorized = stream.peer_cred().is_ok_and(|credentials| {
         // SAFETY: geteuid has no preconditions and only reads the process credential.
@@ -200,7 +287,7 @@ async fn serve_authorized(
         return;
     }
 
-    serve_session(&mut stream, store, activation, release).await;
+    serve_session(&mut stream, store, activation, release, lifecycle, shutdown).await;
 }
 
 async fn serve_session(
@@ -208,6 +295,8 @@ async fn serve_session(
     store: Arc<StateStore>,
     activation: Arc<ActivationService>,
     release: String,
+    lifecycle: Arc<ServerLifecycle>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let Ok(first) = read_frame(stream).await else {
         return;
@@ -272,6 +361,9 @@ async fn serve_session(
     let mut update_rx = store.subscribe_target_views();
     loop {
         tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return; }
+            }
             incoming = read_frame(stream) => {
                 let Ok(raw) = incoming else { return };
                 if raw.get("type").and_then(Value::as_str) == Some("hello") {
@@ -315,6 +407,8 @@ async fn serve_session(
                         if write_frame(stream, &response).await.is_err() { return; }
                     }
                     ControlOperation::Act { action_id, expected_revision, action, .. } => {
+                        lifecycle.pending_actions.fetch_add(1, Ordering::AcqRel);
+                        let _action = ActionGuard(Arc::clone(&lifecycle));
                         match activation.apply_raw(action_id, expected_revision, action).await {
                             Ok(outcome) => {
                                 let response = ServerFrame::Response {
@@ -350,6 +444,13 @@ async fn serve_session(
             }
         }
     }
+}
+
+async fn should_exit_idle(store: &StateStore, lifecycle: &ServerLifecycle) -> bool {
+    lifecycle.accepted.load(Ordering::Acquire)
+        && lifecycle.active_sessions.load(Ordering::Acquire) == 0
+        && lifecycle.pending_actions.load(Ordering::Acquire) == 0
+        && matches!(store.committed_takeover().await, Ok(None))
 }
 
 fn find_codex_executable() -> PathBuf {

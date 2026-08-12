@@ -28,6 +28,26 @@ impl MuxviaHome {
         }
     }
 
+    pub fn from_root(root: PathBuf) -> io::Result<Self> {
+        if !root.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Muxvia Home must be absolute",
+            ));
+        }
+        let user_home = root.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Muxvia Home has no parent")
+        })?;
+        let state = root.join("state");
+        let database = state.join("muxvia.db");
+        Ok(Self {
+            user_home: user_home.to_owned(),
+            root,
+            state,
+            database,
+        })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -54,6 +74,10 @@ impl MuxviaHome {
         options.mode((libc::S_IRUSR | libc::S_IWUSR) as u32);
         options.open(&self.database)?;
         set_private_file_permissions(&self.database)
+    }
+
+    pub(crate) fn prepare_root(&self) -> io::Result<()> {
+        create_private_dir(&self.root)
     }
 }
 

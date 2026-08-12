@@ -5,5 +5,5 @@
     "jsx": "preserve",
     "jsxImportSource": "@opentui/solid"
   },
-  "include": ["src", "test"]
+  "include": ["src", "test", "../../tests/e2e"]
 }

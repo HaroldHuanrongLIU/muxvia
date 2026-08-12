@@ -7,6 +7,8 @@ node_modules/
 dist/
 coverage/
 target/
+.muxvia/
+.codex/
 
 .env
 .env.*

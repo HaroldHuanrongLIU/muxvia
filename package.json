@@ -5,8 +5,10 @@
   "packageManager": "bun@1.3.14",
   "workspaces": ["packages/*"],
   "scripts": {
+    "test": "bun test",
     "test:ts": "bun test packages/control-plane/test",
     "typecheck": "bunx tsc -p packages/control-plane/tsconfig.json --noEmit",
-    "test:rust": "cargo test --workspace"
+    "test:rust": "cargo test --workspace",
+    "verify": "./scripts/verify-t01.sh"
   }
 }

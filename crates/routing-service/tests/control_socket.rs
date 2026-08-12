@@ -130,6 +130,40 @@ async fn socket_and_runtime_are_private_and_shutdown_removes_socket() {
 }
 
 #[tokio::test]
+async fn shutdown_closes_accepted_sessions_before_returning() {
+    let mut fixture = ControlFixture::start().await;
+    let mut stream = fixture.connect().await;
+    assert_eq!(hello(&mut stream).await["type"], "hello-ack");
+
+    fixture.shutdown().await;
+    let _ = write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "after-shutdown",
+            "operation": {
+                "kind": "act", "target": "codex",
+                "actionId": "00000000-0000-4000-8000-000000000006",
+                "expectedRevision": 0,
+                "action": save_action("Too late", "must-not-be-stored")
+            }
+        }),
+    )
+    .await;
+
+    assert!(read_frame(&mut stream).await.is_err());
+    assert_eq!(
+        fixture
+            .store
+            .target_view()
+            .await
+            .unwrap()
+            .management_revision,
+        0
+    );
+}
+
+#[tokio::test]
 async fn bind_rejects_a_non_socket_or_symlink_collision() {
     for symlink in [false, true] {
         let root = short_temp_root("mx-col");

@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
     sync::{broadcast, oneshot},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 
 use crate::{
@@ -65,20 +65,25 @@ impl ControlServer {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let task_path = socket_path.clone();
         let task = tokio::spawn(async move {
+            let mut sessions = JoinSet::new();
             loop {
                 tokio::select! {
+                    biased;
                     _ = &mut shutdown_rx => break,
+                    _ = sessions.join_next(), if !sessions.is_empty() => {}
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break };
                         let store = Arc::clone(&store);
                         let release = release.clone();
                         let updates = updates.clone();
-                        tokio::spawn(async move {
+                        sessions.spawn(async move {
                             serve_authorized(stream, store, release, updates).await;
                         });
                     }
                 }
             }
+            sessions.abort_all();
+            while sessions.join_next().await.is_some() {}
             remove_socket_if_present(&task_path);
         });
 

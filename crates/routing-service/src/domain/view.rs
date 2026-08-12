@@ -1,8 +1,8 @@
 use tokio_rusqlite::rusqlite::{Connection, Result};
 
 use crate::control::protocol::{
-    CredentialPresence, ManagedConfigurationView, ProviderView, ServiceView, TakeoverView, Target,
-    TargetView,
+    CredentialPresence, ManagedConfigurationView, ProviderView, RecoveryView, ServiceView,
+    TakeoverView, Target, TargetView,
 };
 
 pub(crate) fn project_target_view(
@@ -16,8 +16,9 @@ pub(crate) fn project_target_view(
         serving_provider_id,
         takeover_state,
         route_port,
-    ): (u64, u64, Option<String>, Option<String>, String, Option<u16>) = connection.query_row(
-        "SELECT management_revision, view_sequence, current_provider_id, serving_provider_id, takeover_state, route_port
+        recovery_state,
+    ): (u64, u64, Option<String>, Option<String>, String, Option<u16>, String) = connection.query_row(
+        "SELECT management_revision, view_sequence, current_provider_id, serving_provider_id, takeover_state, route_port, recovery_state
          FROM target_route_state WHERE target = 'codex'",
         [],
         |row| {
@@ -28,6 +29,7 @@ pub(crate) fn project_target_view(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
             ))
         },
     )?;
@@ -60,6 +62,13 @@ pub(crate) fn project_target_view(
     } else {
         "unmanaged"
     };
+    let recovery = connection
+        .query_row(
+            "SELECT id, state FROM activation_recovery ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| Ok((Some(row.get::<_, String>(0)?), row.get::<_, String>(1)?)),
+        )
+        .unwrap_or((None, recovery_state.clone()));
 
     Ok(TargetView {
         target: Target::Codex,
@@ -78,9 +87,17 @@ pub(crate) fn project_target_view(
         current_provider_id,
         serving_provider_id,
         managed_configuration: ManagedConfigurationView {
-            state: "unmanaged".to_owned(),
+            state: if recovery_state == "recovery-required" {
+                recovery_state.clone()
+            } else {
+                "unmanaged".to_owned()
+            },
             path: None,
             restart_required: false,
+        },
+        recovery: RecoveryView {
+            intent_id: recovery.0,
+            state: recovery.1,
         },
         activated_snapshot: None,
         problems: Vec::new(),
@@ -108,6 +125,10 @@ pub(crate) fn empty_target_view(service_epoch: &str) -> TargetView {
             state: "unmanaged".to_owned(),
             path: None,
             restart_required: false,
+        },
+        recovery: RecoveryView {
+            intent_id: None,
+            state: "clean".to_owned(),
         },
         activated_snapshot: None,
         problems: Vec::new(),

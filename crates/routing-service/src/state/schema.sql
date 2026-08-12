@@ -36,6 +36,18 @@ CREATE TABLE IF NOT EXISTS action_receipts (
   outcome_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS activation_recovery (
+  id TEXT PRIMARY KEY,
+  target TEXT NOT NULL CHECK (target = 'codex'),
+  action_id TEXT NOT NULL UNIQUE,
+  config_path TEXT NOT NULL,
+  file_identity_json TEXT NOT NULL,
+  before_owned_json TEXT NOT NULL,
+  desired_owned_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'rolled-back', 'recovery-required')),
+  created_revision INTEGER NOT NULL
+);
+
 INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '1');
 INSERT OR IGNORE INTO target_route_state (
   target,

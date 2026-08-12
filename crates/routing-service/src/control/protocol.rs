@@ -259,6 +259,7 @@ pub struct TargetView {
     pub current_provider_id: Option<String>,
     pub serving_provider_id: Option<String>,
     pub managed_configuration: ManagedConfigurationView,
+    pub recovery: RecoveryView,
     pub activated_snapshot: Option<ActivatedSnapshotView>,
     pub problems: Vec<ControlProblem>,
 }
@@ -300,6 +301,13 @@ pub struct ManagedConfigurationView {
     pub state: String,
     pub path: Option<String>,
     pub restart_required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryView {
+    pub intent_id: Option<String>,
+    pub state: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

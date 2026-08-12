@@ -53,10 +53,11 @@
         "currentProviderId": { "type": ["string", "null"] },
         "servingProviderId": { "type": ["string", "null"] },
         "managedConfiguration": { "type": "object" },
+        "recovery": { "type": "object", "properties": { "intentId": { "type": ["string", "null"], "format": "uuid" }, "state": { "type": "string" } }, "required": ["intentId", "state"], "additionalProperties": false },
         "activatedSnapshot": { "oneOf": [{ "$ref": "#/$defs/activatedSnapshot" }, { "type": "null" }] },
         "problems": { "type": "array", "items": { "$ref": "#/$defs/controlProblem" } }
       },
-      "required": ["target", "managementRevision", "viewSequence", "service", "mode", "takeover", "providers", "currentProviderId", "servingProviderId", "managedConfiguration", "activatedSnapshot", "problems"]
+      "required": ["target", "managementRevision", "viewSequence", "service", "mode", "takeover", "providers", "currentProviderId", "servingProviderId", "managedConfiguration", "recovery", "activatedSnapshot", "problems"]
     },
     "controlProblem": {
       "type": "object",

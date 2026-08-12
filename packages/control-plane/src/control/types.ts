@@ -50,6 +50,10 @@ const targetViewSchema = z.object({
     path: z.string().nullable(),
     restartRequired: z.boolean(),
   }),
+  recovery: z.object({
+    intentId: z.string().uuid().nullable(),
+    state: z.string(),
+  }),
   activatedSnapshot: activatedSnapshotSchema.nullable(),
   problems: z.array(controlProblemSchema),
 })

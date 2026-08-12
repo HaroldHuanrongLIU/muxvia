@@ -34,6 +34,7 @@ function viewAtRevision(revision: number, sequence = revision): TargetView {
     currentProviderId: null,
     servingProviderId: null,
     managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
+    recovery: { intentId: null, state: "clean" },
     activatedSnapshot: null,
     problems: [],
   }

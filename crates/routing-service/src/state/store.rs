@@ -39,10 +39,14 @@ pub enum StateError {
     Sqlite(#[from] tokio_rusqlite::rusqlite::Error),
     #[error("state store serialization failed")]
     Serialization(#[from] serde_json::Error),
+    #[error("state store contains an invalid recovery state")]
+    InvalidRecoveryState,
+    #[error("recovery intent does not exist")]
+    MissingRecoveryIntent,
 }
 
 pub struct StateStore {
-    connection: Connection,
+    pub(super) connection: Connection,
     service_epoch: String,
 }
 
@@ -108,6 +112,15 @@ impl StateStore {
                     .failure("state-store-error", "State store operation failed")
                     .await);
             }
+        }
+
+        if self.ensure_managed_writes_allowed().await.is_err() {
+            return Err(self
+                .failure(
+                    "recovery-required",
+                    "Managed writes are blocked until recovery is resolved",
+                )
+                .await);
         }
 
         match serde_json::from_value(raw_action) {
@@ -288,7 +301,7 @@ fn map_call_error(error: tokio_rusqlite::Error<tokio_rusqlite::rusqlite::Error>)
     }
 }
 
-fn map_state_call_error(error: tokio_rusqlite::Error<StateError>) -> StateError {
+pub(super) fn map_state_call_error(error: tokio_rusqlite::Error<StateError>) -> StateError {
     match error {
         tokio_rusqlite::Error::ConnectionClosed => StateError::Unavailable,
         tokio_rusqlite::Error::Error(error) => error,

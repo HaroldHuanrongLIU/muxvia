@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test"
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing"
 import { render } from "@opentui/solid"
 
-import { run, type RunPorts } from "../src/app"
+import { connectTargetSession, run, type RunPorts } from "../src/app"
 import type { TargetSession } from "../src/control/target-session"
 import type { ActionOutcome, TargetAction, TargetView } from "../src/control/types"
 
@@ -26,6 +26,37 @@ function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
   const promise = new Promise<T>((next) => { resolve = next })
   return { promise, resolve }
+}
+
+async function flushMicrotasks(): Promise<void> {
+  for (let pass = 0; pass < 8; pass++) await Promise.resolve()
+}
+
+class ManualClock {
+  #now = 0
+  #nextId = 0
+  #timers = new Map<number, { at: number; callback: () => void }>()
+
+  now = () => this.#now
+  sleep = async (milliseconds: number) => { this.advance(milliseconds) }
+  timeout = (milliseconds: number, callback: () => void) => {
+    const id = this.#nextId++
+    this.#timers.set(id, { at: this.#now + milliseconds, callback })
+    return () => { this.#timers.delete(id) }
+  }
+
+  advance(milliseconds: number): void {
+    this.#now += milliseconds
+    const due = [...this.#timers.entries()].filter(([, timer]) => timer.at <= this.#now)
+    for (const [id, timer] of due) {
+      this.#timers.delete(id)
+      timer.callback()
+    }
+  }
+
+  pendingTimers(): number {
+    return this.#timers.size
+  }
 }
 
 class LifecycleSession implements TargetSession {
@@ -66,6 +97,7 @@ function ports(
     clock: {
       now: () => 0,
       sleep: async () => {},
+      timeout: () => () => {},
     },
     ...overrides,
   }
@@ -159,6 +191,7 @@ test("a protocol connection failure never starts a second service", async () => 
     clock: {
       now: () => now,
       sleep: async (milliseconds) => { now += milliseconds },
+      timeout: () => () => {},
     },
   }))).rejects.toMatchObject({ code: "connection-closed" })
   expect(spawnCalls).toBe(0)
@@ -174,11 +207,94 @@ test("readiness timeout reports service-unavailable and restores the renderer", 
     clock: {
       now: () => now,
       sleep: async (milliseconds) => { now += milliseconds },
+      timeout: () => () => {},
     },
   }))
   await expect(failure).rejects.toMatchObject({ code: "service-unavailable" })
   expect(session.closeCalls).toBe(0)
   expect(destroyCalls()).toBe(1)
+})
+
+test("a never-resolving initial connection is bounded and a late session is closed", async () => {
+  const { setup, destroyCalls } = await rendererFixture()
+  const late = new LifecycleSession()
+  const connection = deferred<TargetSession>()
+  const clock = new ManualClock()
+  let spawnCalls = 0
+  const running = run(options, ports(setup, late, {
+    connect: () => connection.promise,
+    spawn: () => { spawnCalls++ },
+    clock,
+  }))
+  try {
+    await flushMicrotasks()
+    clock.advance(2_000)
+    await expect(running).rejects.toMatchObject({ code: "service-unavailable" })
+    expect(spawnCalls).toBe(0)
+    expect(destroyCalls()).toBe(1)
+    expect(clock.pendingTimers()).toBe(0)
+
+    connection.resolve(late)
+    await flushMicrotasks()
+    expect(late.closeCalls).toBe(1)
+  } finally {
+    connection.resolve(late)
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    await running.catch(() => {})
+  }
+})
+
+test("a never-resolving post-spawn connection shares the deadline and closes a late session", async () => {
+  const { setup, destroyCalls } = await rendererFixture()
+  const late = new LifecycleSession()
+  const connection = deferred<TargetSession>()
+  const clock = new ManualClock()
+  let connects = 0
+  let spawnCalls = 0
+  const running = run(options, ports(setup, late, {
+    connect: () => {
+      connects++
+      if (connects === 1) return Promise.reject(Object.assign(new Error("missing"), { code: "ENOENT" }))
+      return connection.promise
+    },
+    spawn: () => { spawnCalls++ },
+    clock,
+  }))
+  try {
+    await flushMicrotasks()
+    expect(connects).toBe(2)
+    clock.advance(2_000)
+    await expect(running).rejects.toMatchObject({ code: "service-unavailable" })
+    expect(spawnCalls).toBe(1)
+    expect(destroyCalls()).toBe(1)
+    expect(clock.pendingTimers()).toBe(0)
+
+    connection.resolve(late)
+    await flushMicrotasks()
+    expect(late.closeCalls).toBe(1)
+  } finally {
+    connection.resolve(late)
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    await running.catch(() => {})
+  }
+})
+
+test("the production connector closes its control client when opening the Target fails", async () => {
+  const failure = Object.assign(new Error("Target rejected"), {
+    code: "incompatible-target-cli",
+    detail: "preserve-me",
+  })
+  let closeCalls = 0
+  const control = {
+    openTarget: async () => { throw failure },
+    close: async () => {
+      closeCalls++
+      throw new Error("close also failed")
+    },
+  }
+
+  await expect(connectTargetSession("/tmp/control.sock", "test", async () => control)).rejects.toBe(failure)
+  expect(closeCalls).toBe(1)
 })
 
 test("Ctrl+C, session closure, and render failure each close and destroy exactly once", async () => {

@@ -77,21 +77,21 @@ impl ControlServer {
     ) -> Result<ControlServerHandle, ControlServerError> {
         let codec = CodexConfigCodec::for_user_home(home.user_home())
             .map_err(|_| ControlServerError::State)?;
-        if codec.reconcile_pending(&store).await.is_err()
-            && store
-                .target_view()
+        match codec.reconcile_pending(&store).await {
+            Ok(()) => activation
+                .bootstrap_committed_takeover()
                 .await
-                .map_err(|_| ControlServerError::State)?
-                .recovery
-                .state
-                != "recovery-required"
-        {
-            return Err(ControlServerError::State);
+                .map_err(|_| ControlServerError::State)?,
+            Err(_) => {
+                let view = store
+                    .target_view()
+                    .await
+                    .map_err(|_| ControlServerError::State)?;
+                if view.recovery.state != "recovery-required" {
+                    return Err(ControlServerError::State);
+                }
+            }
         }
-        activation
-            .bootstrap_committed_takeover()
-            .await
-            .map_err(|_| ControlServerError::State)?;
 
         let run_dir = home.root().join("run");
         fs::create_dir_all(&run_dir)?;

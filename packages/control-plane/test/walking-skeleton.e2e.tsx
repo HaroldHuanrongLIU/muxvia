@@ -6,10 +6,11 @@ import { spawn } from "node:child_process"
 import { createConnection } from "node:net"
 import { request as httpRequest } from "node:http"
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
-import { homedir, tmpdir } from "node:os"
+import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 
 import { RpcClient } from "../src/control/rpc-client"
+import { FrameDecoder } from "../src/control/framing"
 import { App } from "../src/ui/app"
 import type { TargetView } from "../src/control/types"
 import { SSE_BYTES, startFakeUpstream } from "../../../tests/e2e/fake-upstream"
@@ -26,16 +27,18 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
 })
 
-async function immediateFingerprint(path: string): Promise<string> {
+async function controlledTreeFingerprint(path: string): Promise<string> {
   try {
     const own = await stat(path)
-    const children = own.isDirectory()
-      ? await Promise.all((await readdir(path)).sort().map(async (name) => {
-          const item = await stat(join(path, name))
-          return [name, item.mode, item.size, item.mtimeMs]
-        }))
-      : []
-    return JSON.stringify([[own.mode, own.size, own.mtimeMs], children])
+    const metadata = [own.mode, own.size, own.mtimeMs]
+    if (!own.isDirectory()) {
+      return JSON.stringify([metadata, Buffer.from(await readFile(path)).toString("base64")])
+    }
+    const children = await Promise.all((await readdir(path)).sort().map(async (name) => [
+      name,
+      await controlledTreeFingerprint(join(path, name)),
+    ]))
+    return JSON.stringify([metadata, children])
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing"
     throw error
@@ -100,16 +103,39 @@ function scanNoSecrets(values: unknown[]): void {
   expect(joined).not.toContain(wrongRoutingSecret)
 }
 
+function scanRawRpcFramesNoSecrets(frames: Buffer[]): void {
+  expect(frames.length).toBeGreaterThan(0)
+  const decoder = new FrameDecoder()
+  const decodedFrames = frames.flatMap((frame) => decoder.push(frame))
+  decoder.finish()
+  scanNoSecrets(decodedFrames)
+}
+
+test("secret scanning catches RPC sentinels split across raw transport chunks", () => {
+  expect(() => scanRawRpcFramesNoSecrets([
+    Buffer.from("provider-secret-must-"),
+    Buffer.from("not-escape"),
+  ])).toThrow()
+  expect(() => scanRawRpcFramesNoSecrets([
+    Buffer.from("routing-secret-must-not-"),
+    Buffer.from("escape"),
+  ])).toThrow()
+})
+
 test("real processes prove the Codex takeover walking skeleton", async () => {
-  const actualHome = homedir()
-  const realMuxviaBefore = await immediateFingerprint(join(actualHome, ".muxvia"))
-  const realCodexBefore = await immediateFingerprint(join(actualHome, ".codex"))
   const root = await mkdtemp(join(tmpdir(), "muxvia-e2e-"))
   roots.push(root)
   const userHome = join(root, "home")
+  const operatorHomeCanary = join(root, "operator-home-canary")
+  const codexHomeCanary = join(operatorHomeCanary, ".codex")
   const muxviaHome = join(userHome, ".muxvia")
   const socketPath = join(muxviaHome, "run/control.sock")
   const shutdownFile = join(root, "shutdown")
+  await mkdir(join(operatorHomeCanary, ".muxvia/state"), { recursive: true, mode: 0o700 })
+  await mkdir(codexHomeCanary, { recursive: true, mode: 0o700 })
+  await writeFile(join(codexHomeCanary, "config.toml"), 'canary = "operator-codex-home"\n', { mode: 0o600 })
+  await writeFile(join(operatorHomeCanary, ".muxvia/state/canary"), "operator muxvia state\n", { mode: 0o600 })
+  const operatorHomeCanaryBefore = await controlledTreeFingerprint(operatorHomeCanary)
   await mkdir(join(userHome, ".codex"), { recursive: true, mode: 0o700 })
   await writeFile(join(userHome, ".codex/config.toml"), '# operator comment survives\nunrelated = "keep-me"\n', { mode: 0o600 })
   await chmod(fakeCodex, 0o755)
@@ -121,17 +147,24 @@ test("real processes prove the Codex takeover walking skeleton", async () => {
   let client: RpcClient | undefined
   let setup: Awaited<ReturnType<typeof testRender>> | undefined
   try {
+    const inheritedEnvironmentTraps: NodeJS.ProcessEnv = {
+      HOME: operatorHomeCanary,
+      CODEX_HOME: codexHomeCanary,
+    }
+    const serviceEnvironment: NodeJS.ProcessEnv = {
+      ...inheritedEnvironmentTraps,
+      PATH: `${dirname(fakeCodex)}:/usr/bin:/bin`,
+      MUXVIA_INTEGRATION_TEST: "1",
+    }
+    serviceEnvironment.HOME = userHome
+    delete serviceEnvironment.CODEX_HOME
     service = spawn(serviceBinary, [
       "--home", muxviaHome,
       "--test-shutdown-file", shutdownFile,
       "--test-codex-executable", fakeCodex,
     ], {
       cwd: root,
-      env: {
-        HOME: userHome,
-        PATH: `${dirname(fakeCodex)}:/usr/bin:/bin`,
-        MUXVIA_INTEGRATION_TEST: "1",
-      },
+      env: serviceEnvironment,
       stdio: ["ignore", "pipe", "pipe"],
     })
     service.stdout?.on("data", (data) => logs.push(String(data)))
@@ -219,9 +252,9 @@ test("real processes prove the Codex takeover walking skeleton", async () => {
       .query("SELECT outcome_json FROM action_receipts ORDER BY committed_revision")
       .all()
     receiptDatabase.close()
-    scanNoSecrets([formFrame, activeFrame, servedFrame, rpcFrames, logs, views, receipts])
-    expect(await immediateFingerprint(join(actualHome, ".muxvia"))).toBe(realMuxviaBefore)
-    expect(await immediateFingerprint(join(actualHome, ".codex"))).toBe(realCodexBefore)
+    scanRawRpcFramesNoSecrets(rpcFrames)
+    scanNoSecrets([formFrame, savedFrame, activeFrame, servedFrame, logs, views, receipts])
+    expect(await controlledTreeFingerprint(operatorHomeCanary)).toBe(operatorHomeCanaryBefore)
   } finally {
     if (setup && !setup.renderer.isDestroyed) setup.renderer.destroy()
     await client?.close().catch(() => {})

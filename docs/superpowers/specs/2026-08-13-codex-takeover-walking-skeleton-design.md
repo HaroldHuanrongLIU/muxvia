@@ -1,7 +1,9 @@
 # Codex Takeover Walking Skeleton Design
 
-Status: approved design captured for implementation review  
-Parent specification: [#1 — Muxvia v0.1](https://github.com/HaroldHuanrongLIU/muxvia/issues/1)  
+Status: approved design captured for implementation review
+
+Parent specification: [#1 — Muxvia v0.1](https://github.com/HaroldHuanrongLIU/muxvia/issues/1)
+
 Implementation ticket: [#2 — T01 Codex Takeover walking skeleton](https://github.com/HaroldHuanrongLIU/muxvia/issues/2)
 
 ## Goal

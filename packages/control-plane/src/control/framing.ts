@@ -46,4 +46,8 @@ export class FrameDecoder {
     this.#buffer = this.#buffer.slice(offset)
     return values
   }
+
+  finish(): void {
+    if (this.#buffer.byteLength > 0) throw new Error("unexpected-eof")
+  }
 }

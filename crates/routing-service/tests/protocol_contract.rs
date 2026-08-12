@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use muxvia_routing::control::{
     framing::{FrameError, read_frame, write_frame},
-    protocol::{ClientFrame, ControlProblem, TargetAction, TargetView},
+    protocol::{ClientFrame, ServerFrame, TargetAction, TargetView},
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -79,17 +79,69 @@ async fn framing_writes_a_big_endian_length_prefix() {
 
 #[test]
 fn target_projections_do_not_serialize_secrets() {
-    let view: TargetView = serde_json::from_value(fixture("initial-target-view.json")).unwrap();
-    let problem = ControlProblem {
-        code: "invalid-action".into(),
-        message: "The action cannot be completed.".into(),
-    };
-    let serialized = format!(
-        "{}{}",
-        serde_json::to_string(&view).unwrap(),
-        serde_json::to_string(&problem).unwrap()
-    );
+    let mut value = fixture("initial-target-view.json");
+    value["activatedSnapshot"] = serde_json::json!({
+        "id": "00000000-0000-4000-8000-000000000002",
+        "providerId": "00000000-0000-4000-8000-000000000003",
+        "model": "gpt-test",
+        "epoch": "00000000-0000-4000-8000-000000000004",
+        "providerCredential": "provider-secret-must-not-escape",
+        "routingCredential": "routing-secret-must-not-escape",
+        "authorization": "Bearer provider-secret-must-not-escape",
+        "recovery": { "raw": "routing-secret-must-not-escape" }
+    });
+    value["problems"] = serde_json::json!([{
+        "code": "invalid-action",
+        "message": "The action cannot be completed.",
+        "providerCredential": "provider-secret-must-not-escape",
+        "routingCredential": "routing-secret-must-not-escape"
+    }]);
+    value["providerCredential"] = serde_json::json!("provider-secret-must-not-escape");
+
+    let view: TargetView = serde_json::from_value(value).unwrap();
+    let serialized = serde_json::to_string(&view).unwrap();
 
     assert!(!serialized.contains("provider-secret-must-not-escape"));
     assert!(!serialized.contains("routing-secret-must-not-escape"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&serialized).unwrap()["activatedSnapshot"],
+        serde_json::json!({
+            "id": "00000000-0000-4000-8000-000000000002",
+            "providerId": "00000000-0000-4000-8000-000000000003",
+            "model": "gpt-test",
+            "epoch": "00000000-0000-4000-8000-000000000004"
+        })
+    );
+}
+
+#[test]
+fn protocol_literals_and_identifiers_are_validated() {
+    let invalid_action_id = serde_json::json!({
+        "type": "request",
+        "requestId": "request-1",
+        "operation": {
+            "kind": "act",
+            "target": "codex",
+            "actionId": "not-a-uuid",
+            "expectedRevision": 0,
+            "action": { "kind": "save-provider" }
+        }
+    });
+    assert!(serde_json::from_value::<ClientFrame>(invalid_action_id).is_err());
+
+    let hello_ack = serde_json::json!({
+        "type": "hello-ack",
+        "rpc": { "major": 1, "minor": 0 },
+        "release": "test",
+        "serviceEpoch": "00000000-0000-4000-8000-000000000001",
+        "frameLimit": 1048576
+    });
+    assert!(serde_json::from_value::<ServerFrame>(hello_ack.clone()).is_ok());
+    let mut invalid_rpc = hello_ack.clone();
+    invalid_rpc["rpc"] = serde_json::json!({ "major": 1, "minor": 1 });
+    assert!(serde_json::from_value::<ServerFrame>(invalid_rpc).is_err());
+
+    let mut invalid_frame_limit = hello_ack;
+    invalid_frame_limit["frameLimit"] = serde_json::json!(1048575);
+    assert!(serde_json::from_value::<ServerFrame>(invalid_frame_limit).is_err());
 }

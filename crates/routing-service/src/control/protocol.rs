@@ -1,12 +1,74 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::SerializeStruct};
 use serde_json::Value;
+use uuid::Uuid;
 
 pub const FRAME_LIMIT: u32 = 1_048_576;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct RpcVersion {
-    pub major: u8,
-    pub minor: u8,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RpcVersion;
+
+impl RpcVersion {
+    pub const V1_0: Self = Self;
+}
+
+impl Serialize for RpcVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut value = serializer.serialize_struct("RpcVersion", 2)?;
+        value.serialize_field("major", &1)?;
+        value.serialize_field("minor", &0)?;
+        value.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for RpcVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireVersion {
+            major: u8,
+            minor: u8,
+        }
+
+        let value = WireVersion::deserialize(deserializer)?;
+        if value.major == 1 && value.minor == 0 {
+            Ok(Self::V1_0)
+        } else {
+            Err(D::Error::custom("unsupported-rpc-version"))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameLimit;
+
+impl FrameLimit {
+    pub const V1: Self = Self;
+}
+
+impl Serialize for FrameLimit {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u32(FRAME_LIMIT)
+    }
+}
+
+impl<'de> Deserialize<'de> for FrameLimit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match u32::deserialize(deserializer)? {
+            FRAME_LIMIT => Ok(Self::V1),
+            _ => Err(D::Error::custom("invalid-frame-limit")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -43,7 +105,7 @@ pub enum ServerFrame {
         rpc: RpcVersion,
         release: String,
         service_epoch: String,
-        frame_limit: u32,
+        frame_limit: FrameLimit,
     },
     Response {
         request_id: String,
@@ -72,7 +134,7 @@ pub enum ControlOperation {
     },
     Act {
         target: Target,
-        action_id: String,
+        action_id: Uuid,
         expected_revision: u64,
         action: Value,
     },
@@ -140,7 +202,7 @@ pub struct TargetView {
     pub current_provider_id: Option<String>,
     pub serving_provider_id: Option<String>,
     pub managed_configuration: ManagedConfigurationView,
-    pub activated_snapshot: Option<Value>,
+    pub activated_snapshot: Option<ActivatedSnapshotView>,
     pub problems: Vec<ControlProblem>,
 }
 
@@ -181,6 +243,15 @@ pub struct ManagedConfigurationView {
     pub state: String,
     pub path: Option<String>,
     pub restart_required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivatedSnapshotView {
+    pub id: Uuid,
+    pub provider_id: Uuid,
+    pub model: String,
+    pub epoch: Uuid,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

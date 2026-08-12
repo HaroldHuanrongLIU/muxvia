@@ -22,6 +22,13 @@ const providerViewSchema = z.object({
   credential: z.enum(["present", "missing"]),
 })
 
+const activatedSnapshotSchema = z.object({
+  id: z.string().uuid(),
+  providerId: z.string().uuid(),
+  model: z.string(),
+  epoch: z.string().uuid(),
+})
+
 const targetViewSchema = z.object({
   target: targetSchema,
   managementRevision: z.number().int().nonnegative(),
@@ -43,7 +50,7 @@ const targetViewSchema = z.object({
     path: z.string().nullable(),
     restartRequired: z.boolean(),
   }),
-  activatedSnapshot: z.unknown().nullable(),
+  activatedSnapshot: activatedSnapshotSchema.nullable(),
   problems: z.array(controlProblemSchema),
 })
 
@@ -70,7 +77,7 @@ const controlOperationSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("act"),
     target: targetSchema,
-    actionId: z.string(),
+    actionId: z.string().uuid(),
     expectedRevision: z.number().int().nonnegative(),
     action: z.unknown(),
   }),

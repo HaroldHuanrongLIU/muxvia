@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 struct Fixture {
     _root: TempDir,
+    home: MuxviaHome,
     codec: CodexConfigCodec,
     store: StateStore,
 }
@@ -24,6 +25,7 @@ impl Fixture {
         let store = StateStore::open(&home).await.unwrap();
         Self {
             _root: root,
+            home,
             codec,
             store,
         }
@@ -47,6 +49,73 @@ impl Fixture {
         self.store.insert_recovery_intent(&intent).await.unwrap();
         intent
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn control_server_reconciles_pending_desired_before_accepting_sessions() {
+    use muxvia_routing::control::server::ControlServer;
+    use std::sync::Arc;
+
+    let fixture = Fixture::new("approval_policy = \"never\"\n").await;
+    let intent = fixture.pending().await;
+    fixture
+        .codec
+        .atomic_apply(intent.before(), intent.desired())
+        .unwrap();
+    let store = Arc::new(fixture.store);
+
+    let handle = ControlServer::bind(&fixture.home, Arc::clone(&store), "test")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .recovery_intent(intent.id())
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        RecoveryState::RolledBack
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.codec.config_path()).unwrap(),
+        "approval_policy = \"never\"\n"
+    );
+    handle.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn control_server_persists_third_state_before_allowing_read_only_control() {
+    use muxvia_routing::control::server::ControlServer;
+    use std::sync::Arc;
+
+    let fixture = Fixture::new("approval_policy = \"never\"\n").await;
+    fixture.pending().await;
+    fs::write(fixture.codec.config_path(), "operator_changed = true\n").unwrap();
+    let store = Arc::new(fixture.store);
+
+    let handle = ControlServer::bind(&fixture.home, Arc::clone(&store), "test")
+        .await
+        .unwrap();
+
+    let view = store.target_view().await.unwrap();
+    assert_eq!(view.recovery.state, "recovery-required");
+    let blocked = store
+        .apply_save_provider_action(
+            Uuid::new_v4(),
+            0,
+            serde_json::json!({
+                "kind": "save-provider", "name": "blocked",
+                "baseUrl": "https://api.example/v1", "model": "gpt",
+                "credential": "must-not-store"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(blocked.problem.code, "recovery-required");
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]

@@ -113,6 +113,52 @@ fn restore_preserves_unrelated_edits_made_after_apply() {
 }
 
 #[test]
+fn restore_round_trips_numeric_array_and_owned_comments_exactly() {
+    let home = TempDir::new().unwrap();
+    let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+    fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+    let original = "model=7 # keep numeric comment\nmodel_provider = [\"legacy\", 2] # keep array comment\napproval_policy = \"never\"\n";
+    fs::write(codec.config_path(), original).unwrap();
+    let before = codec.inspect().unwrap();
+    let desired = desired(&codec);
+
+    codec.atomic_apply(&before, &desired).unwrap();
+    codec.restore(&before, &desired).unwrap();
+
+    assert_eq!(fs::read_to_string(codec.config_path()).unwrap(), original);
+}
+
+#[test]
+fn restore_round_trips_inline_table_and_owned_comment_exactly() {
+    let home = TempDir::new().unwrap();
+    let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+    fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+    let original = "model = { kind = \"legacy\", attempts = 2 } # keep inline comment\nmodel_provider = \"legacy\" # keep string comment\n";
+    fs::write(codec.config_path(), original).unwrap();
+    let before = codec.inspect().unwrap();
+    let desired = desired(&codec);
+
+    codec.atomic_apply(&before, &desired).unwrap();
+    codec.restore(&before, &desired).unwrap();
+
+    assert_eq!(fs::read_to_string(codec.config_path()).unwrap(), original);
+}
+
+#[test]
+fn table_shaped_owned_key_rejects_before_write() {
+    let home = TempDir::new().unwrap();
+    let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+    fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+    let original = "[model]\nkind = \"operator-owned-table\"\n";
+    fs::write(codec.config_path(), original).unwrap();
+
+    let error = codec.inspect().unwrap_err();
+
+    assert_eq!(error.code(), "configuration-collision");
+    assert_eq!(fs::read_to_string(codec.config_path()).unwrap(), original);
+}
+
+#[test]
 fn missing_config_creates_private_parent_and_file() {
     let home = TempDir::new().unwrap();
     let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
@@ -173,6 +219,28 @@ fn non_muxvia_reserved_provider_is_a_collision() {
         codec.inspect().unwrap_err().code(),
         "configuration-collision"
     );
+}
+
+#[test]
+fn forged_muxvia_name_and_endpoint_are_still_a_collision() {
+    for body in [
+        "name = \"Muxvia\"\nbase_url = \"https://evil.example/v1\"\n",
+        "name = \"Muxvia\"\nbase_url = \"http://127.0.0.1:43123/v1\"\nwire_api = \"chat\"\n",
+    ] {
+        let home = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+        fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+        fs::write(
+            codec.config_path(),
+            format!("[model_providers.muxvia_codex]\n{body}"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            codec.inspect().unwrap_err().code(),
+            "configuration-collision"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -290,6 +358,50 @@ fn identity_change_before_rename_does_not_overwrite_changed_target() {
         "operator_changed = true\n"
     );
     assert!(!format!("{error:?}\n{error}").contains("route-secret"));
+}
+
+#[test]
+fn absent_target_created_at_commit_is_not_replaced() {
+    let home = TempDir::new().unwrap();
+    let plain = CodexConfigCodec::for_user_home(home.path()).unwrap();
+    let before = plain.inspect().unwrap();
+    let target = plain.config_path().to_owned();
+    let codec = CodexConfigCodec::for_user_home_with_pre_rename_hook(
+        home.path(),
+        Arc::new(move |_| fs::write(&target, "operator_created = true\n")),
+    )
+    .unwrap();
+
+    assert!(codec.atomic_apply(&before, &desired(&codec)).is_err());
+    assert_eq!(
+        fs::read_to_string(codec.config_path()).unwrap(),
+        "operator_created = true\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_replaced_by_symlink_at_commit_never_writes_outside() {
+    use std::os::unix::fs::symlink;
+    let home = TempDir::new().unwrap();
+    let outside = home.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let plain = CodexConfigCodec::for_user_home(home.path()).unwrap();
+    let before = plain.inspect().unwrap();
+    let parent = plain.config_path().parent().unwrap().to_owned();
+    let parked = home.path().join("parked-codex");
+    let outside_for_hook = outside.clone();
+    let codec = CodexConfigCodec::for_user_home_with_pre_rename_hook(
+        home.path(),
+        Arc::new(move |_| {
+            fs::rename(&parent, &parked)?;
+            symlink(&outside_for_hook, &parent)
+        }),
+    )
+    .unwrap();
+
+    assert!(codec.atomic_apply(&before, &desired(&codec)).is_err());
+    assert!(!outside.join("config.toml").exists());
 }
 
 #[allow(dead_code)]

@@ -14,6 +14,7 @@ use tokio::{
 };
 
 use crate::{
+    codex::CodexConfigCodec,
     control::{
         framing::{read_frame, write_frame},
         protocol::{
@@ -51,6 +52,20 @@ impl ControlServer {
         store: Arc<StateStore>,
         release: impl Into<String>,
     ) -> Result<ControlServerHandle, ControlServerError> {
+        let codec = CodexConfigCodec::for_user_home(home.user_home())
+            .map_err(|_| ControlServerError::State)?;
+        if codec.reconcile_pending(&store).await.is_err()
+            && store
+                .target_view()
+                .await
+                .map_err(|_| ControlServerError::State)?
+                .recovery
+                .state
+                != "recovery-required"
+        {
+            return Err(ControlServerError::State);
+        }
+
         let run_dir = home.root().join("run");
         fs::create_dir_all(&run_dir)?;
         fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))?;

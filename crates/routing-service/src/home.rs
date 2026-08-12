@@ -9,6 +9,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 #[derive(Clone)]
 pub struct MuxviaHome {
+    user_home: PathBuf,
     root: PathBuf,
     state: PathBuf,
     database: PathBuf,
@@ -20,6 +21,7 @@ impl MuxviaHome {
         let state = root.join("state");
         let database = state.join("muxvia.db");
         Self {
+            user_home: user_home.to_path_buf(),
             root,
             state,
             database,
@@ -28,6 +30,10 @@ impl MuxviaHome {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn user_home(&self) -> &Path {
+        &self.user_home
     }
 
     pub fn state_dir(&self) -> &Path {

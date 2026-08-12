@@ -1,16 +1,16 @@
 use std::{
     fmt,
     fs::{self, File},
-    io::{self, Write},
+    io::{self, Read, Write},
+    os::fd::AsFd,
     path::{Path, PathBuf},
     sync::Arc,
-    time::UNIX_EPOCH,
 };
 
+use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use tempfile::NamedTempFile;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use super::CodexProblem;
@@ -20,13 +20,19 @@ type PreRenameHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OwnedCodexState {
-    model: Option<serde_json::Value>,
-    model_provider: Option<serde_json::Value>,
-    provider_name: Option<serde_json::Value>,
-    provider_base_url: Option<serde_json::Value>,
-    provider_wire_api: Option<serde_json::Value>,
-    provider_http_headers: Option<serde_json::Value>,
-    provider_supports_websockets: Option<serde_json::Value>,
+    model: Option<OwnedItem>,
+    model_provider: Option<OwnedItem>,
+    provider_name: Option<OwnedItem>,
+    provider_base_url: Option<OwnedItem>,
+    provider_wire_api: Option<OwnedItem>,
+    provider_http_headers: Option<OwnedItem>,
+    provider_supports_websockets: Option<OwnedItem>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct OwnedItem {
+    rendered: String,
+    semantic: serde_json::Value,
 }
 
 impl fmt::Debug for OwnedCodexState {
@@ -73,6 +79,7 @@ pub struct FileIdentity {
     modified_seconds: Option<u64>,
     modified_nanoseconds: Option<u32>,
     length: Option<u64>,
+    mode: Option<u32>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -144,7 +151,11 @@ impl CodexConfigCodec {
 
     pub fn inspect(&self) -> Result<ConfigSnapshot, CodexProblem> {
         let (snapshot, document) = self.read_snapshot()?;
-        if reserved_provider_is_collision(&document) {
+        if document
+            .get("model_providers")
+            .and_then(|providers| providers.get("muxvia_codex"))
+            .is_some()
+        {
             return Err(CodexProblem::new(
                 "configuration-collision",
                 Some(&self.config_path),
@@ -159,19 +170,18 @@ impl CodexConfigCodec {
         base_url: &str,
         routing_credential: &str,
     ) -> DesiredCodexState {
-        let mut headers = serde_json::Map::new();
-        headers.insert(
-            "X-Muxvia-Routing-Credential".to_owned(),
-            serde_json::Value::String(routing_credential.to_owned()),
-        );
+        let header = serde_json::to_string(routing_credential)
+            .expect("serializing a routing credential string cannot fail");
         DesiredCodexState(OwnedCodexState {
-            model: Some(model.into()),
-            model_provider: Some("muxvia_codex".into()),
-            provider_name: Some("Muxvia".into()),
-            provider_base_url: Some(base_url.into()),
-            provider_wire_api: Some("responses".into()),
-            provider_http_headers: Some(serde_json::Value::Object(headers)),
-            provider_supports_websockets: Some(false.into()),
+            model: desired_item(value(model)),
+            model_provider: desired_item(value("muxvia_codex")),
+            provider_name: desired_item(value("Muxvia")),
+            provider_base_url: desired_item(value(base_url)),
+            provider_wire_api: desired_item(value("responses")),
+            provider_http_headers: parse_owned_item(&format!(
+                " {{ \"X-Muxvia-Routing-Credential\" = {header} }}"
+            )),
+            provider_supports_websockets: desired_item(value(false)),
         })
     }
 
@@ -180,7 +190,7 @@ impl CodexConfigCodec {
         before: &ConfigSnapshot,
         desired: &DesiredCodexState,
     ) -> Result<(), CodexProblem> {
-        self.write_owned(before, &desired.0, false)?;
+        self.write_owned(before, &desired.0, false, true)?;
         self.verify(before, desired)
     }
 
@@ -190,7 +200,7 @@ impl CodexConfigCodec {
         expected_current: &DesiredCodexState,
     ) -> Result<(), CodexProblem> {
         let current = self.read_snapshot()?.0;
-        if current.owned != expected_current.0 {
+        if !owned_semantically_matches(&current.owned, &expected_current.0) {
             return Err(CodexProblem::new(
                 "recovery-required",
                 Some(&self.config_path),
@@ -201,7 +211,7 @@ impl CodexConfigCodec {
                 .unrelated
                 .as_object()
                 .is_some_and(serde_json::Map::is_empty);
-        self.write_owned(&current, &before.owned, remove_file)?;
+        self.write_owned(&current, &before.owned, remove_file, false)?;
         let restored = self.read_snapshot()?.0;
         if restored.owned != before.owned || restored.unrelated != current.unrelated {
             return Err(CodexProblem::new(
@@ -218,7 +228,9 @@ impl CodexConfigCodec {
         desired: &DesiredCodexState,
     ) -> Result<(), CodexProblem> {
         let current = self.read_snapshot()?.0;
-        if current.owned != desired.0 || current.unrelated != before.unrelated {
+        if !owned_semantically_matches(&current.owned, &desired.0)
+            || current.unrelated != before.unrelated
+        {
             return Err(CodexProblem::new(
                 "configuration-write-failed",
                 Some(&self.config_path),
@@ -270,7 +282,7 @@ impl CodexConfigCodec {
                 .await
                 .map_err(|_| CodexProblem::new("recovery-required", Some(&self.config_path)));
         }
-        if current.owned == intent.desired().0
+        if owned_semantically_matches(&current.owned, &intent.desired().0)
             && current.unrelated == intent.before().unrelated
             && self.restore(intent.before(), intent.desired()).is_ok()
             && self.matches_before(intent.before())
@@ -312,6 +324,7 @@ impl CodexConfigCodec {
         expected: &ConfigSnapshot,
         owned: &OwnedCodexState,
         remove_file: bool,
+        preserve_decor: bool,
     ) -> Result<(), CodexProblem> {
         let (current, mut document) = self.read_snapshot()?;
         if current != *expected {
@@ -320,7 +333,7 @@ impl CodexConfigCodec {
                 Some(&self.config_path),
             ));
         }
-        apply_owned(&mut document, owned).map_err(|_| {
+        apply_owned(&mut document, owned, preserve_decor).map_err(|_| {
             CodexProblem::new("configuration-write-failed", Some(&self.config_path))
         })?;
         let parent = self.config_path.parent().ok_or_else(|| {
@@ -329,63 +342,181 @@ impl CodexConfigCodec {
         create_private_parent(parent).map_err(|_| {
             CodexProblem::new("configuration-write-failed", Some(&self.config_path))
         })?;
-
-        let mut temporary = NamedTempFile::new_in(parent).map_err(|_| {
+        let directory = rustix::fs::openat(
+            rustix::fs::CWD,
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| CodexProblem::new("configuration-write-failed", Some(&self.config_path)))?;
+        let directory_identity = directory_identity(&directory).map_err(|_| {
             CodexProblem::new("configuration-write-failed", Some(&self.config_path))
         })?;
-        set_mode(temporary.path(), mode_for(&self.config_path)).map_err(|_| {
-            CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-        })?;
-        temporary
-            .write_all(document.to_string().as_bytes())
-            .and_then(|_| temporary.flush())
-            .and_then(|_| temporary.as_file().sync_all())
-            .map_err(|_| {
-                CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-            })?;
-        if let Some(hook) = &self.pre_rename_hook {
-            hook(temporary.path()).map_err(|_| {
-                CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-            })?;
-        }
-        let rechecked = self.read_snapshot()?.0;
-        if rechecked != *expected {
+        if !path_matches_directory(parent, directory_identity) {
             return Err(CodexProblem::new(
                 "configuration-write-failed",
                 Some(&self.config_path),
             ));
         }
-        if remove_file {
-            drop(temporary);
-            fs::remove_file(&self.config_path).map_err(|_| {
-                CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-            })?;
-        } else {
-            temporary.persist(&self.config_path).map_err(|_| {
-                CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-            })?;
+        let target_name = self.config_path.file_name().ok_or_else(|| {
+            CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+        })?;
+        if file_identity_at(&directory, target_name)? != expected.identity {
+            return Err(CodexProblem::new(
+                "configuration-write-failed",
+                Some(&self.config_path),
+            ));
         }
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| {
+        let temporary_name = format!(".muxvia-{}.tmp", uuid::Uuid::new_v4());
+        let temporary_fd = rustix::fs::openat(
+            &directory,
+            temporary_name.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(expected.identity.mode.unwrap_or(0o600) as _),
+        )
+        .map_err(|_| CodexProblem::new("configuration-write-failed", Some(&self.config_path)))?;
+        let mut temporary = File::from(temporary_fd);
+        let result = (|| -> Result<(), CodexProblem> {
+            temporary
+                .write_all(document.to_string().as_bytes())
+                .and_then(|_| temporary.flush())
+                .and_then(|_| temporary.sync_all())
+                .map_err(|_| {
+                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+                })?;
+            if let Some(hook) = &self.pre_rename_hook {
+                hook(&parent.join(&temporary_name)).map_err(|_| {
+                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+                })?;
+            }
+            if !path_matches_directory(parent, directory_identity)
+                || file_identity_at(&directory, target_name)? != expected.identity
+            {
+                return Err(CodexProblem::new(
+                    "configuration-write-failed",
+                    Some(&self.config_path),
+                ));
+            }
+            if expected.identity.exists {
+                rustix::fs::renameat_with(
+                    &directory,
+                    temporary_name.as_str(),
+                    &directory,
+                    target_name,
+                    RenameFlags::EXCHANGE,
+                )
+                .map_err(|_| {
+                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+                })?;
+                if file_identity_at(&directory, temporary_name.as_str())? != expected.identity {
+                    let _ = rustix::fs::renameat_with(
+                        &directory,
+                        temporary_name.as_str(),
+                        &directory,
+                        target_name,
+                        RenameFlags::EXCHANGE,
+                    );
+                    return Err(CodexProblem::new(
+                        "configuration-write-failed",
+                        Some(&self.config_path),
+                    ));
+                }
+                if remove_file {
+                    rustix::fs::unlinkat(&directory, target_name, AtFlags::empty()).map_err(
+                        |_| {
+                            CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+                        },
+                    )?;
+                }
+            } else {
+                rustix::fs::renameat_with(
+                    &directory,
+                    temporary_name.as_str(),
+                    &directory,
+                    target_name,
+                    RenameFlags::NOREPLACE,
+                )
+                .map_err(|_| {
+                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+                })?;
+            }
+            rustix::fs::fsync(&directory).map_err(|_| {
                 CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-            })?;
-        Ok(())
+            })
+        })();
+        let _ = rustix::fs::unlinkat(&directory, temporary_name.as_str(), AtFlags::empty());
+        result
     }
 
     fn read_snapshot(&self) -> Result<(ConfigSnapshot, DocumentMut), CodexProblem> {
-        let identity = file_identity(&self.config_path)?;
-        let source = if identity.exists {
-            fs::read_to_string(&self.config_path).map_err(|_| {
+        let parent = self.config_path.parent().ok_or_else(|| {
+            CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+        })?;
+        let directory = match rustix::fs::openat(
+            rustix::fs::CWD,
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(directory) => Some(directory),
+            Err(error) if error == rustix::io::Errno::NOENT => None,
+            Err(_) => {
+                return Err(CodexProblem::new(
+                    "configuration-write-failed",
+                    Some(&self.config_path),
+                ));
+            }
+        };
+        let (identity, source) = if let Some(directory) = directory {
+            let parent_identity = directory_identity(&directory).map_err(|_| {
                 CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-            })?
+            })?;
+            if !path_matches_directory(parent, parent_identity) {
+                return Err(CodexProblem::new(
+                    "configuration-write-failed",
+                    Some(&self.config_path),
+                ));
+            }
+            let target_name = self.config_path.file_name().ok_or_else(|| {
+                CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+            })?;
+            let identity = file_identity_at(&directory, target_name)?;
+            let source = if identity.exists {
+                let file = rustix::fs::openat(
+                    &directory,
+                    target_name,
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|_| {
+                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+                })?;
+                let mut file = File::from(file);
+                let mut source = String::new();
+                file.read_to_string(&mut source).map_err(|_| {
+                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+                })?;
+                if file_identity_from_stat(rustix::fs::fstat(&file).map_err(|_| {
+                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+                })?) != identity
+                {
+                    return Err(CodexProblem::new(
+                        "configuration-write-failed",
+                        Some(&self.config_path),
+                    ));
+                }
+                source
+            } else {
+                String::new()
+            };
+            (identity, source)
         } else {
-            String::new()
+            (missing_file_identity(), String::new())
         };
         let document = source.parse::<DocumentMut>().map_err(|_| {
             CodexProblem::new("configuration-write-failed", Some(&self.config_path))
         })?;
-        let owned = capture_owned(&document);
+        let owned = capture_owned(&document)?;
         let unrelated = unrelated_projection(&document)?;
         Ok((
             ConfigSnapshot {
@@ -398,44 +529,85 @@ impl CodexConfigCodec {
     }
 }
 
-fn file_identity(path: &Path) -> Result<FileIdentity, CodexProblem> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(FileIdentity {
-                exists: false,
-                device: None,
-                inode: None,
-                modified_seconds: None,
-                modified_nanoseconds: None,
-                length: None,
-            });
-        }
-        Err(_) => return Err(CodexProblem::new("configuration-write-failed", Some(path))),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(CodexProblem::new("configuration-write-failed", Some(path)));
+fn missing_file_identity() -> FileIdentity {
+    FileIdentity {
+        exists: false,
+        device: None,
+        inode: None,
+        modified_seconds: None,
+        modified_nanoseconds: None,
+        length: None,
+        mode: None,
     }
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok());
-    #[cfg(unix)]
-    let (device, inode) = (Some(metadata.dev()), Some(metadata.ino()));
-    #[cfg(not(unix))]
-    let (device, inode) = (None, None);
-    Ok(FileIdentity {
-        exists: true,
-        device,
-        inode,
-        modified_seconds: modified.map(|duration| duration.as_secs()),
-        modified_nanoseconds: modified.map(|duration| duration.subsec_nanos()),
-        length: Some(metadata.len()),
-    })
 }
 
-fn capture_owned(document: &DocumentMut) -> OwnedCodexState {
-    OwnedCodexState {
+fn directory_identity(directory: &impl AsFd) -> io::Result<(u64, u64)> {
+    let stat = rustix::fs::fstat(directory).map_err(io::Error::from)?;
+    Ok((stat_device(&stat), stat.st_ino))
+}
+
+fn path_matches_directory(parent: &Path, expected: (u64, u64)) -> bool {
+    #[cfg(unix)]
+    {
+        fs::symlink_metadata(parent).is_ok_and(|metadata| {
+            !metadata.file_type().is_symlink()
+                && metadata.is_dir()
+                && (metadata.dev(), metadata.ino()) == expected
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = expected;
+        parent.is_dir()
+    }
+}
+
+fn file_identity_at(
+    directory: &impl AsFd,
+    name: impl rustix::path::Arg,
+) -> Result<FileIdentity, CodexProblem> {
+    let stat = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(error) if error == rustix::io::Errno::NOENT => {
+            return Ok(missing_file_identity());
+        }
+        Err(_) => return Err(CodexProblem::new("configuration-write-failed", None)),
+    };
+    if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file() {
+        return Err(CodexProblem::new("configuration-write-failed", None));
+    }
+    Ok(file_identity_from_stat(stat))
+}
+
+fn file_identity_from_stat(stat: rustix::fs::Stat) -> FileIdentity {
+    FileIdentity {
+        exists: true,
+        device: Some(stat_device(&stat)),
+        inode: Some(stat.st_ino),
+        modified_seconds: u64::try_from(stat.st_mtime).ok(),
+        modified_nanoseconds: u32::try_from(stat.st_mtime_nsec).ok(),
+        length: u64::try_from(stat.st_size).ok(),
+        mode: Some(u32::from(stat.st_mode) & 0o777),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn stat_device(stat: &rustix::fs::Stat) -> u64 {
+    stat.st_dev as u64
+}
+
+#[cfg(target_os = "linux")]
+fn stat_device(stat: &rustix::fs::Stat) -> u64 {
+    stat.st_dev
+}
+
+fn capture_owned(document: &DocumentMut) -> Result<OwnedCodexState, CodexProblem> {
+    for key in ["model", "model_provider"] {
+        if document.get(key).is_some_and(|item| !item.is_value()) {
+            return Err(CodexProblem::new("configuration-collision", None));
+        }
+    }
+    Ok(OwnedCodexState {
         model: item_text(document.get("model")),
         model_provider: item_text(document.get("model_provider")),
         provider_name: nested_item_text(document, "name"),
@@ -443,23 +615,33 @@ fn capture_owned(document: &DocumentMut) -> OwnedCodexState {
         provider_wire_api: nested_item_text(document, "wire_api"),
         provider_http_headers: nested_item_text(document, "http_headers"),
         provider_supports_websockets: nested_item_text(document, "supports_websockets"),
-    }
+    })
 }
 
-fn item_text(item: Option<&Item>) -> Option<serde_json::Value> {
+fn item_text(item: Option<&Item>) -> Option<OwnedItem> {
     item.filter(|item| !item.is_none())
         .and_then(|item| item.as_value())
-        .and_then(value_semantic)
+        .and_then(|value| {
+            Some(OwnedItem {
+                rendered: value.to_string(),
+                semantic: value_semantic(value)?,
+            })
+        })
 }
 
-fn nested_item_text(document: &DocumentMut, key: &str) -> Option<serde_json::Value> {
+fn nested_item_text(document: &DocumentMut, key: &str) -> Option<OwnedItem> {
     document
         .get("model_providers")?
         .get("muxvia_codex")?
         .get(key)
         .filter(|item| !item.is_none())
         .and_then(Item::as_value)
-        .and_then(value_semantic)
+        .and_then(|value| {
+            Some(OwnedItem {
+                rendered: value.to_string(),
+                semantic: value_semantic(value)?,
+            })
+        })
 }
 
 fn value_semantic(value: &toml_edit::Value) -> Option<serde_json::Value> {
@@ -468,17 +650,40 @@ fn value_semantic(value: &toml_edit::Value) -> Option<serde_json::Value> {
     tree.as_object_mut()?.remove("owned")
 }
 
-fn reserved_provider_is_collision(document: &DocumentMut) -> bool {
-    let Some(provider) = document
-        .get("model_providers")
-        .and_then(|providers| providers.get("muxvia_codex"))
-    else {
-        return false;
-    };
-    provider
-        .get("name")
-        .and_then(Item::as_str)
-        .is_none_or(|name| name != "Muxvia")
+fn desired_item(item: Item) -> Option<OwnedItem> {
+    item.as_value().and_then(|value| {
+        Some(OwnedItem {
+            rendered: value_to_owned_rendered(value),
+            semantic: value_semantic(value)?,
+        })
+    })
+}
+
+fn parse_owned_item(rendered: &str) -> Option<OwnedItem> {
+    let document = format!("owned ={rendered}\n").parse::<DocumentMut>().ok()?;
+    item_text(document.get("owned"))
+}
+
+fn value_to_owned_rendered(value: &toml_edit::Value) -> String {
+    let mut value = value.clone();
+    value.decor_mut().clear();
+    format!(" {value}")
+}
+
+fn owned_semantically_matches(left: &OwnedCodexState, right: &OwnedCodexState) -> bool {
+    fn equal(left: &Option<OwnedItem>, right: &Option<OwnedItem>) -> bool {
+        left.as_ref().map(|item| &item.semantic) == right.as_ref().map(|item| &item.semantic)
+    }
+    equal(&left.model, &right.model)
+        && equal(&left.model_provider, &right.model_provider)
+        && equal(&left.provider_name, &right.provider_name)
+        && equal(&left.provider_base_url, &right.provider_base_url)
+        && equal(&left.provider_wire_api, &right.provider_wire_api)
+        && equal(&left.provider_http_headers, &right.provider_http_headers)
+        && equal(
+            &left.provider_supports_websockets,
+            &right.provider_supports_websockets,
+        )
 }
 
 fn unrelated_projection(document: &DocumentMut) -> Result<serde_json::Value, CodexProblem> {
@@ -522,9 +727,18 @@ fn unrelated_projection(document: &DocumentMut) -> Result<serde_json::Value, Cod
         .map_err(|_| CodexProblem::new("configuration-write-failed", None))
 }
 
-fn apply_owned(document: &mut DocumentMut, owned: &OwnedCodexState) -> Result<(), ()> {
-    set_top_level(document, "model", owned.model.as_ref())?;
-    set_top_level(document, "model_provider", owned.model_provider.as_ref())?;
+fn apply_owned(
+    document: &mut DocumentMut,
+    owned: &OwnedCodexState,
+    preserve_decor: bool,
+) -> Result<(), ()> {
+    set_top_level(document, "model", owned.model.as_ref(), preserve_decor)?;
+    set_top_level(
+        document,
+        "model_provider",
+        owned.model_provider.as_ref(),
+        preserve_decor,
+    )?;
     let fields = [
         ("name", owned.provider_name.as_ref()),
         ("base_url", owned.provider_base_url.as_ref()),
@@ -546,7 +760,7 @@ fn apply_owned(document: &mut DocumentMut, owned: &OwnedCodexState) -> Result<()
         let provider = providers["muxvia_codex"].as_table_mut().ok_or(())?;
         for (key, encoded) in fields {
             if let Some(encoded) = encoded {
-                provider[key] = parse_value(encoded)?;
+                set_table_item(provider, key, encoded, preserve_decor)?;
             } else {
                 provider.remove(key);
             }
@@ -566,40 +780,58 @@ fn apply_owned(document: &mut DocumentMut, owned: &OwnedCodexState) -> Result<()
 fn set_top_level(
     document: &mut DocumentMut,
     key: &str,
-    encoded: Option<&serde_json::Value>,
+    encoded: Option<&OwnedItem>,
+    preserve_decor: bool,
 ) -> Result<(), ()> {
     if let Some(encoded) = encoded {
+        let decor = preserve_decor
+            .then(|| value_decor(document.get(key)))
+            .flatten();
         document[key] = parse_value(encoded)?;
+        restore_decor(document.get_mut(key), decor);
     } else {
         document.remove(key);
     }
     Ok(())
 }
 
-fn parse_value(encoded: &serde_json::Value) -> Result<Item, ()> {
-    match encoded {
-        serde_json::Value::String(text) => Ok(value(text)),
-        serde_json::Value::Bool(flag) => Ok(value(*flag)),
-        serde_json::Value::Object(entries) => {
-            let body = entries
-                .iter()
-                .map(|(key, value)| {
-                    let text = value.as_str()?;
-                    Some(format!(
-                        "{} = {}",
-                        serde_json::to_string(key).ok()?,
-                        serde_json::to_string(text).ok()?
-                    ))
-                })
-                .collect::<Option<Vec<_>>>()
-                .ok_or(())?
-                .join(", ");
-            let document = format!("owned = {{ {body} }}\n")
-                .parse::<DocumentMut>()
-                .map_err(|_| ())?;
-            document.get("owned").cloned().ok_or(())
+fn set_table_item(
+    table: &mut Table,
+    key: &str,
+    encoded: &OwnedItem,
+    preserve_decor: bool,
+) -> Result<(), ()> {
+    let decor = preserve_decor
+        .then(|| value_decor(table.get(key)))
+        .flatten();
+    table[key] = parse_value(encoded)?;
+    restore_decor(table.get_mut(key), decor);
+    Ok(())
+}
+
+fn parse_value(encoded: &OwnedItem) -> Result<Item, ()> {
+    let document = format!("owned ={}\n", encoded.rendered)
+        .parse::<DocumentMut>()
+        .map_err(|_| ())?;
+    document.get("owned").cloned().ok_or(())
+}
+
+type OwnedDecor = (Option<toml_edit::RawString>, Option<toml_edit::RawString>);
+
+fn value_decor(item: Option<&Item>) -> Option<OwnedDecor> {
+    let decor = item?.as_value()?.decor();
+    Some((decor.prefix().cloned(), decor.suffix().cloned()))
+}
+
+fn restore_decor(item: Option<&mut Item>, decor: Option<OwnedDecor>) {
+    if let (Some(value), Some((prefix, suffix))) = (item.and_then(Item::as_value_mut), decor) {
+        value.decor_mut().clear();
+        if let Some(prefix) = prefix {
+            value.decor_mut().set_prefix(prefix);
         }
-        _ => Err(()),
+        if let Some(suffix) = suffix {
+            value.decor_mut().set_suffix(suffix);
+        }
     }
 }
 
@@ -610,21 +842,5 @@ fn create_private_parent(parent: &Path) -> io::Result<()> {
     if !existed {
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
-    Ok(())
-}
-
-fn mode_for(path: &Path) -> u32 {
-    #[cfg(unix)]
-    if let Ok(metadata) = fs::metadata(path) {
-        return metadata.permissions().mode() & 0o777;
-    }
-    0o600
-}
-
-fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    #[cfg(not(unix))]
-    let _ = (path, mode);
     Ok(())
 }

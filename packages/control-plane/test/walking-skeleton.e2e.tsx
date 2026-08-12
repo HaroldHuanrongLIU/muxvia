@@ -10,7 +10,7 @@ import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 
 import { RpcClient } from "../src/control/rpc-client"
-import { FrameDecoder } from "../src/control/framing"
+import { encodeFrame, FrameDecoder } from "../src/control/framing"
 import { App } from "../src/ui/app"
 import type { TargetView } from "../src/control/types"
 import { SSE_BYTES, startFakeUpstream } from "../../../tests/e2e/fake-upstream"
@@ -111,15 +111,32 @@ function scanRawRpcFramesNoSecrets(frames: Buffer[]): void {
   scanNoSecrets(decodedFrames)
 }
 
-test("secret scanning catches RPC sentinels split across raw transport chunks", () => {
-  expect(() => scanRawRpcFramesNoSecrets([
-    Buffer.from("provider-secret-must-"),
-    Buffer.from("not-escape"),
-  ])).toThrow()
-  expect(() => scanRawRpcFramesNoSecrets([
-    Buffer.from("routing-secret-must-not-"),
-    Buffer.from("escape"),
-  ])).toThrow()
+function splitEncodedFrameWithin(frame: Uint8Array, sentinel: string): Buffer[] {
+  const bytes = Buffer.from(frame)
+  const sentinelStart = bytes.indexOf(Buffer.from(sentinel))
+  expect(sentinelStart).toBeGreaterThanOrEqual(4)
+  const withinSentinel = sentinelStart + Math.floor(Buffer.byteLength(sentinel) / 2)
+  return [
+    bytes.subarray(0, 2),
+    bytes.subarray(2, 4),
+    bytes.subarray(4, withinSentinel),
+    bytes.subarray(withinSentinel),
+  ]
+}
+
+test("secret scanning catches additive RPC sentinels split across valid frame chunks", () => {
+  const cleanFrame = encodeFrame({ type: "target-view", additiveDiagnostic: "safe" })
+  expect(() => scanRawRpcFramesNoSecrets(splitEncodedFrameWithin(cleanFrame, "safe"))).not.toThrow()
+
+  const providerFrame = encodeFrame({ type: "target-view", additiveDiagnostic: providerSecret })
+  expect(() => scanRawRpcFramesNoSecrets(
+    splitEncodedFrameWithin(providerFrame, providerSecret),
+  )).toThrow()
+
+  const routingFrame = encodeFrame({ type: "response", additiveDiagnostic: wrongRoutingSecret })
+  expect(() => scanRawRpcFramesNoSecrets(
+    splitEncodedFrameWithin(routingFrame, wrongRoutingSecret),
+  )).toThrow()
 })
 
 test("real processes prove the Codex takeover walking skeleton", async () => {

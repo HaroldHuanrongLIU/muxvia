@@ -11,19 +11,10 @@ pub fn routing_credential_matches(headers: &HeaderMap, expected: &SecretString) 
     let duplicate = values.next().is_some();
     let bytes = candidate.map_or(&[][..], |value| value.as_bytes());
 
-    let mut padded_candidate = [0_u8; ROUTING_CREDENTIAL_LEN];
-    for (slot, byte) in padded_candidate.iter_mut().zip(bytes.iter().copied()) {
-        *slot = byte;
-    }
+    let padded_candidate = normalize_credential(bytes, |_| {});
 
     let expected_bytes = expected.expose_secret().as_bytes();
-    let mut padded_expected = [0_u8; ROUTING_CREDENTIAL_LEN];
-    for (slot, byte) in padded_expected
-        .iter_mut()
-        .zip(expected_bytes.iter().copied())
-    {
-        *slot = byte;
-    }
+    let padded_expected = normalize_credential(expected_bytes, |_| {});
 
     let shape_is_valid = Choice::from(
         (candidate.is_some()
@@ -34,4 +25,37 @@ pub fn routing_credential_matches(headers: &HeaderMap, expected: &SecretString) 
             && padded_expected.is_ascii()) as u8,
     );
     bool::from(padded_candidate.ct_eq(&padded_expected) & shape_is_valid)
+}
+
+fn normalize_credential(
+    bytes: &[u8],
+    mut observe_index: impl FnMut(usize),
+) -> [u8; ROUTING_CREDENTIAL_LEN] {
+    let mut normalized = [0_u8; ROUTING_CREDENTIAL_LEN];
+    // This explicit fixed range is a credential-comparison security invariant.
+    #[allow(clippy::needless_range_loop)]
+    for index in 0..ROUTING_CREDENTIAL_LEN {
+        observe_index(index);
+        normalized[index] = bytes.get(index).copied().unwrap_or(0);
+    }
+    normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ROUTING_CREDENTIAL_LEN, normalize_credential};
+
+    #[test]
+    fn credential_normalization_visits_all_fixed_indices_for_every_input_length() {
+        for bytes in [
+            &[][..],
+            &b"short"[..],
+            &[b'v'; ROUTING_CREDENTIAL_LEN][..],
+            &[b'l'; ROUTING_CREDENTIAL_LEN + 1][..],
+        ] {
+            let mut visited = Vec::new();
+            let _ = normalize_credential(bytes, |index| visited.push(index));
+            assert_eq!(visited, (0..ROUTING_CREDENTIAL_LEN).collect::<Vec<_>>());
+        }
+    }
 }

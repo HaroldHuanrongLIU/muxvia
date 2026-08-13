@@ -1,14 +1,16 @@
 import { useRenderer, useTerminalDimensions } from "@opentui/solid"
-import { createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js"
+import { createSignal, getOwner, Match, onCleanup, onMount, runWithOwner, Show, Switch } from "solid-js"
 
-import { MuxviaKeymapProvider, useCommandLayer } from "../commands/keymap"
+import { MuxviaKeymapProvider, useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
 import type { TargetSession } from "../control/target-session"
 import type { TargetAction, TargetView as TargetViewProjection } from "../control/types"
 import { createCommandPresenter, createTranslator, type Locale, type Translator } from "../i18n"
 import { theme } from "../theme"
 import { ActionPrompt } from "./action-prompt"
 import { ClaudeContext } from "./claude-context"
+import { CommandPalette } from "./command-palette"
 import { Home } from "./home"
+import { OverlayProvider, useOverlay } from "./overlay-stack"
 import { ProviderForm } from "./provider-form"
 import { TargetView } from "./target-view"
 
@@ -37,6 +39,9 @@ function actionProblem(error: unknown): string {
 function Shell(props: { session: TargetSession; t: Translator }) {
   const renderer = useRenderer()
   const dimensions = useTerminalDimensions()
+  const keymap = useMuxviaKeymap()
+  const overlay = useOverlay()
+  const owner = getOwner()
   const [route, setRoute] = createSignal<ShellRoute>({ kind: "home" })
   const [view, setView] = createSignal<TargetViewProjection>(props.session.get())
   const [providerForm, setProviderForm] = createSignal(false)
@@ -68,6 +73,20 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   }
   const unknownCommand = (input: string) => {
     setNotice({ kind: "error", text: props.t("prompt.unknown", { command: input }) })
+  }
+  const showCommandPalette = () => {
+    const entries = keymap.getCommandEntries({ visibility: "active", namespace: "palette" })
+      .filter((entry) => entry.command.name !== "command.palette.show" && !entry.command.hidden)
+    queueMicrotask(() => {
+      const element = runWithOwner(owner!, () => (
+        <CommandPalette
+          entries={entries}
+          title={props.t("command.palette.title")}
+          searchPlaceholder={props.t("command.palette.search")}
+        />
+      ))
+      overlay.replace({ id: "command-palette", element })
+    })
   }
 
   const saveProvider = async (action: Extract<TargetAction, { kind: "save-provider" }>) => {
@@ -118,12 +137,16 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   useCommandLayer({
     scope: "global",
     priority: 0,
-    handlers: { "app.exit.request": requestExit },
+    enabled: () => overlay.depth === 0,
+    handlers: {
+      "command.palette.show": showCommandPalette,
+      "app.exit.request": requestExit,
+    },
   })
   useCommandLayer({
     scope: "home",
     priority: 100,
-    enabled: () => route().kind === "home",
+    enabled: () => overlay.depth === 0 && route().kind === "home",
     handlers: {
       "target.codex.open": () => showTarget("codex"),
       "target.claude.open": () => showTarget("claude"),
@@ -132,7 +155,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   useCommandLayer({
     scope: "codex",
     priority: 100,
-    enabled: () => isRoute("codex") && !providerForm(),
+    enabled: () => overlay.depth === 0 && isRoute("codex") && !providerForm(),
     handlers: {
       "target.home": showHome,
       "target.sidebar.toggle": () => sidebar[1]((open) => !open),
@@ -147,13 +170,13 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   useCommandLayer({
     scope: "claude",
     priority: 100,
-    enabled: () => isRoute("claude"),
+    enabled: () => overlay.depth === 0 && isRoute("claude"),
     handlers: { "target.home": showHome },
   })
   useCommandLayer({
     scope: "editor",
     priority: 200,
-    enabled: providerForm,
+    enabled: () => overlay.depth === 0 && providerForm(),
     handlers: {
       "provider.cancel": () => setProviderForm(false),
     },
@@ -220,7 +243,9 @@ export function App(props: AppProps) {
   const t = createTranslator(props.locale ?? "en")
   return (
     <MuxviaKeymapProvider presenter={createCommandPresenter(t)}>
-      <Shell session={props.session} t={t} />
+      <OverlayProvider>
+        <Shell session={props.session} t={t} />
+      </OverlayProvider>
     </MuxviaKeymapProvider>
   )
 }

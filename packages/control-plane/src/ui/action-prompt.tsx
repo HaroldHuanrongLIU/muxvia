@@ -1,22 +1,28 @@
 import { useTerminalDimensions } from "@opentui/solid"
-import { createSignal } from "solid-js"
+import { createSignal, type Accessor } from "solid-js"
 
 import { resolveSlash } from "../commands/catalog"
 import { useMuxviaKeymap } from "../commands/keymap"
 import type { CommandScope } from "../commands/types"
 import { theme } from "../theme"
+import { useOptionalOverlay } from "./overlay-stack"
 
 export interface ActionPromptProps {
   scope: CommandScope
   placeholder: string
   metadata: string
+  focusEnabled?: boolean | Accessor<boolean>
   onUnknown: (input: string) => void
 }
 
 export function ActionPrompt(props: ActionPromptProps) {
   const dimensions = useTerminalDimensions()
   const keymap = useMuxviaKeymap()
+  const overlay = useOptionalOverlay()
   const [value, setValue] = createSignal("")
+  const focusEnabled = () => typeof props.focusEnabled === "function"
+    ? props.focusEnabled()
+    : props.focusEnabled ?? (overlay ? overlay.depth === 0 : true)
 
   const submit = () => {
     const original = value()
@@ -40,7 +46,7 @@ export function ActionPrompt(props: ActionPromptProps) {
       justifyContent="center"
     >
       <input
-        focused
+        focused={focusEnabled()}
         value={value()}
         onInput={setValue}
         onSubmit={submit}

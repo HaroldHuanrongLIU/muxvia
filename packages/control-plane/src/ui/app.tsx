@@ -1,14 +1,24 @@
-import { useKeyboard, useRenderer } from "@opentui/solid"
-import { createSignal, onCleanup, onMount, Show } from "solid-js"
+import { useRenderer, useTerminalDimensions } from "@opentui/solid"
+import { createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js"
 
+import { MuxviaKeymapProvider, useCommandLayer } from "../commands/keymap"
 import type { TargetSession } from "../control/target-session"
 import type { TargetAction, TargetView as TargetViewProjection } from "../control/types"
+import { createCommandPresenter, createTranslator, type Locale, type Translator } from "../i18n"
 import { theme } from "../theme"
+import { ActionPrompt } from "./action-prompt"
+import { ClaudeContext } from "./claude-context"
+import { Home } from "./home"
 import { ProviderForm } from "./provider-form"
 import { TargetView } from "./target-view"
 
+export type ShellRoute =
+  | { kind: "home" }
+  | { kind: "target"; target: "codex" | "claude" }
+
 export interface AppProps {
   session: TargetSession
+  locale?: Locale
 }
 
 type Notice = { kind: "error" | "success"; text: string }
@@ -24,18 +34,41 @@ function actionProblem(error: unknown): string {
   return `Action failed (${code}). Review the Target state and try again.`
 }
 
-export function App(props: AppProps) {
+function Shell(props: { session: TargetSession; t: Translator }) {
   const renderer = useRenderer()
+  const dimensions = useTerminalDimensions()
+  const [route, setRoute] = createSignal<ShellRoute>({ kind: "home" })
   const [view, setView] = createSignal<TargetViewProjection>(props.session.get())
   const [providerForm, setProviderForm] = createSignal(false)
   const [saving, setSaving] = createSignal(false)
   const [applying, setApplying] = createSignal(false)
   const [notice, setNotice] = createSignal<Notice>()
+  const sidebar = createSignal(true)
 
   onMount(() => {
     const unsubscribe = props.session.subscribe(setView)
     onCleanup(unsubscribe)
   })
+
+  const isRoute = (target: "codex" | "claude") => {
+    const current = route()
+    return current.kind === "target" && current.target === target
+  }
+  const showHome = () => {
+    setProviderForm(false)
+    setNotice()
+    setRoute({ kind: "home" })
+  }
+  const showTarget = (target: "codex" | "claude") => {
+    setNotice()
+    setRoute({ kind: "target", target })
+  }
+  const requestExit = () => {
+    if (!renderer.isDestroyed) renderer.destroy()
+  }
+  const unknownCommand = (input: string) => {
+    setNotice({ kind: "error", text: props.t("prompt.unknown", { command: input }) })
+  }
 
   const saveProvider = async (action: Extract<TargetAction, { kind: "save-provider" }>) => {
     if (saving()) return false
@@ -82,65 +115,112 @@ export function App(props: AppProps) {
     }
   }
 
-  useKeyboard((key) => {
-    if (key.ctrl && key.name === "c") {
-      key.preventDefault()
-      key.stopPropagation()
-      renderer.destroy()
-      return
-    }
-    if (providerForm()) return
-    if (key.name === "q") {
-      key.preventDefault()
-      key.stopPropagation()
-      renderer.destroy()
-      return
-    }
-    if (key.name === "p" && !saving() && !applying()) {
-      key.preventDefault()
-      key.stopPropagation()
-      setNotice()
-      setProviderForm(true)
-      return
-    }
-    if (key.name === "a" && !saving() && !applying()) {
-      key.preventDefault()
-      key.stopPropagation()
-      void applyTakeover()
-    }
+  useCommandLayer({
+    scope: "global",
+    priority: 0,
+    handlers: { "app.exit.request": requestExit },
+  })
+  useCommandLayer({
+    scope: "home",
+    priority: 100,
+    enabled: () => route().kind === "home",
+    handlers: {
+      "target.codex.open": () => showTarget("codex"),
+      "target.claude.open": () => showTarget("claude"),
+    },
+  })
+  useCommandLayer({
+    scope: "codex",
+    priority: 100,
+    enabled: () => isRoute("codex") && !providerForm(),
+    handlers: {
+      "target.home": showHome,
+      "target.sidebar.toggle": () => sidebar[1]((open) => !open),
+      "provider.create": () => {
+        if (saving() || applying()) return
+        setNotice()
+        setProviderForm(true)
+      },
+      "target.takeover.apply": () => { void applyTakeover() },
+    },
+  })
+  useCommandLayer({
+    scope: "claude",
+    priority: 100,
+    enabled: () => isRoute("claude"),
+    handlers: { "target.home": showHome },
+  })
+  useCommandLayer({
+    scope: "editor",
+    priority: 200,
+    enabled: providerForm,
+    handlers: {
+      "provider.cancel": () => setProviderForm(false),
+    },
   })
 
+  const horizontalPadding = () => dimensions().width >= 5 ? 2 : 0
+
   return (
-    <box width="100%" height="100%" backgroundColor={theme.background} flexDirection="column" paddingX={2}>
-      <scrollbox flexGrow={1} flexShrink={1} paddingTop={1}>
-        <Show
-          when={providerForm()}
-          fallback={<TargetView view={view()} notice={notice()} />}
-        >
-          <box flexDirection="column" rowGap={1}>
-            <text fg={theme.primary}>MUXVIA</text>
-            <Show when={notice()}>
-              <text fg={notice()?.kind === "error" ? theme.error : theme.success}>{notice()?.text}</text>
-            </Show>
-            <ProviderForm
-              pending={saving()}
-              onCancel={() => setProviderForm(false)}
-              onSave={saveProvider}
-            />
-          </box>
-        </Show>
-      </scrollbox>
-      <box
-        height={3}
-        border={["left"]}
-        borderColor={theme.primary}
-        backgroundColor={theme.panel}
-        paddingLeft={1}
-        flexDirection="column"
-        justifyContent="center"
-      >
-        <text fg={theme.text}>{applying() ? "Applying Target Takeover…" : "[p] provider   [a] apply takeover   [q] quit"}</text>
-      </box>
+    <box
+      width="100%"
+      height="100%"
+      backgroundColor={theme.background}
+      flexDirection="column"
+      paddingLeft={horizontalPadding()}
+      paddingRight={horizontalPadding()}
+    >
+      <Switch>
+        <Match when={route().kind === "home"}>
+          <Home t={props.t} notice={notice()?.text} onUnknown={unknownCommand} />
+        </Match>
+        <Match when={isRoute("claude")}>
+          <ClaudeContext t={props.t} notice={notice()?.text} onUnknown={unknownCommand} />
+        </Match>
+        <Match when={isRoute("codex")}>
+          <Show
+            when={providerForm()}
+            fallback={(
+              <>
+                <scrollbox flexGrow={1} flexShrink={1} paddingTop={Math.max(0, Math.min(1, dimensions().height - 1))}>
+                  <TargetView view={view()} notice={notice()} />
+                </scrollbox>
+                <ActionPrompt
+                  scope="codex"
+                  placeholder={props.t("prompt.target")}
+                  metadata={applying()
+                    ? props.t("activity.applying")
+                    : `${props.t("prompt.meta.codex")} · ${props.t("prompt.hint.sidebar")} · ${props.t("prompt.hint.back")} · ${props.t("prompt.hint.exit")}`}
+                  onUnknown={unknownCommand}
+                />
+              </>
+            )}
+          >
+            <scrollbox flexGrow={1} flexShrink={1} paddingTop={Math.max(0, Math.min(1, dimensions().height - 1))}>
+              <box flexDirection="column" rowGap={1}>
+                <text fg={theme.primary}>MUXVIA</text>
+                <Show when={notice()}>
+                  <text fg={notice()?.kind === "error" ? theme.error : theme.success}>{notice()?.text}</text>
+                </Show>
+                <ProviderForm
+                  pending={saving()}
+                  onCancel={() => setProviderForm(false)}
+                  onSave={saveProvider}
+                />
+              </box>
+            </scrollbox>
+          </Show>
+        </Match>
+      </Switch>
     </box>
+  )
+}
+
+export function App(props: AppProps) {
+  const t = createTranslator(props.locale ?? "en")
+  return (
+    <MuxviaKeymapProvider presenter={createCommandPresenter(t)}>
+      <Shell session={props.session} t={t} />
+    </MuxviaKeymapProvider>
   )
 }

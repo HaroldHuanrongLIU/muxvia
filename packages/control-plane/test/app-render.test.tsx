@@ -31,6 +31,7 @@ function view(overrides: Partial<TargetView> = {}): TargetView {
 
 class MemoryTargetSession implements TargetSession {
   readonly actions: TargetAction[] = []
+  subscribeCalls = 0
   #view: TargetView
   #listeners = new Set<(next: TargetView) => void>()
   #handler: (action: TargetAction) => Promise<ActionOutcome>
@@ -58,6 +59,7 @@ class MemoryTargetSession implements TargetSession {
   }
 
   subscribe(listener: (next: TargetView) => void): () => void {
+    this.subscribeCalls++
     this.#listeners.add(listener)
     return () => this.#listeners.delete(listener)
   }
@@ -96,6 +98,7 @@ async function enterProvider(
   mockInput: Awaited<ReturnType<typeof testRender>>["mockInput"],
   fields = ["Fixture Provider", "https://fixture.example/v1", "gpt-test", credentialSentinel],
 ): Promise<void> {
+  mockInput.pressKey("x", { ctrl: true })
   mockInput.pressKey("p")
   await mockInput.typeText(fields[0]!)
   mockInput.pressTab()
@@ -106,13 +109,30 @@ async function enterProvider(
   await mockInput.typeText(fields[3]!)
 }
 
-test("renders one Codex context without dashboard navigation", async () => {
+test("starts on Home and routes to and from the Codex context", async () => {
   const session = new MemoryTargetSession(view())
-  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
   try {
     await setup.renderOnce()
     const frame = setup.captureCharFrame()
     expectInOrder(frame, [
+      "MUXVIA",
+      "Codex CLI",
+      "Providers, configuration, and routed model access",
+      "Claude Code",
+      "Selectable context",
+      "Choose a target or enter a command",
+      "ctrl+p commands",
+    ])
+    expect(frame).not.toContain("Mode       Unmanaged")
+    expect(frame).not.toContain("Overview")
+    expect(frame).not.toContain("Providers | Routing")
+    expect(frame).not.toContain(credentialSentinel)
+
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    const codex = setup.captureCharFrame()
+    expectInOrder(codex, [
       "MUXVIA",
       "Codex",
       "Mode       Unmanaged",
@@ -121,18 +141,50 @@ test("renders one Codex context without dashboard navigation", async () => {
       "Service    Running",
       "Config     Unmanaged",
       "Snapshot   —",
-      "[p] provider   [a] apply takeover   [q] quit",
+      "Run a target action",
+      "Codex · Control Plane",
     ])
-    expect(frame).not.toContain("Overview")
-    expect(frame).not.toContain("Providers | Routing")
-    expect(frame).not.toContain(credentialSentinel)
+    expect(codex).not.toContain("Overview")
+    expect(codex).not.toContain("Providers | Routing")
+    expect(codex).not.toContain(credentialSentinel)
+
+    setup.mockInput.pressEscape()
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Choose a target or enter a command")
 
     setup.resize(40, 12)
     await setup.renderOnce()
     const compact = setup.captureCharFrame()
-    expect(compact).toContain("Codex")
-    expect(compact).toContain("[p] provider")
+    expect(compact).toContain("MUXVIA")
+    expect(compact).toContain("Codex CLI")
     expect(compact).not.toContain("Overview")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("opens the localized Claude context without operating the Codex session", async () => {
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} locale="zh-CN" />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    await setup.mockInput.typeText("/claude")
+    setup.mockInput.pressEnter()
+    const claude = await setup.waitForFrame((frame) => frame.includes("此构建中不提供 Claude Code 管理功能"))
+    expect(claude).toContain("使用 Esc 或 /home 返回")
+    expect(session.actions).toEqual([])
+    expect(session.subscribeCalls).toBe(1)
+
+    await setup.mockInput.typeText("/home")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("选择 Target CLI 或输入命令"))
+
+    setup.mockInput.pressKey("2")
+    await setup.waitForFrame((frame) => frame.includes("此构建中不提供 Claude Code 管理功能"))
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("选择 Target CLI 或输入命令"))
+    expect(session.actions).toEqual([])
+    expect(session.subscribeCalls).toBe(1)
   } finally {
     setup.renderer.destroy()
   }
@@ -148,6 +200,8 @@ test("renders a persisted compatibility warning without exposing Provider creden
   const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
   try {
     await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
     const frame = setup.captureCharFrame()
     expect(frame).toContain("Codex CLI 99.0.0 is untested")
     expect(frame).toContain("target-cli")
@@ -162,6 +216,9 @@ test("Ctrl+C exits even while the Provider form owns input focus", async () => {
   const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
   try {
     await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("p")
     await setup.waitForFrame((frame) => frame.includes("Base URL"))
     setup.mockInput.pressCtrlC()
@@ -191,6 +248,8 @@ test("saves a masked Provider, applies its visible identity, and follows pushed 
   const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
   try {
     await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
     await enterProvider(setup.mockInput)
     await setup.renderOnce()
     const draftFrame = setup.captureCharFrame()
@@ -210,6 +269,7 @@ test("saves a masked Provider, applies its visible identity, and follows pushed 
     })
     expect(setup.captureCharFrame()).not.toContain(credentialSentinel)
 
+    setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("a")
     await setup.waitFor(() => session.actions.length === 2)
     expect(session.actions[1]).toEqual({
@@ -251,6 +311,8 @@ test("invalid Provider guidance clears the credential without echoing it", async
   const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
   try {
     await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
     await enterProvider(setup.mockInput)
     setup.mockInput.pressEnter()
     const frame = await setup.waitForFrame((next) => next.includes("Check the Provider fields and try again"))
@@ -285,6 +347,9 @@ test("a stale action installs the authoritative Target View and asks for an expl
   const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
   try {
     await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("a")
     const frame = await setup.waitForFrame((next) => next.includes("Retry the action"))
     expect(frame).toContain("Current    Authoritative Provider")

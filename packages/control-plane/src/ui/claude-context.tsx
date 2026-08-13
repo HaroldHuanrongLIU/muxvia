@@ -1,0 +1,41 @@
+import { useTerminalDimensions } from "@opentui/solid"
+import { Show } from "solid-js"
+
+import type { Translator } from "../i18n"
+import { theme } from "../theme"
+import { ActionPrompt } from "./action-prompt"
+import { Logo } from "./logo"
+
+export interface ClaudeContextProps {
+  t: Translator
+  notice?: string
+  onUnknown: (input: string) => void
+}
+
+export function ClaudeContext(props: ClaudeContextProps) {
+  const dimensions = useTerminalDimensions()
+
+  return (
+    <box width="100%" height="100%" flexDirection="column">
+      <Show when={dimensions().width > 1 && dimensions().height > 1}>
+        <scrollbox flexGrow={1} flexShrink={1} paddingTop={Math.max(0, Math.min(1, dimensions().height - 1))}>
+          <box flexDirection="column" rowGap={1}>
+            <Logo />
+            <text fg={theme.text}>{props.t("target.claude")}</text>
+            <text fg={theme.muted}>{props.t("target.claude.unavailable")}</text>
+            <text fg={theme.muted}>{props.t("target.claude.return")}</text>
+            <Show when={props.notice}>
+              <text fg={theme.error}>{props.notice}</text>
+            </Show>
+          </box>
+        </scrollbox>
+        <ActionPrompt
+          scope="claude"
+          placeholder={props.t("prompt.target")}
+          metadata={`${props.t("prompt.meta.claude")} · ${props.t("prompt.hint.back")} · ${props.t("prompt.hint.exit")}`}
+          onUnknown={props.onUnknown}
+        />
+      </Show>
+    </box>
+  )
+}

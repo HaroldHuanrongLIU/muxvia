@@ -5,6 +5,7 @@ import { dirname, isAbsolute } from "node:path"
 
 import { RpcClient, ControlError } from "./control/rpc-client"
 import type { TargetSession } from "./control/target-session"
+import { resolveLocale } from "./i18n"
 import { App } from "./ui/app"
 
 export interface RunOptions {
@@ -194,12 +195,13 @@ async function connectOrStart(options: RunOptions, ports: RunPorts): Promise<Tar
 }
 
 export async function run(options: RunOptions, ports: RunPorts = productionPorts): Promise<void> {
+  const locale = resolveLocale(process.env)
   const renderer = await ports.createRenderer()
   const destroyed = new Promise<void>((resolve) => renderer.once("destroy", resolve))
   let session: TargetSession | undefined
   try {
     session = await connectOrStart(options, ports)
-    await ports.render(() => <App session={session!} />, renderer)
+    await ports.render(() => <App session={session!} locale={locale} />, renderer)
     const sessionClosed = session.whenClosed().then(
       () => { if (!renderer.isDestroyed) renderer.destroy() },
       () => { if (!renderer.isDestroyed) renderer.destroy() },

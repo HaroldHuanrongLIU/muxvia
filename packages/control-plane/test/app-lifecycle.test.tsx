@@ -121,8 +121,8 @@ test("an available service connects before rendering and never spawns", async ()
   })
   try {
     const running = run(options, activePorts)
-    await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
-    setup.mockInput.pressKey("q")
+    await setup.waitForFrame((frame) => frame.includes("Choose a target or enter a command"))
+    setup.mockInput.pressCtrlC()
     await running
     expect(events).toEqual(["connect", "render"])
     expect(session.closeCalls).toBe(1)
@@ -150,7 +150,7 @@ test("an unavailable socket directly spawns the absolute sidecar with its Muxvia
     spawn: (path, args, spawnOptions) => { spawns.push({ path, args, shell: spawnOptions.shell }) },
   }))
   try {
-    await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
+    await setup.waitForFrame((frame) => frame.includes("Choose a target or enter a command"))
     setup.mockInput.pressCtrlC()
     await running
     expect(attempts).toHaveLength(2)
@@ -343,7 +343,7 @@ test("Ctrl+C, session closure, and render failure each close and destroy exactly
       if (exit === "render-error") {
         await expect(running).rejects.toThrow("render failed")
       } else {
-        await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
+        await setup.waitForFrame((frame) => frame.includes("Choose a target or enter a command"))
         if (exit === "ctrl-c") setup.mockInput.pressCtrlC()
         else session.closed.resolve()
         await running

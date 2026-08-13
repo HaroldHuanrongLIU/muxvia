@@ -7,8 +7,11 @@
   "scripts": {
     "test": "bun test",
     "test:ts": "bun test packages/control-plane/test",
-    "typecheck": "bunx tsc -p packages/control-plane/tsconfig.json --noEmit",
+    "typecheck": "bun run --cwd packages/control-plane typecheck",
     "test:rust": "cargo test --workspace",
     "verify": "./scripts/verify-t01.sh"
+  },
+  "devDependencies": {
+    "@opentui/solid": "0.4.3"
   }
 }

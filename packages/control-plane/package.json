@@ -2,6 +2,9 @@
   "name": "@muxvia/control-plane",
   "private": true,
   "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
   "dependencies": {
     "@opentui/core": "0.4.3",
     "@opentui/solid": "0.4.3",

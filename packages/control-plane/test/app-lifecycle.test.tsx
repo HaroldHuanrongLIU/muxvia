@@ -2,7 +2,13 @@ import { expect, spyOn, test } from "bun:test"
 import { createTestRenderer, type TestRendererSetup } from "@opentui/core/testing"
 import { render } from "@opentui/solid"
 
-import { connectTargetSession, run, type RunPorts } from "../src/app"
+import {
+  connectTargetSession,
+  run,
+  type RunPorts,
+  type SignalName,
+  type SignalSource,
+} from "../src/app"
 import type { TargetSession } from "../src/control/target-session"
 import type { ActionOutcome, TargetAction, TargetView } from "../src/control/types"
 
@@ -61,6 +67,28 @@ class ManualClock {
   }
 }
 
+class ManualSignalSource implements SignalSource {
+  #handlers = new Map<SignalName, Set<() => void>>()
+  unlistenCalls = 0
+
+  listen(name: SignalName, handler: () => void): () => void {
+    const handlers = this.#handlers.get(name) ?? new Set()
+    handlers.add(handler)
+    this.#handlers.set(name, handlers)
+    let listening = true
+    return () => {
+      this.unlistenCalls++
+      if (!listening) return
+      listening = false
+      handlers.delete(handler)
+    }
+  }
+
+  emit(name: SignalName): void {
+    for (const handler of [...(this.#handlers.get(name) ?? [])]) handler()
+  }
+}
+
 class LifecycleSession implements TargetSession {
   closeCalls = 0
   saveCalls = 0
@@ -99,15 +127,22 @@ async function enterDirtyProvider(setup: TestRendererSetup): Promise<void> {
 async function rendererFixture(): Promise<{
   setup: TestRendererSetup
   destroyCalls: () => number
+  titles: string[]
 }> {
   const setup = await createTestRenderer({ width: 80, height: 24, useThread: false })
   const destroy = setup.renderer.destroy.bind(setup.renderer)
+  const setTerminalTitle = setup.renderer.setTerminalTitle.bind(setup.renderer)
   let calls = 0
+  const titles: string[] = []
   setup.renderer.destroy = () => {
     calls++
     destroy()
   }
-  return { setup, destroyCalls: () => calls }
+  setup.renderer.setTerminalTitle = (title) => {
+    titles.push(title)
+    setTerminalTitle(title)
+  }
+  return { setup, destroyCalls: () => calls, titles }
 }
 
 function ports(
@@ -120,6 +155,7 @@ function ports(
     spawn: () => {},
     createRenderer: async () => setup.renderer,
     render: async (node, renderer) => { await render(node, renderer) },
+    signals: new ManualSignalSource(),
     clock: {
       now: () => 0,
       sleep: async () => {},
@@ -379,6 +415,125 @@ test("Ctrl+C, session closure, and render failure each close and destroy exactly
     } finally {
       if (!setup.renderer.isDestroyed) setup.renderer.destroy()
     }
+  }
+})
+
+test.each(["SIGHUP", "SIGINT", "SIGTERM"] as const)(
+  "%s emitted twice converges on one cleanup without exiting or stopping the service",
+  async (signal) => {
+    const { setup, destroyCalls, titles } = await rendererFixture()
+    const session = new LifecycleSession()
+    const signals = new ManualSignalSource()
+    const exitSpy = spyOn(process, "exit")
+    let spawnCalls = 0
+    try {
+      const running = run(options, ports(setup, session, {
+        signals,
+        spawn: () => { spawnCalls++ },
+      }))
+      await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
+
+      signals.emit(signal)
+      signals.emit(signal)
+      await running
+
+      expect(signals.unlistenCalls).toBe(3)
+      expect(session.closeCalls).toBe(1)
+      expect(titles.at(-1)).toBe("")
+      expect(destroyCalls()).toBe(1)
+      expect(spawnCalls).toBe(0)
+      expect(exitSpy).not.toHaveBeenCalled()
+    } finally {
+      exitSpy.mockRestore()
+      if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    }
+  },
+)
+
+test("a startup signal finishes cleanup without waiting for a stalled connection", async () => {
+  const { setup, destroyCalls, titles } = await rendererFixture()
+  const session = new LifecycleSession()
+  const signals = new ManualSignalSource()
+  const connection = deferred<TargetSession>()
+  let renderCalls = 0
+  let spawnCalls = 0
+  const running = run(options, ports(setup, session, {
+    signals,
+    connect: async () => await connection.promise,
+    spawn: () => { spawnCalls++ },
+    render: async () => { renderCalls++ },
+  }))
+  try {
+    await flushMicrotasks()
+    signals.emit("SIGTERM")
+    await Promise.race([
+      running,
+      Bun.sleep(100).then(() => { throw new Error("startup signal did not finish cleanup") }),
+    ])
+
+    expect(renderCalls).toBe(0)
+    expect(spawnCalls).toBe(0)
+    expect(session.closeCalls).toBe(0)
+    expect(signals.unlistenCalls).toBe(3)
+    expect(titles.at(-1)).toBe("")
+    expect(destroyCalls()).toBe(1)
+
+    connection.resolve(session)
+    await flushMicrotasks()
+    expect(session.closeCalls).toBe(1)
+  } finally {
+    connection.resolve(session)
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    await running.catch(() => {})
+  }
+})
+
+test("a renderer destroyed during creation needs no destroy event subscription to finish cleanup", async () => {
+  const { setup, destroyCalls, titles } = await rendererFixture()
+  const session = new LifecycleSession()
+  const signals = new ManualSignalSource()
+  let connectCalls = 0
+  let renderCalls = 0
+  await run(options, ports(setup, session, {
+    signals,
+    createRenderer: async () => {
+      setup.renderer.destroy()
+      return setup.renderer
+    },
+    connect: async () => { connectCalls++; return session },
+    render: async () => { renderCalls++ },
+  }))
+
+  expect(connectCalls).toBe(0)
+  expect(renderCalls).toBe(0)
+  expect(session.closeCalls).toBe(0)
+  expect(signals.unlistenCalls).toBe(3)
+  expect(titles.at(-1)).toBe("")
+  expect(destroyCalls()).toBe(1)
+})
+
+test("a mounted render rejection rethrows the same error after one cleanup", async () => {
+  const { setup, destroyCalls, titles } = await rendererFixture()
+  const session = new LifecycleSession()
+  const signals = new ManualSignalSource()
+  const failure = new Error("render failed after mount")
+  const running = run(options, ports(setup, session, {
+    signals,
+    render: async (node, renderer) => {
+      await render(node, renderer)
+      await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
+      throw failure
+    },
+  }))
+  try {
+    await expect(running).rejects.toBe(failure)
+    expect(signals.unlistenCalls).toBe(3)
+    expect(session.closeCalls).toBe(1)
+    expect(titles.at(-1)).toBe("")
+    expect(destroyCalls()).toBe(1)
+  } finally {
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    await running.catch(() => {})
   }
 })
 

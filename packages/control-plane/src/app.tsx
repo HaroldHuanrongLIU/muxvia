@@ -20,6 +20,12 @@ export interface Clock {
   timeout(milliseconds: number, callback: () => void): () => void
 }
 
+export type SignalName = "SIGHUP" | "SIGINT" | "SIGTERM"
+
+export interface SignalSource {
+  listen(name: SignalName, handler: () => void): () => void
+}
+
 interface SpawnOptions {
   shell: false
 }
@@ -29,6 +35,7 @@ export interface RunPorts {
   spawn(path: string, args: string[], options: SpawnOptions): void
   createRenderer(): Promise<CliRenderer>
   render(node: () => JSX.Element, renderer: CliRenderer): Promise<void>
+  signals: SignalSource
   clock: Clock
 }
 
@@ -94,18 +101,28 @@ export async function connectTargetSession(
   }
 }
 
+export function createProductionRenderer(): Promise<CliRenderer> {
+  return createCliRenderer({
+    exitOnCtrlC: false,
+    useKittyKeyboard: {},
+    autoFocus: false,
+  })
+}
+
 const productionPorts: RunPorts = {
   connect: connectTargetSession,
   spawn: (path, args) => {
     const child = spawn(path, args, { shell: false, detached: true, stdio: "ignore" })
     child.unref()
   },
-  createRenderer: () => createCliRenderer({
-    exitOnCtrlC: false,
-    useKittyKeyboard: {},
-    autoFocus: false,
-  }),
+  createRenderer: createProductionRenderer,
   render: async (node, renderer) => { await render(node, renderer) },
+  signals: {
+    listen: (name, handler) => {
+      process.on(name, handler)
+      return () => process.off(name, handler)
+    },
+  },
   clock: {
     now: () => Date.now(),
     sleep: async (milliseconds) => { await Bun.sleep(milliseconds) },
@@ -135,7 +152,9 @@ async function connectBeforeDeadline(
   options: RunOptions,
   ports: RunPorts,
   deadline: number,
+  cancelled: () => boolean = () => false,
 ): Promise<TargetSession> {
+  if (cancelled()) throw new ConnectionCancelledError()
   const remaining = deadline - ports.clock.now()
   if (remaining <= 0) throw new ConnectionDeadlineError()
 
@@ -152,6 +171,14 @@ async function connectBeforeDeadline(
   const connection = Promise.resolve()
     .then(() => ports.connect(options.socketPath, options.release, controller.signal))
     .then(async (session) => {
+      if (cancelled()) {
+        try {
+          await session.close()
+        } catch {
+          // A cancelled startup owns the late session, but cleanup failure must not resume startup.
+        }
+        throw new ConnectionCancelledError()
+      }
       if (!expired) return session
       try {
         await session.close()
@@ -168,14 +195,23 @@ async function connectBeforeDeadline(
   }
 }
 
-async function connectOrStart(options: RunOptions, ports: RunPorts): Promise<TargetSession> {
+class ConnectionCancelledError extends Error {}
+
+async function connectOrStart(
+  options: RunOptions,
+  ports: RunPorts,
+  cancelled: () => boolean = () => false,
+): Promise<TargetSession | undefined> {
   const deadline = ports.clock.now() + readinessTimeoutMs
   try {
-    return await connectBeforeDeadline(options, ports, deadline)
+    return await connectBeforeDeadline(options, ports, deadline, cancelled)
   } catch (error) {
+    if (error instanceof ConnectionCancelledError) return undefined
     if (error instanceof ConnectionDeadlineError) throw error
     if (!socketUnavailable(error)) throw error
   }
+
+  if (cancelled()) return undefined
 
   if (!isAbsolute(options.servicePath)) {
     throw new Error("Routing Service path must be absolute")
@@ -183,12 +219,15 @@ async function connectOrStart(options: RunOptions, ports: RunPorts): Promise<Tar
   ports.spawn(options.servicePath, ["--home", muxviaHomeForSocket(options.socketPath)], { shell: false })
 
   while (ports.clock.now() < deadline) {
+    if (cancelled()) return undefined
     try {
-      return await connectBeforeDeadline(options, ports, deadline)
+      return await connectBeforeDeadline(options, ports, deadline, cancelled)
     } catch (error) {
+      if (error instanceof ConnectionCancelledError) return undefined
       if (error instanceof ConnectionDeadlineError) throw error
       if (!socketUnavailable(error)) throw error
     }
+    if (cancelled()) return undefined
     await ports.clock.sleep(retryIntervalMs)
   }
   throw new ControlError("service-unavailable", "Routing Service did not become ready")
@@ -197,10 +236,22 @@ async function connectOrStart(options: RunOptions, ports: RunPorts): Promise<Tar
 export async function run(options: RunOptions, ports: RunPorts = productionPorts): Promise<void> {
   const locale = resolveLocale(process.env)
   const renderer = await ports.createRenderer()
-  const destroyed = new Promise<void>((resolve) => renderer.once("destroy", resolve))
+  const destroyed = renderer.isDestroyed
+    ? Promise.resolve()
+    : new Promise<void>((resolve) => renderer.once("destroy", resolve))
+  const stopListening = (["SIGHUP", "SIGINT", "SIGTERM"] as const).map((name) =>
+    ports.signals.listen(name, () => {
+      if (!renderer.isDestroyed) renderer.destroy()
+    }),
+  )
   let session: TargetSession | undefined
   try {
-    session = await connectOrStart(options, ports)
+    if (renderer.isDestroyed) return
+    session = await Promise.race([
+      connectOrStart(options, ports, () => renderer.isDestroyed),
+      destroyed.then(() => undefined),
+    ])
+    if (!session || renderer.isDestroyed) return
     await ports.render(() => <App session={session!} locale={locale} />, renderer)
     const sessionClosed = session.whenClosed().then(
       () => { if (!renderer.isDestroyed) renderer.destroy() },
@@ -208,6 +259,7 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
     )
     await Promise.race([destroyed, sessionClosed])
   } finally {
+    for (const stop of stopListening) stop()
     try {
       renderer.setTerminalTitle("")
       if (session) await session.close()

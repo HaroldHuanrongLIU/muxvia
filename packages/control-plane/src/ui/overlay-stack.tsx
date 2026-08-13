@@ -9,6 +9,7 @@ import { theme } from "../theme"
 export interface OverlayEntry {
   id: string
   element: JSX.Element
+  dismissOnEscape?: boolean
   onClose?: () => void
 }
 
@@ -40,6 +41,7 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
   let restoreGeneration = 0
   let closeScheduled = false
   let tearingDown = false
+  const top = createMemo(() => stack().at(-1))
 
   const closeEntry = (entry: OverlayEntry) => {
     if (closed.has(entry)) return
@@ -110,7 +112,7 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
   useCommandLayer({
     scope: "overlay",
     priority: 300,
-    enabled: () => controller.depth > 0,
+    enabled: () => controller.depth > 0 && top()?.dismissOnEscape !== false,
     handlers: { "overlay.close": requestCloseTop },
   })
 
@@ -123,7 +125,6 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
     priorFocus = null
   })
 
-  const top = createMemo(() => stack().at(-1))
   const panelWidth = () => Math.max(1, Math.min(60, dimensions().width - 2))
   const panelLeft = () => Math.max(0, Math.floor((dimensions().width - panelWidth()) / 2))
   const panelTop = () => Math.max(0, Math.floor(dimensions().height / 4))

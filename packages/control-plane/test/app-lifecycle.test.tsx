@@ -22,6 +22,8 @@ const initialView: TargetView = {
   problems: [],
 }
 
+const credentialSentinel = "provider-secret-must-not-render"
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
   const promise = new Promise<T>((next) => { resolve = next })
@@ -61,13 +63,37 @@ class ManualClock {
 
 class LifecycleSession implements TargetSession {
   closeCalls = 0
+  saveCalls = 0
+  credentialPresent = false
   readonly closed = deferred<void>()
+  pendingSave?: Promise<ActionOutcome>
 
   get(): Readonly<TargetView> { return initialView }
-  async act(_action: TargetAction): Promise<ActionOutcome> { return { status: "applied", view: initialView } }
+  async act(action: TargetAction): Promise<ActionOutcome> {
+    if (action.kind === "save-provider") {
+      this.saveCalls++
+      this.credentialPresent = action.credential.length > 0
+      if (this.pendingSave) return await this.pendingSave
+    }
+    return { status: "applied", view: initialView }
+  }
   subscribe(_listener: (next: TargetView) => void): () => void { return () => {} }
   async close(): Promise<void> { this.closeCalls++ }
   whenClosed(): Promise<void> { return this.closed.promise }
+}
+
+async function enterDirtyProvider(setup: TestRendererSetup): Promise<void> {
+  setup.mockInput.pressKey("1")
+  await setup.renderOnce()
+  setup.mockInput.pressKey("x", { ctrl: true })
+  setup.mockInput.pressKey("p")
+  await setup.mockInput.typeText("Pending Provider")
+  setup.mockInput.pressTab()
+  await setup.mockInput.typeText("https://pending.example/v1")
+  setup.mockInput.pressTab()
+  await setup.mockInput.typeText("pending-model")
+  setup.mockInput.pressTab()
+  await setup.mockInput.typeText(credentialSentinel)
 }
 
 async function rendererFixture(): Promise<{
@@ -353,5 +379,37 @@ test("Ctrl+C, session closure, and render failure each close and destroy exactly
     } finally {
       if (!setup.renderer.isDestroyed) setup.renderer.destroy()
     }
+  }
+})
+
+test("dirty confirmation completes run cleanup once before a pending save settles", async () => {
+  const { setup, destroyCalls } = await rendererFixture()
+  const session = new LifecycleSession()
+  const save = deferred<ActionOutcome>()
+  session.pendingSave = save.promise
+  const running = run(options, ports(setup, session))
+  try {
+    await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
+    await enterDirtyProvider(setup)
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.saveCalls === 1)
+    setup.mockInput.pressCtrlC()
+    await setup.waitForFrame((frame) => frame.includes("Discard Provider draft?"))
+    setup.mockInput.pressEnter()
+    await running
+
+    expect(session.credentialPresent).toBeTrue()
+    expect(session.closeCalls).toBe(1)
+    expect(destroyCalls()).toBe(1)
+    expect(setup.captureCharFrame()).not.toContain(credentialSentinel)
+
+    save.resolve({ status: "applied", view: initialView })
+    await flushMicrotasks()
+    expect(session.closeCalls).toBe(1)
+    expect(destroyCalls()).toBe(1)
+  } finally {
+    save.resolve({ status: "applied", view: initialView })
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    await running.catch(() => {})
   }
 })

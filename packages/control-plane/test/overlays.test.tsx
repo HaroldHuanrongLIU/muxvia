@@ -8,6 +8,15 @@ import { MuxviaKeymapProvider, useCommandLayer, useMuxviaKeymap } from "../src/c
 import { ActionPrompt } from "../src/ui/action-prompt"
 import { OverlayProvider, useOverlay } from "../src/ui/overlay-stack"
 
+function ConfirmationOverlay(props: { onCancel: () => void }) {
+  useCommandLayer({
+    scope: "confirm",
+    priority: 300,
+    handlers: { "app.exit.cancel": () => queueMicrotask(props.onCancel) },
+  })
+  return <text>Confirmation</text>
+}
+
 function StackHarness(props: {
   expose: (overlay: ReturnType<typeof useOverlay>) => void
   exposeEntries?: (entries: { a: JSX.Element; b: JSX.Element }) => void
@@ -158,6 +167,40 @@ test("clear closes every detached entry exactly once under reentrant callbacks",
     overlay!.clear()
     expect(closed).toEqual(["a", "b"])
     expect(overlay!.depth).toBe(0)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("a nondismissible overlay leaves Escape exclusively to its modal command", async () => {
+  let overlay: ReturnType<typeof useOverlay> | undefined
+  let confirmation!: JSX.Element
+  const closed: string[] = []
+  function Expose() {
+    overlay = useOverlay()
+    confirmation = <ConfirmationOverlay onCancel={() => {
+      closed.push("confirm")
+      overlay!.closeTop()
+    }} />
+    return null
+  }
+  const setup = await testRender(() => (
+    <MuxviaKeymapProvider><OverlayProvider><Expose /></OverlayProvider></MuxviaKeymapProvider>
+  ), { width: 40, height: 10, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    overlay!.push({
+      id: "confirmation",
+      element: confirmation,
+      dismissOnEscape: false,
+      onClose: () => closed.push("entry"),
+    })
+    await setup.renderOnce()
+    setup.mockInput.pressEscape()
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    await setup.renderOnce()
+    expect(overlay!.depth).toBe(0)
+    expect(closed).toEqual(["confirm", "entry"])
   } finally {
     setup.renderer.destroy()
   }

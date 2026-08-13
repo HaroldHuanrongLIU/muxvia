@@ -9,9 +9,10 @@ import { theme } from "../theme"
 import { ActionPrompt } from "./action-prompt"
 import { ClaudeContext } from "./claude-context"
 import { CommandPalette } from "./command-palette"
+import { ExitConfirmation } from "./exit-confirmation"
 import { Home } from "./home"
 import { OverlayProvider, useOverlay } from "./overlay-stack"
-import { ProviderForm } from "./provider-form"
+import { ProviderForm, type ProviderFormRef } from "./provider-form"
 import { TargetView } from "./target-view"
 
 export type ShellRoute =
@@ -75,6 +76,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   const renderer = useRenderer()
   const dimensions = useTerminalDimensions()
   const overlay = useOverlay()
+  const owner = getOwner()
   const showCommandPalette = useCommandPaletteOpener(props.t)
   const [route, setRoute] = createSignal<ShellRoute>({ kind: "home" })
   const [view, setView] = createSignal<TargetViewProjection>(props.session.get())
@@ -83,6 +85,13 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   const [applying, setApplying] = createSignal(false)
   const [notice, setNotice] = createSignal<Notice>()
   const sidebar = createSignal(true)
+  let providerFormRef: ProviderFormRef | undefined
+  let editorGeneration = 0
+  let exitScheduled = false
+  let exiting = false
+  let disposed = false
+
+  onCleanup(() => { disposed = true })
 
   onMount(() => {
     const unsubscribe = props.session.subscribe(setView)
@@ -94,6 +103,8 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     return current.kind === "target" && current.target === target
   }
   const showHome = () => {
+    providerFormRef?.clearSensitive()
+    editorGeneration++
     setProviderForm(false)
     setNotice()
     setRoute({ kind: "home" })
@@ -102,28 +113,64 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     setNotice()
     setRoute({ kind: "target", target })
   }
+  const destroyRenderer = () => {
+    if (exitScheduled || renderer.isDestroyed) return
+    exitScheduled = true
+    queueMicrotask(() => {
+      exitScheduled = false
+      if (!renderer.isDestroyed) renderer.destroy()
+    })
+  }
+  const cancelExit = () => {
+    overlay.closeTop()
+    queueMicrotask(() => providerFormRef?.focus())
+  }
+  const confirmExit = () => {
+    if (exiting) return
+    exiting = true
+    providerFormRef?.clearSensitive()
+    editorGeneration++
+    setProviderForm(false)
+    overlay.clear()
+    destroyRenderer()
+  }
   const requestExit = () => {
-    if (!renderer.isDestroyed) renderer.destroy()
+    if (exitScheduled || exiting) return
+    if (!providerFormRef?.isDirty()) {
+      destroyRenderer()
+      return
+    }
+    exitScheduled = true
+    queueMicrotask(() => {
+      exitScheduled = false
+      if (disposed || exiting || renderer.isDestroyed || !providerFormRef?.isDirty()) return
+      const element = runWithOwner(owner!, () => (
+        <ExitConfirmation t={props.t} onConfirm={confirmExit} onCancel={cancelExit} />
+      ))
+      overlay.replace({ id: "exit-confirmation", element, dismissOnEscape: false })
+    })
   }
   const unknownCommand = (input: string) => {
     setNotice({ kind: "error", text: props.t("prompt.unknown", { command: input }) })
   }
   const saveProvider = async (action: Extract<TargetAction, { kind: "save-provider" }>) => {
     if (saving()) return false
+    const generation = editorGeneration
     setSaving(true)
     setNotice()
     try {
       const outcome = await props.session.act(action)
+      if (disposed || exiting || generation !== editorGeneration) return false
       setView(outcome.view)
-      setProviderForm(false)
       setNotice({ kind: "success", text: "Provider saved." })
       return true
     } catch (error) {
+      if (disposed || exiting || generation !== editorGeneration) return false
       setView(props.session.get() as TargetViewProjection)
       setNotice({ kind: "error", text: actionProblem(error) })
       return false
     } finally {
-      setSaving(false)
+      if (!disposed && !exiting) setSaving(false)
     }
   }
 
@@ -181,6 +228,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
       "provider.create": () => {
         if (saving() || applying()) return
         setNotice()
+        editorGeneration++
         setProviderForm(true)
       },
       "target.takeover.apply": () => { void applyTakeover() },
@@ -192,15 +240,6 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     enabled: () => overlay.depth === 0 && isRoute("claude"),
     handlers: { "target.home": showHome },
   })
-  useCommandLayer({
-    scope: "editor",
-    priority: 200,
-    enabled: () => overlay.depth === 0 && providerForm(),
-    handlers: {
-      "provider.cancel": () => setProviderForm(false),
-    },
-  })
-
   const horizontalPadding = () => dimensions().width >= 5 ? 2 : 0
 
   return (
@@ -245,8 +284,13 @@ function Shell(props: { session: TargetSession; t: Translator }) {
                   <text fg={notice()?.kind === "error" ? theme.error : theme.success}>{notice()?.text}</text>
                 </Show>
                 <ProviderForm
+                  ref={(value) => { providerFormRef = value }}
                   pending={saving()}
-                  onCancel={() => setProviderForm(false)}
+                  onDirtyChange={() => {}}
+                  onCancel={() => {
+                    editorGeneration++
+                    setProviderForm(false)
+                  }}
                   onSave={saveProvider}
                 />
               </box>

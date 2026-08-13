@@ -10,6 +10,22 @@ const snapshotId = "00000000-0000-4000-8000-000000000002"
 const snapshotEpoch = "00000000-0000-4000-8000-000000000003"
 const credentialSentinel = "provider-secret-must-not-render"
 
+type SaveProviderAction = Extract<TargetAction, { kind: "save-provider" }>
+type RecordedAction =
+  | Omit<SaveProviderAction, "credential"> & { credentialPresent: boolean }
+  | Exclude<TargetAction, SaveProviderAction>
+
+function projectAction(action: TargetAction): RecordedAction {
+  if (action.kind !== "save-provider") return action
+  return {
+    kind: action.kind,
+    name: action.name,
+    baseUrl: action.baseUrl,
+    model: action.model,
+    credentialPresent: action.credential.length > 0,
+  }
+}
+
 function view(overrides: Partial<TargetView> = {}): TargetView {
   return {
     target: "codex",
@@ -30,7 +46,7 @@ function view(overrides: Partial<TargetView> = {}): TargetView {
 }
 
 class MemoryTargetSession implements TargetSession {
-  readonly actions: TargetAction[] = []
+  readonly actions: RecordedAction[] = []
   subscribeCalls = 0
   #view: TargetView
   #listeners = new Set<(next: TargetView) => void>()
@@ -52,7 +68,7 @@ class MemoryTargetSession implements TargetSession {
   }
 
   async act(action: TargetAction): Promise<ActionOutcome> {
-    this.actions.push(action)
+    this.actions.push(projectAction(action))
     const outcome = await this.#handler(action)
     this.#view = outcome.view
     return outcome
@@ -78,6 +94,16 @@ class MemoryTargetSession implements TargetSession {
   async whenClosed(): Promise<void> {
     return await new Promise(() => {})
   }
+}
+
+function expectSecretFree(setup: Awaited<ReturnType<typeof testRender>>, session: MemoryTargetSession): void {
+  expect(setup.captureCharFrame()).not.toContain(credentialSentinel)
+  expect(JSON.stringify(session.actions)).not.toContain(credentialSentinel)
+}
+
+async function flushUi(setup: Awaited<ReturnType<typeof testRender>>): Promise<void> {
+  for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+  await setup.renderOnce()
 }
 
 function meaningfulLines(frame: string): string[] {
@@ -228,18 +254,133 @@ test("renders a persisted compatibility warning without exposing Provider creden
   }
 })
 
-test("Ctrl+C exits even while the Provider form owns input focus", async () => {
+test("dirty Provider fields require localized confirmation before Ctrl+C exits", async () => {
   const session = new MemoryTargetSession(view())
   const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
   try {
     await setup.renderOnce()
     setup.mockInput.pressKey("1")
     await setup.renderOnce()
-    setup.mockInput.pressKey("x", { ctrl: true })
-    setup.mockInput.pressKey("p")
-    await setup.waitForFrame((frame) => frame.includes("Base URL"))
+    await enterProvider(setup.mockInput)
     setup.mockInput.pressCtrlC()
-    expect(setup.renderer.isDestroyed).toBeTrue()
+    const frame = await setup.waitForFrame((next) => next.includes("Discard Provider draft?"))
+    expect(frame).toContain("Unsaved Provider fields will be lost.")
+    expect(setup.renderer.isDestroyed).toBeFalse()
+    expectSecretFree(setup, session)
+  } finally {
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("declining dirty exit keeps the Provider draft and restores editor focus", async () => {
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    await enterProvider(setup.mockInput)
+    await setup.renderOnce()
+    const maskedBefore = (setup.captureCharFrame().match(/•/g) ?? []).length
+
+    setup.mockInput.pressCtrlC()
+    await setup.waitForFrame((frame) => frame.includes("Discard Provider draft?"))
+    setup.mockInput.pressKey("n")
+    await flushUi(setup)
+    const draft = await setup.waitForFrame((frame) => frame.includes("Fixture Provider") && !frame.includes("Discard Provider draft?"))
+    expect((draft.match(/•/g) ?? []).length).toBe(maskedBefore)
+    expect(setup.renderer.currentFocusedRenderable).toBeTruthy()
+    expect(setup.renderer.isDestroyed).toBeFalse()
+    expectSecretFree(setup, session)
+  } finally {
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("Esc declines dirty exit and keeps the Provider editor", async () => {
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    await enterProvider(setup.mockInput)
+    setup.mockInput.pressCtrlC()
+    await setup.waitForFrame((frame) => frame.includes("Discard Provider draft?"))
+    setup.mockInput.pressEscape()
+    await flushUi(setup)
+    await setup.waitForFrame((frame) => frame.includes("Fixture Provider") && !frame.includes("Discard Provider draft?"))
+    expect(setup.renderer.isDestroyed).toBeFalse()
+    expectSecretFree(setup, session)
+  } finally {
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("exit confirmation blocks hidden credential key, backspace, and paste mutation", async () => {
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    await enterProvider(setup.mockInput)
+    await setup.renderOnce()
+    const maskedBefore = (setup.captureCharFrame().match(/•/g) ?? []).length
+    setup.mockInput.pressCtrlC()
+    await setup.waitForFrame((frame) => frame.includes("Discard Provider draft?"))
+
+    setup.mockInput.pressKey("z")
+    setup.mockInput.pressBackspace()
+    await setup.mockInput.pasteBracketedText("overlay-text-must-not-enter-credential")
+    await flushUi(setup)
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("Discard Provider draft?")
+    expect((frame.match(/•/g) ?? []).length).toBe(maskedBefore)
+    expectSecretFree(setup, session)
+  } finally {
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("reopening dirty exit after cancel confirms exactly once without retaining Provider credentials", async () => {
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
+  const destroy = setup.renderer.destroy.bind(setup.renderer)
+  let destroyCalls = 0
+  setup.renderer.destroy = () => {
+    destroyCalls++
+    destroy()
+  }
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    await enterProvider(setup.mockInput)
+    setup.mockInput.pressCtrlC()
+    await setup.waitForFrame((frame) => frame.includes("Discard Provider draft?"))
+    setup.mockInput.pressKey("n")
+    await flushUi(setup)
+    await setup.waitForFrame((frame) => frame.includes("Fixture Provider") && !frame.includes("Discard Provider draft?"))
+    setup.mockInput.pressCtrlC()
+    await setup.waitForFrame((frame) => frame.includes("Discard Provider draft?"))
+    setup.mockInput.pressKey("y")
+    await setup.waitFor(() => setup.renderer.isDestroyed)
+    expect(destroyCalls).toBe(1)
+    expectSecretFree(setup, session)
+  } finally {
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("clean Ctrl+C exits immediately without confirmation", async () => {
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressCtrlC()
+    await setup.waitFor(() => setup.renderer.isDestroyed)
+    expect(setup.captureCharFrame()).not.toContain("Discard Provider draft?")
   } finally {
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()
   }
@@ -282,7 +423,7 @@ test("saves a masked Provider, applies its visible identity, and follows pushed 
       name: "Fixture Provider",
       baseUrl: "https://fixture.example/v1",
       model: "gpt-test",
-      credential: credentialSentinel,
+      credentialPresent: true,
     })
     expect(setup.captureCharFrame()).not.toContain(credentialSentinel)
 
@@ -334,8 +475,13 @@ test("invalid Provider guidance clears the credential without echoing it", async
     setup.mockInput.pressEnter()
     const frame = await setup.waitForFrame((next) => next.includes("Check the Provider fields and try again"))
     expect(frame).toContain("Provider details are invalid")
+    expect(frame).toContain("Fixture Provider")
     expect(frame).not.toContain(credentialSentinel)
     expect(frame).not.toContain("••••")
+    setup.mockInput.pressCtrlC()
+    await setup.waitForFrame((next) => next.includes("Discard Provider draft?"))
+    expect(setup.renderer.isDestroyed).toBeFalse()
+    expectSecretFree(setup, session)
   } finally {
     setup.renderer.destroy()
   }

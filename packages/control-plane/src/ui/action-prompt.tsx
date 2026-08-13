@@ -21,7 +21,7 @@ export function ActionPrompt(props: ActionPromptProps) {
   const submit = () => {
     const original = value()
     setValue("")
-    const command = resolveSlash(original, props.scope)
+    const command = resolveSlash(original, props.scope) ?? resolveSlash(original, "global")
     if (command) keymap.dispatchCommand(command)
     else props.onUnknown(original)
   }

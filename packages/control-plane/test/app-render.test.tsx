@@ -168,6 +168,7 @@ test("opens the localized Claude context without operating the Codex session", a
   const setup = await testRender(() => <App session={session} locale="zh-CN" />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
   try {
     await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("MUXVIA")
     await setup.mockInput.typeText("/claude")
     setup.mockInput.pressEnter()
     const claude = await setup.waitForFrame((frame) => frame.includes("此构建中不提供 Claude Code 管理功能"))
@@ -187,6 +188,22 @@ test("opens the localized Claude context without operating the Codex session", a
     expect(session.subscribeCalls).toBe(1)
   } finally {
     setup.renderer.destroy()
+  }
+})
+
+test("submitting the global quit command from Home exits without an unknown-command notice", async () => {
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    await setup.mockInput.typeText("/quit")
+    setup.mockInput.pressEnter()
+    if (!setup.renderer.isDestroyed) await setup.renderOnce()
+
+    expect(setup.captureCharFrame()).not.toContain("Unknown or unavailable command")
+    expect(setup.renderer.isDestroyed).toBeTrue()
+  } finally {
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
   }
 })
 

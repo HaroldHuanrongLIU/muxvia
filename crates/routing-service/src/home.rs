@@ -7,6 +7,11 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+#[cfg(unix)]
+const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(unix)]
+const PRIVATE_FILE_MODE: u32 = 0o600;
+
 #[derive(Clone)]
 pub struct MuxviaHome {
     user_home: PathBuf,
@@ -71,7 +76,7 @@ impl MuxviaHome {
         let mut options = OpenOptions::new();
         options.create(true).read(true).write(true);
         #[cfg(unix)]
-        options.mode((libc::S_IRUSR | libc::S_IWUSR) as u32);
+        options.mode(PRIVATE_FILE_MODE);
         options.open(&self.database)?;
         set_private_file_permissions(&self.database)
     }
@@ -84,15 +89,12 @@ impl MuxviaHome {
 fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(libc::S_IRWXU as u32))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
     Ok(())
 }
 
 fn set_private_file_permissions(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
-    fs::set_permissions(
-        path,
-        fs::Permissions::from_mode((libc::S_IRUSR | libc::S_IWUSR) as u32),
-    )?;
+    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
     Ok(())
 }

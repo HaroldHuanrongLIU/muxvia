@@ -666,8 +666,18 @@ fn file_identity_from_stat(stat: rustix::fs::Stat) -> FileIdentity {
         modified_seconds: u64::try_from(stat.st_mtime).ok(),
         modified_nanoseconds: u32::try_from(stat.st_mtime_nsec).ok(),
         length: u64::try_from(stat.st_size).ok(),
-        mode: Some(u32::from(stat.st_mode) & 0o777),
+        mode: Some(permission_bits(stat.st_mode)),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn permission_bits(mode: rustix::fs::RawMode) -> u32 {
+    u32::from(mode) & 0o777
+}
+
+#[cfg(target_os = "linux")]
+fn permission_bits(mode: rustix::fs::RawMode) -> u32 {
+    mode & 0o777
 }
 
 #[cfg(target_os = "macos")]
@@ -922,4 +932,17 @@ fn create_private_parent(parent: &Path) -> io::Result<()> {
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::permission_bits;
+    use rustix::fs::Mode;
+
+    #[test]
+    fn permission_bits_project_to_portable_u32() {
+        let raw_mode = (Mode::RUSR | Mode::WUSR | Mode::RGRP).as_raw_mode();
+
+        assert_eq!(permission_bits(raw_mode), 0o640);
+    }
 }

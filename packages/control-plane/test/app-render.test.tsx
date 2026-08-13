@@ -9,6 +9,7 @@ const serviceEpoch = "00000000-0000-4000-8000-000000000001"
 const snapshotId = "00000000-0000-4000-8000-000000000002"
 const snapshotEpoch = "00000000-0000-4000-8000-000000000003"
 const credentialSentinel = "provider-secret-must-not-render"
+const problemMessageSentinel = "backend-problem-secret-must-not-render"
 
 type SaveProviderAction = Extract<TargetAction, { kind: "save-provider" }>
 type RecordedAction =
@@ -233,21 +234,37 @@ test("submitting the global quit command from Home exits without an unknown-comm
   }
 })
 
-test("renders a persisted compatibility warning without exposing Provider credentials", async () => {
+test("maps known and unknown problems without rendering backend messages", async () => {
   const session = new MemoryTargetSession(view({
-    problems: [{
-      code: "untested-target-cli",
-      message: "Codex CLI 99.0.0 is untested; required capabilities were detected",
+    providers: [{
+      id: "provider-without-credential",
+      name: "Credential-free Provider",
+      baseUrl: "https://fixture.example/v1",
+      model: "gpt-test",
+      credential: "missing",
     }],
+    problems: [
+      {
+        code: "untested-target-cli",
+        message: `${problemMessageSentinel}-known`,
+      },
+      {
+        code: "future-problem",
+        message: `${problemMessageSentinel}-unknown`,
+      },
+    ],
   }))
-  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 30, useThread: false })
   try {
     await setup.renderOnce()
     setup.mockInput.pressKey("1")
     await setup.renderOnce()
     const frame = setup.captureCharFrame()
-    expect(frame).toContain("Codex CLI 99.0.0 is untested")
-    expect(frame).toContain("target-cli")
+    expect(frame).toContain("This Target CLI version is untested")
+    expect(frame).not.toContain("untested-target-cli")
+    expect(frame).toContain("Action failed (future-problem)")
+    expect(frame).toContain("Credential  Absent")
+    expect(frame).not.toContain(problemMessageSentinel)
     expect(frame).not.toContain(credentialSentinel)
   } finally {
     setup.renderer.destroy()
@@ -405,7 +422,7 @@ test("saves a masked Provider, applies its visible identity, and follows pushed 
     status: "applied",
     view: action.kind === "save-provider" ? saved : saved,
   }))
-  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 30, useThread: false })
   try {
     await setup.renderOnce()
     setup.mockInput.pressKey("1")
@@ -419,7 +436,9 @@ test("saves a masked Provider, applies its visible identity, and follows pushed 
 
     setup.mockInput.pressEnter()
     await setup.waitFor(() => session.actions.length === 1)
-    await setup.waitForFrame((frame) => frame.includes("Credential  Present"))
+    const savedFrame = await setup.waitForFrame((frame) => frame.includes("Credential  Present"))
+    expect(savedFrame).toContain("Recent activity")
+    expect(savedFrame).toContain("Provider saved: Fixture Provider")
     expect(session.actions[0]).toEqual({
       kind: "save-provider",
       name: "Fixture Provider",
@@ -429,9 +448,15 @@ test("saves a masked Provider, applies its visible identity, and follows pushed 
     })
     expect(setup.captureCharFrame()).not.toContain(credentialSentinel)
 
+    session.push(saved)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).not.toContain("Target state updated.")
+
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("a")
     await setup.waitFor(() => session.actions.length === 2)
+    const appliedFrame = await setup.waitForFrame((frame) => frame.includes("Target Takeover applied: Fixture Provider"))
+    expect(appliedFrame.match(/Target Takeover applied/g)?.length).toBe(1)
     expect(session.actions[1]).toEqual({
       kind: "activate-provider",
       providerId: "provider-1",
@@ -454,6 +479,13 @@ test("saves a masked Provider, applies its visible identity, and follows pushed 
     session.push({ ...active, viewSequence: 3, servingProviderId: "provider-1" })
     const served = await setup.waitForFrame((frame) => frame.includes("Serving    Fixture Provider"))
     expect(served).toContain("Restart Codex")
+    expectInOrder(served, [
+      "Provider saved: Fixture Provider",
+      "Target Takeover applied: Fixture Provider",
+      "Target state updated.",
+      "Target state updated.",
+    ])
+    expect(served.match(/Target state updated\./g)?.length).toBe(2)
     expect(served).not.toContain(credentialSentinel)
   } finally {
     setup.renderer.destroy()
@@ -475,7 +507,7 @@ test("invalid Provider guidance clears the credential without echoing it", async
     await setup.renderOnce()
     await enterProvider(setup.mockInput)
     setup.mockInput.pressEnter()
-    const frame = await setup.waitForFrame((next) => next.includes("Check the Provider fields and try again"))
+    const frame = await setup.waitForFrame((next) => next.includes("Check the fields and retry"))
     expect(frame).toContain("Provider details are invalid")
     expect(frame).toContain("Fixture Provider")
     expect(frame).not.toContain(credentialSentinel)
@@ -507,7 +539,7 @@ test("a stale action installs the authoritative Target View and asks for an expl
   let session!: MemoryTargetSession
   session = new MemoryTargetSession(initial, async () => {
     session.setAuthoritative(authoritative)
-    throw Object.assign(new Error("Target state changed"), { code: "stale-revision" })
+    throw Object.assign(new Error(problemMessageSentinel), { code: "stale-revision" })
   })
   const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
   try {
@@ -519,6 +551,76 @@ test("a stale action installs the authoritative Target View and asks for an expl
     const frame = await setup.waitForFrame((next) => next.includes("Retry the action"))
     expect(frame).toContain("Current    Authoritative Provider")
     expect(frame).toContain("Target state changed")
+    expect(frame.match(/Target state changed\. Retry the action\./g)?.length).toBe(1)
+    expect(frame).not.toContain(problemMessageSentinel)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("a replayed Provider save appends one success activity", async () => {
+  const saved = view({
+    managementRevision: 1,
+    viewSequence: 1,
+    providers: [{
+      id: "provider-1",
+      name: "Fixture Provider",
+      baseUrl: "https://fixture.example/v1",
+      model: "gpt-test",
+      credential: "present",
+    }],
+  })
+  const session = new MemoryTargetSession(view(), async () => ({ status: "replayed", view: saved }))
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 30, useThread: false })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    await enterProvider(setup.mockInput)
+    setup.mockInput.pressEnter()
+    const frame = await setup.waitForFrame((next) => next.includes("Provider saved: Fixture Provider"))
+    expect(frame.match(/Provider saved: Fixture Provider/g)?.length).toBe(1)
+    expect(frame).not.toContain("Target state updated.")
+    expectSecretFree(setup, session)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("an unavailable Codex command appends one localized error activity", async () => {
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.waitForFrame((frame) => frame.includes("Mode       Unmanaged"))
+    await setup.mockInput.typeText("/not-a-command")
+    setup.mockInput.pressEnter()
+    const frame = await setup.waitForFrame((next) => next.includes("Unknown or unavailable command"))
+    expect(frame).toContain("Recent activity")
+    expect(frame.match(/Unknown or unavailable command: \/not-a-command/g)?.length).toBe(1)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("subscribed Target View activity keeps only the latest 50 entries", async () => {
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 100, useThread: false })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.waitForFrame((frame) => frame.includes("Mode       Unmanaged"))
+    await setup.mockInput.typeText("/drop-this-oldest-entry")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("/drop-this-oldest-entry"))
+    for (let sequence = 1; sequence <= 50; sequence++) {
+      session.push(view({ viewSequence: sequence }))
+    }
+    await setup.renderOnce()
+    const frame = setup.captureCharFrame()
+    expect(frame.match(/Target state updated\./g)?.length).toBe(50)
+    expect(frame).not.toContain("drop-this-oldest-entry")
   } finally {
     setup.renderer.destroy()
   }

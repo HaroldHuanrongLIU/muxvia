@@ -1,0 +1,135 @@
+import { expect, test } from "bun:test"
+import { testRender } from "@opentui/solid"
+
+import type { TargetSession } from "../src/control/target-session"
+import type { ActionOutcome, TargetAction, TargetView } from "../src/control/types"
+import { App } from "../src/ui/app"
+
+const sizes = [[1, 1], [2, 2], [20, 5], [40, 10], [80, 24], [121, 30]] as const
+
+function view(): TargetView {
+  return {
+    target: "codex",
+    managementRevision: 7,
+    viewSequence: 11,
+    service: { epoch: "00000000-0000-4000-8000-000000000001", state: "running" },
+    mode: "unmanaged",
+    takeover: { state: "inactive", endpoint: null },
+    providers: [],
+    currentProviderId: null,
+    servingProviderId: null,
+    managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
+    recovery: { intentId: null, state: "clean" },
+    activatedSnapshot: null,
+    problems: [],
+  }
+}
+
+class StaticTargetSession implements TargetSession {
+  readonly #view = view()
+
+  get(): Readonly<TargetView> {
+    return this.#view
+  }
+
+  async act(_action: TargetAction): Promise<ActionOutcome> {
+    return { status: "applied", view: this.#view }
+  }
+
+  subscribe(_listener: (next: TargetView) => void): () => void {
+    return () => {}
+  }
+
+  async close(): Promise<void> {}
+
+  async whenClosed(): Promise<void> {
+    return await new Promise(() => {})
+  }
+}
+
+function expectExcludedChrome(frame: string): void {
+  expect(frame).not.toContain("Terminal too small")
+  expect(frame).not.toContain("Overview")
+  expect(frame).not.toContain("Providers | Routing")
+  expect(frame).not.toContain("Global status")
+}
+
+async function expectSizeMatrix(setup: Awaited<ReturnType<typeof testRender>>): Promise<void> {
+  for (const [width, height] of sizes) {
+    setup.resize(width, height)
+    await setup.renderOnce()
+    expect(() => setup.captureCharFrame()).not.toThrow()
+    expectExcludedChrome(setup.captureCharFrame())
+  }
+}
+
+test("Home renders the exact extreme-size matrix without excluded application chrome", async () => {
+  const setup = await testRender(() => <App session={new StaticTargetSession()} />, {
+    width: 80,
+    height: 24,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    await expectSizeMatrix(setup)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Codex renders the exact extreme-size matrix and folds its contextual sidebar", async () => {
+  const setup = await testRender(() => <App session={new StaticTargetSession()} />, {
+    width: 80,
+    height: 24,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.waitForFrame((frame) => frame.includes("Mode       Unmanaged"))
+
+    await expectSizeMatrix(setup)
+
+    setup.resize(80, 24)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).not.toContain("Target context")
+
+    setup.resize(121, 30)
+    await setup.renderOnce()
+    const wide = setup.captureCharFrame()
+    expect(wide).toContain("Mode       Unmanaged")
+    expect(wide).toContain("Target context")
+    expect(wide).toContain("Management revision")
+    expect(wide).toContain("View sequence")
+    expect(wide).toContain("Takeover endpoint")
+    expect(wide).toContain("Recovery")
+    expect(wide).not.toContain("Unknown (clean)")
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("b")
+    const toggled = await setup.waitForFrame((frame) => !frame.includes("Target context"))
+    expect(toggled).toContain("Mode       Unmanaged")
+    expect(toggled).toContain("Snapshot   —")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Claude renders the exact extreme-size matrix without excluded application chrome", async () => {
+  const setup = await testRender(() => <App session={new StaticTargetSession()} />, {
+    width: 80,
+    height: 24,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.waitForFrame((frame) => frame.includes("Claude Code management is not available"))
+    await expectSizeMatrix(setup)
+  } finally {
+    setup.renderer.destroy()
+  }
+})

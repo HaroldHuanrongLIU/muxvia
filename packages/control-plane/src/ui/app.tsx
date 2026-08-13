@@ -4,7 +4,7 @@ import { createSignal, getOwner, Match, onCleanup, onMount, runWithOwner, Show, 
 import { MuxviaKeymapProvider, useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
 import type { TargetSession } from "../control/target-session"
 import type { TargetAction, TargetView as TargetViewProjection } from "../control/types"
-import { createCommandPresenter, createTranslator, type Locale, type Translator } from "../i18n"
+import { createCommandPresenter, createTranslator, messageKeyForProblem, type Locale, type Translator } from "../i18n"
 import { theme } from "../theme"
 import { ActionPrompt } from "./action-prompt"
 import { ClaudeContext } from "./claude-context"
@@ -13,7 +13,8 @@ import { ExitConfirmation } from "./exit-confirmation"
 import { Home } from "./home"
 import { OverlayProvider, useOverlay } from "./overlay-stack"
 import { ProviderForm, type ProviderFormRef } from "./provider-form"
-import { TargetView } from "./target-view"
+import { TargetSidebar } from "./target-sidebar"
+import { TargetView, type ActivityEntry } from "./target-view"
 
 export type ShellRoute =
   | { kind: "home" }
@@ -25,16 +26,18 @@ export interface AppProps {
 }
 
 type Notice = { kind: "error" | "success"; text: string }
+type ActivityDraft = Omit<ActivityEntry, "id">
 
-function actionProblem(error: unknown): string {
+function actionProblem(error: unknown): ActivityDraft {
   const code = typeof error === "object" && error !== null && "code" in error
     ? String(error.code)
     : "internal-failure"
-  if (code === "stale-revision") return "Target state changed. Retry the action."
-  if (code === "invalid-provider" || code === "incomplete-provider") {
-    return "Provider details are invalid. Check the Provider fields and try again."
+  const messageKey = messageKeyForProblem(code)
+  return {
+    kind: "error",
+    messageKey,
+    values: messageKey === "error.generic" ? { code } : undefined,
   }
-  return `Action failed (${code}). Review the Target state and try again.`
 }
 
 export function useCommandPaletteOpener(t: Translator): () => void {
@@ -84,8 +87,11 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   const [saving, setSaving] = createSignal(false)
   const [applying, setApplying] = createSignal(false)
   const [notice, setNotice] = createSignal<Notice>()
-  const sidebar = createSignal(true)
+  const [activities, setActivities] = createSignal<ActivityEntry[]>([])
+  const [sidebarOpen, setSidebarOpen] = createSignal(true)
   let providerFormRef: ProviderFormRef | undefined
+  let nextActivityId = 1
+  let lastViewSequence = props.session.get().viewSequence
   let editorGeneration = 0
   let exitScheduled = false
   let exiting = false
@@ -93,8 +99,22 @@ function Shell(props: { session: TargetSession; t: Translator }) {
 
   onCleanup(() => { disposed = true })
 
+  const appendActivity = (activity: ActivityDraft) => {
+    if (disposed || exiting) return
+    setActivities((current) => [...current, { id: nextActivityId++, ...activity }].slice(-50))
+  }
+  const installView = (next: TargetViewProjection, source: "action" | "subscription") => {
+    if (disposed || exiting || next.viewSequence < lastViewSequence) return
+    const increased = next.viewSequence > lastViewSequence
+    if (increased) lastViewSequence = next.viewSequence
+    setView(next)
+    if (source === "subscription" && increased) {
+      appendActivity({ kind: "info", messageKey: "activity.state.updated" })
+    }
+  }
+
   onMount(() => {
-    const unsubscribe = props.session.subscribe(setView)
+    const unsubscribe = props.session.subscribe((next) => installView(next, "subscription"))
     onCleanup(unsubscribe)
   })
 
@@ -151,23 +171,38 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     })
   }
   const unknownCommand = (input: string) => {
-    setNotice({ kind: "error", text: props.t("prompt.unknown", { command: input }) })
+    const activity: ActivityDraft = {
+      kind: "error",
+      messageKey: "prompt.unknown",
+      values: { command: input },
+    }
+    setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) })
+    if (isRoute("codex")) appendActivity(activity)
   }
   const saveProvider = async (action: Extract<TargetAction, { kind: "save-provider" }>) => {
     if (saving()) return false
     const generation = editorGeneration
+    const providerName = action.name
     setSaving(true)
     setNotice()
     try {
       const outcome = await props.session.act(action)
       if (disposed || exiting || generation !== editorGeneration) return false
-      setView(outcome.view)
-      setNotice({ kind: "success", text: "Provider saved." })
+      installView(outcome.view, "action")
+      const activity: ActivityDraft = {
+        kind: "success",
+        messageKey: "activity.provider.saved",
+        values: { name: providerName },
+      }
+      appendActivity(activity)
+      setNotice({ kind: "success", text: props.t(activity.messageKey, activity.values) })
       return true
     } catch (error) {
       if (disposed || exiting || generation !== editorGeneration) return false
-      setView(props.session.get() as TargetViewProjection)
-      setNotice({ kind: "error", text: actionProblem(error) })
+      installView(props.session.get() as TargetViewProjection, "action")
+      const activity = actionProblem(error)
+      appendActivity(activity)
+      setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) })
       return false
     } finally {
       if (!disposed && !exiting) setSaving(false)
@@ -179,9 +214,12 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     const current = view().providers.find((provider) => provider.id === view().currentProviderId)
     const visible = current ?? view().providers[0]
     if (!visible) {
-      setNotice({ kind: "error", text: "Create a Provider before applying Target Takeover." })
+      const activity: ActivityDraft = { kind: "warning", messageKey: "activity.provider.required" }
+      appendActivity(activity)
+      setNotice({ kind: "error", text: props.t(activity.messageKey) })
       return
     }
+    const providerName = visible.name
     setApplying(true)
     setNotice()
     try {
@@ -190,13 +228,23 @@ function Shell(props: { session: TargetSession; t: Translator }) {
         providerId: visible.id,
         mode: "takeover",
       })
-      setView(outcome.view)
-      setNotice({ kind: "success", text: "Target Takeover applied." })
+      if (disposed || exiting) return
+      installView(outcome.view, "action")
+      const activity: ActivityDraft = {
+        kind: "success",
+        messageKey: "activity.takeover.applied",
+        values: { name: providerName },
+      }
+      appendActivity(activity)
+      setNotice({ kind: "success", text: props.t(activity.messageKey, activity.values) })
     } catch (error) {
-      setView(props.session.get() as TargetViewProjection)
-      setNotice({ kind: "error", text: actionProblem(error) })
+      if (disposed || exiting) return
+      installView(props.session.get() as TargetViewProjection, "action")
+      const activity = actionProblem(error)
+      appendActivity(activity)
+      setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) })
     } finally {
-      setApplying(false)
+      if (!disposed && !exiting) setApplying(false)
     }
   }
 
@@ -224,7 +272,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     enabled: () => overlay.depth === 0 && isRoute("codex") && !providerForm(),
     handlers: {
       "target.home": showHome,
-      "target.sidebar.toggle": () => sidebar[1]((open) => !open),
+      "target.sidebar.toggle": () => setSidebarOpen((open) => !open),
       "provider.create": () => {
         if (saving() || applying()) return
         setNotice()
@@ -241,6 +289,11 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     handlers: { "target.home": showHome },
   })
   const horizontalPadding = () => dimensions().width >= 5 ? 2 : 0
+  const innerWidth = () => Math.max(0, dimensions().width - horizontalPadding() * 2)
+  const showSidebar = () => isRoute("codex") && dimensions().width > 120 && sidebarOpen()
+  const sidebarGap = () => showSidebar() ? 2 : 0
+  const sidebarWidth = () => Math.max(1, Math.min(42, Math.max(0, innerWidth() - sidebarGap() - 1)))
+  const contentPaddingTop = () => Math.max(0, Math.min(1, dimensions().height - 1))
 
   return (
     <box
@@ -259,42 +312,47 @@ function Shell(props: { session: TargetSession; t: Translator }) {
           <ClaudeContext t={props.t} notice={notice()?.text} onUnknown={unknownCommand} />
         </Match>
         <Match when={isRoute("codex")}>
-          <Show
-            when={providerForm()}
-            fallback={(
-              <>
-                <scrollbox flexGrow={1} flexShrink={1} paddingTop={Math.max(0, Math.min(1, dimensions().height - 1))}>
-                  <TargetView view={view()} notice={notice()} />
+          <box flexGrow={1} flexShrink={1} flexDirection="row" columnGap={sidebarGap()}>
+            <Show
+              when={providerForm()}
+              fallback={(
+                <scrollbox minWidth={1} flexGrow={1} flexShrink={1} paddingTop={contentPaddingTop()}>
+                  <TargetView view={view()} activities={activities()} t={props.t} />
                 </scrollbox>
-                <ActionPrompt
-                  scope="codex"
-                  placeholder={props.t("prompt.target")}
-                  metadata={applying()
-                    ? props.t("activity.applying")
-                    : `${props.t("prompt.meta.codex")} · ${props.t("prompt.hint.sidebar")} · ${props.t("prompt.hint.back")} · ${props.t("prompt.hint.exit")}`}
-                  onUnknown={unknownCommand}
-                />
-              </>
-            )}
-          >
-            <scrollbox flexGrow={1} flexShrink={1} paddingTop={Math.max(0, Math.min(1, dimensions().height - 1))}>
-              <box flexDirection="column" rowGap={1}>
-                <text fg={theme.primary}>MUXVIA</text>
-                <Show when={notice()}>
-                  <text fg={notice()?.kind === "error" ? theme.error : theme.success}>{notice()?.text}</text>
-                </Show>
-                <ProviderForm
-                  ref={(value) => { providerFormRef = value }}
-                  pending={saving()}
-                  onDirtyChange={() => {}}
-                  onCancel={() => {
-                    editorGeneration++
-                    setProviderForm(false)
-                  }}
-                  onSave={saveProvider}
-                />
-              </box>
-            </scrollbox>
+              )}
+            >
+              <scrollbox minWidth={1} flexGrow={1} flexShrink={1} paddingTop={contentPaddingTop()}>
+                <box flexDirection="column" rowGap={1}>
+                  <text fg={theme.primary}>MUXVIA</text>
+                  <Show when={notice()}>
+                    <text fg={notice()?.kind === "error" ? theme.error : theme.success}>{notice()?.text}</text>
+                  </Show>
+                  <ProviderForm
+                    ref={(value) => { providerFormRef = value }}
+                    pending={saving()}
+                    onDirtyChange={() => {}}
+                    onCancel={() => {
+                      editorGeneration++
+                      setProviderForm(false)
+                    }}
+                    onSave={saveProvider}
+                  />
+                </box>
+              </scrollbox>
+            </Show>
+            <Show when={showSidebar()}>
+              <TargetSidebar view={view()} t={props.t} width={sidebarWidth()} />
+            </Show>
+          </box>
+          <Show when={!providerForm()}>
+            <ActionPrompt
+              scope="codex"
+              placeholder={props.t("prompt.target")}
+              metadata={applying()
+                ? props.t("activity.applying")
+                : `${props.t("prompt.meta.codex")} · ${props.t("prompt.hint.sidebar")} · ${props.t("prompt.hint.back")} · ${props.t("prompt.hint.exit")}`}
+              onUnknown={unknownCommand}
+            />
           </Show>
         </Match>
       </Switch>

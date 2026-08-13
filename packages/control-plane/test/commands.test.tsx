@@ -1,7 +1,7 @@
 /** @jsxImportSource @opentui/solid */
 import { expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
-import { createSignal, getOwner, onCleanup, runWithOwner, type JSX } from "solid-js"
+import { createSignal, onCleanup, type JSX } from "solid-js"
 
 import { resolveSlash } from "../src/commands/catalog"
 import {
@@ -10,8 +10,9 @@ import {
   useMuxviaKeymap,
 } from "../src/commands/keymap"
 import type { CommandId } from "../src/commands/types"
+import { createTranslator } from "../src/i18n"
 import { ActionPrompt } from "../src/ui/action-prompt"
-import { CommandPalette } from "../src/ui/command-palette"
+import { useCommandPaletteOpener } from "../src/ui/app"
 import { OverlayProvider, useOverlay } from "../src/ui/overlay-stack"
 
 type Handlers = Partial<Record<CommandId, () => void>>
@@ -67,15 +68,28 @@ function PaletteIdentityHarness(props: {
   executed: string[]
   reported: string[]
   dispatched: string[]
-  snapshots: string[][]
+  paletteReplacements: string[]
+  paletteCloses: string[]
   expose: (keymap: ReturnType<typeof useMuxviaKeymap>) => void
-  exposeDisableHome: (disable: () => void) => void
+  exposeSetHomeEnabled: (setEnabled: (enabled: boolean) => void) => void
 }) {
-  const owner = getOwner()
   const overlay = useOverlay()
   const keymap = useMuxviaKeymap()
   const [homeEnabled, setHomeEnabled] = createSignal(true)
-  props.exposeDisableHome(() => setHomeEnabled(false))
+  const originalReplace = overlay.replace
+  overlay.replace = (entry) => {
+    props.paletteReplacements.push(entry.id)
+    originalReplace({
+      ...entry,
+      onClose: () => {
+        entry.onClose?.()
+        props.paletteCloses.push(entry.id)
+      },
+    })
+  }
+  onCleanup(() => { overlay.replace = originalReplace })
+  const showCommandPalette = useCommandPaletteOpener(createTranslator("en"))
+  props.exposeSetHomeEnabled(setHomeEnabled)
   const reportTarget = (id: CommandId) => {
     if (id === "target.codex.open") props.reported.push(id)
   }
@@ -84,17 +98,7 @@ function PaletteIdentityHarness(props: {
     priority: 0,
     enabled: () => overlay.depth === 0,
     handlers: {
-      "command.palette.show": () => {
-        const entries = keymap.getCommandEntries({ visibility: "active", namespace: "palette" })
-          .filter((entry) => entry.command.name !== "command.palette.show" && !entry.command.hidden)
-        props.snapshots.push(entries.map((entry) => entry.command.name))
-        queueMicrotask(() => {
-          const element = runWithOwner(owner!, () => (
-            <CommandPalette entries={entries} title="Commands" searchPlaceholder="Search commands" />
-          ))
-          overlay.replace({ id: "palette", element })
-        })
-      },
+      "command.palette.show": showCommandPalette,
     },
   })
   useCommandLayer({
@@ -133,9 +137,10 @@ test("shortcut slash and palette selection execute one exact target command iden
   const executed: string[] = []
   const reported: string[] = []
   const dispatched: string[] = []
-  const snapshots: string[][] = []
+  const paletteReplacements: string[] = []
+  const paletteCloses: string[] = []
   let keymap!: ReturnType<typeof useMuxviaKeymap>
-  let disableHome!: () => void
+  let setHomeEnabled!: (enabled: boolean) => void
   const setup = await testRender(() => (
     <MuxviaKeymapProvider>
       <OverlayProvider>
@@ -143,9 +148,10 @@ test("shortcut slash and palette selection execute one exact target command iden
           executed={executed}
           reported={reported}
           dispatched={dispatched}
-          snapshots={snapshots}
+          paletteReplacements={paletteReplacements}
+          paletteCloses={paletteCloses}
           expose={(value) => { keymap = value }}
-          exposeDisableHome={(value) => { disableHome = value }}
+          exposeSetHomeEnabled={(value) => { setHomeEnabled = value }}
         />
       </OverlayProvider>
     </MuxviaKeymapProvider>
@@ -167,20 +173,37 @@ test("shortcut slash and palette selection execute one exact target command iden
       "target.codex.open",
     ])
     expect(reported).toEqual(executed)
-    expect(snapshots).toHaveLength(1)
-    expect(snapshots[0]).toEqual([
-      "target.codex.open",
-      "target.claude.open",
-      "app.exit.request",
-    ])
-    expect(snapshots[0]).not.toContain("command.palette.show")
-    expect(snapshots[0]).not.toContain("provider.save")
-    expect(snapshots[0]).not.toContain("target.sidebar.toggle")
+    expect(paletteReplacements).toEqual(["command-palette"])
+    expect(paletteCloses).toEqual(["command-palette"])
 
-    disableHome()
+    setHomeEnabled(false)
+    keymap.dispatchCommand("command.palette.show")
     keymap.dispatchCommand("command.palette.show")
     await setup.renderOnce()
-    expect(snapshots[1]).toEqual(["app.exit.request"])
+    const globalOnly = setup.captureCharFrame()
+    expect(paletteReplacements).toEqual(["command-palette", "command-palette"])
+    expect(paletteCloses).toEqual(["command-palette"])
+    expect(globalOnly).toContain("command.app.exit")
+    expect(globalOnly).not.toContain("command.target.codex")
+    expect(globalOnly).not.toContain("command.target.claude")
+    expect(globalOnly).not.toContain("command.palette")
+    expect(globalOnly).not.toContain("command.provider.save")
+    expect(globalOnly).not.toContain("command.target.sidebar")
+
+    keymap.dispatchCommand("overlay.close")
+    await setup.renderOnce()
+    setHomeEnabled(true)
+    keymap.dispatchCommand("command.palette.show")
+    await setup.renderOnce()
+    expect(paletteReplacements).toEqual([
+      "command-palette",
+      "command-palette",
+      "command-palette",
+    ])
+    const freshHome = setup.captureCharFrame()
+    expect(freshHome).toContain("command.target.codex")
+    expect(freshHome).toContain("command.target.claude")
+    expect(freshHome).toContain("command.app.exit")
   } finally {
     setup.renderer.destroy()
   }

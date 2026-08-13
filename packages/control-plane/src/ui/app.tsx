@@ -36,12 +36,46 @@ function actionProblem(error: unknown): string {
   return `Action failed (${code}). Review the Target state and try again.`
 }
 
-function Shell(props: { session: TargetSession; t: Translator }) {
-  const renderer = useRenderer()
-  const dimensions = useTerminalDimensions()
+export function useCommandPaletteOpener(t: Translator): () => void {
   const keymap = useMuxviaKeymap()
   const overlay = useOverlay()
   const owner = getOwner()
+  let openScheduled = false
+  let ownerActive = true
+
+  onCleanup(() => { ownerActive = false })
+
+  return () => {
+    if (openScheduled) return
+    openScheduled = true
+    const entries = keymap.getCommandEntries({ visibility: "active", namespace: "palette" })
+      .filter((entry) => entry.command.name !== "command.palette.show" && !entry.command.hidden)
+    queueMicrotask(() => {
+      if (!ownerActive) {
+        openScheduled = false
+        return
+      }
+      try {
+        const element = runWithOwner(owner!, () => (
+          <CommandPalette
+            entries={entries}
+            title={t("command.palette.title")}
+            searchPlaceholder={t("command.palette.search")}
+          />
+        ))
+        overlay.replace({ id: "command-palette", element })
+      } finally {
+        openScheduled = false
+      }
+    })
+  }
+}
+
+function Shell(props: { session: TargetSession; t: Translator }) {
+  const renderer = useRenderer()
+  const dimensions = useTerminalDimensions()
+  const overlay = useOverlay()
+  const showCommandPalette = useCommandPaletteOpener(props.t)
   const [route, setRoute] = createSignal<ShellRoute>({ kind: "home" })
   const [view, setView] = createSignal<TargetViewProjection>(props.session.get())
   const [providerForm, setProviderForm] = createSignal(false)
@@ -74,21 +108,6 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   const unknownCommand = (input: string) => {
     setNotice({ kind: "error", text: props.t("prompt.unknown", { command: input }) })
   }
-  const showCommandPalette = () => {
-    const entries = keymap.getCommandEntries({ visibility: "active", namespace: "palette" })
-      .filter((entry) => entry.command.name !== "command.palette.show" && !entry.command.hidden)
-    queueMicrotask(() => {
-      const element = runWithOwner(owner!, () => (
-        <CommandPalette
-          entries={entries}
-          title={props.t("command.palette.title")}
-          searchPlaceholder={props.t("command.palette.search")}
-        />
-      ))
-      overlay.replace({ id: "command-palette", element })
-    })
-  }
-
   const saveProvider = async (action: Extract<TargetAction, { kind: "save-provider" }>) => {
     if (saving()) return false
     setSaving(true)

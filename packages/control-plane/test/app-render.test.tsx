@@ -289,7 +289,9 @@ test("declining dirty exit keeps the Provider draft and restores editor focus", 
     await flushUi(setup)
     const draft = await setup.waitForFrame((frame) => frame.includes("Fixture Provider") && !frame.includes("Discard Provider draft?"))
     expect((draft.match(/•/g) ?? []).length).toBe(maskedBefore)
-    expect(setup.renderer.currentFocusedRenderable).toBeTruthy()
+    await setup.mockInput.typeText(" Restored")
+    const restored = await setup.waitForFrame((frame) => frame.includes("Fixture Provider Restored"))
+    expect((restored.match(/•/g) ?? []).length).toBe(maskedBefore)
     expect(setup.renderer.isDestroyed).toBeFalse()
     expectSecretFree(setup, session)
   } finally {

@@ -447,6 +447,7 @@ struct FakeState {
     capture: SharedCapture,
     status: StatusCode,
     body_dropped: Arc<AtomicBool>,
+    first_body_chunk_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
 }
 
 type SharedCapture = Arc<Mutex<Option<(String, HeaderMap, Vec<u8>)>>>;
@@ -491,21 +492,30 @@ async fn fake_responses(State(state): State<FakeState>, request: Request<Body>) 
             .unwrap();
     }
 
-    let chunks = stream::unfold(0, |index| async move {
-        let chunk: &'static [u8] = match index {
-            0 => b"data: {\"type\":\"response.created\"}\n\n",
-            1 => b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
-            2 => b"data: [DONE]\n\n",
-            _ => return None,
-        };
-        sleep(if index == 0 {
-            Duration::from_millis(25)
-        } else {
-            Duration::from_millis(150)
-        })
-        .await;
-        Some((Ok(chunk), index + 1))
-    });
+    let first_body_chunk_gate = state.first_body_chunk_gate.lock().await.take();
+    let chunks = stream::unfold(
+        (0, first_body_chunk_gate),
+        |(index, mut first_body_chunk_gate)| async move {
+            if index == 0
+                && let Some(gate) = first_body_chunk_gate.take()
+            {
+                let _ = gate.await;
+            }
+            let chunk: &'static [u8] = match index {
+                0 => b"data: {\"type\":\"response.created\"}\n\n",
+                1 => b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+                2 => b"data: [DONE]\n\n",
+                _ => return None,
+            };
+            sleep(if index == 0 {
+                Duration::from_millis(25)
+            } else {
+                Duration::from_millis(150)
+            })
+            .await;
+            Some((Ok(chunk), (index + 1, first_body_chunk_gate)))
+        },
+    );
     Response::builder()
         .status(state.status)
         .header("content-type", "text/event-stream")
@@ -551,6 +561,21 @@ async fn observe_streaming_request(
 
 impl FakeUpstream {
     async fn start(status: StatusCode) -> Self {
+        Self::start_with_body_gate(status, None).await
+    }
+
+    async fn start_with_blocked_body(status: StatusCode) -> (Self, oneshot::Sender<()>) {
+        let (release, gate) = oneshot::channel();
+        (
+            Self::start_with_body_gate(status, Some(gate)).await,
+            release,
+        )
+    }
+
+    async fn start_with_body_gate(
+        status: StatusCode,
+        first_body_chunk_gate: Option<oneshot::Receiver<()>>,
+    ) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let endpoint = listener.local_addr().unwrap();
         let state = FakeState {
@@ -558,6 +583,7 @@ impl FakeUpstream {
             capture: Arc::new(Mutex::new(None)),
             status,
             body_dropped: Arc::new(AtomicBool::new(false)),
+            first_body_chunk_gate: Arc::new(Mutex::new(first_body_chunk_gate)),
         };
         let router = Router::new()
             .route("/api/v1/responses", post(fake_responses))
@@ -677,7 +703,8 @@ async fn upstream_429_status_headers_and_body_pass_through_without_serving_updat
 
 #[tokio::test]
 async fn successful_route_appends_path_forwards_bytes_and_streams_sse_in_order() {
-    let upstream = FakeUpstream::start(StatusCode::OK).await;
+    let (upstream, release_upstream_body) =
+        FakeUpstream::start_with_blocked_body(StatusCode::OK).await;
     let fixture = StoreFixture::new().await;
     let (_snapshot_id, provider_id) = fixture.seed_snapshot(&upstream.base_url()).await;
     let before = fixture.store.target_view().await.unwrap();
@@ -685,7 +712,7 @@ async fn successful_route_appends_path_forwards_bytes_and_streams_sse_in_order()
     let server = start_model(&fixture).await;
 
     let response = timeout(
-        Duration::from_millis(100),
+        Duration::from_secs(1),
         route_client()
             .post(format!("http://{}/v1/responses", server.endpoint()))
             .header("x-muxvia-routing-credential", ROUTING_CREDENTIAL)
@@ -719,7 +746,8 @@ async fn successful_route_appends_path_forwards_bytes_and_streams_sse_in_order()
     );
 
     let mut stream = response.bytes_stream();
-    let first = timeout(Duration::from_millis(150), stream.next())
+    release_upstream_body.send(()).unwrap();
+    let first = timeout(Duration::from_secs(1), stream.next())
         .await
         .expect("first SSE chunk should arrive before the whole response")
         .unwrap()

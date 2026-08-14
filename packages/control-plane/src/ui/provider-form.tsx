@@ -1,6 +1,6 @@
 import type { InputRenderable } from "@opentui/core"
 import { useKeyboard, usePaste } from "@opentui/solid"
-import { createSignal, onCleanup, onMount, Show } from "solid-js"
+import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js"
 
 import { useCommandLayer } from "../commands/keymap"
 import type { DiscoverySource, ModelDiscoveryResult, TargetAction } from "../control/types"
@@ -27,6 +27,7 @@ export interface ProviderFormProps {
   initialDraft: ProviderDraft
   credentialPresence: "present" | "missing"
   duplicateCredentialChoice?: "without" | "reuse-source"
+  visibleProviderRevision?: number
   discoverModels?: (source: DiscoverySource, signal?: AbortSignal) => Promise<ModelDiscoveryResult>
   pending: boolean
   t: Translator
@@ -65,6 +66,7 @@ export function ProviderForm(props: ProviderFormProps) {
   let disposed = false
   let discoveryAbort: AbortController | undefined
   let discoveryGeneration = 0
+  let observedProviderRevision = props.visibleProviderRevision
 
   const setDirty = (next: boolean) => {
     if (dirty() === next) return
@@ -132,6 +134,16 @@ export function ProviderForm(props: ProviderFormProps) {
     }
   })
 
+  createEffect(() => {
+    const nextRevision = props.visibleProviderRevision
+    if (props.mode !== "edit" || nextRevision === observedProviderRevision) return
+    observedProviderRevision = nextRevision
+    discoveryGeneration++
+    discoveryAbort?.abort()
+    discoveryAbort = undefined
+    setDiscovery({ status: "idle" })
+  })
+
   const credentialEdit = (): Extract<TargetAction, { kind: "create-provider" }> ["credential"] => {
     if (credentialIntent() === "replace") return { kind: "replace", value: credential() }
     if (credentialIntent() === "keep") return { kind: "keep" }
@@ -179,7 +191,7 @@ export function ProviderForm(props: ProviderFormProps) {
         ? {
           kind: "saved",
           providerId: props.initialDraft.providerId,
-          providerRevision: props.initialDraft.providerRevision,
+          providerRevision: props.visibleProviderRevision ?? props.initialDraft.providerRevision,
         }
         : { kind: "missing" }
     void runDiscovery({ kind: "draft", baseUrl: baseUrl(), credentialSource })

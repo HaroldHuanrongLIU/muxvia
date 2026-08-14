@@ -31,11 +31,37 @@ export interface AppProps {
 
 type Notice = { kind: "error" | "success"; text: string }
 type ActivityDraft = Omit<ActivityEntry, "id">
+type InspectionCategory = Extract<ReachabilityResult, { status: "unreachable" }>["failure"]["category"]
 type Editor = {
   mode: "create" | "edit" | "duplicate"
   draft: ProviderDraft
   credentialPresence: "present" | "missing"
   duplicateCredentialChoice?: "without" | "reuse-source"
+}
+
+function safeInspectionCategory(error: unknown): InspectionCategory {
+  const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "connect"
+  switch (code) {
+    case "invalid-endpoint":
+    case "missing-credential":
+    case "missing-provider":
+    case "stale-provider-revision":
+    case "authentication-rejected":
+    case "endpoint-unsupported":
+    case "rate-limited":
+    case "upstream-status":
+    case "timeout":
+    case "dns":
+    case "connect":
+    case "tls":
+    case "cancelled":
+    case "malformed-response":
+    case "response-too-large":
+    case "too-many-models":
+      return code
+    default:
+      return "connect"
+  }
 }
 
 function moveIdentity(ids: readonly string[], id: string | undefined, delta: -1 | 1): string[] | undefined {
@@ -106,7 +132,13 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   const [selectedProviderId, setSelectedProviderId] = createSignal<string>()
   const [saving, setSaving] = createSignal(false)
   const [providerMutationPending, setProviderMutationPending] = createSignal(false)
-  const [reachability, setReachability] = createSignal<{ providerId: string; pending: boolean; result?: ReachabilityResult }>()
+  const [reachability, setReachability] = createSignal<{
+    providerId: string
+    providerRevision: number
+    pending: boolean
+    result?: ReachabilityResult
+    errorCategory?: InspectionCategory
+  }>()
   const [applying, setApplying] = createSignal(false)
   const [notice, setNotice] = createSignal<Notice>()
   const [activities, setActivities] = createSignal<ActivityEntry[]>([])
@@ -131,6 +163,15 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   }
   const installView = (next: TargetViewProjection, source: "action" | "subscription") => {
     if (disposed || exiting || next.viewSequence < lastViewSequence) return
+    const inspection = reachability()
+    if (inspection) {
+      const nextProvider = next.providers.find((provider) => provider.id === inspection.providerId)
+      if (!nextProvider || nextProvider.providerRevision !== inspection.providerRevision) {
+        reachabilityGeneration++
+        reachabilityAbort?.abort()
+        setReachability()
+      }
+    }
     const increased = next.viewSequence > lastViewSequence
     if (increased) lastViewSequence = next.viewSequence
     setView(next)
@@ -320,7 +361,11 @@ function Shell(props: { session: TargetSession; t: Translator }) {
           onDuplicate={() => requestDuplicate()}
           reachability={() => {
             const current = reachability()
-            return current?.providerId === selectedProviderId() ? current : undefined
+            const selected = selectedProvider()
+            if (!current || !selected) return undefined
+            return current.providerId === selected.id && current.providerRevision === selected.providerRevision
+              ? current
+              : undefined
           }}
           onCheckReachability={() => { void checkSelectedReachability() }}
           onMove={(delta) => moveSelected(delta)}
@@ -329,6 +374,8 @@ function Shell(props: { session: TargetSession; t: Translator }) {
         onClose: () => {
           reachabilityGeneration++
           reachabilityAbort?.abort()
+          reachabilityAbort = undefined
+          setReachability()
         },
       })
     })
@@ -365,13 +412,28 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     const controller = new AbortController()
     reachabilityAbort = controller
     const generation = ++reachabilityGeneration
-    setReachability({ providerId: provider.id, pending: true })
+    setReachability({ providerId: provider.id, providerRevision: provider.providerRevision, pending: true })
     try {
       const result = await props.session.checkReachability(provider.id, provider.providerRevision, controller.signal)
       if (disposed || controller.signal.aborted || generation !== reachabilityGeneration) return
-      setReachability({ providerId: provider.id, pending: false, result })
-    } catch {
+      if (result.status === "unreachable" && result.failure.category === "cancelled") {
+        setReachability()
+        return
+      }
+      setReachability({ providerId: provider.id, providerRevision: provider.providerRevision, pending: false, result })
+    } catch (error) {
       if (disposed || controller.signal.aborted || generation !== reachabilityGeneration) return
+      const category = safeInspectionCategory(error)
+      if (category === "cancelled") {
+        setReachability()
+        return
+      }
+      setReachability({
+        providerId: provider.id,
+        providerRevision: provider.providerRevision,
+        pending: false,
+        errorCategory: category,
+      })
     }
   }
 
@@ -547,6 +609,9 @@ function Shell(props: { session: TargetSession; t: Translator }) {
                     initialDraft={editor()?.draft ?? { name: "", baseUrl: "", model: "" }}
                     credentialPresence={editor()?.credentialPresence ?? "missing"}
                     duplicateCredentialChoice={editor()?.duplicateCredentialChoice}
+                    visibleProviderRevision={editor()?.draft.providerId
+                      ? view().providers.find((provider) => provider.id === editor()?.draft.providerId)?.providerRevision
+                      : undefined}
                     discoverModels={(source, signal) => props.session.discoverModels(source, signal)}
                     t={props.t}
                     ref={(value) => { providerFormRef = value }}

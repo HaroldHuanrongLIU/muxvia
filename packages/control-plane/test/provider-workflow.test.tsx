@@ -51,8 +51,26 @@ function view(overrides: Partial<TargetView> = {}): TargetView {
   }
 }
 
+type RecordedTargetAction<T extends TargetAction = TargetAction> = T extends { credential: infer Credential }
+  ? Omit<T, "credential"> & {
+    credential: Credential extends { kind: "replace" }
+      ? { kind: "replace"; valuePresent: boolean }
+      : Credential
+  }
+  : T
+
+function projectAction(action: TargetAction): RecordedTargetAction {
+  if ("credential" in action && action.credential.kind === "replace") {
+    return {
+      ...action,
+      credential: { kind: "replace", valuePresent: action.credential.value.length > 0 },
+    } as RecordedTargetAction
+  }
+  return action as RecordedTargetAction
+}
+
 class MemoryTargetSession implements TargetSession {
-  readonly actions: TargetAction[] = []
+  readonly actions: RecordedTargetAction[] = []
   #view: TargetView
   #handler: (action: TargetAction) => Promise<ActionOutcome>
 
@@ -66,7 +84,7 @@ class MemoryTargetSession implements TargetSession {
 
   get(): Readonly<TargetView> { return this.#view }
   async act(action: TargetAction): Promise<ActionOutcome> {
-    this.actions.push(action)
+    this.actions.push(projectAction(action))
     const outcome = await this.#handler(action)
     this.#view = outcome.view
     return outcome
@@ -267,8 +285,12 @@ test("a failed credential replacement keeps dirty fields but retries an edit wit
   const savedSecret = "replacement-secret-must-not-render"
   const selected = provider({ credential: "missing", completeness: "incomplete", missingFields: ["credential"] })
   let attempts = 0
+  let sawReplacementSecret = false
   const session = new MemoryTargetSession(view({ providers: [selected] }), async (action) => {
     attempts++
+    if (action.kind === "update-provider" && action.credential.kind === "replace") {
+      sawReplacementSecret = action.credential.value === savedSecret
+    }
     if (attempts === 1) throw { code: "invalid-provider", message: "server-message-must-not-render" }
     return { status: "applied", view: view({ providers: [selected], viewSequence: 2 }) }
   })
@@ -295,8 +317,11 @@ test("a failed credential replacement keeps dirty fields but retries an edit wit
     expect(setup.captureCharFrame()).not.toContain("server-message-must-not-render")
     expect(session.actions[0]).toMatchObject({
       kind: "update-provider",
-      credential: { kind: "replace", value: savedSecret },
+      credential: { kind: "replace", valuePresent: true },
     })
+    expect(sawReplacementSecret).toBeTrue()
+    const persistedReplacementSecret = JSON.stringify(session.actions).includes(savedSecret)
+    expect(persistedReplacementSecret).toBeFalse()
 
     setup.mockInput.pressEnter()
     await setup.waitFor(() => session.actions.length === 2)
@@ -528,9 +553,13 @@ test("duplicate credential confirmation keeps cancel without and reuse distinct 
     "00000000-0000-4000-8000-000000000022",
     "00000000-0000-4000-8000-000000000023",
   ]
+  let sawDuplicateReplacementSecret = false
   let session!: MemoryTargetSession
   session = new MemoryTargetSession(view({ providers: [source, tail] }), async (action): Promise<ActionOutcome> => {
     if (action.kind !== "duplicate-provider") throw new Error("unexpected action")
+    if (action.credential.kind === "replace") {
+      sawDuplicateReplacementSecret = action.credential.value === credentialSecret
+    }
     const duplicate = provider({
       id: createdIds[session.actions.length - 1]!,
       position: 1,
@@ -615,8 +644,11 @@ test("duplicate credential confirmation keeps cancel without and reuse distinct 
     await setup.waitFor(() => session.actions.length === 3)
     expect(session.actions[2]).toMatchObject({
       kind: "duplicate-provider",
-      credential: { kind: "replace", value: credentialSecret },
+      credential: { kind: "replace", valuePresent: true },
     })
+    expect(sawDuplicateReplacementSecret).toBeTrue()
+    const persistedReplacementSecret = JSON.stringify(session.actions).includes(credentialSecret)
+    expect(persistedReplacementSecret).toBeFalse()
     expect(setup.captureCharFrame()).not.toContain(credentialSecret)
 
     await openPicker()

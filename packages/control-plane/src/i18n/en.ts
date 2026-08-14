@@ -129,6 +129,7 @@ export const en = {
   "provider.reachability.checking": "Checking Reachability…",
   "provider.reachability.reachable": "Reachable · HTTP {status} · TTFB {ttfb} ms · {retries} retry · {slow}",
   "provider.reachability.unreachable": "Unreachable · {reason}{status} · {retries} retry",
+  "provider.reachability.failed": "Unreachable · {reason}",
   "provider.reachability.slow": "Slow",
   "inspection.error.invalid-endpoint": "Invalid endpoint",
   "inspection.error.missing-credential": "Credential missing",

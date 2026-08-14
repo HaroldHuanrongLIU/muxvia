@@ -17,7 +17,11 @@ export interface ProviderPickerProps {
   onSelectedIdChange: (id: string) => void
   onEdit: () => void
   onDuplicate: () => void
-  reachability: Accessor<{ pending: boolean; result?: ReachabilityResult } | undefined>
+  reachability: Accessor<{
+    pending: boolean
+    result?: ReachabilityResult
+    errorCategory?: Extract<ReachabilityResult, { status: "unreachable" }>["failure"]["category"]
+  } | undefined>
   onCheckReachability: () => void
   onMove: (delta: -1 | 1) => void
   onDelete: () => void
@@ -153,6 +157,8 @@ export function ProviderPicker(props: ProviderPickerProps) {
                 status: state.result.failure.httpStatus === null ? "" : ` · HTTP ${state.result.failure.httpStatus}`,
                 retries: state.result.retryCount,
               })
+              : state.errorCategory
+                ? props.t("provider.reachability.failed", { reason: props.t(inspectionErrorKey(state.errorCategory)) })
               : ""
       }</text>}</For>
     </box>}</For>

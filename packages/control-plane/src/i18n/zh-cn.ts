@@ -131,6 +131,7 @@ export const zhCN = {
   "provider.reachability.checking": "正在检查可达性…",
   "provider.reachability.reachable": "可达 · HTTP {status} · TTFB {ttfb} ms · 重试 {retries} 次 · {slow}",
   "provider.reachability.unreachable": "不可达 · {reason}{status} · 重试 {retries} 次",
+  "provider.reachability.failed": "不可达 · {reason}",
   "provider.reachability.slow": "慢",
   "inspection.error.invalid-endpoint": "端点无效",
   "inspection.error.missing-credential": "凭据缺失",

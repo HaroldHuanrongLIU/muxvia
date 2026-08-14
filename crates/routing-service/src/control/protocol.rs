@@ -172,11 +172,20 @@ impl fmt::Debug for ControlOperation {
     rename_all_fields = "camelCase"
 )]
 pub enum TargetAction {
-    SaveProvider {
+    CreateProvider {
         name: String,
         base_url: String,
         model: String,
-        credential: String,
+        credential: CredentialEdit,
+        preset_key: Option<String>,
+    },
+    UpdateProvider {
+        provider_id: String,
+        provider_revision: u64,
+        name: String,
+        base_url: String,
+        model: String,
+        credential: CredentialEdit,
     },
     ActivateProvider {
         provider_id: String,
@@ -187,22 +196,65 @@ pub enum TargetAction {
 impl fmt::Debug for TargetAction {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SaveProvider {
+            Self::CreateProvider {
                 name,
                 base_url,
                 model,
-                ..
+                credential,
+                preset_key,
             } => formatter
-                .debug_struct("SaveProvider")
+                .debug_struct("CreateProvider")
                 .field("name", name)
                 .field("base_url", base_url)
                 .field("model", model)
-                .field("credential", &Redacted)
+                .field("credential", credential)
+                .field("preset_key", preset_key)
+                .finish(),
+            Self::UpdateProvider {
+                provider_id,
+                provider_revision,
+                name,
+                base_url,
+                model,
+                credential,
+            } => formatter
+                .debug_struct("UpdateProvider")
+                .field("provider_id", provider_id)
+                .field("provider_revision", provider_revision)
+                .field("name", name)
+                .field("base_url", base_url)
+                .field("model", model)
+                .field("credential", credential)
                 .finish(),
             Self::ActivateProvider { provider_id, mode } => formatter
                 .debug_struct("ActivateProvider")
                 .field("provider_id", provider_id)
                 .field("mode", mode)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum CredentialEdit {
+    Keep,
+    Remove,
+    Replace { value: String },
+}
+
+impl fmt::Debug for CredentialEdit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Keep => formatter.write_str("Keep"),
+            Self::Remove => formatter.write_str("Remove"),
+            Self::Replace { .. } => formatter
+                .debug_struct("Replace")
+                .field("value", &Redacted)
                 .finish(),
         }
     }
@@ -256,6 +308,7 @@ pub struct TargetView {
     pub mode: String,
     pub takeover: TakeoverView,
     pub providers: Vec<ProviderView>,
+    pub provider_presets: Vec<ProviderPresetView>,
     pub current_provider_id: Option<String>,
     pub serving_provider_id: Option<String>,
     pub managed_configuration: ManagedConfigurationView,
@@ -281,11 +334,90 @@ pub struct TakeoverView {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderView {
-    pub id: String,
+    pub id: Uuid,
+    pub position: u32,
+    pub provider_revision: u64,
     pub name: String,
     pub base_url: String,
     pub model: String,
+    pub protocol: ProviderProtocol,
     pub credential: CredentialPresence,
+    pub completeness: ProviderCompleteness,
+    pub missing_fields: Vec<ProviderRequirement>,
+    pub provenance: Option<ProviderProvenanceView>,
+    pub generated: bool,
+    pub active_references: Vec<ProviderReferenceView>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderProtocol {
+    OpenaiResponses,
+}
+
+impl fmt::Display for ProviderProtocol {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::OpenaiResponses => "openai-responses",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderCompleteness {
+    Complete,
+    Incomplete,
+}
+
+impl fmt::Display for ProviderCompleteness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderRequirement {
+    BaseUrl,
+    Model,
+    Credential,
+}
+
+impl fmt::Display for ProviderRequirement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::BaseUrl => "base-url",
+            Self::Model => "model",
+            Self::Credential => "credential",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderProvenanceView {
+    pub kind: String,
+    pub key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderReferenceView {
+    Current,
+    ActivatedSnapshot,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPresetView {
+    pub key: String,
+    pub base_url: String,
+    pub model: String,
+    pub protocol: ProviderProtocol,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

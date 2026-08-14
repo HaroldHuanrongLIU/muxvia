@@ -178,7 +178,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) })
     if (isRoute("codex")) appendActivity(activity)
   }
-  const saveProvider = async (action: Extract<TargetAction, { kind: "save-provider" }>) => {
+  const saveProvider = async (action: Extract<TargetAction, { kind: "create-provider" }>) => {
     if (saving()) return false
     const generation = editorGeneration
     const providerName = action.name

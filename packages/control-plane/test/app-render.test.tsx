@@ -11,10 +11,10 @@ const snapshotEpoch = "00000000-0000-4000-8000-000000000003"
 const credentialSentinel = "provider-secret-must-not-render"
 const problemMessageSentinel = "backend-problem-secret-must-not-render"
 
-type SaveProviderAction = Extract<TargetAction, { kind: "save-provider" }>
+type CreateProviderAction = Extract<TargetAction, { kind: "create-provider" }>
 type RecordedAction =
-  | Omit<SaveProviderAction, "credential"> & { credentialPresent: boolean }
-  | Exclude<TargetAction, SaveProviderAction>
+  | Omit<CreateProviderAction, "credential"> & { credentialPresent: boolean }
+  | Exclude<TargetAction, CreateProviderAction>
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -23,13 +23,35 @@ function deferred<T>() {
 }
 
 function projectAction(action: TargetAction): RecordedAction {
-  if (action.kind !== "save-provider") return action
+  if (action.kind !== "create-provider") return action
   return {
     kind: action.kind,
     name: action.name,
     baseUrl: action.baseUrl,
     model: action.model,
-    credentialPresent: action.credential.length > 0,
+    credentialPresent: action.credential.kind === "replace" && action.credential.value.length > 0,
+    presetKey: action.presetKey ?? null,
+  }
+}
+
+function provider(
+  overrides: Partial<TargetView["providers"][number]> = {},
+): TargetView["providers"][number] {
+  return {
+    id: "provider-1",
+    position: 0,
+    providerRevision: 1,
+    name: "Fixture Provider",
+    baseUrl: "https://fixture.example/v1",
+    model: "gpt-test",
+    protocol: "openai-responses",
+    credential: "present",
+    completeness: "complete",
+    missingFields: [],
+    provenance: null,
+    generated: false,
+    activeReferences: [],
+    ...overrides,
   }
 }
 
@@ -49,6 +71,7 @@ function view(overrides: Partial<TargetView> = {}): TargetView {
     activatedSnapshot: null,
     problems: [],
     ...overrides,
+    providerPresets: overrides.providerPresets ?? [],
   }
 }
 
@@ -278,13 +301,15 @@ test("submitting the global quit command from Home exits without an unknown-comm
 
 test("maps known and unknown problems without rendering backend messages", async () => {
   const session = new MemoryTargetSession(view({
-    providers: [{
+    providers: [provider({
       id: "provider-without-credential",
       name: "Credential-free Provider",
       baseUrl: "https://fixture.example/v1",
       model: "gpt-test",
       credential: "missing",
-    }],
+      completeness: "incomplete",
+      missingFields: ["credential"],
+    })],
     problems: [
       {
         code: "untested-target-cli",
@@ -504,17 +529,17 @@ test("saves a masked Provider, applies its visible identity, and follows pushed 
   const saved = view({
     managementRevision: 1,
     viewSequence: 1,
-    providers: [{
+    providers: [provider({
       id: "provider-1",
       name: "Fixture Provider",
       baseUrl: "https://fixture.example/v1",
       model: "gpt-test",
       credential: "present",
-    }],
+    })],
   })
   const session = new MemoryTargetSession(initial, async (action) => ({
     status: "applied",
-    view: action.kind === "save-provider" ? saved : saved,
+    view: action.kind === "create-provider" ? saved : saved,
   }))
   const setup = await testRender(() => <App session={session} />, { width: 80, height: 30, useThread: false })
   try {
@@ -534,11 +559,12 @@ test("saves a masked Provider, applies its visible identity, and follows pushed 
     expect(savedFrame).toContain("Recent activity")
     expect(savedFrame).toContain("Provider saved: Fixture Provider")
     expect(session.actions[0]).toEqual({
-      kind: "save-provider",
+      kind: "create-provider",
       name: "Fixture Provider",
       baseUrl: "https://fixture.example/v1",
       model: "gpt-test",
       credentialPresent: true,
+      presetKey: null,
     })
     expect(setup.captureCharFrame()).not.toContain(credentialSentinel)
 
@@ -616,18 +642,18 @@ test("invalid Provider guidance clears the credential without echoing it", async
 })
 
 test("a stale action installs the authoritative Target View and asks for an explicit retry", async () => {
-  const provider = {
+  const before = provider({
     id: "provider-1",
     name: "Before",
     baseUrl: "https://fixture.example/v1",
     model: "gpt-test",
-    credential: "present" as const,
-  }
-  const initial = view({ managementRevision: 1, viewSequence: 1, providers: [provider] })
+    credential: "present",
+  })
+  const initial = view({ managementRevision: 1, viewSequence: 1, providers: [before] })
   const authoritative = view({
     managementRevision: 2,
     viewSequence: 2,
-    providers: [{ ...provider, name: "Authoritative Provider" }],
+    providers: [{ ...before, name: "Authoritative Provider" }],
     currentProviderId: "provider-1",
   })
   let session!: MemoryTargetSession
@@ -656,13 +682,13 @@ test("a replayed Provider save appends one success activity", async () => {
   const saved = view({
     managementRevision: 1,
     viewSequence: 1,
-    providers: [{
+    providers: [provider({
       id: "provider-1",
       name: "Fixture Provider",
       baseUrl: "https://fixture.example/v1",
       model: "gpt-test",
       credential: "present",
-    }],
+    })],
   })
   const session = new MemoryTargetSession(view(), async () => ({ status: "replayed", view: saved }))
   const setup = await testRender(() => <App session={session} />, { width: 80, height: 30, useThread: false })

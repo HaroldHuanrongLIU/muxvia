@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use muxvia_routing::control::{
     framing::{FrameError, read_frame, write_frame},
-    protocol::{ClientFrame, ServerFrame, TargetAction, TargetView},
+    protocol::{
+        ClientFrame, CredentialEdit, ProviderCompleteness, ProviderProtocol, ProviderRequirement,
+        ServerFrame, TargetAction, TargetView,
+    },
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,6 +30,109 @@ fn fixtures_round_trip_as_their_protocol_types() {
     let save_provider = fixture("save-provider.json");
     let action: TargetAction = serde_json::from_value(save_provider.clone()).unwrap();
     assert_eq!(serde_json::to_value(action).unwrap(), save_provider);
+}
+
+#[test]
+fn provider_declaration_contract_round_trips_the_secret_free_projection_and_actions() {
+    let provider = serde_json::json!({
+        "id": "00000000-0000-4000-8000-000000000101",
+        "position": 0,
+        "providerRevision": 1,
+        "name": "Incomplete",
+        "baseUrl": "",
+        "model": "",
+        "protocol": "openai-responses",
+        "credential": "missing",
+        "completeness": "incomplete",
+        "missingFields": ["base-url", "model", "credential"],
+        "provenance": null,
+        "generated": false,
+        "activeReferences": []
+    });
+    let view = serde_json::json!({
+        "target": "codex",
+        "managementRevision": 0,
+        "viewSequence": 0,
+        "service": { "epoch": "00000000-0000-4000-8000-000000000001", "state": "running" },
+        "mode": "unmanaged",
+        "takeover": { "state": "inactive", "endpoint": null },
+        "providers": [provider.clone()],
+        "providerPresets": [{
+            "key": "openai-api-responses",
+            "baseUrl": "https://api.openai.com/v1",
+            "model": "",
+            "protocol": "openai-responses"
+        }],
+        "currentProviderId": null,
+        "servingProviderId": null,
+        "managedConfiguration": { "state": "unmanaged", "path": null, "restartRequired": false },
+        "recovery": { "intentId": null, "state": "clean" },
+        "activatedSnapshot": null,
+        "problems": []
+    });
+    let parsed: TargetView = serde_json::from_value(view.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), view);
+
+    assert_eq!(
+        ProviderProtocol::OpenaiResponses.to_string(),
+        "openai-responses"
+    );
+    assert_eq!(ProviderCompleteness::Incomplete.to_string(), "incomplete");
+    assert_eq!(ProviderRequirement::BaseUrl.to_string(), "base-url");
+
+    let action = TargetAction::CreateProvider {
+        name: "Incomplete".into(),
+        base_url: String::new(),
+        model: String::new(),
+        credential: CredentialEdit::Remove,
+        preset_key: Some("openai-api-responses".into()),
+    };
+    assert_eq!(
+        serde_json::to_value(action).unwrap(),
+        serde_json::json!({
+            "kind": "create-provider",
+            "name": "Incomplete",
+            "baseUrl": "",
+            "model": "",
+            "credential": { "kind": "remove" },
+            "presetKey": "openai-api-responses"
+        })
+    );
+}
+
+#[test]
+fn credential_edit_debug_redacts_replacement_values_and_wire_types_accept_unknown_fields() {
+    let sentinel = "credential-sentinel-must-not-escape";
+    assert!(
+        !format!(
+            "{:?}",
+            CredentialEdit::Replace {
+                value: sentinel.into()
+            }
+        )
+        .contains(sentinel)
+    );
+
+    let action: TargetAction = serde_json::from_value(serde_json::json!({
+        "kind": "create-provider",
+        "name": "Incomplete",
+        "baseUrl": "",
+        "model": "",
+        "credential": { "kind": "remove" },
+        "futureField": "ignored"
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(action).unwrap(),
+        serde_json::json!({
+            "kind": "create-provider",
+            "name": "Incomplete",
+            "baseUrl": "",
+            "model": "",
+            "credential": { "kind": "remove" },
+            "presetKey": null
+        })
+    );
 }
 
 #[tokio::test]
@@ -124,7 +230,7 @@ fn protocol_literals_and_identifiers_are_validated() {
             "target": "codex",
             "actionId": "not-a-uuid",
             "expectedRevision": 0,
-            "action": { "kind": "save-provider" }
+            "action": { "kind": "create-provider" }
         }
     });
     assert!(serde_json::from_value::<ClientFrame>(invalid_action_id).is_err());

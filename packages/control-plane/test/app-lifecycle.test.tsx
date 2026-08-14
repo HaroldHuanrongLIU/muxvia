@@ -20,6 +20,7 @@ const initialView: TargetView = {
   mode: "unmanaged",
   takeover: { state: "inactive", endpoint: null },
   providers: [],
+  providerPresets: [],
   currentProviderId: null,
   servingProviderId: null,
   managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
@@ -98,9 +99,9 @@ class LifecycleSession implements TargetSession {
 
   get(): Readonly<TargetView> { return initialView }
   async act(action: TargetAction): Promise<ActionOutcome> {
-    if (action.kind === "save-provider") {
+    if (action.kind === "create-provider") {
       this.saveCalls++
-      this.credentialPresent = action.credential.length > 0
+      this.credentialPresent = action.credential.kind === "replace" && action.credential.value.length > 0
       if (this.pendingSave) return await this.pendingSave
     }
     return { status: "applied", view: initialView }

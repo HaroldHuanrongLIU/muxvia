@@ -194,10 +194,10 @@ impl ActivationService {
             return Ok(outcome);
         }
         match serde_json::from_value(raw_action.clone()) {
-            Ok(TargetAction::SaveProvider { .. }) => {
+            Ok(TargetAction::CreateProvider { .. } | TargetAction::UpdateProvider { .. }) => {
                 let outcome = self
                     .store
-                    .apply_save_provider_action(action_id, expected_revision, raw_action)
+                    .apply_provider_action(action_id, expected_revision, raw_action)
                     .await?;
                 if outcome.status == ActionStatus::Applied {
                     self.store.publish_target_view(outcome.view.clone());

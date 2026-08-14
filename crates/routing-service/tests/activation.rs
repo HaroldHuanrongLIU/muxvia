@@ -115,19 +115,20 @@ impl Fixture {
     async fn save(&self, name: &str, model: &str, secret: &str) -> (Uuid, u64) {
         let result = self
             .store
-            .apply_save_provider_action(
+            .apply_provider_action(
                 Uuid::new_v4(),
                 self.store.target_view().await.unwrap().management_revision,
                 serde_json::json!({
-                    "kind": "save-provider", "name": name,
+                    "kind": "create-provider", "name": name,
                     "baseUrl": "https://upstream.example/v1", "model": model,
-                    "credential": secret,
+                    "credential": { "kind": "replace", "value": secret },
+                    "presetKey": null,
                 }),
             )
             .await
             .unwrap();
         (
-            Uuid::parse_str(&result.view.providers.last().unwrap().id).unwrap(),
+            result.view.providers.last().unwrap().id,
             result.view.management_revision,
         )
     }
@@ -198,7 +199,7 @@ impl Fixture {
         database
             .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
                 connection.execute(
-                    "DELETE FROM provider_credentials WHERE provider_id = ?1",
+                    "UPDATE providers SET credential_id = NULL WHERE id = ?1",
                     [provider_id.to_string()],
                 )?;
                 Ok(())
@@ -402,8 +403,8 @@ async fn restore_verification_failure_marks_recovery_required_and_blocks_writes(
         "recovery-required"
     );
 
-    let save = fixture.store.apply_save_provider_action(
-        Uuid::new_v4(), revision, serde_json::json!({"kind":"save-provider","name":"x","baseUrl":"https://x.test/v1","model":"m","credential":"s"})
+    let save = fixture.store.apply_provider_action(
+        Uuid::new_v4(), revision, serde_json::json!({"kind":"create-provider","name":"x","baseUrl":"https://x.test/v1","model":"m","credential":{"kind":"replace","value":"s"},"presetKey":null})
     ).await.unwrap_err();
     assert_eq!(save.problem.code, "recovery-required");
 }
@@ -698,8 +699,8 @@ async fn uds_activate_returns_then_pushes_one_complete_secret_free_view() {
         &serde_json::json!({
             "type":"request", "requestId":"save",
             "operation":{"kind":"act","target":"codex","actionId":save_id,
-              "expectedRevision":0,"action":{"kind":"save-provider","name":"First",
-              "baseUrl":"https://upstream.example/v1","model":"gpt","credential":"provider-secret"}}
+              "expectedRevision":0,"action":{"kind":"create-provider","name":"First",
+              "baseUrl":"https://upstream.example/v1","model":"gpt","credential":{"kind":"replace","value":"provider-secret"},"presetKey":null}}
         }),
     )
     .await

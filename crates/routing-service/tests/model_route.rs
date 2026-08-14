@@ -184,13 +184,17 @@ impl StoreFixture {
             .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
                 let transaction = connection.transaction()?;
                 transaction.execute(
-                    "INSERT INTO providers (id, target, name, base_url, model)
-                     VALUES (?1, 'codex', 'Fake upstream', ?2, 'gpt-test')",
-                    (provider_id.to_string(), upstream_base_url.clone()),
+                    "INSERT INTO credentials (id, target, bearer_token)
+                     VALUES (?1, 'codex', ?2)",
+                    (provider_id.to_string(), PROVIDER_SECRET),
                 )?;
                 transaction.execute(
-                    "INSERT INTO provider_credentials (provider_id, bearer_token) VALUES (?1, ?2)",
-                    (provider_id.to_string(), PROVIDER_SECRET),
+                    "INSERT INTO providers
+                     (id, target, position, provider_revision, name, base_url, model, protocol, credential_id,
+                      provenance_kind, provenance_key, generated_owner_id)
+                     VALUES (?1, 'codex', 0, 1, 'Fake upstream', ?2, 'gpt-test', 'openai-responses', ?1,
+                             NULL, NULL, NULL)",
+                    (provider_id.to_string(), upstream_base_url.clone()),
                 )?;
                 transaction.execute(
                     "INSERT INTO activated_snapshots
@@ -224,7 +228,8 @@ impl StoreFixture {
             .unwrap();
         database
             .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
-                connection.execute("DROP TABLE provider_credentials", [])?;
+                connection.execute("DELETE FROM providers", [])?;
+                connection.execute("DELETE FROM credentials", [])?;
                 Ok(())
             })
             .await

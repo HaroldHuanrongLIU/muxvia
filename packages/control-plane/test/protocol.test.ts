@@ -9,6 +9,7 @@ import {
   parseTargetAction,
   parseTargetView,
 } from "../src/control/types"
+import type { TargetView } from "../src/control/types"
 
 const fixtures = new URL("../../../protocol/fixtures/", import.meta.url)
 
@@ -63,6 +64,80 @@ test("ignores unknown additive fields in an action envelope", () => {
       expectedRevision: 0,
       action: { kind: "save-provider" },
     },
+  })
+})
+
+test("round-trips schema-v2 Provider declarations, Presets, and credential intent", () => {
+  const provider = {
+    id: "00000000-0000-4000-8000-000000000101",
+    position: 0,
+    providerRevision: 1,
+    name: "Incomplete",
+    baseUrl: "",
+    model: "",
+    protocol: "openai-responses",
+    credential: "missing",
+    completeness: "incomplete",
+    missingFields: ["base-url", "model", "credential"],
+    provenance: null,
+    generated: false,
+    activeReferences: [],
+  } satisfies TargetView["providers"][number]
+  const view = {
+    target: "codex",
+    managementRevision: 0,
+    viewSequence: 0,
+    service: { epoch: "00000000-0000-4000-8000-000000000001", state: "running" },
+    mode: "unmanaged",
+    takeover: { state: "inactive", endpoint: null },
+    providers: [provider],
+    providerPresets: [{
+      key: "openai-api-responses",
+      baseUrl: "https://api.openai.com/v1",
+      model: "",
+      protocol: "openai-responses",
+    }],
+    currentProviderId: null,
+    servingProviderId: null,
+    managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
+    recovery: { intentId: null, state: "clean" },
+    activatedSnapshot: null,
+    problems: [],
+  } satisfies TargetView
+  expect(parseTargetView(view)).toEqual(view)
+
+  expect(parseTargetAction({
+    kind: "create-provider",
+    name: "Incomplete",
+    baseUrl: "",
+    model: "",
+    credential: { kind: "remove" },
+    presetKey: "openai-api-responses",
+  })).toEqual({
+    kind: "create-provider",
+    name: "Incomplete",
+    baseUrl: "",
+    model: "",
+    credential: { kind: "remove" },
+    presetKey: "openai-api-responses",
+  })
+})
+
+test("accepts additive fields while redacting credential replacement intent", () => {
+  const parsed = parseTargetAction({
+    kind: "create-provider",
+    name: "Incomplete",
+    baseUrl: "",
+    model: "",
+    credential: { kind: "replace", value: "credential-sentinel-must-not-escape" },
+    futureField: "ignored",
+  })
+  expect(parsed).toEqual({
+    kind: "create-provider",
+    name: "Incomplete",
+    baseUrl: "",
+    model: "",
+    credential: { kind: "replace", value: "credential-sentinel-must-not-escape" },
   })
 })
 

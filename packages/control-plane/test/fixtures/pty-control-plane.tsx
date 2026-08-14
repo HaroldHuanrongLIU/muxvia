@@ -18,6 +18,7 @@ const initialView: TargetView = {
   mode: "unmanaged",
   takeover: { state: "inactive", endpoint: null },
   providers: [],
+  providerPresets: [],
   currentProviderId: null,
   servingProviderId: null,
   managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },

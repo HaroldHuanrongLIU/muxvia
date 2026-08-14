@@ -8,7 +8,7 @@ import type { Translator } from "../i18n"
 import { theme } from "../theme"
 import { useOverlay } from "./overlay-stack"
 
-type ProviderDraft = Extract<TargetAction, { kind: "save-provider" }>
+type ProviderDraft = Extract<TargetAction, { kind: "create-provider" }>
 
 export interface ProviderFormProps {
   pending: boolean
@@ -69,11 +69,14 @@ export function ProviderForm(props: ProviderFormProps) {
   const submit = async () => {
     if (props.pending) return
     const draft: ProviderDraft = {
-      kind: "save-provider",
+      kind: "create-provider",
       name: name(),
       baseUrl: baseUrl(),
       model: model(),
-      credential: credential(),
+      credential: credential()
+        ? { kind: "replace", value: credential() }
+        : { kind: "remove" },
+      presetKey: null,
     }
     clearSensitive()
     const applied = await props.onSave(draft)

@@ -36,7 +36,8 @@
     },
     "targetAction": {
       "oneOf": [
-        { "type": "object", "properties": { "kind": { "const": "save-provider" }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "type": "string" } }, "required": ["kind", "name", "baseUrl", "model", "credential"] },
+        { "type": "object", "properties": { "kind": { "const": "create-provider" }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/credentialEdit" }, "presetKey": { "oneOf": [{ "const": "openai-api-responses" }, { "type": "null" }] } }, "required": ["kind", "name", "baseUrl", "model", "credential"] },
+        { "type": "object", "properties": { "kind": { "const": "update-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/credentialEdit" } }, "required": ["kind", "providerId", "providerRevision", "name", "baseUrl", "model", "credential"] },
         { "type": "object", "properties": { "kind": { "const": "activate-provider" }, "providerId": { "type": "string" }, "mode": { "const": "takeover" } }, "required": ["kind", "providerId", "mode"] }
       ]
     },
@@ -49,7 +50,8 @@
         "service": { "type": "object", "properties": { "epoch": { "type": "string", "format": "uuid" }, "state": { "type": "string" } }, "required": ["epoch", "state"] },
         "mode": { "type": "string" },
         "takeover": { "type": "object" },
-        "providers": { "type": "array" },
+        "providers": { "type": "array", "items": { "$ref": "#/$defs/provider" } },
+        "providerPresets": { "type": "array", "items": { "$ref": "#/$defs/providerPreset" } },
         "currentProviderId": { "type": ["string", "null"] },
         "servingProviderId": { "type": ["string", "null"] },
         "managedConfiguration": { "type": "object" },
@@ -57,7 +59,43 @@
         "activatedSnapshot": { "oneOf": [{ "$ref": "#/$defs/activatedSnapshot" }, { "type": "null" }] },
         "problems": { "type": "array", "items": { "$ref": "#/$defs/controlProblem" } }
       },
-      "required": ["target", "managementRevision", "viewSequence", "service", "mode", "takeover", "providers", "currentProviderId", "servingProviderId", "managedConfiguration", "recovery", "activatedSnapshot", "problems"]
+      "required": ["target", "managementRevision", "viewSequence", "service", "mode", "takeover", "providers", "providerPresets", "currentProviderId", "servingProviderId", "managedConfiguration", "recovery", "activatedSnapshot", "problems"]
+    },
+    "credentialEdit": {
+      "oneOf": [
+        { "type": "object", "properties": { "kind": { "const": "keep" } }, "required": ["kind"] },
+        { "type": "object", "properties": { "kind": { "const": "remove" } }, "required": ["kind"] },
+        { "type": "object", "properties": { "kind": { "const": "replace" }, "value": { "type": "string" } }, "required": ["kind", "value"] }
+      ]
+    },
+    "provider": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "position": { "type": "integer", "minimum": 0 },
+        "providerRevision": { "type": "integer", "minimum": 1 },
+        "name": { "type": "string" },
+        "baseUrl": { "type": "string" },
+        "model": { "type": "string" },
+        "protocol": { "const": "openai-responses" },
+        "credential": { "enum": ["present", "missing"] },
+        "completeness": { "enum": ["complete", "incomplete"] },
+        "missingFields": { "type": "array", "items": { "enum": ["base-url", "model", "credential"] } },
+        "provenance": { "type": ["object", "null"] },
+        "generated": { "type": "boolean" },
+        "activeReferences": { "type": "array", "items": { "enum": ["current", "activated-snapshot"] } }
+      },
+      "required": ["id", "position", "providerRevision", "name", "baseUrl", "model", "protocol", "credential", "completeness", "missingFields", "provenance", "generated", "activeReferences"]
+    },
+    "providerPreset": {
+      "type": "object",
+      "properties": {
+        "key": { "const": "openai-api-responses" },
+        "baseUrl": { "const": "https://api.openai.com/v1" },
+        "model": { "const": "" },
+        "protocol": { "const": "openai-responses" }
+      },
+      "required": ["key", "baseUrl", "model", "protocol"]
     },
     "controlProblem": {
       "type": "object",

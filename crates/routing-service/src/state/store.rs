@@ -10,22 +10,10 @@ use crate::{
     control::protocol::{ActionOutcome, ActionStatus, ControlProblem, TargetAction, TargetView},
     domain::{
         activation::ActivatedSnapshot,
-        provider::normalize_provider_base_url,
         view::{empty_target_view, project_target_view},
     },
     home::MuxviaHome,
 };
-
-const SCHEMA: &str = include_str!("schema.sql");
-
-struct SaveProviderCommand {
-    pub action_id: Uuid,
-    pub expected_revision: u64,
-    pub name: String,
-    pub base_url: String,
-    pub model: String,
-    pub credential: SecretString,
-}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{problem:?}")]
@@ -120,8 +108,13 @@ impl StateStore {
         let connection = Connection::open(home.database_path()).await?;
         connection
             .call(|connection| {
+                super::migrations::migrate(connection)?;
                 connection.execute_batch("PRAGMA foreign_keys = ON;")?;
-                connection.execute_batch(SCHEMA)
+                let mut foreign_key_check = connection.prepare("PRAGMA foreign_key_check")?;
+                if foreign_key_check.query([])?.next()?.is_some() {
+                    return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+                }
+                Ok(())
             })
             .await
             .map_err(map_call_error)?;
@@ -222,7 +215,7 @@ impl StateStore {
                 }
                 let provider = connection.query_row(
                     "SELECT p.base_url, p.model, c.bearer_token
-                     FROM providers p LEFT JOIN provider_credentials c ON c.provider_id = p.id
+                     FROM providers p LEFT JOIN credentials c ON c.id = p.credential_id
                      WHERE p.id = ?1 AND p.target = 'codex'",
                     [provider_id.to_string()],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
@@ -234,12 +227,10 @@ impl StateStore {
                     }
                     Err(error) => return Err(StateError::Sqlite(error)),
                 };
-                let Some(credential) = credential.filter(|value| !value.trim().is_empty()) else {
-                    return Ok(Err(failure("incomplete-provider", "Provider is missing or incomplete")));
-                };
-                if model.trim().is_empty() || base_url.trim().is_empty() {
+                if base_url.is_empty() || model.is_empty() || credential.is_none() {
                     return Ok(Err(failure("incomplete-provider", "Provider is missing or incomplete")));
                 }
+                let credential = credential.expect("credential is present after completeness check");
                 let active_model = connection.query_row(
                     "SELECT s.model FROM target_route_state r
                      JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
@@ -481,7 +472,7 @@ impl StateStore {
             .map_err(map_state_call_error)
     }
 
-    pub async fn apply_save_provider_action(
+    pub async fn apply_provider_action(
         &self,
         action_id: Uuid,
         expected_revision: u64,
@@ -506,56 +497,57 @@ impl StateStore {
                 .await);
         }
 
-        match serde_json::from_value(raw_action) {
-            Ok(TargetAction::SaveProvider {
+        let (action, action_kind) = match serde_json::from_value(raw_action) {
+            Ok(TargetAction::CreateProvider {
                 name,
                 base_url,
                 model,
                 credential,
-            }) => {
-                self.save_provider(SaveProviderCommand {
-                    action_id,
-                    expected_revision,
+                preset_key,
+            }) => (
+                super::providers::ProviderAction::Create {
                     name,
                     base_url,
                     model,
-                    credential: SecretString::from(credential),
-                })
-                .await
-            }
-            Ok(TargetAction::ActivateProvider { .. }) => Err(self
-                .failure(
-                    "unsupported-operation",
-                    "Provider activation is not supported yet",
-                )
-                .await),
-            Err(_) => Err(self
-                .failure("invalid-provider", "Provider action is malformed")
-                .await),
-        }
-    }
-
-    async fn save_provider(
-        &self,
-        command: SaveProviderCommand,
-    ) -> Result<ActionOutcome, ActionFailure> {
-        match self.receipt(command.action_id).await {
-            Ok(Some(outcome)) => return Ok(outcome),
-            Ok(None) => {}
-            Err(_) => {
+                    credential,
+                    preset_key,
+                },
+                "create-provider",
+            ),
+            Ok(TargetAction::UpdateProvider {
+                provider_id,
+                provider_revision,
+                name,
+                base_url,
+                model,
+                credential,
+            }) => (
+                super::providers::ProviderAction::Update {
+                    provider_id,
+                    provider_revision,
+                    name,
+                    base_url,
+                    model,
+                    credential,
+                },
+                "update-provider",
+            ),
+            Ok(_) => {
                 return Err(self
-                    .failure("state-store-error", "State store operation failed")
+                    .failure("unsupported-operation", "Provider action is not supported")
                     .await);
             }
-        }
-
+            Err(_) => {
+                return Err(self
+                    .failure("invalid-provider", "Provider action is malformed")
+                    .await);
+            }
+        };
         let service_epoch = self.service_epoch.clone();
-        let action_id = command.action_id.to_string();
-        let provider_id = Uuid::new_v4().to_string();
-        let credential = command.credential.expose_secret().to_owned();
+        let action_id = action_id.to_string();
         let attempt = self
             .connection
-            .call(move |connection| -> Result<SaveAttempt, StateError> {
+            .call(move |connection| -> Result<ProviderAttempt, StateError> {
                 let transaction = connection.transaction_with_behavior(
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
@@ -568,7 +560,7 @@ impl StateStore {
                     Ok(json) => {
                         let mut outcome: ActionOutcome = serde_json::from_str(&json)?;
                         outcome.status = ActionStatus::Replayed;
-                        return Ok(SaveAttempt::Applied(outcome));
+                        return Ok(ProviderAttempt::Applied(outcome));
                     }
                     Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => {}
                     Err(error) => return Err(StateError::Sqlite(error)),
@@ -578,9 +570,24 @@ impl StateStore {
                     [],
                     |row| row.get(0),
                 )?;
-                if current_revision != command.expected_revision {
+                let recovery_state: String = transaction.query_row(
+                    "SELECT recovery_state FROM target_route_state WHERE target = 'codex'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if recovery_state == "recovery-required" {
+                    return Ok(ProviderAttempt::Failure(ActionFailure {
+                        problem: ControlProblem {
+                            code: "recovery-required".to_owned(),
+                            message: "Managed writes are blocked until recovery is resolved"
+                                .to_owned(),
+                        },
+                        authoritative_view: project_target_view(&transaction, &service_epoch)?,
+                    }));
+                }
+                if current_revision != expected_revision {
                     let authoritative_view = project_target_view(&transaction, &service_epoch)?;
-                    return Ok(SaveAttempt::Failure(ActionFailure {
+                    return Ok(ProviderAttempt::Failure(ActionFailure {
                         problem: ControlProblem {
                             code: "stale-revision".to_owned(),
                             message: "Target state changed; refresh and retry".to_owned(),
@@ -588,41 +595,27 @@ impl StateStore {
                         authoritative_view,
                     }));
                 }
-                if command.name.trim().is_empty()
-                    || command.model.trim().is_empty()
-                    || credential.trim().is_empty()
-                {
-                    let authoritative_view = project_target_view(&transaction, &service_epoch)?;
-                    return Ok(SaveAttempt::Failure(ActionFailure {
+                if let Err(error) = super::providers::mutate_provider(&transaction, action) {
+                    let (code, message) = match error {
+                        super::providers::ProviderMutationError::Invalid => {
+                            ("invalid-provider", "Provider declaration is invalid")
+                        }
+                        super::providers::ProviderMutationError::StaleProviderRevision => (
+                            "stale-provider-revision",
+                            "Provider changed; refresh and retry",
+                        ),
+                        super::providers::ProviderMutationError::NoProviderChange => {
+                            ("no-provider-change", "Provider declaration is unchanged")
+                        }
+                    };
+                    return Ok(ProviderAttempt::Failure(ActionFailure {
                         problem: ControlProblem {
-                            code: "incomplete-provider".to_owned(),
-                            message: "Provider name, model, and credential are required".to_owned(),
+                            code: code.to_owned(),
+                            message: message.to_owned(),
                         },
-                        authoritative_view,
+                        authoritative_view: project_target_view(&transaction, &service_epoch)?,
                     }));
                 }
-                let normalized_url = match normalize_provider_base_url(&command.base_url) {
-                    Ok(url) => url,
-                    Err(_) => {
-                        let authoritative_view = project_target_view(&transaction, &service_epoch)?;
-                        return Ok(SaveAttempt::Failure(ActionFailure {
-                            problem: ControlProblem {
-                                code: "invalid-provider".to_owned(),
-                                message: "Provider URL is not allowed".to_owned(),
-                            },
-                            authoritative_view,
-                        }));
-                    }
-                };
-                transaction.execute(
-                    "INSERT INTO providers (id, target, name, base_url, model)
-                     VALUES (?1, 'codex', ?2, ?3, ?4)",
-                    params![provider_id, command.name, normalized_url, command.model],
-                )?;
-                transaction.execute(
-                    "INSERT INTO provider_credentials (provider_id, bearer_token) VALUES (?1, ?2)",
-                    params![provider_id, credential],
-                )?;
                 transaction.execute(
                     "UPDATE target_route_state
                      SET management_revision = management_revision + 1,
@@ -639,21 +632,56 @@ impl StateStore {
                 transaction.execute(
                     "INSERT INTO action_receipts
                      (action_id, action_kind, committed_revision, outcome_json)
-                     VALUES (?1, 'save-provider', ?2, ?3)",
-                    params![action_id, outcome.view.management_revision, outcome_json],
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        action_id,
+                        action_kind,
+                        outcome.view.management_revision,
+                        outcome_json
+                    ],
                 )?;
                 transaction.commit()?;
-                Ok(SaveAttempt::Applied(outcome))
+                Ok(ProviderAttempt::Applied(outcome))
             })
             .await;
 
         match attempt {
-            Ok(SaveAttempt::Applied(outcome)) => Ok(outcome),
-            Ok(SaveAttempt::Failure(failure)) => Err(failure),
+            Ok(ProviderAttempt::Applied(outcome)) => Ok(outcome),
+            Ok(ProviderAttempt::Failure(failure)) => Err(failure),
             Err(_) => Err(self
                 .failure("state-store-error", "State store operation failed")
                 .await),
         }
+    }
+
+    #[doc(hidden)]
+    pub async fn apply_save_provider_action(
+        &self,
+        action_id: Uuid,
+        expected_revision: u64,
+        raw_action: serde_json::Value,
+    ) -> Result<ActionOutcome, ActionFailure> {
+        if let Ok(Some(outcome)) = self.receipt(action_id).await {
+            return Ok(outcome);
+        }
+        let raw_action = match raw_action {
+            serde_json::Value::Object(mut action)
+                if action.get("kind") == Some(&serde_json::json!("save-provider")) =>
+            {
+                action.insert("kind".into(), serde_json::json!("create-provider"));
+                if let Some(serde_json::Value::String(value)) = action.remove("credential") {
+                    action.insert(
+                        "credential".into(),
+                        serde_json::json!({ "kind": "replace", "value": value }),
+                    );
+                }
+                action.insert("presetKey".into(), serde_json::Value::Null);
+                serde_json::Value::Object(action)
+            }
+            value => value,
+        };
+        self.apply_provider_action(action_id, expected_revision, raw_action)
+            .await
     }
 
     pub(crate) async fn failure(&self, code: &str, message: &str) -> ActionFailure {
@@ -671,7 +699,7 @@ impl StateStore {
     }
 }
 
-enum SaveAttempt {
+enum ProviderAttempt {
     Applied(ActionOutcome),
     Failure(ActionFailure),
 }

@@ -16,10 +16,28 @@ const controlProblemSchema = z.object({
 
 const providerViewSchema = z.object({
   id: z.string(),
+  position: z.number().int().nonnegative(),
+  providerRevision: z.number().int().positive(),
   name: z.string(),
   baseUrl: z.string(),
   model: z.string(),
+  protocol: z.literal("openai-responses"),
   credential: z.enum(["present", "missing"]),
+  completeness: z.enum(["complete", "incomplete"]),
+  missingFields: z.array(z.enum(["base-url", "model", "credential"])),
+  provenance: z.object({
+    kind: z.string(),
+    key: z.string(),
+  }).nullable(),
+  generated: z.boolean(),
+  activeReferences: z.array(z.enum(["current", "activated-snapshot"])),
+})
+
+const providerPresetSchema = z.object({
+  key: z.literal("openai-api-responses"),
+  baseUrl: z.literal("https://api.openai.com/v1"),
+  model: z.literal(""),
+  protocol: z.literal("openai-responses"),
 })
 
 const activatedSnapshotSchema = z.object({
@@ -43,6 +61,7 @@ const targetViewSchema = z.object({
     endpoint: z.string().nullable(),
   }),
   providers: z.array(providerViewSchema),
+  providerPresets: z.array(providerPresetSchema),
   currentProviderId: z.string().nullable(),
   servingProviderId: z.string().nullable(),
   managedConfiguration: z.object({
@@ -58,13 +77,29 @@ const targetViewSchema = z.object({
   problems: z.array(controlProblemSchema),
 })
 
+const credentialEditSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("keep") }),
+  z.object({ kind: z.literal("remove") }),
+  z.object({ kind: z.literal("replace"), value: z.string() }),
+])
+
 const targetActionSchema = z.discriminatedUnion("kind", [
   z.object({
-    kind: z.literal("save-provider"),
+    kind: z.literal("create-provider"),
     name: z.string(),
     baseUrl: z.string(),
     model: z.string(),
-    credential: z.string(),
+    credential: credentialEditSchema,
+    presetKey: z.literal("openai-api-responses").nullable().optional(),
+  }),
+  z.object({
+    kind: z.literal("update-provider"),
+    providerId: z.string().uuid(),
+    providerRevision: z.number().int().positive(),
+    name: z.string(),
+    baseUrl: z.string(),
+    model: z.string(),
+    credential: credentialEditSchema,
   }),
   z.object({
     kind: z.literal("activate-provider"),

@@ -157,12 +157,15 @@ async fn recovery_required_startup_opens_read_only_control_without_resuming_comm
         .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
             let transaction = connection.transaction()?;
             transaction.execute(
-                "INSERT INTO providers (id, target, name, base_url, model)
-                 VALUES (?1, 'codex', 'Active', 'https://upstream.example/v1', 'gpt-active')",
+                "INSERT INTO credentials (id, target, bearer_token) VALUES (?1, 'codex', 'secret')",
                 [provider_id.to_string()],
             )?;
             transaction.execute(
-                "INSERT INTO provider_credentials (provider_id, bearer_token) VALUES (?1, 'secret')",
+                "INSERT INTO providers
+                 (id, target, position, provider_revision, name, base_url, model, protocol, credential_id,
+                  provenance_kind, provenance_key, generated_owner_id)
+                 VALUES (?1, 'codex', 0, 1, 'Active', 'https://upstream.example/v1', 'gpt-active',
+                         'openai-responses', ?1, NULL, NULL, NULL)",
                 [provider_id.to_string()],
             )?;
             transaction.execute(
@@ -236,8 +239,8 @@ async fn recovery_required_startup_opens_read_only_control_without_resuming_comm
         (
             "save",
             serde_json::json!({
-                "kind":"save-provider", "name":"blocked", "baseUrl":"https://blocked.test/v1",
-                "model":"gpt", "credential":"blocked-secret"
+                "kind":"create-provider", "name":"blocked", "baseUrl":"https://blocked.test/v1",
+                "model":"gpt", "credential":{"kind":"replace","value":"blocked-secret"}, "presetKey":null
             }),
         ),
         (
@@ -291,8 +294,8 @@ async fn recovery_required_startup_opens_read_only_control_without_resuming_comm
         (
             "save-2",
             serde_json::json!({
-                "kind":"save-provider", "name":"blocked", "baseUrl":"https://blocked.test/v1",
-                "model":"gpt", "credential":"blocked-secret"
+                "kind":"create-provider", "name":"blocked", "baseUrl":"https://blocked.test/v1",
+                "model":"gpt", "credential":{"kind":"replace","value":"blocked-secret"}, "presetKey":null
             }),
         ),
         (

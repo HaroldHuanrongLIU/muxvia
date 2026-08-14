@@ -26,11 +26,20 @@ function viewAtRevision(revision: number, sequence = revision): TargetView {
     takeover: { state: "inactive", endpoint: null },
     providers: revision === 0 ? [] : [{
       id: `provider-${revision}`,
+      position: 0,
+      providerRevision: 1,
       name: `Provider ${revision}`,
       baseUrl: "https://provider.example/v1",
       model: `model-${revision}`,
+      protocol: "openai-responses",
       credential: "present",
+      completeness: "complete",
+      missingFields: [],
+      provenance: null,
+      generated: false,
+      activeReferences: [],
     }],
+    providerPresets: [],
     currentProviderId: null,
     servingProviderId: null,
     managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
@@ -154,11 +163,12 @@ test("a target session serializes actions and replaces stale state", async () =>
   const ordering: string[] = []
   session.subscribe(() => ordering.push("push"))
   const first = session.act({
-    kind: "save-provider",
+    kind: "create-provider",
     name: "P",
     baseUrl: "https://p.test/v1",
     model: "m",
-    credential: "s",
+    credential: { kind: "replace", value: "s" },
+    presetKey: null,
   }).then((outcome) => {
     ordering.push("resolved")
     return outcome
@@ -228,7 +238,7 @@ test("close is idempotent, removes subscriptions, and closes the socket", async 
   await Bun.sleep(10)
   expect(notifications).toBe(0)
   await expect(session.act({
-    kind: "save-provider", name: "P", baseUrl: "https://p.test/v1", model: "m", credential: "s",
+    kind: "create-provider", name: "P", baseUrl: "https://p.test/v1", model: "m", credential: { kind: "replace", value: "s" }, presetKey: null,
   })).rejects.toMatchObject({ code: "connection-closed" })
 
   await server.close()

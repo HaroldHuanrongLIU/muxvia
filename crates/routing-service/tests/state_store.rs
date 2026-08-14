@@ -2,7 +2,8 @@ use std::{fs, path::PathBuf};
 
 use muxvia_routing::{
     control::protocol::{
-        ActionStatus, ClientFrame, ControlOperation, CredentialPresence, Target, TargetAction,
+        ActionStatus, ClientFrame, ControlOperation, CredentialEdit, CredentialPresence, Target,
+        TargetAction,
     },
     domain::provider::normalize_provider_base_url,
     home::MuxviaHome,
@@ -107,11 +108,9 @@ async fn save_provider_persists_secret_separately_and_projects_no_secret() {
     let (credential, provider_secret_columns) = database
         .call(
             |connection| -> tokio_rusqlite::rusqlite::Result<(String, i64)> {
-                let credential = connection.query_row(
-                    "SELECT bearer_token FROM provider_credentials",
-                    [],
-                    |row| row.get(0),
-                )?;
+                let credential =
+                    connection
+                        .query_row("SELECT bearer_token FROM credentials", [], |row| row.get(0))?;
                 let provider_secret_columns = connection.query_row(
                     "SELECT COUNT(*) FROM pragma_table_info('providers')
                  WHERE name IN ('bearer_token', 'credential')",
@@ -329,11 +328,10 @@ async fn unsafe_provider_urls_reject_without_consuming_action_ids() {
 }
 
 #[tokio::test]
-async fn incomplete_provider_fields_reject_without_consuming_action_ids() {
+async fn only_invalid_provider_fields_reject_while_missing_model_persists() {
     let fixture = StoreFixture::new().await;
     let cases = [
         ("", "gpt-test", "provider-secret"),
-        ("Local", "", "provider-secret"),
         ("Local", "gpt-test", ""),
     ];
 
@@ -349,13 +347,23 @@ async fn incomplete_provider_fields_reject_without_consuming_action_ids() {
             .await
             .unwrap_err();
 
-        assert_eq!(failure.problem.code, "incomplete-provider");
+        assert_eq!(failure.problem.code, "invalid-provider");
         assert!(fixture.store.receipt(action_id).await.unwrap().is_none());
     }
+    let incomplete = fixture
+        .store
+        .apply_save_provider_action(
+            fixed_uuid(42),
+            0,
+            raw_save_provider("Local", "https://api.example.com/v1", "", "provider-secret"),
+        )
+        .await
+        .unwrap();
     assert_eq!(
-        fixture.store.target_view().await.unwrap().providers.len(),
-        0
+        incomplete.view.providers[0].credential,
+        CredentialPresence::Present
     );
+    assert_eq!(incomplete.view.providers[0].model, "");
 }
 
 #[tokio::test]
@@ -492,11 +500,14 @@ async fn concurrent_duplicate_action_ids_apply_once_and_replay_once() {
 #[test]
 fn typed_and_raw_action_debug_output_redacts_credentials() {
     let secret = "debug-secret-must-not-escape";
-    let action = TargetAction::SaveProvider {
+    let action = TargetAction::CreateProvider {
         name: "Local".into(),
         base_url: "https://api.example.com/v1".into(),
         model: "gpt-test".into(),
-        credential: secret.into(),
+        credential: CredentialEdit::Replace {
+            value: secret.into(),
+        },
+        preset_key: None,
     };
     let operation = ControlOperation::Act {
         target: Target::Codex,

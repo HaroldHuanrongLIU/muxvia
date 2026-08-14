@@ -278,9 +278,10 @@ async fn disconnected_pending_action_commits_before_inactive_exit() {
                 "kind": "act", "target": "codex",
                 "actionId": Uuid::new_v4(), "expectedRevision": 0,
                 "action": {
-                    "kind": "save-provider", "name": "Committed before exit",
+                    "kind": "create-provider", "name": "Committed before exit",
                     "baseUrl": "https://provider.example/v1", "model": "gpt-test",
-                    "credential": "pending-secret-must-not-escape"
+                    "credential": { "kind": "replace", "value": "pending-secret-must-not-escape" },
+                    "presetKey": null
                 }
             }
         }),

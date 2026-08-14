@@ -3,17 +3,25 @@ CREATE TABLE IF NOT EXISTS metadata (
   value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS credentials (
+  id TEXT PRIMARY KEY,
+  target TEXT NOT NULL CHECK (target = 'codex'),
+  bearer_token TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS providers (
   id TEXT PRIMARY KEY,
   target TEXT NOT NULL CHECK (target = 'codex'),
+  position INTEGER NOT NULL CHECK (position >= 0),
+  provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
   name TEXT NOT NULL,
   base_url TEXT NOT NULL,
-  model TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS provider_credentials (
-  provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,
-  bearer_token TEXT NOT NULL
+  model TEXT NOT NULL,
+  protocol TEXT NOT NULL CHECK (protocol = 'openai-responses'),
+  credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL,
+  provenance_kind TEXT,
+  provenance_key TEXT,
+  generated_owner_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS target_route_state (
@@ -66,7 +74,7 @@ CREATE TABLE IF NOT EXISTS activation_recovery (
   created_revision INTEGER NOT NULL
 );
 
-INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '1');
+INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '2');
 INSERT OR IGNORE INTO target_route_state (
   target,
   management_revision,

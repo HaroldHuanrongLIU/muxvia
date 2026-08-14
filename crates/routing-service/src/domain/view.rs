@@ -2,8 +2,10 @@ use tokio_rusqlite::rusqlite::{Connection, Result};
 
 use crate::control::protocol::{
     ActivatedSnapshotView, ControlProblem, CredentialPresence, ManagedConfigurationView,
-    ProviderView, RecoveryView, ServiceView, TakeoverView, Target, TargetView,
+    ProviderCompleteness, ProviderProtocol, ProviderProvenanceView, ProviderReferenceView,
+    ProviderRequirement, ProviderView, RecoveryView, ServiceView, TakeoverView, Target, TargetView,
 };
+use crate::state::providers::provider_presets;
 
 type RouteProjectionRow = (
     u64,
@@ -48,23 +50,75 @@ pub(crate) fn project_target_view(
     )?;
 
     let mut statement = connection.prepare(
-        "SELECT p.id, p.name, p.base_url, p.model,
-                EXISTS(SELECT 1 FROM provider_credentials c WHERE c.provider_id = p.id)
-         FROM providers p WHERE p.target = 'codex' ORDER BY p.rowid",
+        "SELECT p.id, p.position, p.provider_revision, p.name, p.base_url, p.model, p.protocol,
+                p.provenance_kind, p.provenance_key, p.generated_owner_id,
+                p.credential_id IS NOT NULL,
+                EXISTS(
+                    SELECT 1 FROM target_route_state r
+                    WHERE r.target = 'codex' AND r.current_provider_id = p.id
+                ),
+                EXISTS(
+                    SELECT 1 FROM target_route_state r
+                    JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
+                    WHERE r.target = 'codex' AND s.provider_id = p.id
+                )
+         FROM providers p WHERE p.target = 'codex' ORDER BY p.position",
     )?;
     let providers = statement
         .query_map([], |row| {
-            let has_credential: bool = row.get(4)?;
+            let id = uuid::Uuid::parse_str(&row.get::<_, String>(0)?).map_err(conversion_error)?;
+            let has_credential: bool = row.get(10)?;
+            let base_url: String = row.get(4)?;
+            let model: String = row.get(5)?;
+            let mut missing_fields = Vec::new();
+            if base_url.is_empty() {
+                missing_fields.push(ProviderRequirement::BaseUrl);
+            }
+            if model.is_empty() {
+                missing_fields.push(ProviderRequirement::Model);
+            }
+            if !has_credential {
+                missing_fields.push(ProviderRequirement::Credential);
+            }
+            let provenance_kind: Option<String> = row.get(7)?;
+            let provenance_key: Option<String> = row.get(8)?;
+            let provenance = match (provenance_kind, provenance_key) {
+                (Some(kind), Some(key)) => Some(ProviderProvenanceView { kind, key }),
+                (None, None) => None,
+                _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+            };
+            let mut active_references = Vec::new();
+            if row.get(11)? {
+                active_references.push(ProviderReferenceView::Current);
+            }
+            if row.get(12)? {
+                active_references.push(ProviderReferenceView::ActivatedSnapshot);
+            }
             Ok(ProviderView {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                base_url: row.get(2)?,
-                model: row.get(3)?,
+                id,
+                position: row.get(1)?,
+                provider_revision: row.get(2)?,
+                name: row.get(3)?,
+                base_url,
+                model,
+                protocol: match row.get::<_, String>(6)?.as_str() {
+                    "openai-responses" => ProviderProtocol::OpenaiResponses,
+                    _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+                },
                 credential: if has_credential {
                     CredentialPresence::Present
                 } else {
                     CredentialPresence::Missing
                 },
+                completeness: if missing_fields.is_empty() {
+                    ProviderCompleteness::Complete
+                } else {
+                    ProviderCompleteness::Incomplete
+                },
+                missing_fields,
+                provenance,
+                generated: row.get::<_, Option<String>>(9)?.is_some(),
+                active_references,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
@@ -132,6 +186,7 @@ pub(crate) fn project_target_view(
             endpoint,
         },
         providers,
+        provider_presets: provider_presets(),
         current_provider_id,
         serving_provider_id,
         managed_configuration: ManagedConfigurationView {
@@ -179,6 +234,7 @@ pub(crate) fn empty_target_view(service_epoch: &str) -> TargetView {
             endpoint: None,
         },
         providers: Vec::new(),
+        provider_presets: provider_presets(),
         current_provider_id: None,
         serving_provider_id: None,
         managed_configuration: ManagedConfigurationView {

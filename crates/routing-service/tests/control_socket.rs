@@ -94,13 +94,14 @@ async fn request(stream: &mut UnixStream, request_id: &str, operation: Value) ->
     read_frame(stream).await.unwrap()
 }
 
-fn save_action(name: &str, secret: &str) -> Value {
+fn create_action(name: &str, secret: &str) -> Value {
     json!({
-        "kind": "save-provider",
+        "kind": "create-provider",
         "name": name,
         "baseUrl": "https://provider.example/v1",
         "model": "model-test",
-        "credential": secret,
+        "credential": { "kind": "replace", "value": secret },
+        "presetKey": null,
     })
 }
 
@@ -145,7 +146,7 @@ async fn shutdown_closes_accepted_sessions_before_returning() {
                 "kind": "act", "target": "codex",
                 "actionId": "00000000-0000-4000-8000-000000000006",
                 "expectedRevision": 0,
-                "action": save_action("Too late", "must-not-be-stored")
+                "action": create_action("Too late", "must-not-be-stored")
             }
         }),
     )
@@ -391,7 +392,7 @@ async fn open_target_subscribes_and_action_responds_before_complete_push() {
                 "kind": "act", "target": "codex",
                 "actionId": "00000000-0000-4000-8000-000000000003",
                 "expectedRevision": 0,
-                "action": save_action("Provider", "server-secret-must-not-escape")
+                "action": create_action("Provider", "server-secret-must-not-escape")
             }
         }),
     )
@@ -424,7 +425,7 @@ async fn stale_revision_and_replayed_malformed_action_use_authoritative_boundary
         "first",
         json!({
             "kind": "act", "target": "codex", "actionId": action_id,
-            "expectedRevision": 0, "action": save_action("First", "first-secret")
+            "expectedRevision": 0, "action": create_action("First", "first-secret")
         }),
     )
     .await;
@@ -436,7 +437,7 @@ async fn stale_revision_and_replayed_malformed_action_use_authoritative_boundary
         "replay",
         json!({
             "kind": "act", "target": "codex", "actionId": action_id,
-            "expectedRevision": 999, "action": { "kind": "save-provider", "name": 42 }
+            "expectedRevision": 999, "action": { "kind": "create-provider", "name": 42 }
         }),
     )
     .await;
@@ -457,7 +458,7 @@ async fn stale_revision_and_replayed_malformed_action_use_authoritative_boundary
         json!({
             "kind": "act", "target": "codex",
             "actionId": "00000000-0000-4000-8000-000000000005",
-            "expectedRevision": 0, "action": save_action("Stale", "stale-secret")
+            "expectedRevision": 0, "action": create_action("Stale", "stale-secret")
         }),
     )
     .await;

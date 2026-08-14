@@ -615,6 +615,137 @@ async fn reorder_and_delete_actions_are_receipt_first_and_publish_once_per_appli
 }
 
 #[tokio::test]
+async fn zero_provider_revisions_are_rejected_before_mutation_but_do_not_beat_receipts() {
+    let fixture = ControlFixture::start().await;
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    request(
+        &mut stream,
+        "open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+
+    let created = request(
+        &mut stream,
+        "create",
+        json!({
+            "kind": "act", "target": "codex",
+            "actionId": "00000000-0000-4000-8000-000000000061",
+            "expectedRevision": 0,
+            "action": create_action("Provider", "zero-revision-secret")
+        }),
+    )
+    .await;
+    let _create_push = read_frame(&mut stream).await.unwrap();
+    let provider = created["result"]["outcome"]["view"]["providers"][0].clone();
+    let before = created["result"]["outcome"]["view"].clone();
+
+    for (request_id, action_id, action) in [
+        (
+            "zero-delete",
+            "00000000-0000-4000-8000-000000000062",
+            json!({
+                "kind": "delete-provider",
+                "providerId": provider["id"],
+                "providerRevision": 0,
+            }),
+        ),
+        (
+            "zero-update",
+            "00000000-0000-4000-8000-000000000063",
+            json!({
+                "kind": "update-provider",
+                "providerId": provider["id"],
+                "providerRevision": 0,
+                "name": "Provider",
+                "baseUrl": "https://provider.example/v1",
+                "model": "model-test",
+                "credential": { "kind": "keep" },
+            }),
+        ),
+    ] {
+        let failure = request(
+            &mut stream,
+            request_id,
+            json!({
+                "kind": "act", "target": "codex", "actionId": action_id,
+                "expectedRevision": 1, "action": action,
+            }),
+        )
+        .await;
+        assert_eq!(failure["problem"]["code"], "invalid-provider");
+        assert_eq!(failure["authoritativeView"], before);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                read_frame(&mut stream)
+            )
+            .await
+            .is_err(),
+            "a rejected action must not publish a Target View",
+        );
+        assert!(
+            fixture
+                .store
+                .receipt(action_id.parse().unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+        );
+    }
+
+    let recorded_id = "00000000-0000-4000-8000-000000000064";
+    let applied = request(
+        &mut stream,
+        "recorded-update",
+        json!({
+            "kind": "act", "target": "codex", "actionId": recorded_id,
+            "expectedRevision": 1,
+            "action": {
+                "kind": "update-provider",
+                "providerId": provider["id"],
+                "providerRevision": provider["providerRevision"],
+                "name": "Recorded",
+                "baseUrl": "https://provider.example/v1",
+                "model": "model-test",
+                "credential": { "kind": "keep" },
+            }
+        }),
+    )
+    .await;
+    let _update_push = read_frame(&mut stream).await.unwrap();
+    assert_eq!(applied["result"]["outcome"]["status"], "applied");
+
+    let replay = request(
+        &mut stream,
+        "replay-zero",
+        json!({
+            "kind": "act", "target": "codex", "actionId": recorded_id,
+            "expectedRevision": 999,
+            "action": {
+                "kind": "delete-provider",
+                "providerId": provider["id"],
+                "providerRevision": 0,
+                "sentinel": "zero-revision-must-not-escape",
+            }
+        }),
+    )
+    .await;
+    assert_eq!(replay["result"]["outcome"]["status"], "replayed");
+    assert!(!replay.to_string().contains("zero-revision-must-not-escape"));
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            read_frame(&mut stream)
+        )
+        .await
+        .is_err(),
+        "a replay must not publish a Target View",
+    );
+}
+
+#[tokio::test]
 async fn stale_socket_is_replaced_only_when_it_is_a_socket() {
     let mut fixture = ControlFixture::start().await;
     let socket = fixture.socket().to_owned();

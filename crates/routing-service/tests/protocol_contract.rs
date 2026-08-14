@@ -63,6 +63,28 @@ fn provider_lifecycle_actions_use_revision_guarded_secret_free_wire_shapes() {
 }
 
 #[test]
+fn provider_action_revisions_must_be_positive_on_the_wire() {
+    for action in [
+        serde_json::json!({
+            "kind": "update-provider",
+            "providerId": "00000000-0000-4000-8000-000000000101",
+            "providerRevision": 0,
+            "name": "Provider",
+            "baseUrl": "https://provider.example/v1",
+            "model": "model-test",
+            "credential": { "kind": "keep" },
+        }),
+        serde_json::json!({
+            "kind": "delete-provider",
+            "providerId": "00000000-0000-4000-8000-000000000101",
+            "providerRevision": 0,
+        }),
+    ] {
+        assert!(serde_json::from_value::<TargetAction>(action).is_err());
+    }
+}
+
+#[test]
 fn provider_declaration_contract_round_trips_the_secret_free_projection_and_actions() {
     let provider = serde_json::json!({
         "id": "00000000-0000-4000-8000-000000000101",

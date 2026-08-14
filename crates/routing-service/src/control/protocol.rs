@@ -181,6 +181,7 @@ pub enum TargetAction {
     },
     UpdateProvider {
         provider_id: String,
+        #[serde(deserialize_with = "deserialize_positive_provider_revision")]
         provider_revision: u64,
         name: String,
         base_url: String,
@@ -192,12 +193,24 @@ pub enum TargetAction {
     },
     DeleteProvider {
         provider_id: Uuid,
+        #[serde(deserialize_with = "deserialize_positive_provider_revision")]
         provider_revision: u64,
     },
     ActivateProvider {
         provider_id: String,
         mode: TakeoverMode,
     },
+}
+
+fn deserialize_positive_provider_revision<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let provider_revision = u64::deserialize(deserializer)?;
+    if provider_revision == 0 {
+        return Err(D::Error::custom("invalid-provider-revision"));
+    }
+    Ok(provider_revision)
 }
 
 impl fmt::Debug for TargetAction {

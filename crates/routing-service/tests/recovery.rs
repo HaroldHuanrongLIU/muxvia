@@ -74,13 +74,27 @@ impl Fixture {
 }
 
 #[cfg(unix)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 struct FileFingerprint {
     bytes: Vec<u8>,
     mode: u32,
     size: u64,
     modified_seconds: i64,
     modified_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for FileFingerprint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileFingerprint")
+            .field("bytes", &"<redacted>")
+            .field("mode", &self.mode)
+            .field("size", &self.size)
+            .field("modified_seconds", &self.modified_seconds)
+            .field("modified_nanoseconds", &self.modified_nanoseconds)
+            .finish()
+    }
 }
 
 #[cfg(unix)]
@@ -115,9 +129,18 @@ async fn direct_pending_reconciliation_restores_before_without_touching_auth_jso
         .await
         .unwrap();
 
-    assert_eq!(
-        fs::read_to_string(fixture.codec.config_path()).unwrap(),
-        "approval_policy = \"never\"\n"
+    assert!(
+        fs::read_to_string(fixture.codec.config_path()).unwrap() == "approval_policy = \"never\"\n",
+        "Direct recovery did not restore the expected prior configuration"
+    );
+    let auth_debug = format!("{:?}", fingerprint(&auth_path));
+    assert!(
+        !auth_debug.contains("operator-auth-sentinel"),
+        "recovery fingerprint diagnostics exposed auth text"
+    );
+    assert!(
+        !auth_debug.contains(&format!("{:?}", b"operator-auth-sentinel\n")),
+        "recovery fingerprint diagnostics exposed auth bytes"
     );
     assert_eq!(fingerprint(&auth_path), auth_before);
     assert_eq!(

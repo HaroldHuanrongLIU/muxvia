@@ -205,7 +205,7 @@ impl CodexConfigCodec {
             .map(ManagedCodexState::into_snapshot)
     }
 
-    pub(crate) fn inspect_state(
+    fn inspect_state(
         &self,
         committed: Option<(ManagedCodexMode, &DesiredCodexState)>,
     ) -> Result<ManagedCodexState, CodexProblem> {
@@ -247,6 +247,8 @@ impl CodexConfigCodec {
             .map(ManagedCodexState::into_snapshot)
     }
 
+    /// `expected` must be rebuilt from the authoritative committed Routing Service state,
+    /// never inferred from the observed reserved provider table.
     pub(crate) fn inspect_managed_state(
         &self,
         expected: &DesiredCodexState,

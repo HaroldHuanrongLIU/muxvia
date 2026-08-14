@@ -48,12 +48,25 @@ fn desired_direct(codec: &CodexConfigCodec) -> muxvia_routing::codex::DesiredCod
 }
 
 #[cfg(unix)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 struct FileFingerprint {
     bytes: Vec<u8>,
     mode: u32,
     size: u64,
     modified: std::time::SystemTime,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for FileFingerprint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileFingerprint")
+            .field("bytes", &"<redacted>")
+            .field("mode", &self.mode)
+            .field("size", &self.size)
+            .field("modified", &self.modified)
+            .finish()
+    }
 }
 
 #[cfg(unix)]
@@ -64,6 +77,71 @@ fn fingerprint(path: &Path) -> FileFingerprint {
         mode: metadata.permissions().mode() & 0o777,
         size: metadata.len(),
         modified: metadata.modified().unwrap(),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_test_fingerprint_debug_does_not_expose_auth_bytes() {
+    let fingerprint = FileFingerprint {
+        bytes: b"operator-auth-sentinel".to_vec(),
+        mode: 0o600,
+        size: 22,
+        modified: std::time::SystemTime::UNIX_EPOCH,
+    };
+    let byte_signature = format!("{:?}", fingerprint.bytes);
+
+    assert!(
+        !format!("{fingerprint:?}").contains(&byte_signature),
+        "fingerprint diagnostics exposed auth bytes"
+    );
+    assert!(
+        !format!("{fingerprint:?}").contains("operator-auth-sentinel"),
+        "fingerprint diagnostics exposed auth text"
+    );
+}
+
+fn assert_direct_authorization(actual: Option<&str>) {
+    assert!(
+        actual == Some("Bearer provider-secret"),
+        "Direct Authorization header did not match the expected bearer credential"
+    );
+}
+
+fn assert_config_text(actual: &str, expected: &str, failure: &'static str) {
+    assert!(actual == expected, "{failure}");
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
+
+#[test]
+fn direct_assertion_panic_text_does_not_expose_provider_credentials() {
+    let panics = [
+        std::panic::catch_unwind(|| {
+            assert_direct_authorization(Some("Bearer provider-secret-diagnostic-sentinel"));
+        })
+        .unwrap_err(),
+        std::panic::catch_unwind(|| {
+            assert_config_text(
+                "Authorization = \"Bearer provider-secret-diagnostic-sentinel\"",
+                "approval_policy = \"never\"",
+                "Direct restore did not preserve expected configuration semantics",
+            );
+        })
+        .unwrap_err(),
+    ];
+
+    for panic in panics {
+        assert!(
+            !panic_message(panic).contains("provider-secret"),
+            "Direct assertion panic exposed Provider credential text"
+        );
     }
 }
 
@@ -94,10 +172,7 @@ fn direct_apply_writes_exact_owned_semantics_and_never_touches_auth_json() {
         Some("https://provider.example/api/v1")
     );
     assert_eq!(provider["wire_api"].as_str(), Some("responses"));
-    assert_eq!(
-        provider["http_headers"]["Authorization"].as_str(),
-        Some("Bearer provider-secret")
-    );
+    assert_direct_authorization(provider["http_headers"]["Authorization"].as_str());
     assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
     assert_eq!(document["approval_policy"].as_str(), Some("on-request"));
     assert_eq!(
@@ -145,6 +220,32 @@ fn direct_managed_inspection_requires_the_committed_expected_state() {
 }
 
 #[test]
+fn exact_forged_direct_table_is_a_collision_without_committed_authorization() {
+    let home = TempDir::new().unwrap();
+    let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+    fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+    fs::write(
+        codec.config_path(),
+        r#"model = "model-a"
+model_provider = "muxvia_codex"
+
+[model_providers.muxvia_codex]
+name = "Muxvia Direct"
+base_url = "https://provider.example/api/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer forged-provider-secret" }
+supports_websockets = false
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        codec.inspect().unwrap_err().code(),
+        "configuration-collision"
+    );
+}
+
+#[test]
 fn takeover_managed_inspection_rejects_direct_expected_state() {
     let (_home, codec) = fixture();
     let before = codec.inspect().unwrap();
@@ -185,9 +286,10 @@ fn direct_restore_preserves_exact_prior_items_unrelated_edits_and_auth_json() {
 
     codec.restore(&before, &direct).unwrap();
 
-    assert_eq!(
-        fs::read_to_string(codec.config_path()).unwrap(),
-        format!("operator_runtime_edit = true\n{original}")
+    assert_config_text(
+        &fs::read_to_string(codec.config_path()).unwrap(),
+        &format!("operator_runtime_edit = true\n{original}"),
+        "Direct restore did not preserve the expected prior and unrelated configuration",
     );
     assert_eq!(fingerprint(&auth_path), auth_before);
 }
@@ -204,9 +306,10 @@ fn direct_restore_removes_owned_fields_when_they_were_absent() {
     codec.atomic_apply(&before, &direct).unwrap();
     codec.restore(&before, &direct).unwrap();
 
-    assert_eq!(
-        fs::read_to_string(codec.config_path()).unwrap(),
-        "approval_policy = \"never\"\n"
+    assert_config_text(
+        &fs::read_to_string(codec.config_path()).unwrap(),
+        "approval_policy = \"never\"\n",
+        "Direct restore did not remove previously absent owned fields",
     );
 }
 

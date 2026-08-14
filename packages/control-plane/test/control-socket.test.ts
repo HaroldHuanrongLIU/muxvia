@@ -7,7 +7,7 @@ import { EventEmitter } from "node:events"
 
 import { encodeFrame, FrameDecoder } from "../src/control/framing"
 import { RpcClient } from "../src/control/rpc-client"
-import type { TargetAction } from "../src/control/types"
+import type { ControlOperation, TargetAction } from "../src/control/types"
 
 const roots: string[] = []
 
@@ -202,6 +202,63 @@ test("sends revision-guarded reorder and delete actions unchanged over the contr
   }
 
   expect(received).toEqual(actions)
+  await client.close()
+})
+
+function signal_on_mutation_must_not_typecheck(client: RpcClient, signal: AbortSignal): void {
+  const mutation: Extract<ControlOperation, { kind: "act" }> = {
+    kind: "act",
+    target: "codex",
+    actionId: "00000000-0000-4000-8000-000000000099",
+    expectedRevision: 0,
+    action: { kind: "delete-provider" },
+  }
+  // @ts-expect-error AbortSignal is restricted to read-only inspection operations.
+  void client.request(mutation, { signal })
+}
+void signal_on_mutation_must_not_typecheck
+
+test("rejects an AbortSignal on a mutation before writing any request frame", async () => {
+  const received: Array<Record<string, unknown>> = []
+  const path = await listen((socket) => {
+    const decoder = new FrameDecoder()
+    socket.on("data", (chunk) => {
+      if (typeof chunk === "string") throw new Error("unexpected text chunk")
+      for (const value of decoder.push(chunk)) {
+        const frame = value as Record<string, unknown>
+        if (frame.type === "hello") {
+          socket.write(encodeFrame({
+            type: "hello-ack",
+            rpc: { major: 1, minor: 0 },
+            release: "routing-test",
+            serviceEpoch: "00000000-0000-4000-8000-000000000001",
+            frameLimit: 1_048_576,
+          }))
+        } else {
+          received.push(frame)
+        }
+      }
+    })
+  })
+  const client = await RpcClient.connect(path, "control-test")
+  const controller = new AbortController()
+  const mutation: ControlOperation = {
+    kind: "act",
+    target: "codex",
+    actionId: "00000000-0000-4000-8000-000000000098",
+    expectedRevision: 0,
+    action: { kind: "delete-provider" },
+  }
+  const requestWithRuntimeOptions = client.request.bind(client) as (
+    operation: ControlOperation,
+    options: { signal: AbortSignal },
+  ) => Promise<unknown>
+
+  const pending = requestWithRuntimeOptions(mutation, { signal: controller.signal })
+  controller.abort()
+  await expect(pending).rejects.toMatchObject({ code: "invalid-request" })
+  await Bun.sleep(10)
+  expect(received).toEqual([])
   await client.close()
 })
 

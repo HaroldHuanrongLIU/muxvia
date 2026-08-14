@@ -232,7 +232,7 @@ const modelDiscoveryResultSchema = z.discriminatedUnion("status", [
 const reachabilityResultSchema = z.discriminatedUnion("status", [
   z.object({
     status: z.literal("reachable"),
-    httpStatus: z.number().int().min(100).max(599),
+    httpStatus: z.number().int().min(100).max(999),
     ttfbMs: z.number().int().nonnegative(),
     checkedAtUnixMs: z.number().int().nonnegative(),
     retryCount: z.number().int().min(0).max(1),

@@ -14,7 +14,7 @@ use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
     sync::{broadcast, mpsc, oneshot, watch},
-    task::{AbortHandle, JoinHandle, JoinSet},
+    task::{Id, JoinHandle, JoinSet},
 };
 
 use crate::{
@@ -31,6 +31,9 @@ use crate::{
     service::{activate::ActivationService, provider_inspector::ProviderInspector},
     state::{ManagedWriteStatus, StateStore},
 };
+
+const RESPONSE_QUEUE_CAPACITY: usize = 32;
+const MAX_IN_FLIGHT_INSPECTIONS_PER_SESSION: usize = 4;
 
 #[derive(Debug, Error)]
 pub enum ControlServerError {
@@ -84,6 +87,27 @@ impl Drop for InspectionGuard {
     fn drop(&mut self) {
         self.0.pending_inspections.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+struct InspectionRequest {
+    task_id: Id,
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+struct InspectionCompletion {
+    request_id: String,
+    disposition: InspectionDisposition,
+}
+
+enum InspectionDisposition {
+    Written,
+    Cancelled,
+    CloseSession,
+}
+
+struct QueuedResponse {
+    frame: ServerFrame,
+    written: Option<oneshot::Sender<()>>,
 }
 
 impl ControlServer {
@@ -391,21 +415,31 @@ async fn serve_session(
     }
 
     let (mut reader, writer) = stream.into_split();
-    let (responses, response_rx) = mpsc::channel(32);
+    let (responses, response_rx) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
     let mut writer_task = tokio::spawn(write_responses(writer, response_rx));
     let mut subscribed = false;
     let mut update_rx = store.subscribe_target_views();
-    let mut inspections = JoinSet::new();
-    let mut inspection_aborts = std::collections::HashMap::<String, AbortHandle>::new();
+    let mut inspections = JoinSet::<InspectionCompletion>::new();
+    let mut inspection_requests = std::collections::HashMap::<String, InspectionRequest>::new();
     'session: loop {
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() { break 'session; }
             }
-            completed = inspections.join_next(), if !inspections.is_empty() => {
-                if let Some(Ok(request_id)) = completed {
-                    inspection_aborts.remove(&request_id);
+            completed = inspections.join_next_with_id(), if !inspections.is_empty() => {
+                match completed {
+                    Some(Ok((_, completion))) => {
+                        inspection_requests.remove(&completion.request_id);
+                        if matches!(completion.disposition, InspectionDisposition::CloseSession) {
+                            break 'session;
+                        }
+                    }
+                    Some(Err(failure)) => {
+                        let task_id = failure.id();
+                        inspection_requests.retain(|_, request| request.task_id != task_id);
+                    }
+                    None => {}
                 }
             }
             incoming = read_frame(&mut reader) => {
@@ -413,12 +447,12 @@ async fn serve_session(
                     Ok(raw) => raw,
                     Err(FrameError::EndOfStream | FrameError::Io) => break 'session,
                     Err(_) => {
-                        let _ = responses.send(problem_frame(None, "frame-invalid", "Control frame is invalid", None)).await;
+                        let _ = enqueue_response(&responses, problem_frame(None, "frame-invalid", "Control frame is invalid", None));
                         break 'session;
                     }
                 };
                 if raw.get("type").and_then(Value::as_str) == Some("hello") {
-                    if responses.send(problem_frame(None, "unexpected-hello", "Hello was already negotiated", None)).await.is_err() {
+                    if !enqueue_response(&responses, problem_frame(None, "unexpected-hello", "Hello was already negotiated", None)) {
                         break 'session;
                     }
                     continue;
@@ -427,8 +461,10 @@ async fn serve_session(
                 let parsed = serde_json::from_value::<ClientFrame>(raw.clone());
                 let (request_id, operation) = match parsed {
                     Ok(ClientFrame::Cancel { request_id }) => {
-                        if let Some(abort) = inspection_aborts.remove(&request_id) {
-                            abort.abort();
+                        if let Some(request) = inspection_requests.get_mut(&request_id)
+                            && let Some(cancel) = request.cancel.take()
+                        {
+                            let _ = cancel.send(());
                         }
                         continue;
                     }
@@ -444,7 +480,7 @@ async fn serve_session(
                         } else {
                             "invalid-request"
                         };
-                        if responses.send(problem_frame(request_id, code, "Unsupported or malformed request", None)).await.is_err() {
+                        if !enqueue_response(&responses, problem_frame(request_id, code, "Unsupported or malformed request", None)) {
                             break 'session;
                         }
                         continue;
@@ -454,7 +490,7 @@ async fn serve_session(
                 match operation {
                     ControlOperation::OpenTarget { .. } => {
                         let Ok(view) = store.target_view().await else {
-                            if responses.send(problem_frame(Some(request_id), "state-store-error", "State store unavailable", None)).await.is_err() {
+                            if !enqueue_response(&responses, problem_frame(Some(request_id), "state-store-error", "State store unavailable", None)) {
                                 break 'session;
                             }
                             continue;
@@ -464,7 +500,7 @@ async fn serve_session(
                             request_id,
                             result: ControlResult::TargetView { view },
                         };
-                        if responses.send(response).await.is_err() { break 'session; }
+                        if !enqueue_response(&responses, response) { break 'session; }
                     }
                     ControlOperation::Act { action_id, expected_revision, action, .. } => {
                         lifecycle.pending_actions.fetch_add(1, Ordering::AcqRel);
@@ -475,76 +511,69 @@ async fn serve_session(
                                     request_id,
                                     result: ControlResult::ActionOutcome { outcome },
                                 };
-                                if responses.send(response).await.is_err() { break 'session; }
+                                if !enqueue_response(&responses, response) { break 'session; }
                             }
                             Err(failure) => {
-                                if responses.send(problem_frame(
+                                if !enqueue_response(&responses, problem_frame(
                                     Some(request_id),
                                     &failure.problem.code,
                                     &failure.problem.message,
                                     Some(failure.authoritative_view),
-                                )).await.is_err() { break 'session; }
+                                )) { break 'session; }
                             }
                         }
                     }
                     operation @ (ControlOperation::DiscoverModels { .. }
                     | ControlOperation::CheckReachability { .. }) => {
-                        if inspection_aborts.contains_key(&request_id) {
-                            if responses.send(problem_frame(
+                        if inspection_requests.contains_key(&request_id) {
+                            let _ = enqueue_response(&responses, problem_frame(
                                 Some(request_id),
                                 "request-in-progress",
                                 "Request identifier is already in progress",
                                 None,
-                            )).await.is_err() {
+                            ));
+                            break 'session;
+                        }
+                        if inspections.len() >= MAX_IN_FLIGHT_INSPECTIONS_PER_SESSION {
+                            if !enqueue_response(&responses, problem_frame(
+                                Some(request_id),
+                                "inspection-limit-reached",
+                                "Too many inspections are already in progress",
+                                None,
+                            )) {
                                 break 'session;
                             }
                             continue;
                         }
                         lifecycle.pending_inspections.fetch_add(1, Ordering::AcqRel);
                         let guard = InspectionGuard(Arc::clone(&lifecycle));
-                        let task_request_id = request_id.clone();
-                        let response_request_id = request_id.clone();
                         let inspector = Arc::clone(&inspector);
                         let responses = responses.clone();
-                        let abort = inspections.spawn(async move {
-                            let _guard = guard;
-                            let result = match operation {
-                                ControlOperation::DiscoverModels { source, .. } => {
-                                    ControlResult::ModelDiscovery {
-                                        result: inspector.discover_models(source).await,
-                                    }
-                                }
-                                ControlOperation::CheckReachability {
-                                    provider_id,
-                                    provider_revision,
-                                    ..
-                                } => ControlResult::Reachability {
-                                    result: inspector
-                                        .check_reachability(provider_id, provider_revision)
-                                        .await,
-                                },
-                                _ => unreachable!(),
-                            };
-                            let _ = responses
-                                .send(ServerFrame::Response {
-                                    request_id: response_request_id,
-                                    result,
-                                })
-                                .await;
-                            task_request_id
+                        let task_request_id = request_id.clone();
+                        let (cancel, cancelled) = oneshot::channel();
+                        let abort = inspections.spawn(inspect_and_queue(
+                            task_request_id,
+                            operation,
+                            inspector,
+                            responses,
+                            cancelled,
+                            guard,
+                        ));
+                        inspection_requests.insert(request_id, InspectionRequest {
+                            task_id: abort.id(),
+                            cancel: Some(cancel),
                         });
-                        inspection_aborts.insert(request_id, abort);
                     }
                 }
             }
             update = update_rx.recv(), if subscribed => {
                 match update {
                     Ok(view) => {
-                        if responses.send(ServerFrame::TargetView { view }).await.is_err() { break 'session; }
+                        if !enqueue_response(&responses, ServerFrame::TargetView { view }) { break 'session; }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let Ok(view) = store.target_view().await else { continue };
-                        if responses.send(ServerFrame::TargetView { view }).await.is_err() { break 'session; }
+                        if !enqueue_response(&responses, ServerFrame::TargetView { view }) { break 'session; }
                     }
                     Err(broadcast::error::RecvError::Closed) => break 'session,
                 }
@@ -553,7 +582,7 @@ async fn serve_session(
     }
 
     inspections.abort_all();
-    inspection_aborts.clear();
+    inspection_requests.clear();
     while inspections.join_next().await.is_some() {}
     drop(responses);
     if tokio::time::timeout(Duration::from_millis(250), &mut writer_task)
@@ -565,13 +594,89 @@ async fn serve_session(
     }
 }
 
+async fn inspect_and_queue(
+    request_id: String,
+    operation: ControlOperation,
+    inspector: Arc<ProviderInspector>,
+    responses: mpsc::Sender<QueuedResponse>,
+    cancelled: oneshot::Receiver<()>,
+    guard: InspectionGuard,
+) -> InspectionCompletion {
+    let _guard = guard;
+    let inspection = async {
+        match operation {
+            ControlOperation::DiscoverModels { source, .. } => ControlResult::ModelDiscovery {
+                result: inspector.discover_models(source).await,
+            },
+            ControlOperation::CheckReachability {
+                provider_id,
+                provider_revision,
+                ..
+            } => ControlResult::Reachability {
+                result: inspector
+                    .check_reachability(provider_id, provider_revision)
+                    .await,
+            },
+            _ => unreachable!(),
+        }
+    };
+    let result = tokio::select! {
+        biased;
+        _ = cancelled => {
+            return InspectionCompletion {
+                request_id,
+                disposition: InspectionDisposition::Cancelled,
+            };
+        }
+        result = inspection => result,
+    };
+
+    let (written, write_acknowledged) = oneshot::channel();
+    if responses
+        .try_send(QueuedResponse {
+            frame: ServerFrame::Response {
+                request_id: request_id.clone(),
+                result,
+            },
+            written: Some(written),
+        })
+        .is_err()
+    {
+        return InspectionCompletion {
+            request_id,
+            disposition: InspectionDisposition::CloseSession,
+        };
+    }
+    let disposition = if write_acknowledged.await.is_ok() {
+        InspectionDisposition::Written
+    } else {
+        InspectionDisposition::CloseSession
+    };
+    InspectionCompletion {
+        request_id,
+        disposition,
+    }
+}
+
+fn enqueue_response(responses: &mpsc::Sender<QueuedResponse>, frame: ServerFrame) -> bool {
+    responses
+        .try_send(QueuedResponse {
+            frame,
+            written: None,
+        })
+        .is_ok()
+}
+
 async fn write_responses(
     mut writer: tokio::net::unix::OwnedWriteHalf,
-    mut responses: mpsc::Receiver<ServerFrame>,
+    mut responses: mpsc::Receiver<QueuedResponse>,
 ) {
     while let Some(response) = responses.recv().await {
-        if write_frame(&mut writer, &response).await.is_err() {
+        if write_frame(&mut writer, &response.frame).await.is_err() {
             return;
+        }
+        if let Some(written) = response.written {
+            let _ = written.send(());
         }
     }
 }

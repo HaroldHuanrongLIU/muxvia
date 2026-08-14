@@ -635,7 +635,7 @@ async fn draft_discovery_can_reuse_a_saved_credential_without_using_the_saved_en
 #[tokio::test]
 async fn reachability_reads_headers_only_sends_no_auth_and_accepts_every_http_status() {
     let fixture = InspectionFixture::new().await;
-    for status in [401, 503] {
+    for status in [401, 503, 600] {
         let mut server = HttpServer::start(vec![HttpReply {
             status,
             body: vec![b'x'; 32],

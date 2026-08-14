@@ -189,6 +189,80 @@ impl Drop for CompletedInspectionServer {
     }
 }
 
+struct CountingInspectionServer {
+    base_url: String,
+    completed: mpsc::UnboundedReceiver<()>,
+    task: JoinHandle<()>,
+}
+
+impl CountingInspectionServer {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (completed_tx, completed) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let completed_tx = completed_tx.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let body = br#"{"data":[{"id":"model-complete"}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    if stream.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if stream.write_all(body).await.is_err() {
+                        return;
+                    }
+                    let _ = completed_tx.send(());
+                });
+            }
+        });
+        Self {
+            base_url,
+            completed,
+            task,
+        }
+    }
+
+    async fn wait_completed(&mut self) {
+        tokio::time::timeout(Duration::from_secs(1), self.completed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn assert_no_completion(&mut self) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), self.completed.recv())
+                .await
+                .is_err(),
+            "a reused request ID started a second upstream inspection"
+        );
+    }
+}
+
+impl Drop for CountingInspectionServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 async fn hello(stream: &mut UnixStream) -> Value {
     write_frame(
         stream,
@@ -217,10 +291,10 @@ async fn request(stream: &mut UnixStream, request_id: &str, operation: Value) ->
     read_frame(stream).await.unwrap()
 }
 
-async fn wait_for_zero_inspections(fixture: &ControlFixture) {
+async fn wait_for_inspections(fixture: &ControlFixture, expected: usize) {
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if fixture.handle.as_ref().unwrap().tracked_inspections() == 0 {
+            if fixture.handle.as_ref().unwrap().tracked_inspections() == expected {
                 return;
             }
             tokio::task::yield_now().await;
@@ -228,6 +302,10 @@ async fn wait_for_zero_inspections(fixture: &ControlFixture) {
     })
     .await
     .unwrap();
+}
+
+async fn wait_for_zero_inspections(fixture: &ControlFixture) {
+    wait_for_inspections(fixture, 0).await;
 }
 
 fn create_action(name: &str, secret: &str) -> Value {
@@ -298,6 +376,73 @@ async fn shutdown_closes_accepted_sessions_before_returning() {
             .management_revision,
         0
     );
+}
+
+#[tokio::test]
+async fn shutdown_is_bounded_when_an_authorized_peer_stops_reading() {
+    let mut upstream = HeldInspectionServer::start().await;
+    let mut fixture = ControlFixture::start().await;
+    fixture
+        .store
+        .apply_provider_action(
+            Uuid::new_v4(),
+            0,
+            json!({
+                "kind": "create-provider",
+                "name": "Large response",
+                "baseUrl": "https://provider.example/v1",
+                "model": "m".repeat(128 * 1024),
+                "credential": { "kind": "replace", "value": "large-view-secret" },
+                "presetKey": null,
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "held-during-backpressure",
+            "operation": {
+                "kind": "discover-models",
+                "target": "codex",
+                "source": {
+                    "kind": "draft",
+                    "baseUrl": upstream.base_url,
+                    "credentialSource": {
+                        "kind": "ephemeral",
+                        "value": "backpressure-secret-must-not-escape"
+                    }
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    upstream.wait_started().await;
+    for index in 0..96 {
+        write_frame(
+            &mut stream,
+            &json!({
+                "type": "request",
+                "requestId": format!("unread-{index}"),
+                "operation": { "kind": "open-target", "target": "codex" }
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    fixture.handle.as_mut().unwrap().request_shutdown();
+    upstream.wait_dropped().await;
+    wait_for_zero_inspections(&fixture).await;
+    tokio::time::timeout(Duration::from_secs(1), fixture.shutdown())
+        .await
+        .expect("Control Server shutdown waited on a non-reading peer")
 }
 
 #[tokio::test]
@@ -657,6 +802,127 @@ async fn discovery_is_concurrent_cancellable_and_shutdown_drains_session_work() 
 }
 
 #[tokio::test]
+async fn inspection_admission_is_bounded_and_reaped_capacity_is_reused() {
+    let mut upstream = HeldInspectionServer::start().await;
+    let mut fixture = ControlFixture::start().await;
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+
+    for index in 0..5 {
+        write_frame(
+            &mut stream,
+            &json!({
+                "type": "request",
+                "requestId": format!("held-{index}"),
+                "operation": {
+                    "kind": "discover-models",
+                    "target": "codex",
+                    "source": {
+                        "kind": "draft",
+                        "baseUrl": upstream.base_url,
+                        "credentialSource": {
+                            "kind": "ephemeral",
+                            "value": "admission-secret-must-not-escape"
+                        }
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    for _ in 0..4 {
+        upstream.wait_started().await;
+    }
+
+    let rejected = tokio::time::timeout(Duration::from_millis(250), read_frame(&mut stream))
+        .await
+        .expect("fifth inspection was admitted instead of rejected")
+        .unwrap();
+    assert_eq!(rejected["requestId"], "held-4");
+    assert_eq!(rejected["problem"]["code"], "inspection-limit-reached");
+    assert!(
+        !rejected
+            .to_string()
+            .contains("admission-secret-must-not-escape")
+    );
+    assert_eq!(fixture.handle.as_ref().unwrap().tracked_inspections(), 4);
+
+    write_frame(
+        &mut stream,
+        &json!({ "type": "cancel", "requestId": "held-0" }),
+    )
+    .await
+    .unwrap();
+    upstream.wait_dropped().await;
+    wait_for_inspections(&fixture, 3).await;
+
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "held-replacement",
+            "operation": {
+                "kind": "discover-models",
+                "target": "codex",
+                "source": {
+                    "kind": "draft",
+                    "baseUrl": upstream.base_url,
+                    "credentialSource": {
+                        "kind": "ephemeral",
+                        "value": "replacement-secret-must-not-escape"
+                    }
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    upstream.wait_started().await;
+    wait_for_inspections(&fixture, 4).await;
+
+    for request_id in ["held-1", "held-2", "held-3", "held-replacement"] {
+        write_frame(
+            &mut stream,
+            &json!({ "type": "cancel", "requestId": request_id }),
+        )
+        .await
+        .unwrap();
+    }
+    for _ in 0..4 {
+        upstream.wait_dropped().await;
+    }
+    wait_for_zero_inspections(&fixture).await;
+
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "held-shutdown",
+            "operation": {
+                "kind": "discover-models",
+                "target": "codex",
+                "source": {
+                    "kind": "draft",
+                    "baseUrl": upstream.base_url,
+                    "credentialSource": {
+                        "kind": "ephemeral",
+                        "value": "shutdown-secret-must-not-escape"
+                    }
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    upstream.wait_started().await;
+    fixture.handle.as_mut().unwrap().request_shutdown();
+    upstream.wait_dropped().await;
+    wait_for_zero_inspections(&fixture).await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn completed_and_disconnected_inspections_are_reaped_without_orphans() {
     let completed_upstream = CompletedInspectionServer::start().await;
     let mut fixture = ControlFixture::start().await;
@@ -732,6 +998,111 @@ async fn completed_and_disconnected_inspections_are_reaped_without_orphans() {
     drop(stream);
     held_upstream.wait_dropped().await;
     wait_for_zero_inspections(&fixture).await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn duplicate_inspection_id_closes_before_queued_frames_can_cross_correlate() {
+    let mut upstream = CountingInspectionServer::start().await;
+    let mut fixture = ControlFixture::start().await;
+    fixture
+        .store
+        .apply_provider_action(
+            Uuid::new_v4(),
+            0,
+            json!({
+                "kind": "create-provider",
+                "name": "Blocked writer",
+                "baseUrl": "https://provider.example/v1",
+                "model": "m".repeat(512 * 1024),
+                "credential": { "kind": "replace", "value": "blocked-writer-secret" },
+                "presetKey": null,
+            }),
+        )
+        .await
+        .unwrap();
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "block-writer",
+            "operation": { "kind": "open-target", "target": "codex" }
+        }),
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "reused-inspection-id",
+            "operation": {
+                "kind": "discover-models",
+                "target": "codex",
+                "source": {
+                    "kind": "draft",
+                    "baseUrl": upstream.base_url,
+                    "credentialSource": {
+                        "kind": "ephemeral",
+                        "value": "queued-result-secret-must-not-escape"
+                    }
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    upstream.wait_completed().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    write_frame(
+        &mut stream,
+        &json!({ "type": "cancel", "requestId": "reused-inspection-id" }),
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "reused-inspection-id",
+            "operation": {
+                "kind": "discover-models",
+                "target": "codex",
+                "source": {
+                    "kind": "draft",
+                    "baseUrl": upstream.base_url,
+                    "credentialSource": {
+                        "kind": "ephemeral",
+                        "value": "second-secret-must-not-escape"
+                    }
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    upstream.assert_no_completion().await;
+
+    let blocked = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut stream))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(blocked["requestId"], "block-writer");
+    let original = read_frame(&mut stream).await.unwrap();
+    assert_eq!(original["requestId"], "reused-inspection-id");
+    assert_eq!(original["result"]["kind"], "model-discovery");
+    let duplicate = read_frame(&mut stream).await.unwrap();
+    assert_eq!(duplicate["requestId"], "reused-inspection-id");
+    assert_eq!(duplicate["problem"]["code"], "request-in-progress");
+    wait_for_zero_inspections(&fixture).await;
+    let closed = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut stream))
+        .await
+        .expect("duplicate request ID did not close the session");
+    assert!(closed.is_err());
+    upstream.assert_no_completion().await;
     fixture.shutdown().await;
 }
 

@@ -74,7 +74,7 @@
     },
     "reachabilityResult": {
       "oneOf": [
-        { "type": "object", "properties": { "status": { "const": "reachable" }, "httpStatus": { "type": "integer", "minimum": 100, "maximum": 599 }, "ttfbMs": { "type": "integer", "minimum": 0 }, "checkedAtUnixMs": { "type": "integer", "minimum": 0 }, "retryCount": { "type": "integer", "minimum": 0, "maximum": 1 }, "slow": { "type": "boolean" }, "endpointOrigin": { "type": "string" } }, "required": ["status", "httpStatus", "ttfbMs", "checkedAtUnixMs", "retryCount", "slow", "endpointOrigin"] },
+        { "type": "object", "properties": { "status": { "const": "reachable" }, "httpStatus": { "type": "integer", "minimum": 100, "maximum": 999 }, "ttfbMs": { "type": "integer", "minimum": 0 }, "checkedAtUnixMs": { "type": "integer", "minimum": 0 }, "retryCount": { "type": "integer", "minimum": 0, "maximum": 1 }, "slow": { "type": "boolean" }, "endpointOrigin": { "type": "string" } }, "required": ["status", "httpStatus", "ttfbMs", "checkedAtUnixMs", "retryCount", "slow", "endpointOrigin"] },
         { "type": "object", "properties": { "status": { "const": "unreachable" }, "failure": { "$ref": "#/$defs/inspectionFailure" }, "checkedAtUnixMs": { "type": "integer", "minimum": 0 }, "retryCount": { "type": "integer", "minimum": 0, "maximum": 1 } }, "required": ["status", "failure", "checkedAtUnixMs", "retryCount"] }
       ]
     },

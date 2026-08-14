@@ -115,7 +115,7 @@ fn inspection_protocol_round_trips_all_sources_cancellation_and_view_free_result
     };
     let reachability = ControlResult::Reachability {
         result: ReachabilityResult::Reachable {
-            http_status: 503,
+            http_status: 600,
             ttfb_ms: 12,
             checked_at_unix_ms: 1_775_000_000_000,
             retry_count: 0,
@@ -123,7 +123,17 @@ fn inspection_protocol_round_trips_all_sources_cancellation_and_view_free_result
             endpoint_origin: "https://provider.example".into(),
         },
     };
-    for result in [discovery, reachability] {
+    let maximum_reachability = ControlResult::Reachability {
+        result: ReachabilityResult::Reachable {
+            http_status: 999,
+            ttfb_ms: 12,
+            checked_at_unix_ms: 1_775_000_000_000,
+            retry_count: 0,
+            slow: false,
+            endpoint_origin: "https://provider.example".into(),
+        },
+    };
+    for result in [discovery, reachability, maximum_reachability] {
         let wire = serde_json::to_value(&result).unwrap();
         assert!(wire.get("view").is_none());
         assert!(!wire.to_string().contains("targetView"));

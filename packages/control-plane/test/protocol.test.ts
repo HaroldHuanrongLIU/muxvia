@@ -99,6 +99,26 @@ test("round-trips draft discovery sources and view-free inspection results", () 
   }
 })
 
+test.each([600, 999])("accepts Reachability HTTP status %d", (httpStatus) => {
+  const frame = {
+    type: "response",
+    requestId: `reachability-${httpStatus}`,
+    result: {
+      kind: "reachability",
+      result: {
+        status: "reachable",
+        httpStatus,
+        ttfbMs: 12,
+        checkedAtUnixMs: 1_775_000_000_000,
+        retryCount: 0,
+        slow: false,
+        endpointOrigin: "https://provider.example",
+      },
+    },
+  } as const
+  expect(parseServerFrame(frame)).toEqual(frame)
+})
+
 test("decodes a frame split across arbitrary chunks", () => {
   const frame = encodeFrame({ type: "hello", rpc: { major: 1, minor: 0 }, release: "test" })
   const decoder = new FrameDecoder()

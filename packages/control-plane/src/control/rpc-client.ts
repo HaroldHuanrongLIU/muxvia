@@ -19,6 +19,11 @@ type Pending = {
 }
 
 export type RequestOptions = { signal?: AbortSignal }
+export type InspectionOperation = Extract<
+  ControlOperation,
+  { kind: "discover-models" | "check-reachability" }
+>
+type NonInspectionOperation = Exclude<ControlOperation, InspectionOperation>
 
 type SocketFactory = (socketPath: string) => Socket
 
@@ -37,7 +42,8 @@ export class ControlError extends Error {
 }
 
 export interface RpcTransport {
-  request(operation: ControlOperation, options?: RequestOptions): Promise<ControlResult>
+  request(operation: InspectionOperation, options?: RequestOptions): Promise<ControlResult>
+  request(operation: NonInspectionOperation): Promise<ControlResult>
   onTargetView(listener: (view: TargetView) => void): () => void
   whenClosed(): Promise<void>
   close(): Promise<void>
@@ -124,9 +130,17 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     return createTargetSession(this, result.view)
   }
 
+  request(operation: InspectionOperation, options?: RequestOptions): Promise<ControlResult>
+  request(operation: NonInspectionOperation): Promise<ControlResult>
   request(operation: ControlOperation, options: RequestOptions = {}): Promise<ControlResult> {
     if (this.#closed) {
       return Promise.reject(new ControlError("connection-closed", "Control socket closed"))
+    }
+    if (options.signal && !isInspectionOperation(operation)) {
+      return Promise.reject(new ControlError(
+        "invalid-request",
+        "AbortSignal is only supported for inspection operations",
+      ))
     }
     if (options.signal?.aborted) {
       return Promise.reject(new ControlError("cancelled", "Control request was cancelled"))
@@ -242,6 +256,10 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     }
     return pending
   }
+}
+
+function isInspectionOperation(operation: ControlOperation): operation is InspectionOperation {
+  return operation.kind === "discover-models" || operation.kind === "check-reachability"
 }
 
 function asControlError(error: unknown): ControlError {

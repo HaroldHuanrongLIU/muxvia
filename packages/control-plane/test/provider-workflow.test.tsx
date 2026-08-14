@@ -1,9 +1,13 @@
 import { expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
 
+import { MuxviaKeymapProvider, useMuxviaKeymap } from "../src/commands/keymap"
 import type { TargetSession } from "../src/control/target-session"
 import type { ActionOutcome, TargetAction, TargetView } from "../src/control/types"
+import { createTranslator } from "../src/i18n"
 import { App } from "../src/ui/app"
+import { OverlayProvider } from "../src/ui/overlay-stack"
+import { ProviderForm, type ProviderFormResult } from "../src/ui/provider-form"
 
 const credentialSecret = "provider-secret-must-not-render"
 const credentialUuid = "00000000-0000-4000-8000-000000000099"
@@ -302,6 +306,52 @@ test("a failed credential replacement keeps dirty fields but retries an edit wit
       credential: { kind: "keep" },
     })
     expect(JSON.stringify(session.actions[1])).not.toContain(savedSecret)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("a failed explicit credential removal retries an edit with Remove", async () => {
+  const results: ProviderFormResult[] = []
+  let keymap!: ReturnType<typeof useMuxviaKeymap>
+  function Harness() {
+    keymap = useMuxviaKeymap()
+    return <ProviderForm
+      mode="edit"
+      initialDraft={{
+        name: "First Provider",
+        baseUrl: "https://first.example/v1",
+        model: "first-model",
+        providerId: "00000000-0000-4000-8000-000000000011",
+        providerRevision: 1,
+      }}
+      credentialPresence="present"
+      pending={false}
+      t={createTranslator("en")}
+      onDirtyChange={() => {}}
+      onCancel={() => {}}
+      onSave={async (result) => {
+        results.push(result)
+        return false
+      }}
+    />
+  }
+  const setup = await testRender(() => (
+    <MuxviaKeymapProvider><OverlayProvider><Harness /></OverlayProvider></MuxviaKeymapProvider>
+  ), { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    keymap.dispatchCommand("provider.credential.remove")
+    await setup.renderOnce()
+    keymap.dispatchCommand("provider.save")
+    await setup.waitFor(() => results.length === 1)
+    await setup.renderOnce()
+
+    expect(results[0]).toMatchObject({ kind: "update-provider", credential: { kind: "remove" } })
+
+    keymap.dispatchCommand("provider.save")
+    await setup.waitFor(() => results.length === 2)
+    expect(results[1]).toMatchObject({ kind: "update-provider", credential: { kind: "remove" } })
   } finally {
     setup.renderer.destroy()
   }

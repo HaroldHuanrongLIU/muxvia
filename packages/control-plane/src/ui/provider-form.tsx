@@ -67,7 +67,9 @@ export function ProviderForm(props: ProviderFormProps) {
   }
   const clearSensitive = () => {
     if (credential()) setCredential("")
-    setCredentialIntent(props.mode === "create" ? "remove" : "keep")
+    if (credentialIntent() === "replace") {
+      setCredentialIntent(props.mode === "create" ? "remove" : "keep")
+    }
   }
   const formRef: ProviderFormRef = {
     isDirty: dirty,

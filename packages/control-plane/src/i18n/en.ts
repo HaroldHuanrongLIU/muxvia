@@ -105,6 +105,8 @@ export const en = {
   "provider.incomplete": "Incomplete",
   "provider.provenance.preset": "Preset",
   "provider.provenance.ordinary": "Ordinary",
+  "provider.provenance.universal-provider": "Universal Provider",
+  "provider.provenance.other": "Other provenance",
   "provider.generated": "Generated",
   "provider.not-generated": "Not generated",
   "provider.credential-reference.present": "Credential Reference present",

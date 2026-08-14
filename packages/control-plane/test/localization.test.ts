@@ -94,6 +94,22 @@ test("status labels use the canonical domain concepts in both locales", () => {
   ])
 })
 
+test("provenance labels distinguish presets from Universal Providers in both locales", () => {
+  const en = createTranslator("en")
+  const zhCN = createTranslator("zh-CN")
+
+  expect([
+    en("provider.provenance.preset"),
+    en("provider.provenance.universal-provider"),
+    en("provider.provenance.other"),
+  ]).toEqual(["Preset", "Universal Provider", "Other provenance"])
+  expect([
+    zhCN("provider.provenance.preset"),
+    zhCN("provider.provenance.universal-provider"),
+    zhCN("provider.provenance.other"),
+  ]).toEqual(["预设", "通用 Provider", "其他来源"])
+})
+
 test("command presenter translates a command title and description", () => {
   const present = createCommandPresenter(createTranslator("zh-CN"))
 

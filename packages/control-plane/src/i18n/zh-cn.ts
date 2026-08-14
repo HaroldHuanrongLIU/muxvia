@@ -107,6 +107,8 @@ export const zhCN = {
   "provider.incomplete": "不完整",
   "provider.provenance.preset": "预设",
   "provider.provenance.ordinary": "普通",
+  "provider.provenance.universal-provider": "通用 Provider",
+  "provider.provenance.other": "其他来源",
   "provider.generated": "已生成",
   "provider.not-generated": "非生成",
   "provider.credential-reference.present": "凭据引用已提供",

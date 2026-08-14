@@ -94,9 +94,14 @@ export function ProviderPicker(props: ProviderPickerProps) {
     }
     setKeyCapture(value)
   }
-  const provenance = (provider: Provider) => provider.provenance
-    ? props.t("provider.provenance.preset")
-    : props.t("provider.provenance.ordinary")
+  const provenance = (provider: Provider) => {
+    switch (provider.provenance?.kind) {
+      case undefined: return props.t("provider.provenance.ordinary")
+      case "preset": return props.t("provider.provenance.preset")
+      case "universal-provider": return props.t("provider.provenance.universal-provider")
+      default: return props.t("provider.provenance.other")
+    }
+  }
 
   return <box flexDirection="column" padding={1} rowGap={1} backgroundColor={theme.panel}>
     <text fg={theme.text}>{props.t("provider.list.title")}</text>

@@ -106,30 +106,33 @@ function expectInOrder(frame: string, names: readonly string[]): void {
   }
 }
 
-test("/providers opens a top-only picker with secret-free selected Provider detail", async () => {
+test("/providers renders provenance kinds and generated state with secret-free selected Provider detail", async () => {
   const first = provider({
     id: "00000000-0000-4000-8000-000000000011",
-    name: "First Provider",
-    provenance: { kind: "preset", key: "openai-api-responses" },
+    name: "Generated Provider",
+    provenance: { kind: "universal-provider", key: "00000000-0000-4000-8000-000000000010" },
     generated: true,
     activeReferences: ["current", "activated-snapshot"],
   })
   const second = provider({
     id: "00000000-0000-4000-8000-000000000012",
     position: 1,
-    name: "Second Provider",
-    model: "second-model",
-    credential: "missing",
-    completeness: "incomplete",
-    missingFields: ["credential"],
+    name: "Preset Provider",
+    provenance: { kind: "preset", key: "openai-api-responses" },
   })
   const third = provider({
     id: "00000000-0000-4000-8000-000000000013",
     position: 2,
-    name: "Third Provider",
+    name: "Ordinary Provider",
+  })
+  const fourth = provider({
+    id: "00000000-0000-4000-8000-000000000014",
+    position: 3,
+    name: "Future Provider",
+    provenance: { kind: "future-kind-must-not-render", key: "future-key-must-not-render" },
   })
   const session = new MemoryTargetSession(view({
-    providers: [first, second, third],
+    providers: [first, second, third, fourth],
     currentProviderId: first.id,
     activatedSnapshot: {
       id: "00000000-0000-4000-8000-000000000002",
@@ -149,24 +152,28 @@ test("/providers opens a top-only picker with secret-free selected Provider deta
     const frame = setup.captureCharFrame()
 
     expect(frame).toContain("Providers")
-    expectInOrder(frame, ["First Provider", "Second Provider", "Third Provider"])
+    expectInOrder(frame, ["Generated Provider", "Preset Provider", "Ordinary Provider", "Future Provider"])
     expect(frame).toContain("Complete")
+    expect(frame).toContain("Universal Provider")
     expect(frame).toContain("Preset")
+    expect(frame).toContain("Ordinary")
+    expect(frame).toContain("Other provenance")
     expect(frame).toContain("Generated")
     expect(frame).toContain("Credential Reference present")
     expect(frame).toContain("Current")
     expect(frame).toContain("Activated Snapshot")
     expect(frame).not.toContain(credentialSecret)
     expect(frame).not.toContain(credentialUuid)
+    expect(frame).not.toContain("future-kind-must-not-render")
+    expect(frame).not.toContain("future-key-must-not-render")
 
     setup.mockInput.pressKey("down")
     await setup.renderOnce()
-    expect(setup.captureCharFrame()).toContain("second-model")
-    expect(setup.captureCharFrame()).toContain("Incomplete")
+    expect(setup.captureCharFrame()).toContain("Preset Provider")
     setup.mockInput.pressEnter()
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("Edit Provider")
-    expect(setup.captureCharFrame()).toContain("second-model")
+    expect(setup.captureCharFrame()).toContain("Preset Provider")
   } finally {
     setup.renderer.destroy()
   }

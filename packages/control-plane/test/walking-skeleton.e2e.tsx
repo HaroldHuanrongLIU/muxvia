@@ -1,19 +1,22 @@
 /** @jsxImportSource @opentui/solid */
 import { Database } from "bun:sqlite"
 import { afterEach, expect, test } from "bun:test"
+import { TestRecorder } from "@opentui/core/testing"
 import { testRender } from "@opentui/solid"
+import { createHash } from "node:crypto"
 import { spawn } from "node:child_process"
 import { createConnection } from "node:net"
 import { request as httpRequest } from "node:http"
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
+import { finished } from "node:stream/promises"
 
 import { RpcClient } from "../src/control/rpc-client"
 import { encodeFrame, FrameDecoder } from "../src/control/framing"
 import { App } from "../src/ui/app"
 import type { TargetSession } from "../src/control/target-session"
-import type { TargetView } from "../src/control/types"
+import { parseClientFrame, type TargetView } from "../src/control/types"
 import { SSE_BYTES, startFakeUpstream } from "../../../tests/e2e/fake-upstream"
 
 const providerSecret = "provider-secret-must-not-escape"
@@ -108,59 +111,207 @@ async function chunkedPost(endpoint: string, credential: string) {
 }
 
 function extractManagedConfig(text: string, expectedModel: string): { endpoint: string; credential: string } {
-  expect(text).toContain("# operator comment survives")
-  expect(text).toContain('unrelated = "keep-me"')
-  expect(text).toContain(`model = "${expectedModel}"`)
-  expect(text).toContain('model_provider = "muxvia_codex"')
-  expect(text).toContain('[model_providers.muxvia_codex]')
-  expect(text).toContain('name = "Muxvia"')
-  expect(text).toContain('wire_api = "responses"')
-  expect(text).toContain("supports_websockets = false")
+  expect(text.includes("# operator comment survives")).toBeTrue()
+  expect(text.includes('unrelated = "keep-me"')).toBeTrue()
+  expect(text.includes(`model = "${expectedModel}"`)).toBeTrue()
+  expect(text.includes('model_provider = "muxvia_codex"')).toBeTrue()
+  expect(text.includes('[model_providers.muxvia_codex]')).toBeTrue()
+  expect(text.includes('name = "Muxvia"')).toBeTrue()
+  expect(text.includes('wire_api = "responses"')).toBeTrue()
+  expect(text.includes("supports_websockets = false")).toBeTrue()
   const endpoint = text.match(/base_url\s*=\s*"(http:\/\/127\.0\.0\.1:\d+\/v1)"/)?.[1]
   const credential = text.match(/X-Muxvia-Routing-Credential"\s*=\s*"([a-f0-9]{64})"/)?.[1]
   if (!endpoint || !credential) throw new Error("managed endpoint or credential missing")
   return { endpoint, credential }
 }
 
-function scanNoSecrets(values: unknown[], secrets: readonly string[] = [providerSecret, wrongRoutingSecret]): void {
-  const joined = values.map((value) => typeof value === "string" ? value : JSON.stringify(value)).join("\n")
-  for (const secret of secrets) expect(joined).not.toContain(secret)
+function assertBytesContainNoSecrets(bytes: Buffer, secrets: readonly string[], label: string): void {
+  const contaminated = secrets.some((secret) => secret.length > 0 && bytes.includes(Buffer.from(secret)))
+  if (contaminated) throw new Error(`secret-scan-failed:${label}`)
+}
+
+function scanNoSecrets(
+  values: readonly unknown[],
+  secrets: readonly string[] = [providerSecret, wrongRoutingSecret],
+  label = "structured-surfaces",
+): void {
+  const serialized = values.map((value) => {
+    if (typeof value === "string") return value
+    const json = JSON.stringify(value)
+    return json === undefined ? String(value) : json
+  }).join("\n")
+  assertBytesContainNoSecrets(Buffer.from(serialized), secrets, label)
 }
 
 function scanRawRpcFramesNoSecrets(
   streams: readonly (readonly Buffer[])[],
   secrets: readonly string[] = [providerSecret, wrongRoutingSecret],
 ): void {
-  expect(streams.reduce((count, frames) => count + frames.length, 0)).toBeGreaterThan(0)
+  if (streams.reduce((count, frames) => count + frames.length, 0) === 0) {
+    throw new Error("rpc-frame-audit-empty")
+  }
   const decodedFrames = streams.flatMap((frames) => {
     const decoder = new FrameDecoder()
-    const decoded = frames.flatMap((frame) => decoder.push(frame))
-    decoder.finish()
-    return decoded
+    try {
+      const decoded = frames.flatMap((frame) => decoder.push(frame))
+      decoder.finish()
+      return decoded
+    } catch {
+      throw new Error("rpc-frame-audit-invalid")
+    }
   })
-  scanNoSecrets(decodedFrames, secrets)
+  scanNoSecrets(decodedFrames, secrets, "decoded-rpc-frame")
+}
+
+function createOutboundOperationAudit(): {
+  operationKinds: string[]
+  observe: (chunk: Uint8Array) => void
+  finish: () => void
+} {
+  const decoder = new FrameDecoder()
+  const operationKinds: string[] = []
+  return {
+    operationKinds,
+    observe: (chunk) => {
+      try {
+        for (const value of decoder.push(chunk)) {
+          const frame = parseClientFrame(value)
+          if (frame.type === "request") operationKinds.push(frame.operation.kind)
+        }
+      } catch {
+        throw new Error("outbound-operation-audit-invalid")
+      }
+    },
+    finish: () => {
+      try {
+        decoder.finish()
+      } catch {
+        throw new Error("outbound-operation-audit-incomplete")
+      }
+    },
+  }
+}
+
+function createRendererAudit(_setup: Awaited<ReturnType<typeof testRender>>): {
+  frames: () => string[]
+  start: () => void
+  stop: () => void
+} {
+  const recorder = new TestRecorder(_setup.renderer)
+  return {
+    frames: () => recorder.recordedFrames.map(({ frame }) => frame),
+    start: () => recorder.rec(),
+    stop: () => recorder.stop(),
+  }
+}
+
+function scanProcessOutputNoSecrets(
+  streams: readonly (readonly Buffer[])[],
+  secrets: readonly string[],
+): void {
+  streams.forEach((chunks, index) => {
+    assertBytesContainNoSecrets(Buffer.concat(chunks), secrets, `process-output-stream-${index}`)
+  })
+}
+
+function captureProcessOutput(child: ReturnType<typeof spawn>): {
+  streams: readonly [Buffer[], Buffer[]]
+  completed: Promise<{ code: number | null; signal: NodeJS.Signals | null }>
+} {
+  const stdoutChunks: Buffer[] = []
+  const stderrChunks: Buffer[] = []
+  child.stdout?.on("data", (chunk) => stdoutChunks.push(Buffer.from(chunk)))
+  child.stderr?.on("data", (chunk) => stderrChunks.push(Buffer.from(chunk)))
+  const stdoutFinished = child.stdout ? finished(child.stdout) : Promise.resolve()
+  const stderrFinished = child.stderr ? finished(child.stderr) : Promise.resolve()
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveClose, reject) => {
+    child.once("error", () => reject(new Error("routing-service-spawn-failed")))
+    child.once("close", (code, signal) => resolveClose({ code, signal }))
+  })
+  return {
+    streams: [stdoutChunks, stderrChunks],
+    completed: closed.then(async (result) => {
+      try {
+        await Promise.all([stdoutFinished, stderrFinished])
+      } catch {
+        throw new Error("routing-service-output-drain-failed")
+      }
+      return result
+    }),
+  }
+}
+
+function sensitiveDigest(value: unknown): string | null {
+  if (value === null || value === undefined) return null
+  const bytes = Buffer.isBuffer(value)
+    ? value
+    : value instanceof Uint8Array
+      ? Buffer.from(value)
+      : Buffer.from(String(value))
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`
 }
 
 function readDatabaseProjection(path: string): unknown {
   const database = new Database(path, { readonly: true })
   try {
-    const queries = [
-      ["metadata", "SELECT key, value FROM metadata ORDER BY key"],
-      ["credentials", "SELECT id, target FROM credentials ORDER BY id"],
-      ["providers", `SELECT id, target, position, provider_revision, name, base_url, model, protocol,
-        credential_id, provenance_kind, provenance_key, generated_owner_id FROM providers ORDER BY position`],
-      ["target-route", `SELECT target, management_revision, view_sequence, current_provider_id,
-        serving_provider_id, takeover_state, route_port, activated_snapshot_id, managed_config_path,
-        recovery_state FROM target_route_state ORDER BY target`],
-      ["target-problems", "SELECT target, code, message FROM target_problems ORDER BY target, code"],
-      ["snapshots", `SELECT id, target, provider_id, base_url, model, epoch
-        FROM activated_snapshots ORDER BY id`],
-      ["receipts", `SELECT action_id, action_kind, committed_revision, outcome_json
-        FROM action_receipts ORDER BY committed_revision, action_id`],
-      ["recovery", `SELECT id, target, action_id, config_path, state, created_revision
-        FROM activation_recovery ORDER BY created_revision, id`],
-    ] as const
-    return queries.map(([name, sql]) => [name, database.query(sql).all()])
+    const credentials = database.query(`SELECT id, target, bearer_token AS bearerToken
+      FROM credentials ORDER BY id`).all() as Array<Record<string, unknown> & { bearerToken: string }>
+    const targetRoute = database.query(`SELECT target, management_revision, view_sequence, current_provider_id,
+      serving_provider_id, takeover_state, route_port, routing_credential AS routingCredential,
+      activated_snapshot_id, managed_config_path, recovery_state
+      FROM target_route_state ORDER BY target`).all() as Array<Record<string, unknown> & { routingCredential: string | null }>
+    const targetProblems = database.query(`SELECT target, code, message
+      FROM target_problems ORDER BY target, code`).all() as Array<Record<string, unknown> & { message: string }>
+    const snapshots = database.query(`SELECT id, target, provider_id, base_url, model,
+      provider_bearer_token AS providerBearerToken, epoch
+      FROM activated_snapshots ORDER BY id`).all() as Array<Record<string, unknown> & { providerBearerToken: string }>
+    const receipts = database.query(`SELECT action_id, action_kind, committed_revision,
+      outcome_json AS outcomeJson FROM action_receipts ORDER BY committed_revision, action_id`
+    ).all() as Array<Record<string, unknown> & { outcomeJson: string }>
+    const recovery = database.query(`SELECT id, target, action_id, config_path,
+      file_identity_json AS fileIdentityJson, before_owned_json AS beforeOwnedJson,
+      desired_owned_json AS desiredOwnedJson, state, created_revision
+      FROM activation_recovery ORDER BY created_revision, id`).all() as Array<Record<string, unknown> & {
+        fileIdentityJson: string
+        beforeOwnedJson: string
+        desiredOwnedJson: string
+      }>
+    return [
+      ["metadata", database.query("SELECT key, value FROM metadata ORDER BY key").all()],
+      ["credentials", credentials.map(({ bearerToken, ...row }) => ({
+        ...row,
+        bearerTokenDigest: sensitiveDigest(bearerToken),
+      }))],
+      ["providers", database.query(`SELECT id, target, position, provider_revision, name, base_url, model, protocol,
+        credential_id, provenance_kind, provenance_key, generated_owner_id FROM providers ORDER BY position`).all()],
+      ["target-route", targetRoute.map(({ routingCredential, ...row }) => ({
+        ...row,
+        routingCredentialDigest: sensitiveDigest(routingCredential),
+      }))],
+      ["target-problems", targetProblems.map(({ message, ...row }) => ({
+        ...row,
+        messageDigest: sensitiveDigest(message),
+      }))],
+      ["snapshots", snapshots.map(({ providerBearerToken, ...row }) => ({
+        ...row,
+        providerBearerTokenDigest: sensitiveDigest(providerBearerToken),
+      }))],
+      ["receipts", receipts.map(({ outcomeJson, ...row }) => ({
+        ...row,
+        outcomeJsonDigest: sensitiveDigest(outcomeJson),
+      }))],
+      ["recovery", recovery.map(({
+        fileIdentityJson,
+        beforeOwnedJson,
+        desiredOwnedJson,
+        ...row
+      }) => ({
+        ...row,
+        fileIdentityJsonDigest: sensitiveDigest(fileIdentityJson),
+        beforeOwnedJsonDigest: sensitiveDigest(beforeOwnedJson),
+        desiredOwnedJsonDigest: sensitiveDigest(desiredOwnedJson),
+      }))],
+    ]
   } finally {
     database.close()
   }
@@ -168,7 +319,7 @@ function readDatabaseProjection(path: string): unknown {
 
 async function readManagedConfigurationFingerprint(path: string): Promise<string> {
   try {
-    return Buffer.from(await readFile(path)).toString("base64")
+    return sensitiveDigest(await readFile(path))!
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing"
     throw error
@@ -195,13 +346,9 @@ function credentialReferences(databasePath: string): Array<{ name: string; crede
 function captureFrame(
   setup: Awaited<ReturnType<typeof testRender>>,
   renderedFrames: string[],
-  activities: string[],
 ): string {
   const frame = setup.captureCharFrame()
   renderedFrames.push(frame)
-  activities.push(...frame.split("\n").map((line) => line.trim()).filter((line) =>
-    /Provider saved:|Target Takeover applied:|Target state updated/.test(line)
-  ))
   return frame
 }
 
@@ -233,6 +380,137 @@ test("secret scanning catches additive RPC sentinels split across valid frame ch
   )).toThrow()
 })
 
+test("outbound operation audit catches a preset-phase discovery without retaining its payload", () => {
+  const credential = "controlled-outbound-credential"
+  const baseUrl = "https://controlled-outbound.invalid/v1"
+  const audit = createOutboundOperationAudit()
+  audit.observe(encodeFrame({
+    type: "request",
+    requestId: "controlled-discovery",
+    operation: {
+      kind: "discover-models",
+      target: "codex",
+      source: {
+        kind: "draft",
+        baseUrl,
+        credentialSource: { kind: "ephemeral", value: credential },
+      },
+    },
+  }))
+  audit.finish()
+
+  expect(audit.operationKinds.join("|") === "discover-models").toBeTrue()
+  const diagnostic = JSON.stringify(audit.operationKinds)
+  expect(diagnostic.includes(credential)).toBeFalse()
+  expect(diagnostic.includes(baseUrl)).toBeFalse()
+})
+
+test("renderer audit catches a secret on a native frame without a manual capture", async () => {
+  const setup = await testRender(() => <text>{providerSecret}</text>, { width: 40, height: 4, useThread: false })
+  const audit = createRendererAudit(setup)
+  try {
+    audit.start()
+    await setup.renderOnce()
+    let caught = false
+    try {
+      scanNoSecrets(audit.frames(), [providerSecret])
+    } catch {
+      caught = true
+    }
+    expect(caught).toBeTrue()
+  } finally {
+    audit.stop()
+    setup.renderer.destroy()
+  }
+})
+
+test("read-only fingerprints change for every sensitive database payload without retaining values", async () => {
+  const root = await mkdtemp(join(tmpdir(), "muxvia-fingerprint-"))
+  roots.push(root)
+  const databasePath = join(root, "state.db")
+  const configPath = join(root, "config.toml")
+  const database = new Database(databasePath)
+  try {
+    database.exec(await readFile(resolve(repoRoot, "crates/routing-service/src/state/schema.sql"), "utf8"))
+    database.exec(`
+      INSERT INTO credentials (id, target, bearer_token)
+        VALUES ('credential-id', 'codex', 'credential-sensitive-one');
+      INSERT INTO activated_snapshots
+        (id, target, provider_id, base_url, model, provider_bearer_token, epoch)
+        VALUES ('snapshot-id', 'codex', 'provider-id', 'https://snapshot.invalid/v1', 'model',
+          'snapshot-sensitive-one', 'epoch');
+      UPDATE target_route_state SET routing_credential = 'routing-sensitive-one' WHERE target = 'codex';
+      INSERT INTO activation_recovery
+        (id, target, action_id, config_path, file_identity_json, before_owned_json,
+          desired_owned_json, state, created_revision)
+        VALUES ('recovery-id', 'codex', 'action-id', '/controlled/config',
+          'identity-sensitive-one', 'before-sensitive-one', 'desired-sensitive-one', 'pending', 1);
+    `)
+    await writeFile(configPath, "managed-sensitive-one")
+
+    const mutations = [
+      "UPDATE credentials SET bearer_token = 'credential-sensitive-two'",
+      "UPDATE target_route_state SET routing_credential = 'routing-sensitive-two' WHERE target = 'codex'",
+      "UPDATE activated_snapshots SET provider_bearer_token = 'snapshot-sensitive-two'",
+      "UPDATE activation_recovery SET file_identity_json = 'identity-sensitive-two'",
+      "UPDATE activation_recovery SET before_owned_json = 'before-sensitive-two'",
+      "UPDATE activation_recovery SET desired_owned_json = 'desired-sensitive-two'",
+    ]
+    for (const mutation of mutations) {
+      const before = JSON.stringify(readDatabaseProjection(databasePath))
+      database.exec(mutation)
+      const after = JSON.stringify(readDatabaseProjection(databasePath))
+      expect(after === before).toBeFalse()
+      expect(after.includes("sensitive-")).toBeFalse()
+    }
+
+    const beforeConfiguration = JSON.stringify(await readOnlyStateFingerprint(databasePath, configPath))
+    await writeFile(configPath, "managed-sensitive-two")
+    const afterConfiguration = JSON.stringify(await readOnlyStateFingerprint(databasePath, configPath))
+    expect(afterConfiguration === beforeConfiguration).toBeFalse()
+    expect(afterConfiguration.includes("managed-sensitive-")).toBeFalse()
+  } finally {
+    database.close()
+  }
+})
+
+test("process-output audit catches cross-chunk and final-tail secrets without inserting separators", () => {
+  const secret = "controlled-process-output-secret"
+  const cases: readonly (readonly Buffer[])[][] = [
+    [
+      [Buffer.from("prefix-controlled-process-"), Buffer.from("output-secret")],
+      [Buffer.from("clean-stderr")],
+    ],
+    [
+      [Buffer.from("clean-stdout")],
+      [Buffer.from("clean-prefix"), Buffer.from(secret)],
+    ],
+  ]
+  for (const streams of cases) {
+    let caught = false
+    try {
+      scanProcessOutputNoSecrets(streams, [secret])
+    } catch {
+      caught = true
+    }
+    expect(caught).toBeTrue()
+  }
+})
+
+test("secret-scan failures expose only a fixed redacted diagnostic", () => {
+  const secret = "controlled-redaction-secret"
+  const surface = `controlled raw surface ${secret}`
+  let diagnostic = ""
+  try {
+    scanNoSecrets([surface], [secret], "controlled-surface")
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(diagnostic === "secret-scan-failed:controlled-surface").toBeTrue()
+  expect(diagnostic.includes(secret)).toBeFalse()
+  expect(diagnostic.includes(surface)).toBeFalse()
+})
+
 test("real processes prove the complete Target Provider workflow without leaking secrets or mutating inspections", async () => {
   const root = await mkdtemp(join(tmpdir(), "muxvia-e2e-"))
   roots.push(root)
@@ -253,18 +531,20 @@ test("real processes prove the complete Target Provider workflow without leaking
   await writeFile(configPath, '# operator comment survives\nunrelated = "keep-me"\n', { mode: 0o600 })
   await chmod(fakeCodex, 0o755)
   const upstream = await startFakeUpstream(providerSecret)
-  const logs: string[] = []
   const rpcStreams: Buffer[][] = []
+  const outboundOperationKinds: string[] = []
+  const outboundAudits: ReturnType<typeof createOutboundOperationAudit>[] = []
   const decodedInboundFrames: unknown[] = []
   const views: TargetView[] = []
-  const activities: string[] = []
-  const renderedFrames: string[] = []
+  const selectedRenderedFrames: string[] = []
   const readOnlyInspections: string[] = []
   let service: ReturnType<typeof spawn> | undefined
+  let processOutput: ReturnType<typeof captureProcessOutput> | undefined
   let client: RpcClient | undefined
   let session: TargetSession | undefined
   let unsubscribe: (() => void) | undefined
   let setup: Awaited<ReturnType<typeof testRender>> | undefined
+  let rendererAudit: ReturnType<typeof createRendererAudit> | undefined
   try {
     const inheritedEnvironmentTraps: NodeJS.ProcessEnv = {
       HOME: operatorHomeCanary,
@@ -286,8 +566,7 @@ test("real processes prove the complete Target Provider workflow without leaking
       env: serviceEnvironment,
       stdio: ["ignore", "pipe", "pipe"],
     })
-    service.stdout?.on("data", (data) => logs.push(String(data)))
-    service.stderr?.on("data", (data) => logs.push(String(data)))
+    processOutput = captureProcessOutput(service)
 
     await waitFor(async () => {
       try {
@@ -302,6 +581,15 @@ test("real processes prove the complete Target Provider workflow without leaking
       rpcStreams.push(stream)
       return await RpcClient.connect(socketPath, release, undefined, (path) => {
         const socket = createConnection({ path })
+        const outboundAudit = createOutboundOperationAudit()
+        outboundAudits.push(outboundAudit)
+        const write = socket.write.bind(socket)
+        socket.write = ((chunk: Uint8Array, callback?: (error?: Error | null) => void) => {
+          const beforeCount = outboundAudit.operationKinds.length
+          outboundAudit.observe(chunk)
+          outboundOperationKinds.push(...outboundAudit.operationKinds.slice(beforeCount))
+          return write(chunk, callback)
+        }) as typeof socket.write
         socket.on("data", (chunk) => {
           const bytes = Buffer.from(chunk)
           stream.push(bytes)
@@ -336,6 +624,8 @@ test("real processes prove the complete Target Provider workflow without leaking
       useThread: false,
       kittyKeyboard: true,
     })
+    rendererAudit = createRendererAudit(setup)
+    rendererAudit.start()
     await setup.renderOnce()
     await setup.mockInput.typeText("/codex")
     setup.mockInput.pressEnter()
@@ -351,7 +641,7 @@ test("real processes prove the complete Target Provider workflow without leaking
     setup.mockInput.pressEnter()
     await waitForSession(session, (view) => view.providers.length === 1, "name-only Provider save")
     await setup.waitForFrame((frame) => frame.includes("Provider saved: Original Provider"))
-    captureFrame(setup, renderedFrames, activities)
+    captureFrame(setup, selectedRenderedFrames)
     const incomplete = session.get().providers[0]!
     expect(incomplete).toMatchObject({
       name: "Original Provider",
@@ -362,11 +652,11 @@ test("real processes prove the complete Target Provider workflow without leaking
     // 2. The first saved-state inspection sees only the incomplete saved declaration.
     const incompletePickerFrame = await openProviderPicker()
     expect(incompletePickerFrame).toContain("Incomplete")
-    renderedFrames.push(incompletePickerFrame)
+    selectedRenderedFrames.push(incompletePickerFrame)
     const incompleteInspectionBefore = await readOnlyStateFingerprint(databasePath, configPath)
     setup.mockInput.pressEnter()
     const missingCredentialFrame = await setup.waitForFrame((frame) => frame.includes("Credential missing"))
-    renderedFrames.push(missingCredentialFrame)
+    selectedRenderedFrames.push(missingCredentialFrame)
     await assertReadOnlyInspection("incomplete automatic discovery", incompleteInspectionBefore)
     expect(upstream.calls).toHaveLength(0)
 
@@ -378,13 +668,13 @@ test("real processes prove the complete Target Provider workflow without leaking
     setup.mockInput.pressTab()
     await setup.mockInput.typeText(providerSecret)
     await setup.renderOnce()
-    const formFrame = captureFrame(setup, renderedFrames, activities)
+    const formFrame = captureFrame(setup, selectedRenderedFrames)
     expect(formFrame.includes(providerSecret)).toBeFalse()
     expect(upstream.calls).toHaveLength(0)
     setup.mockInput.pressEnter()
     await waitForSession(session, (view) => view.providers[0]?.completeness === "complete", "complete Provider save")
     const completeFrame = await setup.waitForFrame((frame) => frame.includes("Provider saved: Original Provider"))
-    renderedFrames.push(completeFrame)
+    selectedRenderedFrames.push(completeFrame)
 
     // Reopening now performs automatic discovery with the newly saved endpoint and Credential Reference.
     await openProviderPicker()
@@ -392,14 +682,14 @@ test("real processes prove the complete Target Provider workflow without leaking
     setup.mockInput.pressEnter()
     await upstream.waitForCallCount(1)
     const automaticModelsFrame = await setup.waitForFrame((frame) => frame.includes("2 models available"))
-    renderedFrames.push(automaticModelsFrame)
+    selectedRenderedFrames.push(automaticModelsFrame)
     await assertReadOnlyInspection("complete automatic discovery", savedInspectionBefore)
     expect(upstream.calls[0]).toMatchObject({
       method: "GET",
       path: "/v1/models",
-      authorization: `Bearer ${providerSecret}`,
       body: "",
     })
+    expect(upstream.calls[0]!.authorization === `Bearer ${providerSecret}`).toBeTrue()
 
     // 3. Explicit discovery is a second read-only request; selecting is local until save.
     const explicitInspectionBefore = await readOnlyStateFingerprint(databasePath, configPath)
@@ -410,13 +700,13 @@ test("real processes prove the complete Target Provider workflow without leaking
       JSON.stringify(frame).includes('"kind":"model-discovery"')
     ))
     const explicitModelsFrame = await setup.waitForFrame((frame) => frame.includes("2 models available"))
-    renderedFrames.push(explicitModelsFrame)
+    selectedRenderedFrames.push(explicitModelsFrame)
     await assertReadOnlyInspection("explicit discovery", explicitInspectionBefore)
     leader("m")
     const modelPickerFrame = await setup.waitForFrame((frame) =>
       frame.includes("gpt-fixture-a") && frame.includes("gpt-fixture-b")
     )
-    renderedFrames.push(modelPickerFrame)
+    selectedRenderedFrames.push(modelPickerFrame)
     setup.mockInput.pressKey("down")
     setup.mockInput.pressEnter()
     await setup.waitForFrame((frame) => frame.includes("gpt-fixture-b") && !frame.includes("Select Model"))
@@ -427,18 +717,24 @@ test("real processes prove the complete Target Provider workflow without leaking
     const originalId = session.get().providers[0]!.id
 
     // 4. The safe Preset is copy-on-create and typing its draft makes no network request.
+    const presetOutboundStart = outboundOperationKinds.length
     await setup.mockInput.typeText("/provider")
     setup.mockInput.pressEnter()
     await setup.waitForFrame((frame) => frame.includes("OpenAI API (Responses)"))
     setup.mockInput.pressKey("down")
     setup.mockInput.pressEnter()
     const presetEditor = await setup.waitForFrame((frame) => frame.includes("https://api.openai.com/v1"))
-    renderedFrames.push(presetEditor)
+    selectedRenderedFrames.push(presetEditor)
     const callsBeforePresetTyping = upstream.calls.length
     await setup.mockInput.typeText("Preset Provider")
     await setup.renderOnce()
-    captureFrame(setup, renderedFrames, activities)
+    captureFrame(setup, selectedRenderedFrames)
     expect(upstream.calls).toHaveLength(callsBeforePresetTyping)
+    const presetOutboundOperations = outboundOperationKinds.slice(presetOutboundStart)
+    expect(presetOutboundOperations.length === 0).toBeTrue()
+    expect(presetOutboundOperations.some((kind) =>
+      kind === "discover-models" || kind === "check-reachability"
+    )).toBeFalse()
     setup.mockInput.pressEnter()
     await waitForSession(session, (view) => view.providers.length === 2, "Preset Provider save")
     await setup.waitForFrame((frame) => frame.includes("Run a target action"))
@@ -460,7 +756,7 @@ test("real processes prove the complete Target Provider workflow without leaking
     setup.mockInput.pressEnter()
     await waitForSession(session, (view) => view.providers.length === 3, "without-credential duplicate save")
     await setup.waitForFrame((frame) => frame.includes("Run a target action"))
-    captureFrame(setup, renderedFrames, activities)
+    captureFrame(setup, selectedRenderedFrames)
 
     await openProviderPicker()
     leader("c")
@@ -471,7 +767,7 @@ test("real processes prove the complete Target Provider workflow without leaking
     setup.mockInput.pressEnter()
     await waitForSession(session, (view) => view.providers.length === 4, "shared-credential duplicate save")
     await setup.waitForFrame((frame) => frame.includes("Run a target action"))
-    captureFrame(setup, renderedFrames, activities)
+    captureFrame(setup, selectedRenderedFrames)
 
     const withoutCredential = session.get().providers.find((provider) => provider.name.endsWith("Without"))!
     const sharedCredential = session.get().providers.find((provider) => provider.name.endsWith("Shared"))!
@@ -502,7 +798,7 @@ test("real processes prove the complete Target Provider workflow without leaking
       "persisted Provider order",
     )
     await setup.renderOnce()
-    captureFrame(setup, renderedFrames, activities)
+    captureFrame(setup, selectedRenderedFrames)
     const reconnectClient = await connect("e2e-reconnect")
     const reconnected = await reconnectClient.openTarget("codex")
     views.push(reconnected.get() as TargetView)
@@ -518,10 +814,22 @@ test("real processes prove the complete Target Provider workflow without leaking
     const activeFrame = await setup.waitForFrame((frame) =>
       frame.includes("Mode       Takeover") && frame.includes("Current Target Provider  Original Provider")
     )
-    renderedFrames.push(activeFrame)
+    selectedRenderedFrames.push(activeFrame)
 
     const activatedConfigBytes = await readFile(configPath)
     const managed = extractManagedConfig(activatedConfigBytes.toString("utf8"), "gpt-fixture-b")
+    const actualRoutingSplit = Math.floor(managed.credential.length / 2)
+    let actualRoutingDiagnostic = ""
+    try {
+      scanProcessOutputNoSecrets([[
+        Buffer.from(managed.credential.slice(0, actualRoutingSplit)),
+        Buffer.from(managed.credential.slice(actualRoutingSplit)),
+      ]], [managed.credential])
+    } catch (error) {
+      actualRoutingDiagnostic = error instanceof Error ? error.message : String(error)
+    }
+    expect(actualRoutingDiagnostic === "secret-scan-failed:process-output-stream-0").toBeTrue()
+    expect(actualRoutingDiagnostic.includes(managed.credential)).toBeFalse()
     expect(session.get().currentProviderId).toBe(originalId)
     expect(session.get().activatedSnapshot).toMatchObject({ providerId: originalId, model: "gpt-fixture-b" })
     const wrong = await chunkedPost(managed.endpoint, wrongRoutingSecret)
@@ -555,7 +863,7 @@ test("real processes prove the complete Target Provider workflow without leaking
       model: "gpt-fixture-b-declared",
     })
     expect(session.get().activatedSnapshot).toMatchObject({ providerId: originalId, model: "gpt-fixture-b" })
-    expect(await readFile(configPath)).toEqual(activatedConfigBytes)
+    expect(sensitiveDigest(await readFile(configPath)) === sensitiveDigest(activatedConfigBytes)).toBeTrue()
 
     const valid = await chunkedPost(managed.endpoint, managed.credential)
     await upstream.waitForCallCount(4)
@@ -564,15 +872,15 @@ test("real processes prove the complete Target Provider workflow without leaking
     expect(valid.body).toBe(SSE_BYTES.join(""))
     expect(upstream.calls[3]).toMatchObject({
       method: "POST",
-      authorization: `Bearer ${providerSecret}`,
       contentType: "application/json",
       testHeader: "preserved",
       body: '{"model":"gpt-test","input":"hello"}',
       path: "/v1/responses",
     })
+    expect(upstream.calls[3]!.authorization === `Bearer ${providerSecret}`).toBeTrue()
     await waitFor(() => views.some((view) => view.servingProviderId !== null), "Serving push")
     await setup.renderOnce()
-    const servedFrame = captureFrame(setup, renderedFrames, activities)
+    const servedFrame = captureFrame(setup, selectedRenderedFrames)
     expect(servedFrame.includes("Serving Provider  Original Provider")).toBeTrue()
 
     // 8. Reachability is an unauthenticated, headers-only 401 observation with no state change.
@@ -583,7 +891,7 @@ test("real processes prove the complete Target Provider workflow without leaking
     const reachabilityFrame = await setup.waitForFrame((frame) =>
       frame.includes("Reachable") && frame.includes("HTTP 401")
     )
-    renderedFrames.push(reachabilityFrame)
+    selectedRenderedFrames.push(reachabilityFrame)
     await assertReadOnlyInspection("reachability", reachabilityBefore)
     expect(upstream.calls[4]).toMatchObject({
       method: "GET",
@@ -594,12 +902,20 @@ test("real processes prove the complete Target Provider workflow without leaking
 
     // 9. Active deletion is rejected; deleting the inactive shared duplicate preserves its credential.
     const activeDeleteFrameStart = decodedInboundFrames.length
+    const activeDeleteRenderStart = rendererAudit.frames().length
     leader("d")
-    await setup.waitForFrame((frame) => frame.includes("Delete Provider?"))
+    const activeDeleteConfirmation = await setup.waitForFrame((frame) => frame.includes("Delete Provider?"))
+    selectedRenderedFrames.push(activeDeleteConfirmation)
     setup.mockInput.pressKey("y")
     await setup.waitFor(() => decodedInboundFrames.slice(activeDeleteFrameStart).some((frame) =>
       JSON.stringify(frame).includes("provider-referenced")
     ))
+    await setup.renderOnce()
+    const activeDeleteRejected = captureFrame(setup, selectedRenderedFrames)
+    const activeDeleteRenderedFrames = rendererAudit.frames().slice(activeDeleteRenderStart)
+    expect(activeDeleteRenderedFrames.some((frame) => frame.includes("Delete Provider?"))).toBeTrue()
+    expect(activeDeleteRejected.includes("Delete Provider?")).toBeFalse()
+    expect(activeDeleteRenderedFrames.length >= 2).toBeTrue()
     expect(session.get().providers).toHaveLength(4)
     expect(session.get().providers.find(({ id }) => id === originalId)?.activeReferences).toEqual([
       "current",
@@ -615,13 +931,15 @@ test("real processes prove the complete Target Provider workflow without leaking
     const referencesAfterDelete = credentialReferences(databasePath)
     expect(referencesAfterDelete.find(({ name }) => name === "Original Provider")!.credentialId).toBe(originalCredentialId)
     await setup.renderOnce()
-    captureFrame(setup, renderedFrames, activities)
+    captureFrame(setup, selectedRenderedFrames)
 
     // 10. Closing the Control Plane does not stop an active Routing Service.
     setup.mockInput.pressEscape()
     await setup.waitForFrame((frame) => frame.includes("Run a target action"))
     setup.mockInput.pressCtrlC()
     await setup.waitFor(() => setup!.renderer.isDestroyed)
+    rendererAudit.stop()
+    const allRenderedFrames = rendererAudit.frames()
     setup = undefined
     unsubscribe()
     unsubscribe = undefined
@@ -635,11 +953,12 @@ test("real processes prove the complete Target Provider workflow without leaking
     expect(upstream.calls[5]).toMatchObject({
       method: "POST",
       path: "/v1/responses",
-      authorization: `Bearer ${providerSecret}`,
     })
+    expect(upstream.calls[5]!.authorization === `Bearer ${providerSecret}`).toBeTrue()
 
     await writeFile(shutdownFile, "shutdown\n")
-    await waitFor(() => service!.exitCode !== null, "drained test shutdown")
+    const processResult = await processOutput.completed
+    expect(processResult).toEqual({ code: 0, signal: null })
     expect(service.exitCode).toBe(0)
     await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" })
     await expect(chunkedPost(managed.endpoint, managed.credential)).rejects.toBeDefined()
@@ -650,8 +969,14 @@ test("real processes prove the complete Target Provider workflow without leaking
       .all()
     receiptDatabase.close()
     const secrets = [providerSecret, wrongRoutingSecret, managed.credential]
+    for (const audit of outboundAudits) audit.finish()
     scanRawRpcFramesNoSecrets(rpcStreams, secrets)
-    scanNoSecrets([decodedInboundFrames, receipts, views, activities, renderedFrames, logs], secrets)
+    scanNoSecrets(
+      [decodedInboundFrames, receipts, views, selectedRenderedFrames, allRenderedFrames],
+      secrets,
+      "inbound-and-rendered-surfaces",
+    )
+    scanProcessOutputNoSecrets(processOutput.streams, secrets)
     expect(readOnlyInspections).toEqual([
       "incomplete automatic discovery",
       "complete automatic discovery",
@@ -659,30 +984,39 @@ test("real processes prove the complete Target Provider workflow without leaking
       "active declaration automatic discovery",
       "reachability",
     ])
-    expect(activities.length).toBeGreaterThan(0)
+    expect(allRenderedFrames.length).toBeGreaterThan(selectedRenderedFrames.length)
 
     for (const call of upstream.calls) {
-      expect(JSON.stringify(call)).not.toContain(wrongRoutingSecret)
-      expect(JSON.stringify(call)).not.toContain(managed.credential)
+      scanNoSecrets([call], [wrongRoutingSecret, managed.credential], "fake-upstream-routing-credentials")
       const headersWithoutAuthorization = { ...call.headers, authorization: null }
-      scanNoSecrets([{ ...call, authorization: null, headers: headersWithoutAuthorization }], [providerSecret])
+      scanNoSecrets(
+        [{ ...call, authorization: null, headers: headersWithoutAuthorization }],
+        [providerSecret],
+        "fake-upstream-provider-credential-outside-authorization",
+      )
       const expectsProviderAuthorization = call.path.endsWith("/models") || call.method === "POST"
-      expect(call.authorization).toBe(expectsProviderAuthorization ? `Bearer ${providerSecret}` : null)
-      expect(call.headers.authorization ?? null).toBe(expectsProviderAuthorization ? `Bearer ${providerSecret}` : null)
+      const hasExpectedProviderAuthorization = call.authorization === `Bearer ${providerSecret}`
+      const fullHeadersHaveExpectedProviderAuthorization =
+        (call.headers.authorization ?? null) === `Bearer ${providerSecret}`
+      expect(hasExpectedProviderAuthorization).toBe(expectsProviderAuthorization)
+      expect(fullHeadersHaveExpectedProviderAuthorization).toBe(expectsProviderAuthorization)
     }
     expect(await controlledTreeFingerprint(operatorHomeCanary)).toBe(operatorHomeCanaryBefore)
   } finally {
+    rendererAudit?.stop()
     if (setup && !setup.renderer.isDestroyed) setup.renderer.destroy()
     unsubscribe?.()
     await session?.close().catch(() => {})
     await client?.close().catch(() => {})
     await writeFile(shutdownFile, "shutdown\n").catch(() => {})
     if (service && service.exitCode === null) {
-      await Promise.race([
-        new Promise<void>((resolveExit) => service!.once("exit", () => resolveExit())),
-        Bun.sleep(deadlineMs).then(() => { service!.kill("SIGKILL") }),
+      const closed = await Promise.race([
+        processOutput!.completed.then(() => true, () => true),
+        Bun.sleep(deadlineMs).then(() => false),
       ])
+      if (!closed) service.kill("SIGKILL")
     }
+    await processOutput?.completed.catch(() => {})
     await upstream.stop()
   }
 })

@@ -55,6 +55,12 @@ export function ProviderPicker(props: ProviderPickerProps) {
       "provider.delete": props.onDelete,
     },
   })
+  useCommandLayer({
+    scope: "overlay",
+    priority: 400,
+    enabled: () => overlay.depth === 1 && props.activationMode() !== undefined,
+    handlers: { "overlay.close": () => {} },
+  })
 
   const moveSelection = (delta: -1 | 1) => {
     const current = selected()

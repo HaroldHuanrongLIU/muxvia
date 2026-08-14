@@ -769,6 +769,16 @@ test("Provider Direct Activation disables picker actions while pending then clos
     const pendingFrame = await setup.waitForFrame((frame) => frame.includes("Applying Direct Activation…"))
     expect(pendingFrame).toContain("Providers")
 
+    setup.mockInput.pressEscape()
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    setup.mockInput.pressKey("p", { ctrl: true })
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    await setup.renderOnce()
+    const guardedFrame = setup.captureCharFrame()
+    expect(guardedFrame).toContain("Applying Direct Activation…")
+    expect(guardedFrame).toContain("Providers")
+    expect(guardedFrame).not.toContain("Search commands")
+
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("d")
     setup.mockInput.pressEnter()
@@ -912,7 +922,7 @@ test("a Takeover-required Provider offers only Takeover or cancel with scoped si
   }
 })
 
-test("authoritative takeover-required opens the same confirmation without retaining its error", async () => {
+test("authoritative takeover-required preserves the pending picker and restores it after cancel", async () => {
   const selected = provider({
     id: "00000000-0000-4000-8000-000000000011",
     name: "Changed Requirement Provider",
@@ -924,16 +934,9 @@ test("authoritative takeover-required opens the same confirmation without retain
     providers: [{ ...selected, routingRequirement: "takeover-required" }],
     currentProviderId: selected.id,
   })
-  let attempts = 0
+  const pendingDirect = deferred<ActionOutcome>()
   let session!: MemoryTargetSession
-  session = new MemoryTargetSession(view({ providers: [selected] }), async () => {
-    attempts++
-    if (attempts === 1) {
-      session.setView(authoritative)
-      throw { code: "takeover-required", message: "backend-takeover-secret-must-not-render" }
-    }
-    return { status: "applied", view: authoritative }
-  })
+  session = new MemoryTargetSession(view({ providers: [selected] }), async () => await pendingDirect.promise)
   const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
   try {
     await setup.renderOnce()
@@ -941,8 +944,18 @@ test("authoritative takeover-required opens the same confirmation without retain
     await setup.mockInput.typeText("/providers")
     setup.mockInput.pressEnter()
     await setup.waitForFrame((frame) => frame.includes("Changed Requirement Provider"))
+    const pickerFocus = setup.renderer.currentFocusedRenderable as InputRenderable
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("a")
+    await setup.waitFor(() => session.actions.length === 1)
+    await setup.waitForFrame((frame) => frame.includes("Applying Direct Activation…"))
+
+    setup.mockInput.pressEscape()
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    setup.mockInput.pressKey("p", { ctrl: true })
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    session.setView(authoritative)
+    pendingDirect.reject({ code: "takeover-required", message: "backend-takeover-secret-must-not-render" })
     const confirmation = await setup.waitForFrame((frame) => frame.includes("Enable Target Takeover?"))
 
     expect(session.actions).toEqual([{
@@ -954,15 +967,20 @@ test("authoritative takeover-required opens the same confirmation without retain
     expect(confirmation).not.toContain("Action failed")
     expect(confirmation).not.toContain(credentialSecret)
 
-    setup.mockInput.pressEnter()
-    await setup.waitFor(() => session.actions.length === 2)
-    expect(session.actions[1]).toEqual({
-      kind: "activate-provider",
-      providerId: selected.id,
-      mode: "takeover",
-    })
+    setup.mockInput.pressEscape()
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    await setup.renderOnce()
+    const restored = setup.captureCharFrame()
+    expect(restored).toContain("Providers")
+    expect(restored).not.toContain("Commands")
+    const restoredFocus = setup.renderer.currentFocusedRenderable as InputRenderable
+    expect(pickerFocus.isDestroyed).toBeTrue()
+    expect(restoredFocus.isDestroyed).toBeFalse()
+    expect(restoredFocus.placeholder).toBe("Navigate Providers")
+    expect(session.actions).toHaveLength(1)
     expect(JSON.stringify(session.actions)).not.toContain("backend-takeover-secret-must-not-render")
   } finally {
+    pendingDirect.reject({ code: "takeover-required" })
     setup.renderer.destroy()
   }
 })

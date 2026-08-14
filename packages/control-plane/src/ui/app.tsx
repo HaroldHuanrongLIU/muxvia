@@ -12,7 +12,9 @@ import { CommandPalette } from "./command-palette"
 import { ExitConfirmation } from "./exit-confirmation"
 import { Home } from "./home"
 import { OverlayProvider, useOverlay } from "./overlay-stack"
-import { ProviderForm, type ProviderFormRef } from "./provider-form"
+import { ProviderDeleteConfirmation } from "./provider-delete-confirmation"
+import { ProviderForm, type ProviderDraft, type ProviderFormRef, type ProviderFormResult } from "./provider-form"
+import { ProviderPicker } from "./provider-picker"
 import { TargetSidebar } from "./target-sidebar"
 import { TargetView, type ActivityEntry } from "./target-view"
 
@@ -27,6 +29,18 @@ export interface AppProps {
 
 type Notice = { kind: "error" | "success"; text: string }
 type ActivityDraft = Omit<ActivityEntry, "id">
+type Editor = { mode: "create" | "edit"; draft: ProviderDraft; credentialPresence: "present" | "missing" }
+
+function moveIdentity(ids: readonly string[], id: string | undefined, delta: -1 | 1): string[] | undefined {
+  if (!id) return undefined
+  const index = ids.indexOf(id)
+  const target = index + delta
+  if (index < 0 || target < 0 || target >= ids.length) return undefined
+  const next = [...ids]
+  const [moved] = next.splice(index, 1)
+  next.splice(target, 0, moved!)
+  return next
+}
 
 function actionProblem(error: unknown): ActivityDraft {
   const code = typeof error === "object" && error !== null && "code" in error
@@ -81,8 +95,10 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   const showCommandPalette = useCommandPaletteOpener(props.t)
   const [route, setRoute] = createSignal<ShellRoute>({ kind: "home" })
   const [view, setView] = createSignal<TargetViewProjection>(props.session.get())
-  const [providerForm, setProviderForm] = createSignal(false)
+  const [editor, setEditor] = createSignal<Editor>()
+  const [selectedProviderId, setSelectedProviderId] = createSignal<string>()
   const [saving, setSaving] = createSignal(false)
+  const [providerMutationPending, setProviderMutationPending] = createSignal(false)
   const [applying, setApplying] = createSignal(false)
   const [notice, setNotice] = createSignal<Notice>()
   const [activities, setActivities] = createSignal<ActivityEntry[]>([])
@@ -92,6 +108,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   let lastViewSequence = props.session.get().viewSequence
   let editorGeneration = 0
   let exitScheduled = false
+  let providerPickerScheduled = false
   let exiting = false
   let disposed = false
 
@@ -123,7 +140,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   const showHome = () => {
     providerFormRef?.clearSensitive()
     editorGeneration++
-    setProviderForm(false)
+    setEditor()
     setNotice()
     setRoute({ kind: "home" })
   }
@@ -148,7 +165,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     exiting = true
     providerFormRef?.clearSensitive()
     editorGeneration++
-    setProviderForm(false)
+    setEditor()
     overlay.clear()
     destroyRenderer()
   }
@@ -178,7 +195,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) })
     if (isRoute("codex")) appendActivity(activity)
   }
-  const saveProvider = async (action: Extract<TargetAction, { kind: "create-provider" }>) => {
+  const saveProvider = async (action: ProviderFormResult) => {
     if (saving()) return false
     const generation = editorGeneration
     const providerName = action.name
@@ -206,6 +223,102 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     } finally {
       if (!disposed && !exiting) setSaving(false)
     }
+  }
+
+  const selectedProvider = () => view().providers.find((provider) => provider.id === selectedProviderId())
+  const openEditor = (mode: Editor["mode"], provider?: TargetViewProjection["providers"][number]) => {
+    if (saving() || providerMutationPending()) return
+    setNotice()
+    editorGeneration++
+    setEditor({
+      mode,
+      draft: provider
+        ? {
+          name: provider.name,
+          baseUrl: provider.baseUrl,
+          model: provider.model,
+          providerId: provider.id,
+          providerRevision: provider.providerRevision,
+        }
+        : { name: "", baseUrl: "", model: "" },
+      credentialPresence: provider?.credential ?? "missing",
+    })
+  }
+  const openProviderPicker = () => {
+    if (saving() || providerMutationPending() || providerPickerScheduled) return
+    providerPickerScheduled = true
+    queueMicrotask(() => {
+      providerPickerScheduled = false
+      if (disposed || saving() || providerMutationPending()) return
+      setNotice()
+      const first = view().providers[0]
+      setSelectedProviderId((current) => view().providers.some((provider) => provider.id === current) ? current : first?.id)
+      overlay.replace({
+        id: "provider-picker",
+        render: () => <ProviderPicker
+          providers={() => view().providers}
+          selectedId={selectedProviderId}
+          t={props.t}
+          pending={providerMutationPending}
+          onSelectedIdChange={setSelectedProviderId}
+          onEdit={() => {
+            const provider = selectedProvider()
+            if (!provider || providerMutationPending()) return
+            overlay.closeTop()
+            openEditor("edit", provider)
+          }}
+          onMove={(delta) => moveSelected(delta)}
+          onDelete={() => requestDelete()}
+        />,
+      })
+    })
+  }
+
+  const runProviderMutation = async (action: Extract<TargetAction, { kind: "reorder-providers" | "delete-provider" }>) => {
+    if (providerMutationPending()) return false
+    setProviderMutationPending(true)
+    setNotice()
+    try {
+      const outcome = await props.session.act(action)
+      if (disposed || exiting) return false
+      installView(outcome.view, "action")
+      return true
+    } catch (error) {
+      if (disposed || exiting) return false
+      installView(props.session.get() as TargetViewProjection, "action")
+      const activity = actionProblem(error)
+      appendActivity(activity)
+      setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) })
+      return false
+    } finally {
+      if (!disposed && !exiting) setProviderMutationPending(false)
+    }
+  }
+  const moveSelected = (delta: -1 | 1) => {
+    const nextIds = moveIdentity(view().providers.map(({ id }) => id), selectedProviderId(), delta)
+    if (nextIds) void runProviderMutation({ kind: "reorder-providers", providerIds: nextIds })
+  }
+  const requestDelete = () => {
+    const provider = selectedProvider()
+    if (!provider || providerMutationPending()) return
+    overlay.push({
+      id: "provider-delete-confirmation",
+      dismissOnEscape: false,
+      render: () => <ProviderDeleteConfirmation
+        name={provider.name}
+        t={props.t}
+        pending={providerMutationPending()}
+        onCancel={() => overlay.closeTop()}
+        onConfirm={() => {
+          overlay.closeTop()
+          void runProviderMutation({
+            kind: "delete-provider",
+            providerId: provider.id,
+            providerRevision: provider.providerRevision,
+          })
+        }}
+      />,
+    })
   }
 
   const applyTakeover = async () => {
@@ -268,16 +381,15 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   useCommandLayer({
     scope: "codex",
     priority: 100,
-    enabled: () => overlay.depth === 0 && isRoute("codex") && !providerForm(),
+    enabled: () => overlay.depth === 0 && isRoute("codex") && !editor(),
     handlers: {
       "target.home": showHome,
       "target.sidebar.toggle": () => setSidebarOpen((open) => !open),
       "provider.create": () => {
         if (saving() || applying()) return
-        setNotice()
-        editorGeneration++
-        setProviderForm(true)
+        openEditor("create")
       },
+      "provider.list": openProviderPicker,
       "target.takeover.apply": () => { void applyTakeover() },
     },
   })
@@ -313,7 +425,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
         <Match when={isRoute("codex")}>
           <box flexGrow={1} flexShrink={1} flexDirection="row" columnGap={sidebarGap()}>
             <Show
-              when={providerForm()}
+              when={editor()}
               fallback={(
                 <scrollbox minWidth={1} flexGrow={1} flexShrink={1} paddingTop={contentPaddingTop()}>
                   <TargetView view={view()} activities={activities()} t={props.t} />
@@ -327,13 +439,16 @@ function Shell(props: { session: TargetSession; t: Translator }) {
                     <text fg={notice()?.kind === "error" ? theme.error : theme.success}>{notice()?.text}</text>
                   </Show>
                   <ProviderForm
+                    mode={editor()!.mode}
+                    initialDraft={editor()!.draft}
+                    credentialPresence={editor()!.credentialPresence}
                     t={props.t}
                     ref={(value) => { providerFormRef = value }}
                     pending={saving()}
                     onDirtyChange={() => {}}
                     onCancel={() => {
                       editorGeneration++
-                      setProviderForm(false)
+                      setEditor()
                     }}
                     onSave={saveProvider}
                   />
@@ -344,10 +459,11 @@ function Shell(props: { session: TargetSession; t: Translator }) {
               <TargetSidebar view={view()} t={props.t} width={sidebarWidth()} />
             </Show>
           </box>
-          <Show when={!providerForm()}>
+          <Show when={!editor() && overlay.depth === 0}>
             <ActionPrompt
               scope="codex"
               placeholder={props.t("prompt.target")}
+              focusEnabled={() => overlay.depth === 0}
               metadata={applying()
                 ? props.t("activity.applying")
                 : `${props.t("prompt.meta.codex")} · ${props.t("prompt.hint.sidebar")} · ${props.t("prompt.hint.back")} · ${props.t("prompt.hint.exit")}`}

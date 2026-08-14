@@ -8,15 +8,28 @@ import type { Translator } from "../i18n"
 import { theme } from "../theme"
 import { useOverlay } from "./overlay-stack"
 
-type ProviderDraft = Extract<TargetAction, { kind: "create-provider" }>
+export interface ProviderDraft {
+  name: string
+  baseUrl: string
+  model: string
+  providerId?: string
+  providerRevision?: number
+}
+
+export type ProviderFormResult = Extract<TargetAction,
+  { kind: "create-provider" | "update-provider" | "duplicate-provider" }
+>
 
 export interface ProviderFormProps {
+  mode: "create" | "edit" | "duplicate"
+  initialDraft: ProviderDraft
+  credentialPresence: "present" | "missing"
   pending: boolean
   t: Translator
   ref?: (value: ProviderFormRef | undefined) => void
   onDirtyChange: (dirty: boolean) => void
   onCancel: () => void
-  onSave: (draft: ProviderDraft) => Promise<boolean>
+  onSave(result: ProviderFormResult): Promise<boolean>
 }
 
 export interface ProviderFormRef {
@@ -25,13 +38,18 @@ export interface ProviderFormRef {
   focus(): void
 }
 
+type CredentialIntent = "keep" | "remove" | "replace"
+
 export function ProviderForm(props: ProviderFormProps) {
   const overlay = useOverlay()
   const [focus, setFocus] = createSignal(0)
-  const [name, setName] = createSignal("")
-  const [baseUrl, setBaseUrl] = createSignal("")
-  const [model, setModel] = createSignal("")
+  const [name, setName] = createSignal(props.initialDraft.name)
+  const [baseUrl, setBaseUrl] = createSignal(props.initialDraft.baseUrl)
+  const [model, setModel] = createSignal(props.initialDraft.model)
   const [credential, setCredential] = createSignal("")
+  const [credentialIntent, setCredentialIntent] = createSignal<CredentialIntent>(
+    props.mode === "create" || props.credentialPresence === "missing" ? "remove" : "keep",
+  )
   const [dirty, setDirtySignal] = createSignal(false)
   const inputs: Array<InputRenderable | undefined> = []
   let cancelScheduled = false
@@ -66,26 +84,46 @@ export function ProviderForm(props: ProviderFormProps) {
     props.ref?.(undefined)
   })
 
+  const credentialEdit = (): Extract<TargetAction, { kind: "create-provider" }> ["credential"] => {
+    if (credentialIntent() === "replace") return { kind: "replace", value: credential() }
+    if (credentialIntent() === "keep") return { kind: "keep" }
+    return { kind: "remove" }
+  }
   const submit = async () => {
     if (props.pending) return
-    const draft: ProviderDraft = {
-      kind: "create-provider",
-      name: name(),
-      baseUrl: baseUrl(),
-      model: model(),
-      credential: credential()
-        ? { kind: "replace", value: credential() }
-        : { kind: "remove" },
-      presetKey: null,
-    }
+    const fields = { name: name(), baseUrl: baseUrl(), model: model() }
+    const result: ProviderFormResult = props.mode === "create"
+      ? { kind: "create-provider", ...fields, credential: credentialEdit(), presetKey: null }
+      : props.mode === "edit"
+        ? {
+          kind: "update-provider",
+          ...fields,
+          providerId: props.initialDraft.providerId!,
+          providerRevision: props.initialDraft.providerRevision!,
+          credential: credentialEdit(),
+        }
+        : {
+          kind: "duplicate-provider",
+          ...fields,
+          sourceProviderId: props.initialDraft.providerId!,
+          sourceProviderRevision: props.initialDraft.providerRevision!,
+          credential: credentialIntent() === "replace"
+            ? { kind: "replace", value: credential() }
+            : credentialIntent() === "keep" ? { kind: "reuse-source" } : { kind: "without" },
+        }
     clearSensitive()
-    const applied = await props.onSave(draft)
+    const applied = await props.onSave(result)
     if (applied && !disposed) {
       setDirty(false)
       props.onCancel()
     }
   }
 
+  const removeCredential = () => {
+    clearSensitive()
+    setCredentialIntent("remove")
+    setDirty(true)
+  }
   const cancel = () => {
     if (cancelScheduled) return
     cancelScheduled = true
@@ -102,12 +140,12 @@ export function ProviderForm(props: ProviderFormProps) {
     handlers: {
       "provider.save": () => { void submit() },
       "provider.cancel": cancel,
+      "provider.credential.remove": removeCredential,
     },
   })
 
   useKeyboard((key) => {
-    if (key.defaultPrevented) return
-    if (overlay.depth > 0) return
+    if (key.defaultPrevented || overlay.depth > 0) return
     if (key.name === "tab") {
       key.preventDefault()
       key.stopPropagation()
@@ -118,9 +156,9 @@ export function ProviderForm(props: ProviderFormProps) {
     if (key.name === "backspace") {
       key.preventDefault()
       key.stopPropagation()
-      const current = credential()
-      if (current) {
-        setCredential(current.slice(0, -1))
+      if (credential()) {
+        setCredential((current) => current.slice(0, -1))
+        setCredentialIntent("replace")
         setDirty(true)
       }
       return
@@ -129,19 +167,19 @@ export function ProviderForm(props: ProviderFormProps) {
       key.preventDefault()
       key.stopPropagation()
       setCredential((current) => current + key.sequence)
+      setCredentialIntent("replace")
       setDirty(true)
     }
   })
 
   usePaste((event) => {
-    if (event.defaultPrevented) return
-    if (overlay.depth > 0) return
-    if (focus() !== 3) return
+    if (event.defaultPrevented || overlay.depth > 0 || focus() !== 3) return
     event.preventDefault()
     event.stopPropagation()
     const value = new TextDecoder().decode(event.bytes).replace(/[\r\n]/g, "")
     if (!value) return
     setCredential((current) => current + value)
+    setCredentialIntent("replace")
     setDirty(true)
   })
 
@@ -152,10 +190,14 @@ export function ProviderForm(props: ProviderFormProps) {
     focusedTextColor: theme.text,
     placeholderColor: theme.muted,
   }
+  const title = props.mode === "edit" ? "provider.editor.edit-title" : "provider.editor.title"
+  const credentialPlaceholder = () => credentialIntent() === "keep"
+    ? props.t("provider.credential-reference.present")
+    : props.t("provider.placeholder.credential")
 
   return (
     <box backgroundColor={theme.panel} flexDirection="column" padding={1} rowGap={1}>
-      <text fg={theme.text}>{props.t("provider.editor.title")}</text>
+      <text fg={theme.text}>{props.t(title)}</text>
       <box flexDirection="column">
         <text fg={focus() === 0 ? theme.primary : theme.muted}>{props.t("provider.field.name")}</text>
         <input ref={(input: InputRenderable) => { inputs[0] = input }} {...inputStyle} focused={focus() === 0} value={name()} onInput={update(name, setName)} placeholder={props.t("provider.placeholder.name")} />
@@ -170,7 +212,7 @@ export function ProviderForm(props: ProviderFormProps) {
       </box>
       <box flexDirection="column">
         <text fg={focus() === 3 ? theme.primary : theme.muted}>{props.t("provider.field.credential")}</text>
-        <text fg={theme.text} bg={theme.element}>{credential() ? "•".repeat(credential().length) : props.t("provider.placeholder.credential")}</text>
+        <text fg={theme.text} bg={theme.element}>{credential() ? "•".repeat(credential().length) : credentialPlaceholder()}</text>
       </box>
       <text fg={theme.muted}>{props.t(props.pending ? "provider.editor.saving" : "provider.editor.help")}</text>
     </box>

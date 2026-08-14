@@ -17,7 +17,7 @@ import { encodeFrame, FrameDecoder } from "../src/control/framing"
 import { App } from "../src/ui/app"
 import type { TargetSession } from "../src/control/target-session"
 import { parseClientFrame, type TargetView } from "../src/control/types"
-import { SSE_BYTES, startFakeUpstream } from "../../../tests/e2e/fake-upstream"
+import { SSE_BYTES, startFakeUpstream, type CapturedRequest } from "../../../tests/e2e/fake-upstream"
 
 const providerSecret = "provider-secret-must-not-escape"
 const wrongRoutingSecret = "routing-secret-must-not-escape"
@@ -36,7 +36,7 @@ async function controlledTreeFingerprint(path: string): Promise<string> {
     const own = await stat(path)
     const metadata = [own.mode, own.size, own.mtimeMs]
     if (!own.isDirectory()) {
-      return JSON.stringify([metadata, Buffer.from(await readFile(path)).toString("base64")])
+      return JSON.stringify([metadata, sensitiveDigest(await readFile(path))])
     }
     const children = await Promise.all((await readdir(path)).sort().map(async (name) => [
       name,
@@ -249,6 +249,72 @@ function sensitiveDigest(value: unknown): string | null {
       ? Buffer.from(value)
       : Buffer.from(String(value))
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`
+}
+
+function authorizationClassification(
+  value: string | null,
+  expectedProviderCredential: string,
+): "absent" | "expected-provider" | "unexpected" {
+  if (value === null) return "absent"
+  return value === `Bearer ${expectedProviderCredential}` ? "expected-provider" : "unexpected"
+}
+
+function safeCapturedRequestProjection(
+  request: CapturedRequest,
+  expectedProviderCredential: string,
+): {
+  method: string
+  pathClass: "models" | "responses" | "edited-reachability" | "other"
+  hasQuery: boolean
+  authorizationClass: "absent" | "expected-provider" | "unexpected"
+  headerAuthorizationClass: "absent" | "expected-provider" | "unexpected"
+  hasAuthorizationHeader: boolean
+  hasContentTypeHeader: boolean
+  hasTestHeader: boolean
+  contentTypeClass: "absent" | "application-json" | "other"
+  testHeaderClass: "absent" | "preserved" | "other"
+  bodyClass: "empty" | "expected-response-request" | "other"
+  bodyBytes: number
+  bodyDigest: string
+} {
+  const path = request.path.split("?", 1)[0]
+  const pathClass = path === "/v1/models"
+    ? "models"
+    : path === "/v1/responses"
+      ? "responses"
+      : path === "/v1/edited"
+        ? "edited-reachability"
+        : "other"
+  return {
+    method: request.method,
+    pathClass,
+    hasQuery: request.path.includes("?"),
+    authorizationClass: authorizationClassification(request.authorization, expectedProviderCredential),
+    headerAuthorizationClass: authorizationClassification(
+      request.headers.authorization ?? null,
+      expectedProviderCredential,
+    ),
+    hasAuthorizationHeader: request.headers.authorization !== undefined,
+    hasContentTypeHeader: request.headers["content-type"] !== undefined,
+    hasTestHeader: request.headers["x-test-preserved"] !== undefined,
+    contentTypeClass: request.contentType === null
+      ? "absent"
+      : request.contentType === "application/json"
+        ? "application-json"
+        : "other",
+    testHeaderClass: request.testHeader === null
+      ? "absent"
+      : request.testHeader === "preserved"
+        ? "preserved"
+        : "other",
+    bodyClass: request.body === ""
+      ? "empty"
+      : request.body === '{"model":"gpt-test","input":"hello"}'
+        ? "expected-response-request"
+        : "other",
+    bodyBytes: Buffer.byteLength(request.body),
+    bodyDigest: sensitiveDigest(request.body)!,
+  }
 }
 
 function readDatabaseProjection(path: string): unknown {
@@ -511,6 +577,49 @@ test("secret-scan failures expose only a fixed redacted diagnostic", () => {
   expect(diagnostic.includes(surface)).toBeFalse()
 })
 
+test("CapturedRequest matcher diagnostics never retain raw request surfaces", () => {
+  const sentinel = "controlled-request-diagnostic-secret"
+  const request: CapturedRequest = {
+    authorization: `Bearer ${sentinel}`,
+    headers: {
+      authorization: `Bearer ${sentinel}`,
+      "x-controlled": sentinel,
+    },
+    contentType: "application/json",
+    method: "POST",
+    testHeader: "preserved",
+    body: `{"credential":"${sentinel}"}`,
+    path: `/v1/responses?credential=${sentinel}`,
+  }
+  const projection = safeCapturedRequestProjection(request, sentinel)
+  let diagnostic = ""
+  try {
+    expect(projection).toMatchObject({ method: "GET" })
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+
+  expect(diagnostic.length > 0).toBeTrue()
+  expect(diagnostic.includes(sentinel)).toBeFalse()
+  expect(diagnostic.includes(request.body)).toBeFalse()
+  expect(diagnostic.includes(request.path)).toBeFalse()
+  expect(diagnostic.includes(JSON.stringify(request.headers))).toBeFalse()
+  expect(projection).toMatchObject({
+    method: "POST",
+    pathClass: "responses",
+    hasQuery: true,
+    authorizationClass: "expected-provider",
+    headerAuthorizationClass: "expected-provider",
+    hasAuthorizationHeader: true,
+    hasContentTypeHeader: false,
+    hasTestHeader: false,
+    contentTypeClass: "application-json",
+    testHeaderClass: "preserved",
+    bodyClass: "other",
+  })
+  expect(projection.bodyDigest.includes(sentinel)).toBeFalse()
+})
+
 test("real processes prove the complete Target Provider workflow without leaking secrets or mutating inspections", async () => {
   const root = await mkdtemp(join(tmpdir(), "muxvia-e2e-"))
   roots.push(root)
@@ -651,14 +760,14 @@ test("real processes prove the complete Target Provider workflow without leaking
 
     // 2. The first saved-state inspection sees only the incomplete saved declaration.
     const incompletePickerFrame = await openProviderPicker()
-    expect(incompletePickerFrame).toContain("Incomplete")
+    expect(incompletePickerFrame.includes("Incomplete")).toBeTrue()
     selectedRenderedFrames.push(incompletePickerFrame)
     const incompleteInspectionBefore = await readOnlyStateFingerprint(databasePath, configPath)
     setup.mockInput.pressEnter()
     const missingCredentialFrame = await setup.waitForFrame((frame) => frame.includes("Credential missing"))
     selectedRenderedFrames.push(missingCredentialFrame)
     await assertReadOnlyInspection("incomplete automatic discovery", incompleteInspectionBefore)
-    expect(upstream.calls).toHaveLength(0)
+    expect(upstream.calls.length === 0).toBeTrue()
 
     // Typing endpoint/model/credential never starts discovery; save is the first declaration mutation.
     setup.mockInput.pressTab()
@@ -670,7 +779,7 @@ test("real processes prove the complete Target Provider workflow without leaking
     await setup.renderOnce()
     const formFrame = captureFrame(setup, selectedRenderedFrames)
     expect(formFrame.includes(providerSecret)).toBeFalse()
-    expect(upstream.calls).toHaveLength(0)
+    expect(upstream.calls.length === 0).toBeTrue()
     setup.mockInput.pressEnter()
     await waitForSession(session, (view) => view.providers[0]?.completeness === "complete", "complete Provider save")
     const completeFrame = await setup.waitForFrame((frame) => frame.includes("Provider saved: Original Provider"))
@@ -684,12 +793,20 @@ test("real processes prove the complete Target Provider workflow without leaking
     const automaticModelsFrame = await setup.waitForFrame((frame) => frame.includes("2 models available"))
     selectedRenderedFrames.push(automaticModelsFrame)
     await assertReadOnlyInspection("complete automatic discovery", savedInspectionBefore)
-    expect(upstream.calls[0]).toMatchObject({
+    expect(safeCapturedRequestProjection(upstream.calls[0]!, providerSecret)).toMatchObject({
       method: "GET",
-      path: "/v1/models",
-      body: "",
+      pathClass: "models",
+      hasQuery: false,
+      authorizationClass: "expected-provider",
+      headerAuthorizationClass: "expected-provider",
+      hasAuthorizationHeader: true,
+      hasContentTypeHeader: false,
+      hasTestHeader: false,
+      contentTypeClass: "absent",
+      testHeaderClass: "absent",
+      bodyClass: "empty",
+      bodyBytes: 0,
     })
-    expect(upstream.calls[0]!.authorization === `Bearer ${providerSecret}`).toBeTrue()
 
     // 3. Explicit discovery is a second read-only request; selecting is local until save.
     const explicitInspectionBefore = await readOnlyStateFingerprint(databasePath, configPath)
@@ -729,7 +846,7 @@ test("real processes prove the complete Target Provider workflow without leaking
     await setup.mockInput.typeText("Preset Provider")
     await setup.renderOnce()
     captureFrame(setup, selectedRenderedFrames)
-    expect(upstream.calls).toHaveLength(callsBeforePresetTyping)
+    expect(upstream.calls.length === callsBeforePresetTyping).toBeTrue()
     const presetOutboundOperations = outboundOperationKinds.slice(presetOutboundStart)
     expect(presetOutboundOperations.length === 0).toBeTrue()
     expect(presetOutboundOperations.some((kind) =>
@@ -834,7 +951,7 @@ test("real processes prove the complete Target Provider workflow without leaking
     expect(session.get().activatedSnapshot).toMatchObject({ providerId: originalId, model: "gpt-fixture-b" })
     const wrong = await chunkedPost(managed.endpoint, wrongRoutingSecret)
     expect(wrong.status).toBe(401)
-    expect(upstream.calls).toHaveLength(2)
+    expect(upstream.calls.length === 2).toBeTrue()
 
     await openProviderPicker()
     for (let step = 0; step < 2; step++) {
@@ -850,7 +967,7 @@ test("real processes prove the complete Target Provider workflow without leaking
     await setup.mockInput.typeText("/edited")
     setup.mockInput.pressTab()
     await setup.mockInput.typeText("-declared")
-    expect(upstream.calls).toHaveLength(3)
+    expect(upstream.calls.length === 3).toBeTrue()
     setup.mockInput.pressEnter()
     await waitForSession(
       session,
@@ -868,16 +985,26 @@ test("real processes prove the complete Target Provider workflow without leaking
     const valid = await chunkedPost(managed.endpoint, managed.credential)
     await upstream.waitForCallCount(4)
     expect(valid.status).toBe(201)
-    expect(valid.headers["content-type"]).toStartWith("text/event-stream")
-    expect(valid.body).toBe(SSE_BYTES.join(""))
-    expect(upstream.calls[3]).toMatchObject({
+    const responseContentType = valid.headers["content-type"]
+    const responseIsEventStream = Array.isArray(responseContentType)
+      ? responseContentType.some((value) => value.startsWith("text/event-stream"))
+      : responseContentType?.startsWith("text/event-stream") === true
+    expect(responseIsEventStream).toBeTrue()
+    expect(valid.body === SSE_BYTES.join("")).toBeTrue()
+    expect(safeCapturedRequestProjection(upstream.calls[3]!, providerSecret)).toMatchObject({
       method: "POST",
-      contentType: "application/json",
-      testHeader: "preserved",
-      body: '{"model":"gpt-test","input":"hello"}',
-      path: "/v1/responses",
+      pathClass: "responses",
+      hasQuery: false,
+      authorizationClass: "expected-provider",
+      headerAuthorizationClass: "expected-provider",
+      hasAuthorizationHeader: true,
+      hasContentTypeHeader: true,
+      hasTestHeader: true,
+      contentTypeClass: "application-json",
+      testHeaderClass: "preserved",
+      bodyClass: "expected-response-request",
+      bodyBytes: 36,
     })
-    expect(upstream.calls[3]!.authorization === `Bearer ${providerSecret}`).toBeTrue()
     await waitFor(() => views.some((view) => view.servingProviderId !== null), "Serving push")
     await setup.renderOnce()
     const servedFrame = captureFrame(setup, selectedRenderedFrames)
@@ -893,11 +1020,19 @@ test("real processes prove the complete Target Provider workflow without leaking
     )
     selectedRenderedFrames.push(reachabilityFrame)
     await assertReadOnlyInspection("reachability", reachabilityBefore)
-    expect(upstream.calls[4]).toMatchObject({
+    expect(safeCapturedRequestProjection(upstream.calls[4]!, providerSecret)).toMatchObject({
       method: "GET",
-      path: "/v1/edited",
-      authorization: null,
-      body: "",
+      pathClass: "edited-reachability",
+      hasQuery: false,
+      authorizationClass: "absent",
+      headerAuthorizationClass: "absent",
+      hasAuthorizationHeader: false,
+      hasContentTypeHeader: false,
+      hasTestHeader: false,
+      contentTypeClass: "absent",
+      testHeaderClass: "absent",
+      bodyClass: "empty",
+      bodyBytes: 0,
     })
 
     // 9. Active deletion is rejected; deleting the inactive shared duplicate preserves its credential.
@@ -950,11 +1085,20 @@ test("real processes prove the complete Target Provider workflow without leaking
     await upstream.waitForCallCount(6)
     expect(second.status).toBe(201)
     expect(service.exitCode).toBeNull()
-    expect(upstream.calls[5]).toMatchObject({
+    expect(safeCapturedRequestProjection(upstream.calls[5]!, providerSecret)).toMatchObject({
       method: "POST",
-      path: "/v1/responses",
+      pathClass: "responses",
+      hasQuery: false,
+      authorizationClass: "expected-provider",
+      headerAuthorizationClass: "expected-provider",
+      hasAuthorizationHeader: true,
+      hasContentTypeHeader: true,
+      hasTestHeader: true,
+      contentTypeClass: "application-json",
+      testHeaderClass: "preserved",
+      bodyClass: "expected-response-request",
+      bodyBytes: 36,
     })
-    expect(upstream.calls[5]!.authorization === `Bearer ${providerSecret}`).toBeTrue()
 
     await writeFile(shutdownFile, "shutdown\n")
     const processResult = await processOutput.completed

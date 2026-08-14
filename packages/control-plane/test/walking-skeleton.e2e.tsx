@@ -16,16 +16,19 @@ import { RpcClient } from "../src/control/rpc-client"
 import { encodeFrame, FrameDecoder } from "../src/control/framing"
 import { App } from "../src/ui/app"
 import type { TargetSession } from "../src/control/target-session"
-import { parseClientFrame, type TargetView } from "../src/control/types"
+import { parseClientFrame, type TargetAction, type TargetView } from "../src/control/types"
 import { SSE_BYTES, startFakeUpstream, type CapturedRequest } from "../../../tests/e2e/fake-upstream"
 
 const providerSecret = "provider-secret-must-not-escape"
 const wrongRoutingSecret = "routing-secret-must-not-escape"
+const authSentinel = "auth-sentinel-must-not-escape"
 const repoRoot = resolve(import.meta.dir, "../../..")
 const serviceBinary = resolve(repoRoot, "target/debug/muxvia-routing")
 const fakeCodex = resolve(repoRoot, "tests/e2e/fixtures/fake-codex")
 const deadlineMs = 10_000
 const roots: string[] = []
+
+if (process.env.MUXVIA_DIRECT_RESTRICTIVE_UMASK_CHILD === "1") process.umask(0o077)
 
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
@@ -166,6 +169,147 @@ function scanNoSecrets(
     return json === undefined ? String(value) : json
   }).join("\n")
   assertBytesContainNoSecrets(Buffer.from(serialized), secrets, label)
+}
+
+function fixedSurfaceError(error: unknown, scanFailure: string, fallback: string): Error {
+  const message = error instanceof Error ? error.message : ""
+  return new Error(message === scanFailure ? scanFailure : fallback)
+}
+
+async function waitForSecretSafeFrame(
+  setup: Awaited<ReturnType<typeof testRender>>,
+  predicate: (frame: string) => boolean,
+  secrets: readonly string[],
+  label: string,
+): Promise<string> {
+  const scanLabel = `${label}-frame`
+  const scanFailure = `secret-scan-failed:${scanLabel}`
+  try {
+    const frame = await setup.waitForFrame((current) => {
+      scanNoSecrets([current], secrets, scanLabel)
+      return predicate(current)
+    })
+    scanNoSecrets([frame], secrets, scanLabel)
+    return frame
+  } catch (error) {
+    throw fixedSurfaceError(error, scanFailure, `renderer-wait-failed:${label}`)
+  }
+}
+
+function captureSecretSafeFrame(
+  setup: Awaited<ReturnType<typeof testRender>>,
+  renderedFrames: string[],
+  secrets: readonly string[],
+  label: string,
+): string {
+  const scanLabel = `${label}-frame`
+  const scanFailure = `secret-scan-failed:${scanLabel}`
+  try {
+    const frame = setup.captureCharFrame()
+    scanNoSecrets([frame], secrets, scanLabel)
+    renderedFrames.push(frame)
+    return frame
+  } catch (error) {
+    throw fixedSurfaceError(error, scanFailure, `renderer-capture-failed:${label}`)
+  }
+}
+
+function assertSecretSafeStructured<T>(
+  value: T,
+  secrets: readonly string[],
+  label: string,
+  assertion: (safeValue: T) => void = () => {},
+): void {
+  const scanLabel = `${label}-structured`
+  const scanFailure = `secret-scan-failed:${scanLabel}`
+  try {
+    scanNoSecrets([value], secrets, scanLabel)
+    assertion(value)
+  } catch (error) {
+    throw fixedSurfaceError(error, scanFailure, `structured-assertion-failed:${label}`)
+  }
+}
+
+function asyncErrorSurface(error: unknown): unknown {
+  if (!(error instanceof Error)) return error
+  const control = error as Error & { code?: unknown; authoritativeView?: unknown }
+  return {
+    name: control.name,
+    message: control.message,
+    code: control.code,
+    authoritativeView: control.authoritativeView,
+  }
+}
+
+async function actSecretSafe(
+  session: TargetSession,
+  action: TargetAction,
+  secrets: readonly string[],
+  label: string,
+): Promise<Awaited<ReturnType<TargetSession["act"]>>> {
+  try {
+    const outcome = await session.act(action)
+    assertSecretSafeStructured(outcome, secrets, `${label}-outcome`)
+    return outcome
+  } catch (error) {
+    const scanLabel = `${label}-error`
+    const scanFailure = `secret-scan-failed:${scanLabel}`
+    try {
+      scanNoSecrets([asyncErrorSurface(error)], secrets, scanLabel)
+    } catch (scanError) {
+      throw fixedSurfaceError(scanError, scanFailure, `target-action-failed:${label}`)
+    }
+    throw new Error(`target-action-failed:${label}`)
+  }
+}
+
+async function waitForSecretSafeSession(
+  session: TargetSession,
+  predicate: (view: Readonly<TargetView>) => boolean,
+  secrets: readonly string[],
+  label: string,
+): Promise<Readonly<TargetView>> {
+  const structuredLabel = `${label}-target-view`
+  const scanFailure = `secret-scan-failed:${structuredLabel}-structured`
+  const inspect = (view: Readonly<TargetView>) => {
+    assertSecretSafeStructured(view, secrets, structuredLabel)
+    return predicate(view)
+  }
+  try {
+    const current = session.get()
+    if (inspect(current)) return current
+    return await new Promise<Readonly<TargetView>>((resolveWait, reject) => {
+      let unsubscribe = () => {}
+      const timeout = setTimeout(() => {
+        unsubscribe()
+        reject(new Error(`target-view-wait-failed:${label}`))
+      }, deadlineMs)
+      const finish = (view: Readonly<TargetView>) => {
+        clearTimeout(timeout)
+        unsubscribe()
+        resolveWait(view)
+      }
+      unsubscribe = session.subscribe((view) => {
+        try {
+          if (inspect(view)) finish(view)
+        } catch (error) {
+          clearTimeout(timeout)
+          unsubscribe()
+          reject(fixedSurfaceError(error, scanFailure, `target-view-wait-failed:${label}`))
+        }
+      })
+      try {
+        const latest = session.get()
+        if (inspect(latest)) finish(latest)
+      } catch (error) {
+        clearTimeout(timeout)
+        unsubscribe()
+        reject(fixedSurfaceError(error, scanFailure, `target-view-wait-failed:${label}`))
+      }
+    })
+  } catch (error) {
+    throw fixedSurfaceError(error, scanFailure, `target-view-wait-failed:${label}`)
+  }
 }
 
 function scanRawRpcFramesNoSecrets(
@@ -795,6 +939,93 @@ test("TCP listener observation detects a known current-process listener", async 
   }
 })
 
+test("renderer wait diagnostics never retain a secret current frame", async () => {
+  const setup = await testRender(() => <text>{providerSecret}</text>, { width: 60, height: 4, useThread: false })
+  try {
+    await setup.renderOnce()
+    let diagnostic = ""
+    try {
+      await waitForSecretSafeFrame(setup, () => false, [providerSecret], "controlled-renderer-wait")
+    } catch (error) {
+      diagnostic = error instanceof Error ? error.message : String(error)
+    }
+    expect(diagnostic === "secret-scan-failed:controlled-renderer-wait-frame").toBeTrue()
+    expect(diagnostic.includes(providerSecret)).toBeFalse()
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("structured assertion diagnostics never retain additive view secrets", () => {
+  const controlledViews = [
+    { mode: "direct", currentProviderId: "actual-provider", additiveDiagnostic: providerSecret },
+    { mode: "direct", currentProviderId: providerSecret, additiveDiagnostic: "safe" },
+  ]
+  for (const controlledView of controlledViews) {
+    let diagnostic = ""
+    try {
+      assertSecretSafeStructured(controlledView, [providerSecret], "controlled-target-view", (safeView) => {
+        expect(safeView).toMatchObject({ currentProviderId: "expected-provider" })
+      })
+    } catch (error) {
+      diagnostic = error instanceof Error ? error.message : String(error)
+    }
+    expect(diagnostic === "secret-scan-failed:controlled-target-view-structured").toBeTrue()
+    expect(diagnostic.includes(providerSecret)).toBeFalse()
+    expect(diagnostic.includes(JSON.stringify(controlledView))).toBeFalse()
+  }
+})
+
+test("action error diagnostics never retain a secret error or authoritative view", async () => {
+  const controlledError = new Error(`controlled action failed: ${providerSecret}`) as Error & {
+    authoritativeView?: unknown
+  }
+  controlledError.authoritativeView = { currentProviderId: providerSecret }
+  const controlledSession = {
+    act: async () => { throw controlledError },
+  } as unknown as TargetSession
+  let diagnostic = ""
+  try {
+    await actSecretSafe(controlledSession, {
+      kind: "activate-provider",
+      providerId: "controlled-provider",
+      mode: "direct",
+    }, [providerSecret], "controlled-act")
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(diagnostic === "secret-scan-failed:controlled-act-error").toBeTrue()
+  expect(diagnostic.includes(providerSecret)).toBeFalse()
+  expect(diagnostic.includes(controlledError.message)).toBeFalse()
+})
+
+test("Direct tracer fixture enforces file modes under a restrictive umask", async () => {
+  const child = spawn(process.execPath, [
+    "test",
+    "./packages/control-plane/test/walking-skeleton.e2e.tsx",
+    "--test-name-pattern",
+    "real processes prove Codex direct activation is control-only and survives restart",
+  ], {
+    cwd: repoRoot,
+    env: { ...process.env, MUXVIA_DIRECT_RESTRICTIVE_UMASK_CHILD: "1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+  const output = captureProcessOutput(child)
+  const completed = await Promise.race([
+    output.completed,
+    Bun.sleep(deadlineMs).then(() => undefined),
+  ])
+  if (!completed) {
+    child.kill("SIGKILL")
+    await output.completed.catch(() => {})
+    throw new Error("restrictive-umask-direct-tracer-timeout")
+  }
+  scanProcessOutputNoSecrets(output.streams, [providerSecret, wrongRoutingSecret, authSentinel])
+  if (completed.code !== 0 || completed.signal !== null) {
+    throw new Error("restrictive-umask-direct-tracer-failed")
+  }
+})
+
 test("outbound operation audit catches a preset-phase discovery without retaining its payload", () => {
   const credential = "controlled-outbound-credential"
   const baseUrl = "https://controlled-outbound.invalid/v1"
@@ -1165,9 +1396,9 @@ test("real processes prove Codex direct activation is control-only and survives 
   const databasePath = join(muxviaHome, "state/muxvia.db")
   const configPath = join(codexHome, "config.toml")
   const authPath = join(codexHome, "auth.json")
-  const authSentinel = "auth-sentinel-must-not-escape"
   const directModel = "gpt-direct"
   const editedModel = "gpt-direct-edited"
+  const directSecrets = [providerSecret, wrongRoutingSecret, authSentinel]
   await mkdir(codexHome, { recursive: true, mode: 0o700 })
   await writeFile(configPath, [
     "# operator comment survives",
@@ -1178,7 +1409,9 @@ test("real processes prove Codex direct activation is control-only and survives 
     "nested = { enabled = true, count = 2 }",
     "",
   ].join("\n"), { mode: 0o640 })
+  await chmod(configPath, 0o640)
   await writeFile(authPath, `{"tokens":"${authSentinel}"}\n`, { mode: 0o600 })
+  await chmod(authPath, 0o600)
   await chmod(fakeCodex, 0o755)
   const originalConfigMode = (await stat(configPath)).mode & 0o777
   const authFingerprint = await safeFileFingerprint(authPath)
@@ -1207,6 +1440,11 @@ test("real processes prove Codex direct activation is control-only and survives 
   let unsubscribe: (() => void) | undefined
   let setup: Awaited<ReturnType<typeof testRender>> | undefined
   let rendererAudit: ReturnType<typeof createRendererAudit> | undefined
+
+  const collectView = (view: TargetView, label: string) => {
+    assertSecretSafeStructured(view, directSecrets, label)
+    views.push(view)
+  }
 
   const startService = async () => {
     const child = spawn(serviceBinary, [
@@ -1249,7 +1487,10 @@ test("real processes prove Codex direct activation is control-only and survives 
       socket.on("data", (chunk) => {
         const bytes = Buffer.from(chunk)
         stream.push(bytes)
-        decodedInboundFrames.push(...decoder.push(bytes))
+        for (const frame of decoder.push(bytes)) {
+          assertSecretSafeStructured(frame, directSecrets, "direct-decoded-inbound-frame")
+          decodedInboundFrames.push(frame)
+        }
       })
       return socket
     })
@@ -1273,9 +1514,11 @@ test("real processes prove Codex direct activation is control-only and survives 
   }
   const closeControlPlane = async () => {
     setup!.mockInput.pressCtrlC()
-    await setup!.waitFor(() => setup!.renderer.isDestroyed)
+    await waitFor(() => setup!.renderer.isDestroyed, "Direct renderer destroy")
     rendererAudit!.stop()
-    nativeRenderedFrames.push(...rendererAudit!.frames())
+    const recordedFrames = rendererAudit!.frames()
+    assertSecretSafeStructured(recordedFrames, directSecrets, "direct-native-renderer-frames")
+    nativeRenderedFrames.push(...recordedFrames)
     setup = undefined
     rendererAudit = undefined
     unsubscribe?.()
@@ -1289,8 +1532,8 @@ test("real processes prove Codex direct activation is control-only and survives 
     const firstService = await startService()
     client = await connect("direct-e2e")
     session = await client.openTarget("codex")
-    views.push(session.get() as TargetView)
-    unsubscribe = session.subscribe((view) => views.push(view))
+    collectView(session.get() as TargetView, "direct-initial-view")
+    unsubscribe = session.subscribe((view) => collectView(view, "direct-subscribed-view"))
     setup = await testRender(() => <App session={session!} />, {
       width: 80,
       height: 24,
@@ -1319,47 +1562,76 @@ test("real processes prove Codex direct activation is control-only and survives 
     setup.mockInput.pressTab()
     await setup.mockInput.typeText(providerSecret)
     await setup.renderOnce()
-    captureFrame(setup, selectedRenderedFrames)
+    captureSecretSafeFrame(
+      setup,
+      selectedRenderedFrames,
+      directSecrets,
+      "direct-provider-credential-entry",
+    )
     setup.mockInput.pressEnter()
-    await waitForSession(session, (view) => view.providers.length === 1, "Direct Provider save")
-    await setup.waitForFrame((frame) => frame.includes("Provider saved: Direct Provider"))
-    const savedProvider = session.get().providers[0]!
-    expect(savedProvider).toMatchObject({
-      name: "Direct Provider",
-      baseUrl: upstream.baseUrl,
-      model: directModel,
-      routingRequirement: "direct-compatible",
-      credential: "present",
-      completeness: "complete",
+    const savedView = await waitForSecretSafeSession(
+      session,
+      (view) => view.providers.length === 1,
+      directSecrets,
+      "direct-provider-save",
+    )
+    await waitForSecretSafeFrame(
+      setup,
+      (frame) => frame.includes("Provider saved: Direct Provider"),
+      directSecrets,
+      "direct-provider-saved",
+    )
+    const savedProvider = savedView.providers[0]!
+    assertSecretSafeStructured(savedProvider, directSecrets, "direct-saved-provider", (safeProvider) => {
+      expect(safeProvider).toMatchObject({
+        name: "Direct Provider",
+        baseUrl: upstream.baseUrl,
+        model: directModel,
+        routingRequirement: "direct-compatible",
+        credential: "present",
+        completeness: "complete",
+      })
     })
     expect(upstream.calls.length === 0).toBeTrue()
 
     await setup.mockInput.typeText("/providers")
     setup.mockInput.pressEnter()
-    const providerPickerFrame = await setup.waitForFrame((frame) =>
-      frame.includes("Providers") && frame.includes("Direct Provider")
+    const providerPickerFrame = await waitForSecretSafeFrame(
+      setup,
+      (frame) => frame.includes("Providers") && frame.includes("Direct Provider"),
+      directSecrets,
+      "direct-provider-picker",
     )
     selectedRenderedFrames.push(providerPickerFrame)
     leader("a")
-    await waitForSession(session, (view) => view.mode === "direct", "Direct Activation")
-    const directFrame = await setup.waitForFrame((frame) =>
-      frame.includes("Mode       Direct")
-      && frame.includes("Current Target Provider  Direct Provider")
-      && frame.includes("Direct Activation applied: Direct Provider")
-      && frame.includes("Restart Codex to use the managed configuration.")
+    const directView = await waitForSecretSafeSession(
+      session,
+      (view) => view.mode === "direct",
+      directSecrets,
+      "direct-activation",
+    )
+    const directFrame = await waitForSecretSafeFrame(
+      setup,
+      (frame) => frame.includes("Mode       Direct")
+        && frame.includes("Current Target Provider  Direct Provider")
+        && frame.includes("Direct Activation applied: Direct Provider")
+        && frame.includes("Restart Codex to use the managed configuration."),
+      directSecrets,
+      "direct-activation-result",
     )
     selectedRenderedFrames.push(directFrame)
 
-    const directView = session.get()
-    views.push(directView as TargetView)
-    expect(directView).toMatchObject({
-      mode: "direct",
-      takeover: { state: "inactive", endpoint: null },
-      currentProviderId: savedProvider.id,
-      servingProviderId: null,
-      managedConfiguration: { state: "applied", path: configPath, restartRequired: true },
-      recovery: { state: "committed" },
-      activatedSnapshot: { providerId: savedProvider.id, model: directModel },
+    collectView(directView as TargetView, "direct-applied-view")
+    assertSecretSafeStructured(directView, directSecrets, "direct-applied-view", (safeView) => {
+      expect(safeView).toMatchObject({
+        mode: "direct",
+        takeover: { state: "inactive", endpoint: null },
+        currentProviderId: savedProvider.id,
+        servingProviderId: null,
+        managedConfiguration: { state: "applied", path: configPath, restartRequired: true },
+        recovery: { state: "committed" },
+        activatedSnapshot: { providerId: savedProvider.id, model: directModel },
+      })
     })
 
     const directConfigBytes = await readFile(configPath)
@@ -1422,7 +1694,7 @@ test("real processes prove Codex direct activation is control-only and survives 
     await assertNoTcpListeners(firstService.child.pid)
     expect((await stat(socketPath)).isSocket()).toBeTrue()
 
-    const updateOutcome = await session.act({
+    const updateOutcome = await actSecretSafe(session, {
       kind: "update-provider",
       providerId: savedProvider.id,
       providerRevision: savedProvider.providerRevision,
@@ -1430,17 +1702,19 @@ test("real processes prove Codex direct activation is control-only and survives 
       baseUrl: `${upstream.baseUrl}/edited`,
       model: editedModel,
       credential: { kind: "keep" },
-    })
-    views.push(updateOutcome.view)
-    expect(updateOutcome.view.providers[0]).toMatchObject({
-      id: savedProvider.id,
-      baseUrl: `${upstream.baseUrl}/edited`,
-      model: editedModel,
-    })
-    expect(updateOutcome.view.activatedSnapshot).toMatchObject({
-      id: directView.activatedSnapshot!.id,
-      providerId: savedProvider.id,
-      model: directModel,
+    }, directSecrets, "direct-provider-edit")
+    collectView(updateOutcome.view, "direct-provider-edit-view")
+    assertSecretSafeStructured(updateOutcome.view, directSecrets, "direct-provider-edit-view", (safeView) => {
+      expect(safeView.providers[0]).toMatchObject({
+        id: savedProvider.id,
+        baseUrl: `${upstream.baseUrl}/edited`,
+        model: editedModel,
+      })
+      expect(safeView.activatedSnapshot).toMatchObject({
+        id: directView.activatedSnapshot!.id,
+        providerId: savedProvider.id,
+        model: directModel,
+      })
     })
     expect(sensitiveDigest(await readFile(configPath))).toBe(sensitiveDigest(directConfigBytes))
 
@@ -1463,7 +1737,9 @@ test("real processes prove Codex direct activation is control-only and survives 
       baseUrl: `${upstream.baseUrl}/edited`,
       model: editedModel,
     })
-    expect(session.get().takeover.endpoint).toBeNull()
+    assertSecretSafeStructured(session.get(), directSecrets, "direct-post-edit-view", (safeView) => {
+      expect(safeView.takeover.endpoint).toBeNull()
+    })
     expect(upstream.calls.length === 0).toBeTrue()
 
     await closeControlPlane()
@@ -1473,22 +1749,24 @@ test("real processes prove Codex direct activation is control-only and survives 
     client = await connect("direct-e2e-restart")
     session = await client.openTarget("codex")
     const restartedView = session.get()
-    views.push(restartedView as TargetView)
-    expect(restartedView).toMatchObject({
-      managementRevision: updateOutcome.view.managementRevision,
-      mode: "direct",
-      takeover: { state: "inactive", endpoint: null },
-      currentProviderId: savedProvider.id,
-      servingProviderId: null,
-      managedConfiguration: { state: "applied", path: configPath, restartRequired: true },
-      activatedSnapshot: {
-        id: directView.activatedSnapshot!.id,
-        providerId: savedProvider.id,
-        model: directModel,
-      },
+    collectView(restartedView as TargetView, "direct-restarted-view")
+    assertSecretSafeStructured(restartedView, directSecrets, "direct-restarted-view", (safeView) => {
+      expect(safeView).toMatchObject({
+        managementRevision: updateOutcome.view.managementRevision,
+        mode: "direct",
+        takeover: { state: "inactive", endpoint: null },
+        currentProviderId: savedProvider.id,
+        servingProviderId: null,
+        managedConfiguration: { state: "applied", path: configPath, restartRequired: true },
+        activatedSnapshot: {
+          id: directView.activatedSnapshot!.id,
+          providerId: savedProvider.id,
+          model: directModel,
+        },
+      })
     })
     expect(restartedView.service.epoch === directView.service.epoch).toBeFalse()
-    unsubscribe = session.subscribe((view) => views.push(view))
+    unsubscribe = session.subscribe((view) => collectView(view, "direct-restarted-subscribed-view"))
     setup = await testRender(() => <App session={session!} />, {
       width: 80,
       height: 24,
@@ -1500,11 +1778,14 @@ test("real processes prove Codex direct activation is control-only and survives 
     await setup.renderOnce()
     await setup.mockInput.typeText("/codex")
     setup.mockInput.pressEnter()
-    const restartedFrame = await setup.waitForFrame((frame) =>
-      frame.includes("Mode       Direct")
-      && frame.includes("Current Target Provider  Direct Provider Edited")
-      && frame.includes(`Activated Snapshot  Direct Provider Edited · ${directModel}`)
-      && frame.includes("Restart Codex to use the managed configuration.")
+    const restartedFrame = await waitForSecretSafeFrame(
+      setup,
+      (frame) => frame.includes("Mode       Direct")
+        && frame.includes("Current Target Provider  Direct Provider Edited")
+        && frame.includes(`Activated Snapshot  Direct Provider Edited · ${directModel}`)
+        && frame.includes("Restart Codex to use the managed configuration."),
+      directSecrets,
+      "direct-restarted-render",
     )
     selectedRenderedFrames.push(restartedFrame)
     expect(restartedView.takeover.endpoint).toBeNull()
@@ -1525,6 +1806,7 @@ test("real processes prove Codex direct activation is control-only and survives 
     const receiptDatabase = new Database(databasePath, { readonly: true })
     const receipts = receiptDatabase.query(`SELECT action_kind AS actionKind,
       outcome_json AS outcomeJson FROM action_receipts ORDER BY committed_revision, action_id`).all()
+    assertSecretSafeStructured(receipts, directSecrets, "direct-action-receipts")
     const finalRoute = receiptDatabase.query(`SELECT takeover_state AS takeoverState,
       route_port IS NULL AS routePortAbsent,
       routing_credential IS NULL AS routingCredentialAbsent
@@ -1540,14 +1822,13 @@ test("real processes prove Codex direct activation is control-only and survives 
     expect(outboundOperationKinds.some((kind) =>
       kind === "discover-models" || kind === "check-reachability"
     )).toBeFalse()
-    const secrets = [providerSecret, wrongRoutingSecret, authSentinel]
-    scanRawRpcFramesNoSecrets(rpcStreams, secrets)
+    scanRawRpcFramesNoSecrets(rpcStreams, directSecrets)
     scanNoSecrets(
       [decodedInboundFrames, receipts, views, selectedRenderedFrames, nativeRenderedFrames],
-      secrets,
+      directSecrets,
       "direct-inbound-and-rendered-surfaces",
     )
-    scanProcessOutputNoSecrets(services.map(({ output }) => output.streams).flat(), secrets)
+    scanProcessOutputNoSecrets(services.map(({ output }) => output.streams).flat(), directSecrets)
   } finally {
     rendererAudit?.stop()
     if (setup && !setup.renderer.isDestroyed) setup.renderer.destroy()

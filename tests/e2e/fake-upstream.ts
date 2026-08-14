@@ -20,17 +20,33 @@ function header(value: string | string[] | undefined): string | null {
   return Array.isArray(value) ? value.join(", ") : value ?? null
 }
 
-export async function startFakeUpstream(expectedProviderCredential: string) {
+export async function startFakeUpstream(
+  expectedProviderCredential: string,
+  onCapturedRequest?: (request: CapturedRequest) => void,
+) {
   const calls: CapturedRequest[] = []
   const callWaiters = new Set<() => void>()
+  const handlerIdleWaiters = new Set<() => void>()
+  const handlerCountWaiters = new Set<() => void>()
+  let activeHandlers = 0
+  let quiescePromise: Promise<void> | undefined
   const server = createServer(async (request, response) => {
+    activeHandlers++
+    response.once("close", () => {
+      activeHandlers--
+      if (activeHandlers === 0) {
+        for (const resolveIdle of handlerIdleWaiters) resolveIdle()
+        handlerIdleWaiters.clear()
+      }
+    })
+    for (const notify of handlerCountWaiters) notify()
     const body: Buffer[] = []
     for await (const chunk of request) body.push(Buffer.from(chunk))
     const headers = Object.fromEntries(Object.entries(request.headers).map(([name, value]) => [
       name,
       header(value),
     ]))
-    calls.push({
+    const capturedRequest = {
       authorization: header(request.headers.authorization),
       headers,
       contentType: header(request.headers["content-type"]),
@@ -38,7 +54,9 @@ export async function startFakeUpstream(expectedProviderCredential: string) {
       testHeader: header(request.headers["x-test-preserved"]),
       body: Buffer.concat(body).toString("utf8"),
       path: request.url ?? "",
-    })
+    }
+    onCapturedRequest?.(capturedRequest)
+    calls.push(capturedRequest)
     for (const notify of callWaiters) notify()
 
     if (request.method === "GET" && request.url === "/v1/models") {
@@ -78,6 +96,19 @@ export async function startFakeUpstream(expectedProviderCredential: string) {
   })
   const address = server.address()
   if (!address || typeof address === "string") throw new Error("fake upstream did not bind TCP")
+  const waitForHandlersToDrain = () => activeHandlers === 0
+    ? Promise.resolve()
+    : new Promise<void>((resolve) => handlerIdleWaiters.add(resolve))
+  const quiesce = () => {
+    if (!quiescePromise) {
+      quiescePromise = (async () => {
+        await waitForHandlersToDrain()
+        await new Promise<void>((resolve) => server.close(() => resolve()))
+        await waitForHandlersToDrain()
+      })()
+    }
+    return quiescePromise
+  }
   return {
     calls,
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
@@ -97,9 +128,27 @@ export async function startFakeUpstream(expectedProviderCredential: string) {
         callWaiters.add(notify)
       })
     },
+    waitForActiveHandlerCount: async (count: number) => {
+      if (activeHandlers >= count) return
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          handlerCountWaiters.delete(notify)
+          reject(new Error(`Timed out waiting for fake upstream active handler ${count}; saw ${activeHandlers}`))
+        }, 10_000)
+        const notify = () => {
+          if (activeHandlers < count) return
+          clearTimeout(timeout)
+          handlerCountWaiters.delete(notify)
+          resolve()
+        }
+        handlerCountWaiters.add(notify)
+      })
+    },
+    quiesce,
     stop: async () => {
+      const quiesced = quiesce()
       server.closeAllConnections()
-      await new Promise<void>((resolve) => server.close(() => resolve()))
+      await quiesced
     },
   }
 }

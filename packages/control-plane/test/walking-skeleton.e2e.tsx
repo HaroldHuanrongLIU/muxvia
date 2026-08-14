@@ -356,6 +356,134 @@ function auditCapturedRequestAndProject(
   return projectCapturedRequest(request, policy.providerCredential)
 }
 
+type CapturedRequestProjection = ReturnType<typeof projectCapturedRequest>
+
+const expectedModelRequestProjection: CapturedRequestProjection = {
+  method: "GET",
+  pathClass: "models",
+  hasQuery: false,
+  authorizationClass: "expected-provider",
+  headerAuthorizationClass: "expected-provider",
+  hasAuthorizationHeader: true,
+  hasContentTypeHeader: false,
+  hasTestHeader: false,
+  contentTypeClass: "absent",
+  testHeaderClass: "absent",
+  bodyClass: "empty",
+  bodyBytes: 0,
+  bodyDigest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+}
+
+const expectedResponseRequestProjection: CapturedRequestProjection = {
+  method: "POST",
+  pathClass: "responses",
+  hasQuery: false,
+  authorizationClass: "expected-provider",
+  headerAuthorizationClass: "expected-provider",
+  hasAuthorizationHeader: true,
+  hasContentTypeHeader: true,
+  hasTestHeader: true,
+  contentTypeClass: "application-json",
+  testHeaderClass: "preserved",
+  bodyClass: "expected-response-request",
+  bodyBytes: 36,
+  bodyDigest: "sha256:a17bd595d1c0f60f0ac4d95a500643fa08ab4f8519760f80f30c5a9fa74a6da5",
+}
+
+const expectedReachabilityRequestProjection: CapturedRequestProjection = {
+  method: "GET",
+  pathClass: "edited-reachability",
+  hasQuery: false,
+  authorizationClass: "absent",
+  headerAuthorizationClass: "absent",
+  hasAuthorizationHeader: false,
+  hasContentTypeHeader: false,
+  hasTestHeader: false,
+  contentTypeClass: "absent",
+  testHeaderClass: "absent",
+  bodyClass: "empty",
+  bodyBytes: 0,
+  bodyDigest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+}
+
+function fixedCapturedRequestAuditDiagnostic(error: unknown): string {
+  const message = error instanceof Error ? error.message : ""
+  if (
+    message === "secret-scan-failed:captured-request-routing-credential"
+    || message === "secret-scan-failed:captured-request-provider-credential"
+    || message === "captured-request-authorization-policy-failed"
+    || message === "captured-request-unexpected"
+  ) return message
+  return "captured-request-audit-failed"
+}
+
+function createCapturedRequestAudit(config: {
+  providerCredential: string
+  forbiddenRoutingCredentials: () => readonly string[]
+  expectedRequestCount: number
+}): {
+  expectNext: (authorization: "expected-provider" | "absent") => void
+  observe: (request: CapturedRequest) => void
+  projection: (index: number) => CapturedRequestProjection
+  assertComplete: (requestCount: number) => void
+} {
+  let pendingAuthorization: "expected-provider" | "absent" | undefined
+  let expectedCount = 0
+  let auditedCount = 0
+  let failure: string | undefined
+  const projections: CapturedRequestProjection[] = []
+  const inspectedIndexes = new Set<number>()
+
+  return {
+    expectNext: (authorization) => {
+      if (pendingAuthorization || expectedCount >= config.expectedRequestCount) {
+        failure ??= "captured-request-audit-plan-invalid"
+        return
+      }
+      pendingAuthorization = authorization
+      expectedCount++
+    },
+    observe: (request) => {
+      const authorization = pendingAuthorization
+      pendingAuthorization = undefined
+      try {
+        const projection = auditCapturedRequestAndProject(request, {
+          providerCredential: config.providerCredential,
+          forbiddenRoutingCredentials: config.forbiddenRoutingCredentials(),
+          authorization: authorization ?? "absent",
+        })
+        if (!authorization) throw new Error("captured-request-unexpected")
+        projections.push(projection)
+      } catch (error) {
+        failure ??= fixedCapturedRequestAuditDiagnostic(error)
+      } finally {
+        auditedCount++
+      }
+    },
+    projection: (index) => {
+      if (failure) throw new Error(failure)
+      const projection = projections[index]
+      if (!projection) throw new Error("captured-request-audit-projection-missing")
+      inspectedIndexes.add(index)
+      return projection
+    },
+    assertComplete: (requestCount) => {
+      if (failure) throw new Error(failure)
+      if (requestCount !== auditedCount) throw new Error("captured-request-audit-count-mismatch")
+      if (pendingAuthorization || expectedCount !== config.expectedRequestCount) {
+        throw new Error("captured-request-audit-incomplete")
+      }
+      if (
+        auditedCount !== config.expectedRequestCount
+        || projections.length !== config.expectedRequestCount
+        || inspectedIndexes.size !== config.expectedRequestCount
+      ) {
+        throw new Error("captured-request-audit-request-set-mismatch")
+      }
+    },
+  }
+}
+
 function readDatabaseProjection(path: string): unknown {
   const database = new Database(path, { readonly: true })
   try {
@@ -697,6 +825,154 @@ test("CapturedRequest secret scanning precedes safe semantic projection", () => 
   expect(diagnostic.includes(request.body)).toBeFalse()
 })
 
+const controlledProviderCredential = "controlled-expected-provider"
+
+function createControlledSixRequestAudit(): ReturnType<typeof createCapturedRequestAudit> {
+  const audit = createCapturedRequestAudit({
+    providerCredential: controlledProviderCredential,
+    forbiddenRoutingCredentials: () => [wrongRoutingSecret],
+    expectedRequestCount: 6,
+  })
+  for (let index = 0; index < 6; index++) {
+    audit.expectNext("expected-provider")
+    audit.observe({
+      authorization: `Bearer ${controlledProviderCredential}`,
+      headers: { authorization: `Bearer ${controlledProviderCredential}` },
+      contentType: null,
+      method: "GET",
+      testHeader: null,
+      body: "",
+      path: "/v1/models",
+    })
+  }
+  return audit
+}
+
+function closeCapturedRequestAudit(
+  audit: ReturnType<typeof createCapturedRequestAudit>,
+  requestCount: number,
+): string {
+  try {
+    audit.assertComplete(requestCount)
+    return ""
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error)
+  }
+}
+
+test("CapturedRequest audit scans a forbidden unexpected seventh request before closing", () => {
+  const unexpectedBody = `{"routing":"${wrongRoutingSecret}"}`
+  const audit = createControlledSixRequestAudit()
+  audit.observe({
+    authorization: null,
+    headers: { "x-forbidden-routing": wrongRoutingSecret },
+    contentType: "application/json",
+    method: "DELETE",
+    testHeader: null,
+    body: unexpectedBody,
+    path: "/v1/unexpected",
+  })
+  const diagnostic = closeCapturedRequestAudit(audit, 7)
+
+  expect(diagnostic === "secret-scan-failed:captured-request-routing-credential").toBeTrue()
+  expect(diagnostic.includes(wrongRoutingSecret)).toBeFalse()
+  expect(diagnostic.includes(unexpectedBody)).toBeFalse()
+})
+
+test("CapturedRequest audit rejects a clean unexpected seventh request with a fixed diagnostic", () => {
+  const unexpectedPath = "/v1/unexpected?surface=controlled-raw-seventh-request"
+  const audit = createControlledSixRequestAudit()
+  audit.observe({
+    authorization: null,
+    headers: {},
+    contentType: null,
+    method: "DELETE",
+    testHeader: null,
+    body: "",
+    path: unexpectedPath,
+  })
+  const diagnostic = closeCapturedRequestAudit(audit, 7)
+
+  expect(diagnostic === "captured-request-unexpected").toBeTrue()
+  expect(diagnostic.includes(unexpectedPath)).toBeFalse()
+})
+
+test("CapturedRequest audit closes over the exact observed request count", () => {
+  const diagnostic = closeCapturedRequestAudit(createControlledSixRequestAudit(), 7)
+  expect(diagnostic === "captured-request-audit-count-mismatch").toBeTrue()
+})
+
+test("fake upstream quiesce audits a delayed forbidden seventh request before closing", async () => {
+  const audit = createControlledSixRequestAudit()
+  for (let index = 0; index < 6; index++) audit.projection(index)
+  const upstream = await startFakeUpstream(controlledProviderCredential, audit.observe)
+  const requestBody = '{"late":true}'
+  let request: ReturnType<typeof httpRequest> | undefined
+  let legacyDiagnostic = ""
+  let finalDiagnostic = ""
+  let hasQuiesce = false
+  try {
+    const url = new URL(`${upstream.baseUrl}/responses`)
+    let resolveContinue = () => {}
+    let rejectContinue = (_error: unknown) => {}
+    const continued = new Promise<void>((resolve, reject) => {
+      resolveContinue = resolve
+      rejectContinue = reject
+    })
+    let resolveResponse = () => {}
+    let rejectResponse = (_error: unknown) => {}
+    const responseCompleted = new Promise<void>((resolve, reject) => {
+      resolveResponse = resolve
+      rejectResponse = reject
+    })
+    request = httpRequest({
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method: "POST",
+      headers: {
+        connection: "close",
+        expect: "100-continue",
+        "content-length": Buffer.byteLength(requestBody),
+        "x-forbidden-routing": wrongRoutingSecret,
+      },
+    }, (response) => {
+      response.resume()
+      response.once("end", resolveResponse)
+      response.once("error", rejectResponse)
+    })
+    request.once("continue", resolveContinue)
+    request.once("error", (error) => {
+      rejectContinue(error)
+      rejectResponse(error)
+    })
+    request.flushHeaders()
+    await continued
+    await new Promise<void>((resolveWrite, rejectWrite) => {
+      request!.write(requestBody.slice(0, 1), (error) => error ? rejectWrite(error) : resolveWrite())
+    })
+    await upstream.waitForActiveHandlerCount(1)
+
+    legacyDiagnostic = closeCapturedRequestAudit(audit, 6 + upstream.calls.length)
+    const quiesce = (upstream as typeof upstream & { quiesce?: () => Promise<void> }).quiesce
+    hasQuiesce = typeof quiesce === "function"
+    const quiesced = quiesce?.()
+    request.end(requestBody.slice(1))
+    await responseCompleted
+    await quiesced
+    finalDiagnostic = closeCapturedRequestAudit(audit, 6 + upstream.calls.length)
+  } finally {
+    request?.destroy()
+    await upstream.stop()
+  }
+
+  expect(legacyDiagnostic === "").toBeTrue()
+  expect(hasQuiesce).toBeTrue()
+  expect(finalDiagnostic === "secret-scan-failed:captured-request-routing-credential").toBeTrue()
+  expect(finalDiagnostic.includes(wrongRoutingSecret)).toBeFalse()
+  expect(finalDiagnostic.includes(requestBody)).toBeFalse()
+})
+
 test("real processes prove the complete Target Provider workflow without leaking secrets or mutating inspections", async () => {
   const root = await mkdtemp(join(tmpdir(), "muxvia-e2e-"))
   roots.push(root)
@@ -716,7 +992,15 @@ test("real processes prove the complete Target Provider workflow without leaking
   await mkdir(join(userHome, ".codex"), { recursive: true, mode: 0o700 })
   await writeFile(configPath, '# operator comment survives\nunrelated = "keep-me"\n', { mode: 0o600 })
   await chmod(fakeCodex, 0o755)
-  const upstream = await startFakeUpstream(providerSecret)
+  let routingCredentialForRequestAudit: string | undefined
+  const requestAudit = createCapturedRequestAudit({
+    providerCredential: providerSecret,
+    forbiddenRoutingCredentials: () => routingCredentialForRequestAudit
+      ? [wrongRoutingSecret, routingCredentialForRequestAudit]
+      : [wrongRoutingSecret],
+    expectedRequestCount: 6,
+  })
+  const upstream = await startFakeUpstream(providerSecret, requestAudit.observe)
   const rpcStreams: Buffer[][] = []
   const outboundOperationKinds: string[] = []
   const outboundAudits: ReturnType<typeof createOutboundOperationAudit>[] = []
@@ -865,50 +1149,24 @@ test("real processes prove the complete Target Provider workflow without leaking
     // Reopening now performs automatic discovery with the newly saved endpoint and Credential Reference.
     await openProviderPicker()
     const savedInspectionBefore = await readOnlyStateFingerprint(databasePath, configPath)
+    requestAudit.expectNext("expected-provider")
     setup.mockInput.pressEnter()
     await upstream.waitForCallCount(1)
+    expect(requestAudit.projection(0)).toEqual(expectedModelRequestProjection)
     const automaticModelsFrame = await setup.waitForFrame((frame) => frame.includes("2 models available"))
     selectedRenderedFrames.push(automaticModelsFrame)
     await assertReadOnlyInspection("complete automatic discovery", savedInspectionBefore)
-    expect(auditCapturedRequestAndProject(upstream.calls[0]!, {
-      providerCredential: providerSecret,
-      forbiddenRoutingCredentials: [wrongRoutingSecret],
-      authorization: "expected-provider",
-    })).toMatchObject({
-      method: "GET",
-      pathClass: "models",
-      hasQuery: false,
-      authorizationClass: "expected-provider",
-      headerAuthorizationClass: "expected-provider",
-      hasAuthorizationHeader: true,
-      hasContentTypeHeader: false,
-      hasTestHeader: false,
-      contentTypeClass: "absent",
-      testHeaderClass: "absent",
-      bodyClass: "empty",
-      bodyBytes: 0,
-    })
 
     // 3. Explicit discovery is a second read-only request; selecting is local until save.
     const explicitInspectionBefore = await readOnlyStateFingerprint(databasePath, configPath)
     const explicitInboundStart = decodedInboundFrames.length
+    requestAudit.expectNext("expected-provider")
     leader("f")
     await upstream.waitForCallCount(2)
+    expect(requestAudit.projection(1)).toEqual(expectedModelRequestProjection)
     await setup.waitFor(() => decodedInboundFrames.slice(explicitInboundStart).some((frame) =>
       JSON.stringify(frame).includes('"kind":"model-discovery"')
     ))
-    expect(auditCapturedRequestAndProject(upstream.calls[1]!, {
-      providerCredential: providerSecret,
-      forbiddenRoutingCredentials: [wrongRoutingSecret],
-      authorization: "expected-provider",
-    })).toMatchObject({
-      method: "GET",
-      pathClass: "models",
-      hasQuery: false,
-      authorizationClass: "expected-provider",
-      headerAuthorizationClass: "expected-provider",
-      bodyClass: "empty",
-    })
     const explicitModelsFrame = await setup.waitForFrame((frame) => frame.includes("2 models available"))
     selectedRenderedFrames.push(explicitModelsFrame)
     await assertReadOnlyInspection("explicit discovery", explicitInspectionBefore)
@@ -1028,6 +1286,7 @@ test("real processes prove the complete Target Provider workflow without leaking
 
     const activatedConfigBytes = await readFile(configPath)
     const managed = extractManagedConfig(activatedConfigBytes.toString("utf8"), "gpt-fixture-b")
+    routingCredentialForRequestAudit = managed.credential
     const actualRoutingSplit = Math.floor(managed.credential.length / 2)
     let actualRoutingDiagnostic = ""
     try {
@@ -1052,20 +1311,10 @@ test("real processes prove the complete Target Provider workflow without leaking
       await setup.renderOnce()
     }
     const activeEditorInspectionBefore = await readOnlyStateFingerprint(databasePath, configPath)
+    requestAudit.expectNext("expected-provider")
     setup.mockInput.pressEnter()
     await upstream.waitForCallCount(3)
-    expect(auditCapturedRequestAndProject(upstream.calls[2]!, {
-      providerCredential: providerSecret,
-      forbiddenRoutingCredentials: [wrongRoutingSecret, managed.credential],
-      authorization: "expected-provider",
-    })).toMatchObject({
-      method: "GET",
-      pathClass: "models",
-      hasQuery: false,
-      authorizationClass: "expected-provider",
-      headerAuthorizationClass: "expected-provider",
-      bodyClass: "empty",
-    })
+    expect(requestAudit.projection(2)).toEqual(expectedModelRequestProjection)
     await setup.waitForFrame((frame) => frame.includes("2 models available"))
     await assertReadOnlyInspection("active declaration automatic discovery", activeEditorInspectionBefore)
     setup.mockInput.pressTab()
@@ -1087,8 +1336,10 @@ test("real processes prove the complete Target Provider workflow without leaking
     expect(session.get().activatedSnapshot).toMatchObject({ providerId: originalId, model: "gpt-fixture-b" })
     expect(sensitiveDigest(await readFile(configPath)) === sensitiveDigest(activatedConfigBytes)).toBeTrue()
 
+    requestAudit.expectNext("expected-provider")
     const valid = await chunkedPost(managed.endpoint, managed.credential)
     await upstream.waitForCallCount(4)
+    expect(requestAudit.projection(3)).toEqual(expectedResponseRequestProjection)
     expect(valid.status).toBe(201)
     const responseContentType = valid.headers["content-type"]
     const responseIsEventStream = Array.isArray(responseContentType)
@@ -1096,24 +1347,6 @@ test("real processes prove the complete Target Provider workflow without leaking
       : responseContentType?.startsWith("text/event-stream") === true
     expect(responseIsEventStream).toBeTrue()
     expect(valid.body === SSE_BYTES.join("")).toBeTrue()
-    expect(auditCapturedRequestAndProject(upstream.calls[3]!, {
-      providerCredential: providerSecret,
-      forbiddenRoutingCredentials: [wrongRoutingSecret, managed.credential],
-      authorization: "expected-provider",
-    })).toMatchObject({
-      method: "POST",
-      pathClass: "responses",
-      hasQuery: false,
-      authorizationClass: "expected-provider",
-      headerAuthorizationClass: "expected-provider",
-      hasAuthorizationHeader: true,
-      hasContentTypeHeader: true,
-      hasTestHeader: true,
-      contentTypeClass: "application-json",
-      testHeaderClass: "preserved",
-      bodyClass: "expected-response-request",
-      bodyBytes: 36,
-    })
     await waitFor(() => views.some((view) => view.servingProviderId !== null), "Serving push")
     await setup.renderOnce()
     const servedFrame = captureFrame(setup, selectedRenderedFrames)
@@ -1122,31 +1355,15 @@ test("real processes prove the complete Target Provider workflow without leaking
     // 8. Reachability is an unauthenticated, headers-only 401 observation with no state change.
     await openProviderPicker()
     const reachabilityBefore = await readOnlyStateFingerprint(databasePath, configPath)
+    requestAudit.expectNext("absent")
     leader("t")
     await upstream.waitForCallCount(5)
+    expect(requestAudit.projection(4)).toEqual(expectedReachabilityRequestProjection)
     const reachabilityFrame = await setup.waitForFrame((frame) =>
       frame.includes("Reachable") && frame.includes("HTTP 401")
     )
     selectedRenderedFrames.push(reachabilityFrame)
     await assertReadOnlyInspection("reachability", reachabilityBefore)
-    expect(auditCapturedRequestAndProject(upstream.calls[4]!, {
-      providerCredential: providerSecret,
-      forbiddenRoutingCredentials: [wrongRoutingSecret, managed.credential],
-      authorization: "absent",
-    })).toMatchObject({
-      method: "GET",
-      pathClass: "edited-reachability",
-      hasQuery: false,
-      authorizationClass: "absent",
-      headerAuthorizationClass: "absent",
-      hasAuthorizationHeader: false,
-      hasContentTypeHeader: false,
-      hasTestHeader: false,
-      contentTypeClass: "absent",
-      testHeaderClass: "absent",
-      bodyClass: "empty",
-      bodyBytes: 0,
-    })
 
     // 9. Active deletion is rejected; deleting the inactive shared duplicate preserves its credential.
     const activeDeleteFrameStart = decodedInboundFrames.length
@@ -1194,28 +1411,12 @@ test("real processes prove the complete Target Provider workflow without leaking
     await session.close()
     session = undefined
     client = undefined
+    requestAudit.expectNext("expected-provider")
     const second = await chunkedPost(managed.endpoint, managed.credential)
     await upstream.waitForCallCount(6)
+    expect(requestAudit.projection(5)).toEqual(expectedResponseRequestProjection)
     expect(second.status).toBe(201)
     expect(service.exitCode).toBeNull()
-    expect(auditCapturedRequestAndProject(upstream.calls[5]!, {
-      providerCredential: providerSecret,
-      forbiddenRoutingCredentials: [wrongRoutingSecret, managed.credential],
-      authorization: "expected-provider",
-    })).toMatchObject({
-      method: "POST",
-      pathClass: "responses",
-      hasQuery: false,
-      authorizationClass: "expected-provider",
-      headerAuthorizationClass: "expected-provider",
-      hasAuthorizationHeader: true,
-      hasContentTypeHeader: true,
-      hasTestHeader: true,
-      contentTypeClass: "application-json",
-      testHeaderClass: "preserved",
-      bodyClass: "expected-response-request",
-      bodyBytes: 36,
-    })
 
     await writeFile(shutdownFile, "shutdown\n")
     const processResult = await processOutput.completed
@@ -1223,6 +1424,8 @@ test("real processes prove the complete Target Provider workflow without leaking
     expect(service.exitCode).toBe(0)
     await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" })
     await expect(chunkedPost(managed.endpoint, managed.credential)).rejects.toBeDefined()
+    await upstream.quiesce()
+    requestAudit.assertComplete(upstream.calls.length)
 
     const receiptDatabase = new Database(databasePath, { readonly: true })
     const receipts = receiptDatabase

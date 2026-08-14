@@ -240,3 +240,117 @@ test("a nondismissible overlay leaves Escape exclusively to its modal command", 
     setup.renderer.destroy()
   }
 })
+
+test("exact overlay tokens close only their matching entry and restore focus once", async () => {
+  let overlay: ReturnType<typeof useOverlay> | undefined
+  const closed: string[] = []
+  const setup = await testRender(() => (
+    <MuxviaKeymapProvider>
+      <OverlayProvider>
+        <StackHarness executed={[]} expose={(value) => { overlay = value }} />
+      </OverlayProvider>
+    </MuxviaKeymapProvider>
+  ), { width: 40, height: 10, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    const original = setup.renderer.currentFocusedRenderable as InputRenderable
+    expect(original).toBeTruthy()
+    const oldToken = Symbol("old-provider-picker")
+    const newToken = Symbol("new-provider-picker")
+    overlay!.push({
+      id: "provider-picker",
+      token: oldToken,
+      render: () => <text>Old Provider Picker</text>,
+      onClose: () => closed.push("old"),
+    })
+    overlay!.push({
+      id: "provider-picker",
+      token: newToken,
+      render: () => <text>New Provider Picker</text>,
+      onClose: () => closed.push("new"),
+    })
+    await setup.renderOnce()
+
+    overlay!.close(oldToken)
+    overlay!.close(oldToken)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("New Provider Picker")
+    expect(overlay!.depth).toBe(1)
+    expect(closed).toEqual(["old"])
+
+    overlay!.close(newToken)
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    await setup.renderOnce()
+    expect(overlay!.depth).toBe(0)
+    expect(closed).toEqual(["old", "new"])
+    expect(setup.renderer.currentFocusedRenderable).toBe(original)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("queued Escape rechecks reactive dismissibility before closing", async () => {
+  let overlay: ReturnType<typeof useOverlay> | undefined
+  const [dismissible, setDismissible] = createSignal(true)
+  const closed: string[] = []
+  function Expose() {
+    overlay = useOverlay()
+    return null
+  }
+  const setup = await testRender(() => (
+    <MuxviaKeymapProvider><OverlayProvider><Expose /></OverlayProvider></MuxviaKeymapProvider>
+  ), { width: 40, height: 10, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    overlay!.push({
+      id: "reactive",
+      dismissOnEscape: dismissible,
+      render: () => <text>Reactive Overlay</text>,
+      onClose: () => closed.push("reactive"),
+    })
+    await setup.renderOnce()
+
+    setup.mockInput.pressEscape()
+    setDismissible(false)
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    await setup.renderOnce()
+    expect(overlay!.depth).toBe(1)
+    expect(closed).toEqual([])
+
+    setDismissible(true)
+    setup.mockInput.pressEscape()
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    await setup.renderOnce()
+    expect(overlay!.depth).toBe(0)
+    expect(closed).toEqual(["reactive"])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("a queued Escape never closes a replacement overlay", async () => {
+  let overlay: ReturnType<typeof useOverlay> | undefined
+  const closed: string[] = []
+  function Expose() {
+    overlay = useOverlay()
+    return null
+  }
+  const setup = await testRender(() => (
+    <MuxviaKeymapProvider><OverlayProvider><Expose /></OverlayProvider></MuxviaKeymapProvider>
+  ), { width: 40, height: 10, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    overlay!.push({ id: "old", render: () => <text>Old Overlay</text>, onClose: () => closed.push("old") })
+    await setup.renderOnce()
+
+    setup.mockInput.pressEscape()
+    overlay!.replace({ id: "new", render: () => <text>New Overlay</text>, onClose: () => closed.push("new") })
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    await setup.renderOnce()
+    expect(overlay!.depth).toBe(1)
+    expect(setup.captureCharFrame()).toContain("New Overlay")
+    expect(closed).toEqual(["old"])
+  } finally {
+    setup.renderer.destroy()
+  }
+})

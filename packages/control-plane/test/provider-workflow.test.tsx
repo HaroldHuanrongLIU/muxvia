@@ -83,6 +83,7 @@ function projectAction(action: TargetAction): RecordedTargetAction {
 
 class MemoryTargetSession implements TargetSession {
   readonly actions: RecordedTargetAction[] = []
+  readonly #listeners = new Set<(next: TargetView) => void>()
   #view: TargetView
   #handler: (action: TargetAction) => Promise<ActionOutcome>
 
@@ -102,9 +103,16 @@ class MemoryTargetSession implements TargetSession {
     return outcome
   }
   setView(next: TargetView): void { this.#view = next }
+  pushView(next: TargetView): void {
+    this.#view = next
+    for (const listener of this.#listeners) listener(next)
+  }
   async discoverModels(): Promise<never> { throw new Error("not used") }
   async checkReachability(): Promise<never> { throw new Error("not used") }
-  subscribe(): () => void { return () => {} }
+  subscribe(listener: (next: TargetView) => void): () => void {
+    this.#listeners.add(listener)
+    return () => this.#listeners.delete(listener)
+  }
   async whenClosed(): Promise<void> { return await new Promise(() => {}) }
   async close(): Promise<void> {}
 }
@@ -737,6 +745,51 @@ test("Provider Direct Activation defaults to Current and dispatches the selected
   }
 })
 
+for (const action of ["activate", "edit"] as const) {
+  test(`authoritative removal synchronizes the visible Provider fallback before ${action}`, async () => {
+    const fallback = provider({ id: "00000000-0000-4000-8000-000000000011", name: "Fallback Provider" })
+    const removed = provider({ id: "00000000-0000-4000-8000-000000000012", position: 1, name: "Removed Provider" })
+    const initial = view({ providers: [fallback, removed], currentProviderId: removed.id })
+    const authoritative = view({
+      ...initial,
+      managementRevision: 2,
+      viewSequence: 2,
+      providers: [fallback],
+      currentProviderId: null,
+    })
+    const session = new MemoryTargetSession(initial, async () => ({ status: "applied", view: authoritative }))
+    const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("1")
+      await setup.mockInput.typeText("/providers")
+      setup.mockInput.pressEnter()
+      await setup.waitForFrame((frame) => frame.includes("Removed Provider"))
+
+      session.pushView(authoritative)
+      const fallbackFrame = await setup.waitForFrame((frame) => frame.includes("Fallback Provider") && !frame.includes("Removed Provider"))
+      expect(fallbackFrame).toContain("Fallback Provider")
+
+      if (action === "activate") {
+        setup.mockInput.pressKey("x", { ctrl: true })
+        setup.mockInput.pressKey("a")
+        for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+        expect(session.actions).toEqual([{
+          kind: "activate-provider",
+          providerId: "00000000-0000-4000-8000-000000000011",
+          mode: "direct",
+        }])
+      } else {
+        setup.mockInput.pressEnter()
+        const editor = await setup.waitForFrame((frame) => frame.includes("Edit Provider"))
+        expect(editor).toContain("Fallback Provider")
+      }
+    } finally {
+      setup.renderer.destroy()
+    }
+  })
+}
+
 test("Provider Direct Activation disables picker actions while pending then closes onto restart guidance", async () => {
   const selected = provider({ id: "00000000-0000-4000-8000-000000000011", name: "Pending Direct Provider" })
   const initial = view({ providers: [selected] })
@@ -763,13 +816,13 @@ test("Provider Direct Activation disables picker actions while pending then clos
     await setup.mockInput.typeText("/providers")
     setup.mockInput.pressEnter()
     await setup.waitForFrame((frame) => frame.includes("Pending Direct Provider"))
+    setup.mockInput.pressEscape()
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("a")
     await setup.waitFor(() => session.actions.length === 1)
     const pendingFrame = await setup.waitForFrame((frame) => frame.includes("Applying Direct Activation…"))
     expect(pendingFrame).toContain("Providers")
 
-    setup.mockInput.pressEscape()
     for (let pass = 0; pass < 4; pass++) await Promise.resolve()
     setup.mockInput.pressKey("p", { ctrl: true })
     for (let pass = 0; pass < 4; pass++) await Promise.resolve()
@@ -945,12 +998,12 @@ test("authoritative takeover-required preserves the pending picker and restores 
     setup.mockInput.pressEnter()
     await setup.waitForFrame((frame) => frame.includes("Changed Requirement Provider"))
     const pickerFocus = setup.renderer.currentFocusedRenderable as InputRenderable
+    setup.mockInput.pressEscape()
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("a")
     await setup.waitFor(() => session.actions.length === 1)
     await setup.waitForFrame((frame) => frame.includes("Applying Direct Activation…"))
 
-    setup.mockInput.pressEscape()
     for (let pass = 0; pass < 4; pass++) await Promise.resolve()
     setup.mockInput.pressKey("p", { ctrl: true })
     for (let pass = 0; pass < 4; pass++) await Promise.resolve()

@@ -1,5 +1,5 @@
 import type { InputRenderable, KeyEvent } from "@opentui/core"
-import { createSignal, For, onMount, Show, type Accessor } from "solid-js"
+import { createEffect, createSignal, For, onMount, Show, type Accessor } from "solid-js"
 
 import { useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
 import type { ReachabilityResult, TargetView } from "../control/types"
@@ -15,7 +15,7 @@ export interface ProviderPickerProps {
   t: Translator
   pending: Accessor<boolean>
   activationMode: Accessor<"direct" | "takeover" | undefined>
-  onSelectedIdChange: (id: string) => void
+  onSelectedIdChange: (id: string | undefined) => void
   onEdit: () => void
   onActivateDirect: () => void
   onDuplicate: () => void
@@ -36,6 +36,16 @@ export function ProviderPicker(props: ProviderPickerProps) {
   const [keyCapture, setKeyCapture] = createSignal("")
   let input: InputRenderable | undefined
   const selected = () => props.providers().find((provider) => provider.id === selectedId()) ?? props.providers()[0]
+
+  createEffect(() => {
+    const providers = props.providers()
+    const currentId = selectedId()
+    const nextId = currentId && providers.some((provider) => provider.id === currentId)
+      ? currentId
+      : providers[0]?.id
+    if (currentId !== nextId) setSelectedId(nextId)
+    if (props.selectedId() !== nextId) props.onSelectedIdChange(nextId)
+  })
 
   onMount(() => {
     if (input && !input.isDestroyed) input.focus()

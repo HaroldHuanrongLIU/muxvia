@@ -8,15 +8,19 @@ import { theme } from "../theme"
 
 export interface OverlayEntry {
   id: string
+  token?: OverlayToken
   render: () => JSX.Element
-  dismissOnEscape?: boolean
+  dismissOnEscape?: boolean | (() => boolean)
   onClose?: () => void
 }
+
+export type OverlayToken = symbol
 
 export interface OverlayController {
   readonly depth: number
   push(entry: OverlayEntry): void
   replace(entry: OverlayEntry): void
+  close(token: OverlayToken): void
   closeTop(): void
   clear(): void
 }
@@ -30,6 +34,12 @@ function reachesRoot(candidate: Renderable, root: Renderable): boolean {
     current = current.parent
   }
   return false
+}
+
+function canDismiss(entry: OverlayEntry | undefined): boolean {
+  if (!entry) return false
+  const dismissible = entry.dismissOnEscape
+  return (typeof dismissible === "function" ? dismissible() : dismissible) !== false
 }
 
 export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
@@ -81,6 +91,17 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
       setStack(replaced ? [...current.slice(0, -1), entry] : [entry])
       if (replaced) closeEntry(replaced)
     },
+    close(token) {
+      if (tearingDown) return
+      const current = stack()
+      const index = current.findIndex((entry) => entry.token === token)
+      if (index < 0) return
+      const entry = current[index]!
+      const next = [...current.slice(0, index), ...current.slice(index + 1)]
+      setStack(next)
+      closeEntry(entry)
+      if (next.length === 0) scheduleRestore()
+    },
     closeTop() {
       if (tearingDown) return
       const current = stack()
@@ -102,9 +123,12 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
   }
   const requestCloseTop = () => {
     if (closeScheduled || tearingDown) return
+    const requested = top()
+    if (!canDismiss(requested)) return
     closeScheduled = true
     queueMicrotask(() => {
       closeScheduled = false
+      if (top() !== requested || !canDismiss(requested)) return
       controller.closeTop()
     })
   }
@@ -112,7 +136,7 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
   useCommandLayer({
     scope: "overlay",
     priority: 300,
-    enabled: () => controller.depth > 0 && top()?.dismissOnEscape !== false,
+    enabled: () => controller.depth > 0 && canDismiss(top()),
     handlers: { "overlay.close": requestCloseTop },
   })
 

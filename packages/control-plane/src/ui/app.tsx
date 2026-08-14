@@ -11,7 +11,7 @@ import { ClaudeContext } from "./claude-context"
 import { CommandPalette } from "./command-palette"
 import { ExitConfirmation } from "./exit-confirmation"
 import { Home } from "./home"
-import { OverlayProvider, useOverlay } from "./overlay-stack"
+import { OverlayProvider, useOverlay, type OverlayToken } from "./overlay-stack"
 import { ProviderDeleteConfirmation } from "./provider-delete-confirmation"
 import { ProviderCredentialConfirmation } from "./provider-credential-confirmation"
 import { ProviderForm, type ProviderDraft, type ProviderFormRef, type ProviderFormResult } from "./provider-form"
@@ -88,7 +88,7 @@ function actionProblem(error: unknown): ActivityDraft {
   }
 }
 
-export function useCommandPaletteOpener(t: Translator): () => void {
+export function useCommandPaletteOpener(t: Translator, canOpen: () => boolean = () => true): () => void {
   const keymap = useMuxviaKeymap()
   const overlay = useOverlay()
   let openScheduled = false
@@ -97,12 +97,12 @@ export function useCommandPaletteOpener(t: Translator): () => void {
   onCleanup(() => { ownerActive = false })
 
   return () => {
-    if (openScheduled) return
+    if (openScheduled || !canOpen()) return
     openScheduled = true
     const entries = keymap.getCommandEntries({ visibility: "active", namespace: "palette" })
       .filter((entry) => entry.command.name !== "command.palette.show" && !entry.command.hidden)
     queueMicrotask(() => {
-      if (!ownerActive) {
+      if (!ownerActive || !canOpen()) {
         openScheduled = false
         return
       }
@@ -126,7 +126,6 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   const renderer = useRenderer()
   const dimensions = useTerminalDimensions()
   const overlay = useOverlay()
-  const showCommandPalette = useCommandPaletteOpener(props.t)
   const [route, setRoute] = createSignal<ShellRoute>({ kind: "home" })
   const [view, setView] = createSignal<TargetViewProjection>(props.session.get())
   const [editor, setEditor] = createSignal<Editor>()
@@ -141,6 +140,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     errorCategory?: InspectionCategory
   }>()
   const [applying, setApplying] = createSignal<"direct" | "takeover">()
+  const showCommandPalette = useCommandPaletteOpener(props.t, () => applying() === undefined)
   const [notice, setNotice] = createSignal<Notice>()
   const [activities, setActivities] = createSignal<ActivityEntry[]>([])
   const [sidebarOpen, setSidebarOpen] = createSignal(true)
@@ -337,18 +337,21 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     })
   }
   const openProviderPicker = () => {
-    if (saving() || providerMutationPending() || providerPickerScheduled) return
+    if (saving() || providerMutationPending() || applying() || providerPickerScheduled) return
     providerPickerScheduled = true
     queueMicrotask(() => {
       providerPickerScheduled = false
-      if (disposed || saving() || providerMutationPending()) return
+      if (disposed || saving() || providerMutationPending() || applying()) return
       setNotice()
       const preferred = view().providers.find((provider) => provider.id === view().currentProviderId) ?? view().providers[0]
       setSelectedProviderId((selected) => view().providers.some((provider) => provider.id === selected)
         ? selected
         : preferred?.id)
+      const pickerToken = Symbol("provider-picker")
       overlay.replace({
         id: "provider-picker",
+        token: pickerToken,
+        dismissOnEscape: () => applying() === undefined,
         render: () => <ProviderPicker
           providers={() => view().providers}
           selectedId={selectedProviderId}
@@ -359,13 +362,13 @@ function Shell(props: { session: TargetSession; t: Translator }) {
           onEdit={() => {
             const provider = selectedProvider()
             if (!provider || providerMutationPending()) return
-            overlay.closeTop()
+            overlay.close(pickerToken)
             openEditor("edit", provider)
           }}
           onActivateDirect={() => {
             const provider = selectedProvider()
             if (!provider || applying()) return
-            void activateProvider(provider.id, "direct", true)
+            void activateProvider(provider.id, "direct", pickerToken)
           }}
           onDuplicate={() => requestDuplicate()}
           reachability={() => {
@@ -496,7 +499,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     })
   }
 
-  const openTakeoverConfirmation = (providerId: string, providerName: string, pickerOrigin: boolean) => {
+  const openTakeoverConfirmation = (providerId: string, providerName: string, pickerToken?: OverlayToken) => {
     overlay.push({
       id: "takeover-required-confirm",
       dismissOnEscape: false,
@@ -505,7 +508,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
         t={props.t}
         onConfirm={() => {
           overlay.closeTop()
-          void activateProvider(providerId, "takeover", pickerOrigin)
+          void activateProvider(providerId, "takeover", pickerToken)
         }}
         onCancel={() => overlay.closeTop()}
       />,
@@ -518,29 +521,29 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) })
   }
 
-  const closeOriginPicker = (pickerOrigin: boolean) => {
-    if (pickerOrigin && overlay.depth > 0) overlay.closeTop()
+  const closeOriginPicker = (pickerToken?: OverlayToken) => {
+    if (pickerToken) overlay.close(pickerToken)
   }
 
   const activateProvider = async (
     providerId: string,
     mode: "direct" | "takeover",
-    pickerOrigin = false,
+    pickerToken?: OverlayToken,
   ) => {
     if (applying()) return
     const provider = view().providers.find((candidate) => candidate.id === providerId)
     if (!provider) {
-      closeOriginPicker(pickerOrigin)
+      closeOriginPicker(pickerToken)
       showActivationProblem("missing-provider")
       return
     }
     if (mode === "direct" && provider.completeness === "incomplete") {
-      closeOriginPicker(pickerOrigin)
+      closeOriginPicker(pickerToken)
       showActivationProblem("incomplete-provider")
       return
     }
     if (mode === "direct" && provider.routingRequirement === "takeover-required") {
-      openTakeoverConfirmation(provider.id, provider.name, pickerOrigin)
+      openTakeoverConfirmation(provider.id, provider.name, pickerToken)
       return
     }
     const providerName = provider.name
@@ -553,7 +556,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
         mode,
       })
       if (disposed || exiting) return
-      closeOriginPicker(pickerOrigin)
+      closeOriginPicker(pickerToken)
       installView(outcome.view, "action")
       const activity: ActivityDraft = {
         kind: "success",
@@ -571,10 +574,10 @@ function Shell(props: { session: TargetSession; t: Translator }) {
       if (mode === "direct" && code === "takeover-required") {
         installView(authoritative, "action")
         const authoritativeProvider = authoritative.providers.find((candidate) => candidate.id === providerId)
-        openTakeoverConfirmation(providerId, authoritativeProvider?.name ?? providerName, pickerOrigin)
+        openTakeoverConfirmation(providerId, authoritativeProvider?.name ?? providerName, pickerToken)
         return
       }
-      closeOriginPicker(pickerOrigin)
+      closeOriginPicker(pickerToken)
       installView(authoritative, "action")
       const activity = actionProblem(error)
       appendActivity(activity)

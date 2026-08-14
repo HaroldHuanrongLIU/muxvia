@@ -471,6 +471,150 @@ async fn stale_revision_and_replayed_malformed_action_use_authoritative_boundary
 }
 
 #[tokio::test]
+async fn reorder_and_delete_actions_are_receipt_first_and_publish_once_per_applied_mutation() {
+    let fixture = ControlFixture::start().await;
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    request(
+        &mut stream,
+        "open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+
+    let mut provider_ids = Vec::new();
+    for (request_id, action_id, name, secret, revision) in [
+        (
+            "create-one",
+            "00000000-0000-4000-8000-000000000021",
+            "One",
+            "one-secret",
+            0,
+        ),
+        (
+            "create-two",
+            "00000000-0000-4000-8000-000000000022",
+            "Two",
+            "two-secret",
+            1,
+        ),
+    ] {
+        let response = request(
+            &mut stream,
+            request_id,
+            json!({
+                "kind": "act", "target": "codex", "actionId": action_id,
+                "expectedRevision": revision, "action": create_action(name, secret),
+            }),
+        )
+        .await;
+        provider_ids.push(
+            response["result"]["outcome"]["view"]["providers"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["id"]
+                .clone(),
+        );
+        let push = read_frame(&mut stream).await.unwrap();
+        assert_eq!(response["result"]["outcome"]["status"], "applied");
+        assert_eq!(push["type"], "target-view");
+        assert_eq!(push["view"], response["result"]["outcome"]["view"]);
+    }
+
+    let reordered = request(
+        &mut stream,
+        "reorder",
+        json!({
+            "kind": "act", "target": "codex",
+            "actionId": "00000000-0000-4000-8000-000000000023",
+            "expectedRevision": 2,
+            "action": {
+                "kind": "reorder-providers",
+                "providerIds": [provider_ids[1].clone(), provider_ids[0].clone()]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(reordered["result"]["outcome"]["status"], "applied");
+    let push = read_frame(&mut stream).await.unwrap();
+    assert_eq!(push["view"], reordered["result"]["outcome"]["view"]);
+
+    let provider = reordered["result"]["outcome"]["view"]["providers"][0].clone();
+    let replay = request(
+        &mut stream,
+        "replay",
+        json!({
+            "kind": "act", "target": "codex",
+            "actionId": "00000000-0000-4000-8000-000000000023",
+            "expectedRevision": 999,
+            "action": { "malformed": "lifecycle-secret-sentinel-must-not-escape" }
+        }),
+    )
+    .await;
+    assert_eq!(replay["result"]["outcome"]["status"], "replayed");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            read_frame(&mut stream)
+        )
+        .await
+        .is_err(),
+        "a replay must not publish a Target View",
+    );
+
+    let stale = request(
+        &mut stream,
+        "stale-delete",
+        json!({
+            "kind": "act", "target": "codex",
+            "actionId": "00000000-0000-4000-8000-000000000024",
+            "expectedRevision": 2,
+            "action": {
+                "kind": "delete-provider",
+                "providerId": provider["id"],
+                "providerRevision": provider["providerRevision"]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(stale["problem"]["code"], "stale-revision");
+    assert_eq!(stale["authoritativeView"]["managementRevision"], 3);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            read_frame(&mut stream)
+        )
+        .await
+        .is_err(),
+        "a failed mutation must not publish a Target View",
+    );
+
+    let deleted = request(
+        &mut stream,
+        "delete",
+        json!({
+            "kind": "act", "target": "codex",
+            "actionId": "00000000-0000-4000-8000-000000000025",
+            "expectedRevision": 3,
+            "action": {
+                "kind": "delete-provider",
+                "providerId": provider["id"],
+                "providerRevision": provider["providerRevision"]
+            }
+        }),
+    )
+    .await;
+    let delete_push = read_frame(&mut stream).await.unwrap();
+    assert_eq!(deleted["result"]["outcome"]["status"], "applied");
+    assert_eq!(delete_push["view"], deleted["result"]["outcome"]["view"]);
+    assert!(
+        !format!("{reordered}{replay}{stale}{deleted}{delete_push}")
+            .contains("lifecycle-secret-sentinel-must-not-escape")
+    );
+}
+
+#[tokio::test]
 async fn stale_socket_is_replaced_only_when_it_is_a_socket() {
     let mut fixture = ControlFixture::start().await;
     let socket = fixture.socket().to_owned();

@@ -187,6 +187,13 @@ pub enum TargetAction {
         model: String,
         credential: CredentialEdit,
     },
+    ReorderProviders {
+        provider_ids: Vec<Uuid>,
+    },
+    DeleteProvider {
+        provider_id: Uuid,
+        provider_revision: u64,
+    },
     ActivateProvider {
         provider_id: String,
         mode: TakeoverMode,
@@ -225,6 +232,18 @@ impl fmt::Debug for TargetAction {
                 .field("base_url", base_url)
                 .field("model", model)
                 .field("credential", credential)
+                .finish(),
+            Self::ReorderProviders { provider_ids } => formatter
+                .debug_struct("ReorderProviders")
+                .field("provider_ids", provider_ids)
+                .finish(),
+            Self::DeleteProvider {
+                provider_id,
+                provider_revision,
+            } => formatter
+                .debug_struct("DeleteProvider")
+                .field("provider_id", provider_id)
+                .field("provider_revision", provider_revision)
                 .finish(),
             Self::ActivateProvider { provider_id, mode } => formatter
                 .debug_struct("ActivateProvider")

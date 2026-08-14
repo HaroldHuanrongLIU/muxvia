@@ -102,6 +102,15 @@ const targetActionSchema = z.discriminatedUnion("kind", [
     credential: credentialEditSchema,
   }),
   z.object({
+    kind: z.literal("reorder-providers"),
+    providerIds: z.array(z.string().uuid()),
+  }),
+  z.object({
+    kind: z.literal("delete-provider"),
+    providerId: z.string().uuid(),
+    providerRevision: z.number().int().positive(),
+  }),
+  z.object({
     kind: z.literal("activate-provider"),
     providerId: z.string(),
     mode: z.literal("takeover"),

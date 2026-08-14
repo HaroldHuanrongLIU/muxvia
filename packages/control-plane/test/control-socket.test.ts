@@ -7,6 +7,7 @@ import { EventEmitter } from "node:events"
 
 import { encodeFrame, FrameDecoder } from "../src/control/framing"
 import { RpcClient } from "../src/control/rpc-client"
+import type { TargetAction } from "../src/control/types"
 
 const roots: string[] = []
 
@@ -144,4 +145,62 @@ test("a generic server frame error rejects the handshake before socket close", a
   await expect(RpcClient.connect(path, "control-test")).rejects.toMatchObject({
     code: "frame-invalid",
   })
+})
+
+test("sends revision-guarded reorder and delete actions unchanged over the control socket", async () => {
+  const received: unknown[] = []
+  const path = await listen((socket) => {
+    const decoder = new FrameDecoder()
+    socket.on("data", (chunk) => {
+      if (typeof chunk === "string") throw new Error("unexpected text chunk")
+      for (const value of decoder.push(chunk)) {
+        const frame = value as { type: string; requestId?: string; operation?: { action?: unknown } }
+        if (frame.type === "hello") {
+          socket.write(encodeFrame({
+            type: "hello-ack",
+            rpc: { major: 1, minor: 0 },
+            release: "routing-test",
+            serviceEpoch: "00000000-0000-4000-8000-000000000001",
+            frameLimit: 1_048_576,
+          }))
+          continue
+        }
+        received.push(frame.operation?.action)
+        socket.write(encodeFrame({
+          type: "error",
+          requestId: frame.requestId,
+          problem: { code: "stale-revision", message: "refresh" },
+        }))
+      }
+    })
+  })
+  const client = await RpcClient.connect(path, "control-test")
+  const actions = [
+    {
+      kind: "reorder-providers",
+      providerIds: [
+        "00000000-0000-4000-8000-000000000103",
+        "00000000-0000-4000-8000-000000000101",
+        "00000000-0000-4000-8000-000000000102",
+      ],
+    },
+    {
+      kind: "delete-provider",
+      providerId: "00000000-0000-4000-8000-000000000101",
+      providerRevision: 7,
+    },
+  ] satisfies TargetAction[]
+
+  for (const action of actions) {
+    await expect(client.request({
+      kind: "act",
+      target: "codex",
+      actionId: crypto.randomUUID(),
+      expectedRevision: 9,
+      action,
+    })).rejects.toMatchObject({ code: "stale-revision" })
+  }
+
+  expect(received).toEqual(actions)
+  await client.close()
 })

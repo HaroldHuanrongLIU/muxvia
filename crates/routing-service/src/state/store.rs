@@ -532,6 +532,20 @@ impl StateStore {
                 },
                 "update-provider",
             ),
+            Ok(TargetAction::ReorderProviders { provider_ids }) => (
+                super::providers::ProviderAction::Reorder { provider_ids },
+                "reorder-providers",
+            ),
+            Ok(TargetAction::DeleteProvider {
+                provider_id,
+                provider_revision,
+            }) => (
+                super::providers::ProviderAction::Delete {
+                    provider_id,
+                    provider_revision,
+                },
+                "delete-provider",
+            ),
             Ok(_) => {
                 return Err(self
                     .failure("unsupported-operation", "Provider action is not supported")
@@ -600,6 +614,14 @@ impl StateStore {
                         super::providers::ProviderMutationError::Invalid => {
                             ("invalid-provider", "Provider declaration is invalid")
                         }
+                        super::providers::ProviderMutationError::InvalidOrder => (
+                            "invalid-provider-order",
+                            "Provider order must contain every Provider exactly once",
+                        ),
+                        super::providers::ProviderMutationError::ProviderReferenced => (
+                            "provider-referenced",
+                            "Provider is referenced by Current or an Activated Snapshot",
+                        ),
                         super::providers::ProviderMutationError::StaleProviderRevision => (
                             "stale-provider-revision",
                             "Provider changed; refresh and retry",

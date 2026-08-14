@@ -30,6 +30,36 @@ fn fixtures_round_trip_as_their_protocol_types() {
     let save_provider = fixture("save-provider.json");
     let action: TargetAction = serde_json::from_value(save_provider.clone()).unwrap();
     assert_eq!(serde_json::to_value(action).unwrap(), save_provider);
+
+    for name in ["reorder-providers.json", "delete-provider.json"] {
+        let action = fixture(name);
+        let parsed: TargetAction = serde_json::from_value(action.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), action);
+    }
+}
+
+#[test]
+fn provider_lifecycle_actions_use_revision_guarded_secret_free_wire_shapes() {
+    let reorder = TargetAction::ReorderProviders {
+        provider_ids: vec![
+            "00000000-0000-4000-8000-000000000103".parse().unwrap(),
+            "00000000-0000-4000-8000-000000000101".parse().unwrap(),
+            "00000000-0000-4000-8000-000000000102".parse().unwrap(),
+        ],
+    };
+    assert_eq!(
+        serde_json::to_value(reorder).unwrap(),
+        fixture("reorder-providers.json")
+    );
+
+    let delete = TargetAction::DeleteProvider {
+        provider_id: "00000000-0000-4000-8000-000000000101".parse().unwrap(),
+        provider_revision: 7,
+    };
+    assert_eq!(
+        serde_json::to_value(delete).unwrap(),
+        fixture("delete-provider.json")
+    );
 }
 
 #[test]

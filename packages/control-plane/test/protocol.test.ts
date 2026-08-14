@@ -21,6 +21,8 @@ test.each([
   ["hello.json", parseClientFrame],
   ["initial-target-view.json", parseTargetView],
   ["save-provider.json", parseTargetAction],
+  ["reorder-providers.json", parseTargetAction],
+  ["delete-provider.json", parseTargetAction],
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)

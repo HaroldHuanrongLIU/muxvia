@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use tokio_rusqlite::rusqlite::{OptionalExtension, Transaction, params};
 use uuid::Uuid;
 
@@ -34,10 +36,19 @@ pub(super) enum ProviderAction {
         model: String,
         credential: CredentialEdit,
     },
+    Reorder {
+        provider_ids: Vec<Uuid>,
+    },
+    Delete {
+        provider_id: Uuid,
+        provider_revision: u64,
+    },
 }
 
 pub(super) enum ProviderMutationError {
     Invalid,
+    InvalidOrder,
+    ProviderReferenced,
     StaleProviderRevision,
     NoProviderChange,
 }
@@ -70,7 +81,136 @@ pub(super) fn mutate_provider(
             model,
             credential,
         ),
+        ProviderAction::Reorder { provider_ids } => reorder_providers(transaction, &provider_ids),
+        ProviderAction::Delete {
+            provider_id,
+            provider_revision,
+        } => delete_provider(transaction, provider_id, provider_revision),
     }
+}
+
+pub(super) fn reorder_providers(
+    transaction: &Transaction<'_>,
+    provider_ids: &[Uuid],
+) -> Result<(), ProviderMutationError> {
+    let existing = transaction
+        .prepare("SELECT id FROM providers WHERE target = 'codex' ORDER BY position")
+        .map_err(|_| ProviderMutationError::Invalid)?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| ProviderMutationError::Invalid)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ProviderMutationError::Invalid)?
+        .into_iter()
+        .map(|id| Uuid::parse_str(&id).map_err(|_| ProviderMutationError::Invalid))
+        .collect::<Result<Vec<_>, _>>()?;
+    let requested = provider_ids.iter().copied().collect::<HashSet<_>>();
+    let expected = existing.iter().copied().collect::<HashSet<_>>();
+    if provider_ids.len() != existing.len()
+        || requested.len() != provider_ids.len()
+        || requested != expected
+    {
+        return Err(ProviderMutationError::InvalidOrder);
+    }
+    if provider_ids == existing {
+        return Err(ProviderMutationError::NoProviderChange);
+    }
+
+    let temporary_start: u64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM providers WHERE target = 'codex'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| ProviderMutationError::Invalid)?;
+    for (position, provider_id) in provider_ids.iter().enumerate() {
+        let temporary_position = temporary_start
+            .checked_add(position as u64)
+            .ok_or(ProviderMutationError::Invalid)?;
+        transaction
+            .execute(
+                "UPDATE providers SET position = ?1 WHERE id = ?2 AND target = 'codex'",
+                params![temporary_position, provider_id.to_string()],
+            )
+            .map_err(|_| ProviderMutationError::Invalid)?;
+    }
+    for (position, provider_id) in provider_ids.iter().enumerate() {
+        transaction
+            .execute(
+                "UPDATE providers SET position = ?1 WHERE id = ?2 AND target = 'codex'",
+                params![position as u32, provider_id.to_string()],
+            )
+            .map_err(|_| ProviderMutationError::Invalid)?;
+    }
+    Ok(())
+}
+
+pub(super) fn delete_provider(
+    transaction: &Transaction<'_>,
+    provider_id: Uuid,
+    provider_revision: u64,
+) -> Result<(), ProviderMutationError> {
+    let (position, credential_id, revision, generated_owner_id): (
+        u32,
+        Option<String>,
+        u64,
+        Option<String>,
+    ) = transaction
+        .query_row(
+            "SELECT position, credential_id, provider_revision, generated_owner_id
+             FROM providers WHERE id = ?1 AND target = 'codex'",
+            [provider_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|_| ProviderMutationError::Invalid)?
+        .ok_or(ProviderMutationError::Invalid)?;
+    if revision != provider_revision {
+        return Err(ProviderMutationError::StaleProviderRevision);
+    }
+    if generated_owner_id.is_some() {
+        return Err(ProviderMutationError::Invalid);
+    }
+    let referenced: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM target_route_state
+                 WHERE target = 'codex' AND current_provider_id = ?1
+                UNION ALL
+                SELECT 1 FROM target_route_state r
+                 JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
+                 WHERE r.target = 'codex' AND s.provider_id = ?1
+             )",
+            [provider_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|_| ProviderMutationError::Invalid)?;
+    if referenced {
+        return Err(ProviderMutationError::ProviderReferenced);
+    }
+    transaction
+        .execute(
+            "DELETE FROM providers WHERE id = ?1 AND target = 'codex'",
+            [provider_id.to_string()],
+        )
+        .map_err(|_| ProviderMutationError::Invalid)?;
+    transaction
+        .execute(
+            "UPDATE providers SET position = position - 1
+             WHERE target = 'codex' AND position > ?1",
+            [position],
+        )
+        .map_err(|_| ProviderMutationError::Invalid)?;
+    if let Some(credential_id) = credential_id {
+        transaction
+            .execute(
+                "DELETE FROM credentials
+                 WHERE id = ?1
+                   AND NOT EXISTS (SELECT 1 FROM providers WHERE credential_id = ?1)",
+                [credential_id],
+            )
+            .map_err(|_| ProviderMutationError::Invalid)?;
+    }
+    Ok(())
 }
 
 fn create_provider(

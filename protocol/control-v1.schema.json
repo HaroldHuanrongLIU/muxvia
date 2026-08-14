@@ -38,6 +38,8 @@
       "oneOf": [
         { "type": "object", "properties": { "kind": { "const": "create-provider" }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/credentialEdit" }, "presetKey": { "oneOf": [{ "const": "openai-api-responses" }, { "type": "null" }] } }, "required": ["kind", "name", "baseUrl", "model", "credential"] },
         { "type": "object", "properties": { "kind": { "const": "update-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/credentialEdit" } }, "required": ["kind", "providerId", "providerRevision", "name", "baseUrl", "model", "credential"] },
+        { "type": "object", "properties": { "kind": { "const": "reorder-providers" }, "providerIds": { "type": "array", "items": { "type": "string", "format": "uuid" } } }, "required": ["kind", "providerIds"] },
+        { "type": "object", "properties": { "kind": { "const": "delete-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"] },
         { "type": "object", "properties": { "kind": { "const": "activate-provider" }, "providerId": { "type": "string" }, "mode": { "const": "takeover" } }, "required": ["kind", "providerId", "mode"] }
       ]
     },

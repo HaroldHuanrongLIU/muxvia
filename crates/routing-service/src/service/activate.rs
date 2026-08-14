@@ -194,7 +194,12 @@ impl ActivationService {
             return Ok(outcome);
         }
         match serde_json::from_value(raw_action.clone()) {
-            Ok(TargetAction::CreateProvider { .. } | TargetAction::UpdateProvider { .. }) => {
+            Ok(
+                TargetAction::CreateProvider { .. }
+                | TargetAction::UpdateProvider { .. }
+                | TargetAction::ReorderProviders { .. }
+                | TargetAction::DeleteProvider { .. },
+            ) => {
                 let outcome = self
                     .store
                     .apply_provider_action(action_id, expected_revision, raw_action)

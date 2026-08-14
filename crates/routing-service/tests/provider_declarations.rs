@@ -1,11 +1,14 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::Arc};
 
 use muxvia_routing::{
+    codex::CommandCodexProbe,
     control::protocol::{
         ActionStatus, CredentialPresence, ProviderCompleteness, ProviderReferenceView,
         ProviderRequirement,
     },
     home::MuxviaHome,
+    model::ReqwestUpstream,
+    service::activate::ActivationService,
     state::StateStore,
 };
 use tokio_rusqlite::rusqlite::{Connection, params};
@@ -189,7 +192,9 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
     let second_provider_id = "00000000-0000-4000-8000-000000000102";
     let existing_snapshot_id = Uuid::parse_str("00000000-0000-4000-8000-000000000103").unwrap();
     let epoch = "00000000-0000-4000-8000-000000000104";
+    let receipt_id = Uuid::parse_str("00000000-0000-4000-8000-000000000105").unwrap();
     let credential = "v1-provider-secret-must-not-escape";
+    let malformed_secret = "malformed-replay-secret-must-not-escape";
 
     let connection = Connection::open(fixture.home.database_path()).unwrap();
     connection.execute_batch(V1_SCHEMA).unwrap();
@@ -243,9 +248,59 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
             params![existing_provider_id, existing_snapshot_id.to_string()],
         )
         .unwrap();
+    let legacy_outcome = serde_json::json!({
+        "status": "applied",
+        "view": {
+            "target": "codex",
+            "managementRevision": 7,
+            "viewSequence": 9,
+            "service": { "epoch": epoch, "state": "running" },
+            "mode": "takeover",
+            "takeover": { "state": "active", "endpoint": "http://127.0.0.1:1234" },
+            "providers": [
+                {
+                    "id": existing_provider_id,
+                    "name": "One",
+                    "baseUrl": "https://one.example/v1",
+                    "model": "one",
+                    "credential": "present"
+                },
+                {
+                    "id": second_provider_id,
+                    "name": "Two at receipt time",
+                    "baseUrl": "",
+                    "model": "",
+                    "credential": "missing"
+                }
+            ],
+            "currentProviderId": existing_provider_id,
+            "servingProviderId": null,
+            "managedConfiguration": {
+                "state": "applied",
+                "path": "/tmp/config.toml",
+                "restartRequired": true
+            },
+            "recovery": { "intentId": null, "state": "clean" },
+            "activatedSnapshot": {
+                "id": existing_snapshot_id,
+                "providerId": existing_provider_id,
+                "model": "one",
+                "epoch": epoch
+            },
+            "problems": []
+        }
+    });
+    connection
+        .execute(
+            "INSERT INTO action_receipts
+             (action_id, action_kind, committed_revision, outcome_json)
+             VALUES (?1, 'activate-provider', 7, ?2)",
+            params![receipt_id.to_string(), legacy_outcome.to_string()],
+        )
+        .unwrap();
     drop(connection);
 
-    let store = StateStore::open(&fixture.home).await.unwrap();
+    let store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
     let view = store.target_view().await.unwrap();
 
     assert_eq!(
@@ -296,6 +351,73 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
         secrecy::ExposeSecret::expose_secret(&preparation.provider_credential),
         credential
     );
+
+    let service = ActivationService::new(
+        Arc::clone(&store),
+        fixture.home.clone(),
+        Arc::new(CommandCodexProbe),
+        "/must/not/probe/codex".into(),
+        Arc::new(ReqwestUpstream::new().unwrap()),
+    );
+    let replay = service
+        .apply_raw(
+            receipt_id,
+            u64::MAX,
+            serde_json::json!({ "malformed": malformed_secret }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(replay.status, ActionStatus::Replayed);
+    assert_eq!(replay.view.management_revision, 7);
+    assert_eq!(replay.view.view_sequence, 9);
+    assert_eq!(replay.view.service.epoch, epoch);
+    assert_eq!(replay.view.providers[0].position, 0);
+    assert_eq!(replay.view.providers[0].provider_revision, 1);
+    assert_eq!(
+        replay.view.providers[0].active_references,
+        [
+            ProviderReferenceView::Current,
+            ProviderReferenceView::ActivatedSnapshot,
+        ]
+    );
+    assert_eq!(replay.view.providers[1].position, 1);
+    assert_eq!(
+        replay.view.providers[1].missing_fields,
+        [
+            ProviderRequirement::BaseUrl,
+            ProviderRequirement::Model,
+            ProviderRequirement::Credential,
+        ]
+    );
+    assert_eq!(replay.view.provider_presets.len(), 1);
+    assert_eq!(replay.view.provider_presets[0].key, "openai-api-responses");
+    let replay_json = serde_json::to_string(&replay).unwrap();
+    assert!(!replay_json.contains(credential));
+    assert!(!replay_json.contains(malformed_secret));
+
+    let receipt_metadata = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap()
+        .call(move |connection| {
+            connection.query_row(
+                "SELECT action_kind, committed_revision, outcome_json
+                 FROM action_receipts WHERE action_id = ?1",
+                [receipt_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt_metadata.0, "activate-provider");
+    assert_eq!(receipt_metadata.1, 7);
+    assert!(!receipt_metadata.2.contains(credential));
 }
 
 #[tokio::test]

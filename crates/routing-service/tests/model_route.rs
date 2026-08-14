@@ -363,7 +363,8 @@ async fn every_invalid_credential_shape_returns_the_same_401_before_state_or_ups
     let mut observed = Vec::new();
     for response in [missing, wrong, short, long, duplicate, non_ascii] {
         let status = response.status();
-        let headers = response.headers().clone();
+        let mut headers = response.headers().clone();
+        headers.remove("date");
         let body = response.bytes().await.unwrap();
         observed.push((status, headers, body));
     }

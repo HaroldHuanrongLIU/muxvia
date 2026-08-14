@@ -17,7 +17,8 @@ T03 completes declaration management only. It does not add Claude Code as a live
 - Codex T03 has one fixed protocol/auth profile: OpenAI-compatible Responses with bearer authentication. Anthropic auth profiles and pagination belong to the Claude Target ticket.
 - Incomplete Providers can be saved, inspected, edited, reordered, duplicated, and deleted when unreferenced. Activation continues to reject them before any recovery intent, configuration write, or snapshot creation.
 - Credentials have identities independent of Providers. Create or replace makes a new Credential Reference; keep retains the current reference; remove detaches it. Replacing a shared credential rebinds only the edited Provider and never mutates the secret used by another Provider.
-- Duplicate opens an editor prefilled from the source, with the localized default name `<source> Copy`, and inserts the saved duplicate immediately after the source. It creates a new Provider identity and copies declaration state only. Reusing the source Credential Reference requires a separate explicit confirmation; declining leaves the duplicate credential missing unless the Operator enters a replacement.
+- Duplicate opens an editor prefilled from the source, with the localized default name `<source> Copy`, and inserts the saved duplicate immediately after the source. It creates a new Provider identity and copies declaration state plus non-owning provenance metadata only; it never copies runtime state or active references. Reusing the source Credential Reference requires a separate explicit confirmation; declining leaves the duplicate credential missing unless the Operator enters a replacement.
+- Duplicating a future Generated Target Provider creates a detached ordinary Provider: declaration values may be copied, but generated ownership and ownership-implying provenance are cleared. T03 does not create Generated Providers, but the mutation boundary is safe for the reserved wire state.
 - T03 ships Blank creation plus one release-owned Preset with stable key `openai-api-responses`. The Preset copies `https://api.openai.com/v1` and the fixed Responses protocol into a new editable draft; it contains no credential, model, affiliate content, or `auth.json` behavior. Saving may retain the non-owning Preset provenance key for display, but later catalog changes never update the Provider.
 - Automatic Model Discovery runs once only when an existing Provider editor opens. It uses the last-saved endpoint and Credential Reference. A create or Preset draft has no automatic network request.
 - Editing endpoint or credential fields never starts a request. Explicit refresh uses the current draft endpoint and either the newly typed ephemeral credential or, when unchanged, the saved Credential Reference.
@@ -26,13 +27,13 @@ T03 completes declaration management only. It does not add Claude Code as a live
 
 ## Domain and storage model
 
-The Routing Service remains the sole storage owner. Schema version 2 introduces explicit declaration order and independent credential identities while migrating existing T01 state without changing Provider UUIDs, current state, snapshots, or credential bytes.
+The Routing Service remains the sole storage owner. Schema version 2 introduces explicit declaration order and independent credential identities while migrating existing T01 state without changing Provider UUIDs, current state, snapshots, credential bytes, or the existing string-shaped wire fields.
 
 Each Provider stores:
 
 - UUID, target, and per-target zero-based position;
 - required display name;
-- optional normalized base URL and optional model;
+- normalized base URL and model strings, using an empty string when the value is missing;
 - fixed protocol `openai-responses`;
 - optional Credential Reference;
 - configuration revision, incremented only when that Provider declaration changes;
@@ -57,6 +58,8 @@ All persistent Provider mutations remain Target actions guarded by a new action 
 
 The Routing Service checks a recorded receipt before parsing the raw action. A successful mutation, including a successful no-op only when explicitly defined, commits its declaration changes, management revision, view sequence, secret-free receipt, and complete Target View in one immediate transaction. Stale, invalid, incomplete-order, referenced-delete, and recovery-required failures do not partially mutate state. All Provider mutations remain blocked while the Codex Target is Recovery Required.
 
+T03 defines identical update and unchanged-order reorder as `no-provider-change` failures: they write no receipt and advance no Provider, management, or view revision. The Control Plane avoids dispatching these requests, while the service enforces the rule authoritatively.
+
 Reorder changes display order only. It is not a Failover Chain and never changes routing attempt order. The service accepts only an exact permutation of all current ordinary Provider IDs for the target.
 
 ## Target View and RPC
@@ -64,7 +67,7 @@ Reorder changes display order only. It is not a Failover Chain and never changes
 Provider projection adds:
 
 - stable position and per-Provider configuration revision;
-- nullable endpoint and model;
+- endpoint and model strings, empty when missing;
 - fixed protocol;
 - Credential Reference presence, never its identity or bytes;
 - completeness and missing fields;
@@ -75,7 +78,7 @@ The Preset catalog is a secret-free Target View field owned by the Routing Servi
 
 Persistent mutations continue through `TargetSession.act()` and return `ActionOutcome` with a complete authoritative Target View. Model Discovery and Reachability use separate read-only RPC results with no Target View and no action receipt. A read-only result therefore cannot roll the session back after a newer pushed view.
 
-Probe requests are redacted in Rust and TypeScript diagnostics. Automatic discovery sends only Provider identity plus configuration revision; the Routing Service resolves the saved Credential Reference. Explicit refresh may carry one ephemeral draft credential, which is never persisted, placed in a receipt, echoed in a result, or included in ordinary errors. Editor generation suppresses late or superseded results.
+Probe requests are redacted in Rust and TypeScript diagnostics. Automatic discovery sends only Provider identity plus configuration revision; the Routing Service resolves the saved Credential Reference. Explicit refresh always carries the current draft endpoint and a credential source of missing, one ephemeral typed value, or a saved Provider identity plus configuration revision. This lets unsaved Blank and Preset drafts refresh without inventing a Provider identity. An ephemeral credential is never persisted, placed in a receipt, echoed in a result, or included in ordinary errors. Editor generation suppresses late or superseded results.
 
 ## Provider inspection adapter
 

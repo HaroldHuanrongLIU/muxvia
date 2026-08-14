@@ -3,7 +3,8 @@ use tokio_rusqlite::rusqlite::{Connection, Result};
 use crate::control::protocol::{
     ActivatedSnapshotView, ControlProblem, CredentialPresence, ManagedConfigurationView,
     ProviderCompleteness, ProviderProtocol, ProviderProvenanceView, ProviderReferenceView,
-    ProviderRequirement, ProviderView, RecoveryView, ServiceView, TakeoverView, Target, TargetView,
+    ProviderRequirement, ProviderRoutingRequirement, ProviderView, RecoveryView, ServiceView,
+    TakeoverView, Target, TargetView,
 };
 use crate::state::providers::provider_presets;
 
@@ -15,6 +16,7 @@ type RouteProjectionRow = (
     String,
     Option<u16>,
     String,
+    Option<String>,
     Option<String>,
 );
 
@@ -31,8 +33,11 @@ pub(crate) fn project_target_view(
         route_port,
         recovery_state,
         managed_config_path,
+        activated_snapshot_id,
     ): RouteProjectionRow = connection.query_row(
-        "SELECT management_revision, view_sequence, current_provider_id, serving_provider_id, takeover_state, route_port, recovery_state, managed_config_path
+        "SELECT management_revision, view_sequence, current_provider_id, serving_provider_id,
+                takeover_state, route_port, recovery_state, managed_config_path,
+                activated_snapshot_id
          FROM target_route_state WHERE target = 'codex'",
         [],
         |row| {
@@ -45,13 +50,14 @@ pub(crate) fn project_target_view(
                 row.get(5)?,
                 row.get(6)?,
                 row.get(7)?,
+                row.get(8)?,
             ))
         },
     )?;
 
     let mut statement = connection.prepare(
         "SELECT p.id, p.position, p.provider_revision, p.name, p.base_url, p.model, p.protocol,
-                p.provenance_kind, p.provenance_key, p.generated_owner_id,
+                p.routing_requirement, p.provenance_kind, p.provenance_key, p.generated_owner_id,
                 p.credential_id IS NOT NULL,
                 EXISTS(
                     SELECT 1 FROM target_route_state r
@@ -67,7 +73,7 @@ pub(crate) fn project_target_view(
     let providers = statement
         .query_map([], |row| {
             let id = uuid::Uuid::parse_str(&row.get::<_, String>(0)?).map_err(conversion_error)?;
-            let has_credential: bool = row.get(10)?;
+            let has_credential: bool = row.get(11)?;
             let base_url: String = row.get(4)?;
             let model: String = row.get(5)?;
             let mut missing_fields = Vec::new();
@@ -80,18 +86,18 @@ pub(crate) fn project_target_view(
             if !has_credential {
                 missing_fields.push(ProviderRequirement::Credential);
             }
-            let provenance_kind: Option<String> = row.get(7)?;
-            let provenance_key: Option<String> = row.get(8)?;
+            let provenance_kind: Option<String> = row.get(8)?;
+            let provenance_key: Option<String> = row.get(9)?;
             let provenance = match (provenance_kind, provenance_key) {
                 (Some(kind), Some(key)) => Some(ProviderProvenanceView { kind, key }),
                 (None, None) => None,
                 _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
             };
             let mut active_references = Vec::new();
-            if row.get(11)? {
+            if row.get(12)? {
                 active_references.push(ProviderReferenceView::Current);
             }
-            if row.get(12)? {
+            if row.get(13)? {
                 active_references.push(ProviderReferenceView::ActivatedSnapshot);
             }
             Ok(ProviderView {
@@ -103,6 +109,11 @@ pub(crate) fn project_target_view(
                 model,
                 protocol: match row.get::<_, String>(6)?.as_str() {
                     "openai-responses" => ProviderProtocol::OpenaiResponses,
+                    _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+                },
+                routing_requirement: match row.get::<_, String>(7)?.as_str() {
+                    "direct-compatible" => ProviderRoutingRequirement::DirectCompatible,
+                    "takeover-required" => ProviderRoutingRequirement::TakeoverRequired,
                     _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
                 },
                 credential: if has_credential {
@@ -117,17 +128,17 @@ pub(crate) fn project_target_view(
                 },
                 missing_fields,
                 provenance,
-                generated: row.get::<_, Option<String>>(9)?.is_some(),
+                generated: row.get::<_, Option<String>>(10)?.is_some(),
                 active_references,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
 
     let endpoint = route_port.map(|port| format!("http://127.0.0.1:{port}"));
-    let mode = if takeover_state == "active" {
-        "takeover"
-    } else {
-        "unmanaged"
+    let mode = match (takeover_state.as_str(), activated_snapshot_id.as_ref()) {
+        ("active", _) => "takeover",
+        (_, Some(_)) => "direct",
+        _ => "unmanaged",
     };
     let recovery = connection
         .query_row(
@@ -192,13 +203,13 @@ pub(crate) fn project_target_view(
         managed_configuration: ManagedConfigurationView {
             state: if recovery_state == "recovery-required" {
                 recovery_state.clone()
-            } else if takeover_state == "active" {
+            } else if mode != "unmanaged" {
                 "applied".to_owned()
             } else {
                 "unmanaged".to_owned()
             },
             path: managed_config_path,
-            restart_required: takeover_state == "active",
+            restart_required: mode != "unmanaged",
         },
         recovery: RecoveryView {
             intent_id: recovery.0,

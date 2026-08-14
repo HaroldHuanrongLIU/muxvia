@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     codex::{CodexCapability, CodexConfigCodec, CodexProbe},
     control::protocol::{
-        ActionOutcome, ActionStatus, ControlProblem, TakeoverMode, Target, TargetAction,
+        ActionOutcome, ActionStatus, ActivationMode, ControlProblem, Target, TargetAction,
     },
     domain::activation::ActivatedSnapshot,
     home::MuxviaHome,
@@ -138,7 +138,7 @@ pub struct ActivateProviderCommand {
     pub action_id: Uuid,
     pub expected_revision: u64,
     pub provider_id: Uuid,
-    pub mode: TakeoverMode,
+    pub mode: ActivationMode,
 }
 
 pub struct ActivationService {
@@ -246,7 +246,7 @@ impl ActivationService {
         if let Some(outcome) = self.receipt_or_failure(command.action_id).await? {
             return Ok(outcome);
         }
-        if command.mode != TakeoverMode::Takeover {
+        if command.mode != ActivationMode::Takeover {
             return Err(self
                 .activation_failure("internal-failure", "Activation failed")
                 .await);

@@ -4,9 +4,9 @@ use muxvia_routing::{
     control::{
         framing::{FrameError, read_frame, write_frame},
         protocol::{
-            ClientFrame, ControlResult, CredentialEdit, DiscoverySource, DraftCredentialSource,
-            DuplicateCredential, ProviderCompleteness, ProviderProtocol, ProviderRequirement,
-            ServerFrame, TargetAction, TargetView,
+            ActivationMode, ClientFrame, ControlResult, CredentialEdit, DiscoverySource,
+            DraftCredentialSource, DuplicateCredential, ProviderCompleteness, ProviderProtocol,
+            ProviderRequirement, ProviderRoutingRequirement, ServerFrame, TargetAction, TargetView,
         },
     },
     service::provider_inspector::{DiscoveredModel, ModelDiscoveryResult, ReachabilityResult},
@@ -235,13 +235,14 @@ fn provider_declaration_contract_round_trips_the_secret_free_projection_and_acti
         "id": "00000000-0000-4000-8000-000000000101",
         "position": 0,
         "providerRevision": 1,
-        "name": "Incomplete",
-        "baseUrl": "",
-        "model": "",
+        "name": "Direct Provider",
+        "baseUrl": "https://provider.example/v1",
+        "model": "model-a",
         "protocol": "openai-responses",
-        "credential": "missing",
-        "completeness": "incomplete",
-        "missingFields": ["base-url", "model", "credential"],
+        "routingRequirement": "direct-compatible",
+        "credential": "present",
+        "completeness": "complete",
+        "missingFields": [],
         "provenance": null,
         "generated": false,
         "activeReferences": []
@@ -276,6 +277,10 @@ fn provider_declaration_contract_round_trips_the_secret_free_projection_and_acti
     );
     assert_eq!(ProviderCompleteness::Incomplete.to_string(), "incomplete");
     assert_eq!(ProviderRequirement::BaseUrl.to_string(), "base-url");
+    assert_eq!(
+        ProviderRoutingRequirement::DirectCompatible.to_string(),
+        "direct-compatible"
+    );
 
     let action = TargetAction::CreateProvider {
         name: "Incomplete".into(),
@@ -298,6 +303,38 @@ fn provider_declaration_contract_round_trips_the_secret_free_projection_and_acti
 }
 
 #[test]
+fn activate_provider_uses_exact_direct_and_takeover_wire_modes() {
+    for (mode, expected) in [
+        ("direct", ActivationMode::Direct),
+        ("takeover", ActivationMode::Takeover),
+    ] {
+        let parsed: TargetAction = serde_json::from_value(serde_json::json!({
+            "kind": "activate-provider",
+            "providerId": "00000000-0000-4000-8000-000000000101",
+            "mode": mode,
+            "futureField": "ignored"
+        }))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            TargetAction::ActivateProvider {
+                provider_id: "00000000-0000-4000-8000-000000000101".into(),
+                mode: expected,
+            }
+        );
+    }
+
+    assert!(
+        serde_json::from_value::<TargetAction>(serde_json::json!({
+            "kind": "activate-provider",
+            "providerId": "00000000-0000-4000-8000-000000000101",
+            "mode": "automatic"
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn credential_edit_debug_redacts_replacement_values_and_wire_types_accept_unknown_fields() {
     let sentinel = "credential-sentinel-must-not-escape";
     assert!(
@@ -316,6 +353,7 @@ fn credential_edit_debug_redacts_replacement_values_and_wire_types_accept_unknow
         "baseUrl": "",
         "model": "",
         "credential": { "kind": "remove" },
+        "routingRequirement": "takeover-required",
         "futureField": "ignored"
     }))
     .unwrap();

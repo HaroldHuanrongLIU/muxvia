@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio_rusqlite::rusqlite::{
     Connection, Error, OptionalExtension, Result, Transaction, TransactionBehavior, params,
     types::Type,
@@ -6,13 +6,14 @@ use tokio_rusqlite::rusqlite::{
 
 use crate::control::protocol::{
     ActionOutcome, ActionStatus, ActivatedSnapshotView, ControlProblem, CredentialPresence,
-    ManagedConfigurationView, ProviderCompleteness, ProviderProtocol, ProviderReferenceView,
-    ProviderRequirement, ProviderView, RecoveryView, ServiceView, TakeoverView, Target, TargetView,
+    ManagedConfigurationView, ProviderCompleteness, ProviderPresetView, ProviderProtocol,
+    ProviderProvenanceView, ProviderReferenceView, ProviderRequirement, ProviderRoutingRequirement,
+    ProviderView, RecoveryView, ServiceView, TakeoverView, Target, TargetView,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -36,10 +37,15 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
         .transpose()?;
 
     match version {
-        None | Some(SCHEMA_VERSION) => connection.execute_batch(SCHEMA)?,
-        Some(1) => migrate_v1(connection)?,
+        None | Some(SCHEMA_VERSION) => {}
+        Some(1) => {
+            migrate_v1(connection)?;
+            migrate_v2(connection)?;
+        }
+        Some(2) => migrate_v2(connection)?,
         Some(_) => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
+    connection.execute_batch(SCHEMA)?;
     Ok(())
 }
 
@@ -113,7 +119,27 @@ fn migrate_v1(connection: &mut Connection) -> Result<()> {
          UPDATE metadata SET value = '2' WHERE key = 'schema-version';",
     )?;
     transaction.commit()?;
-    connection.execute_batch(SCHEMA)?;
+    Ok(())
+}
+
+fn migrate_v2(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "ALTER TABLE providers
+         ADD COLUMN routing_requirement TEXT NOT NULL DEFAULT 'direct-compatible'
+           CHECK (routing_requirement IN ('direct-compatible', 'takeover-required'));",
+    )?;
+    migrate_v2_receipts(&transaction)?;
+    transaction.execute(
+        "UPDATE metadata SET value = '3' WHERE key = 'schema-version'",
+        [],
+    )?;
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.commit()?;
     Ok(())
 }
 
@@ -141,6 +167,30 @@ fn migrate_v1_receipts(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v2_receipts(transaction: &Transaction<'_>) -> Result<()> {
+    let receipts = {
+        let mut statement =
+            transaction.prepare("SELECT action_id, outcome_json FROM action_receipts")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    for (action_id, outcome_json) in receipts {
+        let legacy: LegacyV2ActionOutcome =
+            serde_json::from_str(&outcome_json).map_err(json_conversion_error)?;
+        let outcome = legacy.into_v3();
+        let outcome_json = serde_json::to_string(&outcome).map_err(json_conversion_error)?;
+        transaction.execute(
+            "UPDATE action_receipts SET outcome_json = ?1 WHERE action_id = ?2",
+            params![outcome_json, action_id],
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct LegacyActionOutcome {
     status: ActionStatus,
@@ -148,7 +198,7 @@ struct LegacyActionOutcome {
 }
 
 impl LegacyActionOutcome {
-    fn into_v2(self) -> Result<ActionOutcome> {
+    fn into_v2(self) -> Result<LegacyV2ActionOutcome> {
         let current_provider_id = self.view.current_provider_id.clone();
         let activated_provider_id = self
             .view
@@ -169,9 +219,9 @@ impl LegacyActionOutcome {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(ActionOutcome {
+        Ok(LegacyV2ActionOutcome {
             status: self.status,
-            view: TargetView {
+            view: LegacyV2TargetView {
                 target: self.view.target,
                 management_revision: self.view.management_revision,
                 view_sequence: self.view.view_sequence,
@@ -191,6 +241,41 @@ impl LegacyActionOutcome {
     }
 }
 
+#[derive(Deserialize, Serialize)]
+struct LegacyV2ActionOutcome {
+    status: ActionStatus,
+    view: LegacyV2TargetView,
+}
+
+impl LegacyV2ActionOutcome {
+    fn into_v3(self) -> ActionOutcome {
+        ActionOutcome {
+            status: self.status,
+            view: TargetView {
+                target: self.view.target,
+                management_revision: self.view.management_revision,
+                view_sequence: self.view.view_sequence,
+                service: self.view.service,
+                mode: self.view.mode,
+                takeover: self.view.takeover,
+                providers: self
+                    .view
+                    .providers
+                    .into_iter()
+                    .map(LegacyV2ProviderView::into_v3)
+                    .collect(),
+                provider_presets: self.view.provider_presets,
+                current_provider_id: self.view.current_provider_id,
+                serving_provider_id: self.view.serving_provider_id,
+                managed_configuration: self.view.managed_configuration,
+                recovery: self.view.recovery,
+                activated_snapshot: self.view.activated_snapshot,
+                problems: self.view.problems,
+            },
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LegacyTargetView {
@@ -201,6 +286,25 @@ struct LegacyTargetView {
     mode: String,
     takeover: TakeoverView,
     providers: Vec<LegacyProviderView>,
+    current_provider_id: Option<String>,
+    serving_provider_id: Option<String>,
+    managed_configuration: ManagedConfigurationView,
+    recovery: RecoveryView,
+    activated_snapshot: Option<ActivatedSnapshotView>,
+    problems: Vec<ControlProblem>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyV2TargetView {
+    target: Target,
+    management_revision: u64,
+    view_sequence: u64,
+    service: ServiceView,
+    mode: String,
+    takeover: TakeoverView,
+    providers: Vec<LegacyV2ProviderView>,
+    provider_presets: Vec<ProviderPresetView>,
     current_provider_id: Option<String>,
     serving_provider_id: Option<String>,
     managed_configuration: ManagedConfigurationView,
@@ -225,7 +329,7 @@ impl LegacyProviderView {
         position: usize,
         current_provider_id: Option<&str>,
         activated_provider_id: Option<uuid::Uuid>,
-    ) -> Result<ProviderView> {
+    ) -> Result<LegacyV2ProviderView> {
         let id = uuid::Uuid::parse_str(&self.id).map_err(json_conversion_error)?;
         let mut missing_fields = Vec::new();
         if self.base_url.is_empty() {
@@ -245,7 +349,7 @@ impl LegacyProviderView {
             active_references.push(ProviderReferenceView::ActivatedSnapshot);
         }
 
-        Ok(ProviderView {
+        Ok(LegacyV2ProviderView {
             id,
             position: u32::try_from(position).map_err(json_conversion_error)?,
             provider_revision: 1,
@@ -264,6 +368,45 @@ impl LegacyProviderView {
             generated: false,
             active_references,
         })
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyV2ProviderView {
+    id: uuid::Uuid,
+    position: u32,
+    provider_revision: u64,
+    name: String,
+    base_url: String,
+    model: String,
+    protocol: ProviderProtocol,
+    credential: CredentialPresence,
+    completeness: ProviderCompleteness,
+    missing_fields: Vec<ProviderRequirement>,
+    provenance: Option<ProviderProvenanceView>,
+    generated: bool,
+    active_references: Vec<ProviderReferenceView>,
+}
+
+impl LegacyV2ProviderView {
+    fn into_v3(self) -> ProviderView {
+        ProviderView {
+            id: self.id,
+            position: self.position,
+            provider_revision: self.provider_revision,
+            name: self.name,
+            base_url: self.base_url,
+            model: self.model,
+            protocol: self.protocol,
+            routing_requirement: ProviderRoutingRequirement::DirectCompatible,
+            credential: self.credential,
+            completeness: self.completeness,
+            missing_fields: self.missing_fields,
+            provenance: self.provenance,
+            generated: self.generated,
+            active_references: self.active_references,
+        }
     }
 }
 

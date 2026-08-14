@@ -160,18 +160,19 @@ test("ignores unknown additive fields in an action envelope", () => {
   })
 })
 
-test("round-trips schema-v2 Provider declarations, Presets, and credential intent", () => {
+test("round-trips schema-v3 Provider declarations, Presets, and credential intent", () => {
   const provider = {
     id: "00000000-0000-4000-8000-000000000101",
     position: 0,
     providerRevision: 1,
-    name: "Incomplete",
-    baseUrl: "",
-    model: "",
+    name: "Direct Provider",
+    baseUrl: "https://provider.example/v1",
+    model: "model-a",
     protocol: "openai-responses",
-    credential: "missing",
-    completeness: "incomplete",
-    missingFields: ["base-url", "model", "credential"],
+    routingRequirement: "direct-compatible",
+    credential: "present",
+    completeness: "complete",
+    missingFields: [],
     provenance: null,
     generated: false,
     activeReferences: [],
@@ -234,6 +235,28 @@ test("round-trips schema-v2 Provider declarations, Presets, and credential inten
   })
 })
 
+test.each(["direct", "takeover"] as const)("accepts activate-provider mode %s", (mode) => {
+  const action = {
+    kind: "activate-provider",
+    providerId: "00000000-0000-4000-8000-000000000101",
+    mode,
+    futureField: "ignored",
+  } as const
+  expect(parseTargetAction(action)).toEqual({
+    kind: "activate-provider",
+    providerId: "00000000-0000-4000-8000-000000000101",
+    mode,
+  })
+})
+
+test("rejects an unknown activate-provider mode", () => {
+  expect(() => parseTargetAction({
+    kind: "activate-provider",
+    providerId: "00000000-0000-4000-8000-000000000101",
+    mode: "automatic",
+  })).toThrow()
+})
+
 test("accepts additive fields while redacting credential replacement intent", () => {
   const parsed = parseTargetAction({
     kind: "create-provider",
@@ -241,6 +264,7 @@ test("accepts additive fields while redacting credential replacement intent", ()
     baseUrl: "",
     model: "",
     credential: { kind: "replace", value: "credential-sentinel-must-not-escape" },
+    routingRequirement: "takeover-required",
     futureField: "ignored",
   })
   expect(parsed).toEqual({

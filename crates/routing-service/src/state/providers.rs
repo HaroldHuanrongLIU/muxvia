@@ -18,6 +18,7 @@ struct SourceDeclaration {
     position: u32,
     provider_revision: u64,
     protocol: String,
+    routing_requirement: String,
     credential_id: Option<String>,
     provenance_kind: Option<String>,
     provenance_key: Option<String>,
@@ -325,9 +326,11 @@ fn create_provider(
     transaction
         .execute(
             "INSERT INTO providers
-             (id, target, position, provider_revision, name, base_url, model, protocol, credential_id,
-              provenance_kind, provenance_key, generated_owner_id)
-             VALUES (?1, 'codex', ?2, 1, ?3, ?4, ?5, 'openai-responses', ?6, ?7, ?8, NULL)",
+             (id, target, position, provider_revision, name, base_url, model, protocol,
+              routing_requirement, credential_id, provenance_kind, provenance_key,
+              generated_owner_id)
+             VALUES (?1, 'codex', ?2, 1, ?3, ?4, ?5, 'openai-responses',
+                     'direct-compatible', ?6, ?7, ?8, NULL)",
             params![
                 Uuid::new_v4().to_string(),
                 position,
@@ -357,8 +360,8 @@ fn duplicate_provider(
     let base_url = normalized_base_url(base_url)?;
     let source = transaction
         .query_row(
-            "SELECT position, provider_revision, protocol, credential_id, provenance_kind,
-                    provenance_key, generated_owner_id
+            "SELECT position, provider_revision, protocol, routing_requirement, credential_id,
+                    provenance_kind, provenance_key, generated_owner_id
              FROM providers WHERE id = ?1 AND target = 'codex'",
             [source_provider_id.to_string()],
             |row| {
@@ -366,10 +369,11 @@ fn duplicate_provider(
                     position: row.get(0)?,
                     provider_revision: row.get(1)?,
                     protocol: row.get(2)?,
-                    credential_id: row.get(3)?,
-                    provenance_kind: row.get(4)?,
-                    provenance_key: row.get(5)?,
-                    generated_owner_id: row.get(6)?,
+                    routing_requirement: row.get(3)?,
+                    credential_id: row.get(4)?,
+                    provenance_kind: row.get(5)?,
+                    provenance_key: row.get(6)?,
+                    generated_owner_id: row.get(7)?,
                 })
             },
         )
@@ -405,9 +409,10 @@ fn duplicate_provider(
     transaction
         .execute(
             "INSERT INTO providers
-             (id, target, position, provider_revision, name, base_url, model, protocol, credential_id,
-              provenance_kind, provenance_key, generated_owner_id)
-             VALUES (?1, 'codex', ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+             (id, target, position, provider_revision, name, base_url, model, protocol,
+              routing_requirement, credential_id, provenance_kind, provenance_key,
+              generated_owner_id)
+             VALUES (?1, 'codex', ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
             params![
                 Uuid::new_v4().to_string(),
                 position,
@@ -415,6 +420,7 @@ fn duplicate_provider(
                 base_url,
                 model,
                 source.protocol,
+                source.routing_requirement,
                 credential_id,
                 provenance_kind,
                 provenance_key,

@@ -31,6 +31,7 @@ function provider(overrides: Partial<TargetView["providers"][number]> = {}): Tar
     baseUrl: "https://inspection.example/v1",
     model: "manual-model",
     protocol: "openai-responses",
+    routingRequirement: "direct-compatible",
     credential: "present",
     completeness: "complete",
     missingFields: [],

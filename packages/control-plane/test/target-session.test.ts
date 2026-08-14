@@ -32,6 +32,7 @@ function viewAtRevision(revision: number, sequence = revision): TargetView {
       baseUrl: "https://provider.example/v1",
       model: `model-${revision}`,
       protocol: "openai-responses",
+      routingRequirement: "direct-compatible",
       credential: "present",
       completeness: "complete",
       missingFields: [],

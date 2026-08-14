@@ -316,7 +316,7 @@ pub enum TargetAction {
     },
     ActivateProvider {
         provider_id: String,
-        mode: TakeoverMode,
+        mode: ActivationMode,
     },
 }
 
@@ -461,7 +461,8 @@ impl fmt::Debug for Redacted {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum TakeoverMode {
+pub enum ActivationMode {
+    Direct,
     Takeover,
 }
 
@@ -534,6 +535,7 @@ pub struct ProviderView {
     pub base_url: String,
     pub model: String,
     pub protocol: ProviderProtocol,
+    pub routing_requirement: ProviderRoutingRequirement,
     pub credential: CredentialPresence,
     pub completeness: ProviderCompleteness,
     pub missing_fields: Vec<ProviderRequirement>,
@@ -546,6 +548,22 @@ pub struct ProviderView {
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderProtocol {
     OpenaiResponses,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderRoutingRequirement {
+    DirectCompatible,
+    TakeoverRequired,
+}
+
+impl fmt::Display for ProviderRoutingRequirement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DirectCompatible => "direct-compatible",
+            Self::TakeoverRequired => "takeover-required",
+        })
+    }
 }
 
 impl fmt::Display for ProviderProtocol {

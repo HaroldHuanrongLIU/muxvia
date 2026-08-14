@@ -1,7 +1,9 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
 use muxvia_routing::{
-    control::protocol::{ActionStatus, CredentialPresence, ProviderReferenceView},
+    control::protocol::{
+        ActionStatus, CredentialPresence, ProviderReferenceView, ProviderRoutingRequirement,
+    },
     home::MuxviaHome,
     state::StateStore,
 };
@@ -251,6 +253,10 @@ async fn duplicate_inserts_after_source_and_copies_only_server_owned_declaration
     assert_eq!(copied.base_url, "https://duplicate.example/v1");
     assert_eq!(copied.model, "duplicate-model");
     assert_eq!(copied.provider_revision, 1);
+    assert_eq!(
+        copied.routing_requirement,
+        ProviderRoutingRequirement::DirectCompatible
+    );
     assert_eq!(copied.provenance, source.provenance);
     assert!(!copied.generated);
     assert_eq!(copied.active_references, []);

@@ -190,10 +190,11 @@ impl StoreFixture {
                 )?;
                 transaction.execute(
                     "INSERT INTO providers
-                     (id, target, position, provider_revision, name, base_url, model, protocol, credential_id,
-                      provenance_kind, provenance_key, generated_owner_id)
-                     VALUES (?1, 'codex', 0, 1, 'Fake upstream', ?2, 'gpt-test', 'openai-responses', ?1,
-                             NULL, NULL, NULL)",
+                     (id, target, position, provider_revision, name, base_url, model, protocol,
+                      routing_requirement, credential_id, provenance_kind, provenance_key,
+                      generated_owner_id)
+                     VALUES (?1, 'codex', 0, 1, 'Fake upstream', ?2, 'gpt-test',
+                             'openai-responses', 'direct-compatible', ?1, NULL, NULL, NULL)",
                     (provider_id.to_string(), upstream_base_url.clone()),
                 )?;
                 transaction.execute(

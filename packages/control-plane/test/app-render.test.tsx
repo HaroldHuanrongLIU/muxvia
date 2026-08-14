@@ -45,6 +45,7 @@ function provider(
     baseUrl: "https://fixture.example/v1",
     model: "gpt-test",
     protocol: "openai-responses",
+    routingRequirement: "direct-compatible",
     credential: "present",
     completeness: "complete",
     missingFields: [],

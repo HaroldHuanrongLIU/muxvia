@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS providers (
   credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL,
   provenance_kind TEXT,
   provenance_key TEXT,
-  generated_owner_id TEXT
+  generated_owner_id TEXT,
+  routing_requirement TEXT NOT NULL DEFAULT 'direct-compatible'
+    CHECK (routing_requirement IN ('direct-compatible', 'takeover-required'))
 );
 
 CREATE TABLE IF NOT EXISTS target_route_state (
@@ -74,7 +76,7 @@ CREATE TABLE IF NOT EXISTS activation_recovery (
   created_revision INTEGER NOT NULL
 );
 
-INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '2');
+INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '3');
 INSERT OR IGNORE INTO target_route_state (
   target,
   management_revision,

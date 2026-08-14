@@ -21,6 +21,7 @@ function provider(overrides: Partial<TargetView["providers"][number]>): TargetVi
     baseUrl: "https://first.example/v1",
     model: "first-model",
     protocol: "openai-responses",
+    routingRequirement: "direct-compatible",
     credential: "present",
     completeness: "complete",
     missingFields: [],

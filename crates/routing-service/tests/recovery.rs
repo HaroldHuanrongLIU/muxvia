@@ -162,10 +162,11 @@ async fn recovery_required_startup_opens_read_only_control_without_resuming_comm
             )?;
             transaction.execute(
                 "INSERT INTO providers
-                 (id, target, position, provider_revision, name, base_url, model, protocol, credential_id,
-                  provenance_kind, provenance_key, generated_owner_id)
+                 (id, target, position, provider_revision, name, base_url, model, protocol,
+                  routing_requirement, credential_id, provenance_kind, provenance_key,
+                  generated_owner_id)
                  VALUES (?1, 'codex', 0, 1, 'Active', 'https://upstream.example/v1', 'gpt-active',
-                         'openai-responses', ?1, NULL, NULL, NULL)",
+                         'openai-responses', 'direct-compatible', ?1, NULL, NULL, NULL)",
                 [provider_id.to_string()],
             )?;
             transaction.execute(

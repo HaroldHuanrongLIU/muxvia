@@ -85,7 +85,7 @@
         { "type": "object", "properties": { "kind": { "const": "reorder-providers" }, "providerIds": { "type": "array", "items": { "type": "string", "format": "uuid" } } }, "required": ["kind", "providerIds"] },
         { "type": "object", "properties": { "kind": { "const": "delete-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"] },
         { "type": "object", "properties": { "kind": { "const": "duplicate-provider" }, "sourceProviderId": { "type": "string", "format": "uuid" }, "sourceProviderRevision": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/duplicateCredential" } }, "required": ["kind", "sourceProviderId", "sourceProviderRevision", "name", "baseUrl", "model", "credential"] },
-        { "type": "object", "properties": { "kind": { "const": "activate-provider" }, "providerId": { "type": "string" }, "mode": { "const": "takeover" } }, "required": ["kind", "providerId", "mode"] }
+        { "type": "object", "properties": { "kind": { "const": "activate-provider" }, "providerId": { "type": "string" }, "mode": { "enum": ["direct", "takeover"] } }, "required": ["kind", "providerId", "mode"] }
       ]
     },
     "targetView": {
@@ -132,6 +132,7 @@
         "baseUrl": { "type": "string" },
         "model": { "type": "string" },
         "protocol": { "const": "openai-responses" },
+        "routingRequirement": { "enum": ["direct-compatible", "takeover-required"] },
         "credential": { "enum": ["present", "missing"] },
         "completeness": { "enum": ["complete", "incomplete"] },
         "missingFields": { "type": "array", "items": { "enum": ["base-url", "model", "credential"] } },
@@ -139,7 +140,7 @@
         "generated": { "type": "boolean" },
         "activeReferences": { "type": "array", "items": { "enum": ["current", "activated-snapshot"] } }
       },
-      "required": ["id", "position", "providerRevision", "name", "baseUrl", "model", "protocol", "credential", "completeness", "missingFields", "provenance", "generated", "activeReferences"]
+      "required": ["id", "position", "providerRevision", "name", "baseUrl", "model", "protocol", "routingRequirement", "credential", "completeness", "missingFields", "provenance", "generated", "activeReferences"]
     },
     "providerPreset": {
       "type": "object",

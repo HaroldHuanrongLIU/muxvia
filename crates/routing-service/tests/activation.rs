@@ -17,7 +17,7 @@ use muxvia_routing::{
     codex::{CodexCapability, CodexProbe, CodexProblem, CommandCodexProbe},
     control::{
         framing::{read_frame, write_frame},
-        protocol::{ActionStatus, TakeoverMode},
+        protocol::{ActionStatus, ActivationMode},
         server::ControlServer,
     },
     home::MuxviaHome,
@@ -214,7 +214,7 @@ fn command(provider_id: Uuid, revision: u64, action_id: Uuid) -> ActivateProvide
         action_id,
         expected_revision: revision,
         provider_id,
-        mode: TakeoverMode::Takeover,
+        mode: ActivationMode::Takeover,
     }
 }
 

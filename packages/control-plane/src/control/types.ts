@@ -22,6 +22,7 @@ const providerViewSchema = z.object({
   baseUrl: z.string(),
   model: z.string(),
   protocol: z.literal("openai-responses"),
+  routingRequirement: z.enum(["direct-compatible", "takeover-required"]),
   credential: z.enum(["present", "missing"]),
   completeness: z.enum(["complete", "incomplete"]),
   missingFields: z.array(z.enum(["base-url", "model", "credential"])),
@@ -151,7 +152,7 @@ const targetActionSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("activate-provider"),
     providerId: z.string(),
-    mode: z.literal("takeover"),
+    mode: z.enum(["direct", "takeover"]),
   }),
 ])
 

@@ -4,7 +4,7 @@ use muxvia_routing::{
     codex::CommandCodexProbe,
     control::protocol::{
         ActionStatus, CredentialPresence, ProviderCompleteness, ProviderReferenceView,
-        ProviderRequirement,
+        ProviderRequirement, ProviderRoutingRequirement,
     },
     home::MuxviaHome,
     model::ReqwestUpstream,
@@ -31,6 +31,84 @@ CREATE TABLE providers (
 CREATE TABLE provider_credentials (
   provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,
   bearer_token TEXT NOT NULL
+);
+
+CREATE TABLE target_route_state (
+  target TEXT PRIMARY KEY CHECK (target = 'codex'),
+  management_revision INTEGER NOT NULL,
+  view_sequence INTEGER NOT NULL,
+  current_provider_id TEXT,
+  serving_provider_id TEXT,
+  takeover_state TEXT NOT NULL,
+  route_port INTEGER,
+  routing_credential TEXT,
+  activated_snapshot_id TEXT,
+  managed_config_path TEXT,
+  recovery_state TEXT NOT NULL
+);
+
+CREATE TABLE target_problems (
+  target TEXT NOT NULL CHECK (target = 'codex'),
+  code TEXT NOT NULL,
+  message TEXT NOT NULL,
+  PRIMARY KEY (target, code)
+);
+
+CREATE TABLE activated_snapshots (
+  id TEXT PRIMARY KEY,
+  target TEXT NOT NULL CHECK (target = 'codex'),
+  provider_id TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  model TEXT NOT NULL,
+  provider_bearer_token TEXT NOT NULL,
+  epoch TEXT NOT NULL
+);
+
+CREATE TABLE action_receipts (
+  action_id TEXT PRIMARY KEY,
+  action_kind TEXT NOT NULL,
+  committed_revision INTEGER NOT NULL,
+  outcome_json TEXT NOT NULL
+);
+
+CREATE TABLE activation_recovery (
+  id TEXT PRIMARY KEY,
+  target TEXT NOT NULL CHECK (target = 'codex'),
+  action_id TEXT NOT NULL UNIQUE,
+  config_path TEXT NOT NULL,
+  file_identity_json TEXT NOT NULL,
+  before_owned_json TEXT NOT NULL,
+  desired_owned_json TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'rolled-back', 'recovery-required')),
+  created_revision INTEGER NOT NULL
+);
+"#;
+
+const V2_SCHEMA: &str = r#"
+CREATE TABLE metadata (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE TABLE credentials (
+  id TEXT PRIMARY KEY,
+  target TEXT NOT NULL CHECK (target = 'codex'),
+  bearer_token TEXT NOT NULL
+);
+
+CREATE TABLE providers (
+  id TEXT PRIMARY KEY,
+  target TEXT NOT NULL CHECK (target = 'codex'),
+  position INTEGER NOT NULL CHECK (position >= 0),
+  provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
+  name TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  model TEXT NOT NULL,
+  protocol TEXT NOT NULL CHECK (protocol = 'openai-responses'),
+  credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL,
+  provenance_kind TEXT,
+  provenance_key TEXT,
+  generated_owner_id TEXT
 );
 
 CREATE TABLE target_route_state (
@@ -184,6 +262,42 @@ async fn credential_id_for_provider(home: &MuxviaHome, provider_id: Uuid) -> Str
         .unwrap()
 }
 
+async fn routing_requirement_schema(home: &MuxviaHome) -> (i64, i64, Option<String>, String) {
+    tokio_rusqlite::Connection::open(home.database_path())
+        .await
+        .unwrap()
+        .call(|connection| -> tokio_rusqlite::rusqlite::Result<_> {
+            let column = connection.query_row(
+                "SELECT cid, \"notnull\", dflt_value
+                 FROM pragma_table_info('providers') WHERE name = 'routing_requirement'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )?;
+            let table_sql = connection.query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'providers'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?;
+            Ok((column.0, column.1, column.2, table_sql))
+        })
+        .await
+        .unwrap()
+}
+
+async fn assert_schema_v3_routing_requirement(home: &MuxviaHome) {
+    let (column_id, not_null, default_value, table_sql) = routing_requirement_schema(home).await;
+    assert_eq!(column_id, 12);
+    assert_eq!(not_null, 1);
+    assert_eq!(default_value.as_deref(), Some("'direct-compatible'"));
+    assert!(table_sql.contains("'direct-compatible', 'takeover-required'"));
+}
+
 #[tokio::test]
 async fn v1_database_migrates_provider_identity_order_credential_and_active_state() {
     let fixture = StoreFixture::new();
@@ -301,6 +415,7 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
     drop(connection);
 
     let store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+    assert_schema_v3_routing_requirement(&fixture.home).await;
     let view = store.target_view().await.unwrap();
 
     assert_eq!(
@@ -332,7 +447,7 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "2");
+    assert_eq!(schema_version, "3");
     assert_eq!(
         view.providers[0].id,
         Uuid::parse_str(existing_provider_id).unwrap()
@@ -341,6 +456,9 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
         view.providers[1].id,
         Uuid::parse_str(second_provider_id).unwrap()
     );
+    assert!(view.providers.iter().all(|provider| {
+        provider.routing_requirement == ProviderRoutingRequirement::DirectCompatible
+    }));
 
     let preparation = store
         .prepare_activation(Uuid::parse_str(existing_provider_id).unwrap(), 7)
@@ -418,12 +536,210 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
     assert_eq!(receipt_metadata.0, "activate-provider");
     assert_eq!(receipt_metadata.1, 7);
     assert!(!receipt_metadata.2.contains(credential));
+    let receipt_json: serde_json::Value = serde_json::from_str(&receipt_metadata.2).unwrap();
+    assert!(
+        receipt_json["view"]["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|provider| provider["routingRequirement"] == "direct-compatible")
+    );
+}
+
+#[tokio::test]
+async fn v2_database_migrates_routing_requirement_and_historical_receipts() {
+    let fixture = StoreFixture::new();
+    fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
+    let provider_id = Uuid::parse_str("00000000-0000-4000-8000-000000000101").unwrap();
+    let snapshot_id = Uuid::parse_str("00000000-0000-4000-8000-000000000102").unwrap();
+    let epoch = Uuid::parse_str("00000000-0000-4000-8000-000000000103").unwrap();
+    let receipt_id = Uuid::parse_str("00000000-0000-4000-8000-000000000104").unwrap();
+    let credential_id = Uuid::parse_str("00000000-0000-4000-8000-000000000105").unwrap();
+    let malformed_secret = "malformed-v2-replay-secret-must-not-escape";
+
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    connection.execute_batch(V2_SCHEMA).unwrap();
+    connection
+        .execute(
+            "INSERT INTO metadata (key, value) VALUES ('schema-version', '2')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO credentials (id, target, bearer_token)
+             VALUES (?1, 'codex', 'v2-provider-secret-must-not-escape')",
+            [credential_id.to_string()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO providers
+             (id, target, position, provider_revision, name, base_url, model, protocol,
+              credential_id, provenance_kind, provenance_key, generated_owner_id)
+             VALUES (?1, 'codex', 0, 1, 'Direct Provider', 'https://provider.example/v1',
+                     'model-a', 'openai-responses', ?2, NULL, NULL, NULL)",
+            params![provider_id.to_string(), credential_id.to_string()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO activated_snapshots
+             (id, target, provider_id, base_url, model, provider_bearer_token, epoch)
+             VALUES (?1, 'codex', ?2, 'https://provider.example/v1', 'model-a',
+                     'v2-provider-secret-must-not-escape', ?3)",
+            params![
+                snapshot_id.to_string(),
+                provider_id.to_string(),
+                epoch.to_string()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO target_route_state
+             (target, management_revision, view_sequence, current_provider_id, serving_provider_id,
+              takeover_state, route_port, routing_credential, activated_snapshot_id,
+              managed_config_path, recovery_state)
+             VALUES ('codex', 4, 5, ?1, NULL, 'active', 1234, 'routing-secret', ?2,
+                     '/tmp/config.toml', 'clean')",
+            params![provider_id.to_string(), snapshot_id.to_string()],
+        )
+        .unwrap();
+    let historical_outcome = serde_json::json!({
+        "status": "applied",
+        "view": {
+            "target": "codex",
+            "managementRevision": 4,
+            "viewSequence": 5,
+            "service": { "epoch": epoch, "state": "running" },
+            "mode": "takeover",
+            "takeover": { "state": "active", "endpoint": "http://127.0.0.1:1234" },
+            "providers": [{
+                "id": provider_id,
+                "position": 0,
+                "providerRevision": 1,
+                "name": "Direct Provider",
+                "baseUrl": "https://provider.example/v1",
+                "model": "model-a",
+                "protocol": "openai-responses",
+                "credential": "present",
+                "completeness": "complete",
+                "missingFields": [],
+                "provenance": null,
+                "generated": false,
+                "activeReferences": ["current", "activated-snapshot"]
+            }],
+            "providerPresets": [{
+                "key": "openai-api-responses",
+                "baseUrl": "https://api.openai.com/v1",
+                "model": "",
+                "protocol": "openai-responses"
+            }],
+            "currentProviderId": provider_id,
+            "servingProviderId": null,
+            "managedConfiguration": {
+                "state": "applied",
+                "path": "/tmp/config.toml",
+                "restartRequired": true
+            },
+            "recovery": { "intentId": null, "state": "clean" },
+            "activatedSnapshot": {
+                "id": snapshot_id,
+                "providerId": provider_id,
+                "model": "model-a",
+                "epoch": epoch
+            },
+            "problems": []
+        }
+    });
+    connection
+        .execute(
+            "INSERT INTO action_receipts
+             (action_id, action_kind, committed_revision, outcome_json)
+             VALUES (?1, 'activate-provider', 4, ?2)",
+            params![receipt_id.to_string(), historical_outcome.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+    assert_schema_v3_routing_requirement(&fixture.home).await;
+    let schema_version = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap()
+        .call(|connection| {
+            connection.query_row(
+                "SELECT value FROM metadata WHERE key = 'schema-version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(schema_version, "3");
+    assert_eq!(
+        store.target_view().await.unwrap().providers[0].routing_requirement,
+        ProviderRoutingRequirement::DirectCompatible
+    );
+    assert_eq!(
+        store
+            .receipt(receipt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .view
+            .providers[0]
+            .routing_requirement,
+        ProviderRoutingRequirement::DirectCompatible
+    );
+
+    let stored_outcome = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap()
+        .call(move |connection| {
+            connection.query_row(
+                "SELECT outcome_json FROM action_receipts WHERE action_id = ?1",
+                [receipt_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stored_outcome).unwrap()["view"]["providers"][0]
+            ["routingRequirement"],
+        "direct-compatible"
+    );
+
+    let service = ActivationService::new(
+        Arc::clone(&store),
+        fixture.home.clone(),
+        Arc::new(CommandCodexProbe),
+        "/must/not/probe/codex".into(),
+        Arc::new(ReqwestUpstream::new().unwrap()),
+    );
+    let replay = service
+        .apply_raw(
+            receipt_id,
+            u64::MAX,
+            serde_json::json!({ "malformed": malformed_secret }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status, ActionStatus::Replayed);
+    assert!(
+        !serde_json::to_string(&replay)
+            .unwrap()
+            .contains(malformed_secret)
+    );
 }
 
 #[tokio::test]
 async fn create_name_only_persists_an_incomplete_provider_with_all_missing_requirements() {
     let fixture = StoreFixture::new();
     let store = fixture.open().await;
+    assert_schema_v3_routing_requirement(&fixture.home).await;
 
     let outcome = store
         .apply_provider_action(
@@ -443,6 +759,10 @@ async fn create_name_only_persists_an_incomplete_provider_with_all_missing_requi
     assert_eq!(outcome.view.management_revision, 1);
     let provider = &outcome.view.providers[0];
     assert_eq!(provider.provider_revision, 1);
+    assert_eq!(
+        provider.routing_requirement,
+        ProviderRoutingRequirement::DirectCompatible
+    );
     assert_eq!(provider.completeness, ProviderCompleteness::Incomplete);
     assert_eq!(
         provider.missing_fields,
@@ -557,6 +877,10 @@ async fn update_preserves_provider_identity_and_advances_only_declaration_revisi
 
     assert_eq!(after.id, before.id);
     assert_eq!(after.provider_revision, 2);
+    assert_eq!(
+        after.routing_requirement,
+        ProviderRoutingRequirement::DirectCompatible
+    );
     assert_eq!(updated.view.management_revision, 2);
     assert_eq!(after.base_url, "https://one.example/v1");
 }
@@ -796,7 +1120,8 @@ async fn declaration_edits_do_not_mutate_active_snapshot_bytes() {
             )?;
             connection.execute(
                 "UPDATE target_route_state
-                 SET current_provider_id = ?1, activated_snapshot_id = ?2
+                 SET current_provider_id = ?1, activated_snapshot_id = ?2,
+                     managed_config_path = '/tmp/config.toml'
                  WHERE target = 'codex'",
                 params![provider.id.to_string(), snapshot_id.to_string()],
             )?;
@@ -826,6 +1151,13 @@ async fn declaration_edits_do_not_mutate_active_snapshot_bytes() {
     assert_eq!(snapshot.id(), snapshot_id);
     assert_eq!(snapshot.base_url(), "https://one.example/v1");
     assert_eq!(snapshot.model(), "one");
+    assert_eq!(view.mode, "direct");
+    assert_eq!(view.managed_configuration.state, "applied");
+    assert_eq!(
+        view.managed_configuration.path.as_deref(),
+        Some("/tmp/config.toml")
+    );
+    assert!(view.managed_configuration.restart_required);
     assert_eq!(
         secrecy::ExposeSecret::expose_secret(snapshot.provider_credential()),
         "snapshot-secret"

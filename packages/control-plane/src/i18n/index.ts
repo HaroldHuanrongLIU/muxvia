@@ -52,6 +52,7 @@ export function messageKeyForProblem(code: string): MessageKey {
 export function labelTargetState(t: Translator, value: string): string {
   switch (value) {
     case "unmanaged": return t("state.unmanaged")
+    case "managed": return t("state.managed")
     case "takeover": return t("state.takeover")
     case "direct": return t("state.direct")
     case "running": return t("state.running")

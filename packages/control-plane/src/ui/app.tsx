@@ -1,5 +1,5 @@
 import { useRenderer, useTerminalDimensions } from "@opentui/solid"
-import { createSignal, getOwner, Match, onCleanup, onMount, runWithOwner, Show, Switch } from "solid-js"
+import { createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js"
 
 import { MuxviaKeymapProvider, useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
 import type { TargetSession } from "../control/target-session"
@@ -43,7 +43,6 @@ function actionProblem(error: unknown): ActivityDraft {
 export function useCommandPaletteOpener(t: Translator): () => void {
   const keymap = useMuxviaKeymap()
   const overlay = useOverlay()
-  const owner = getOwner()
   let openScheduled = false
   let ownerActive = true
 
@@ -60,14 +59,14 @@ export function useCommandPaletteOpener(t: Translator): () => void {
         return
       }
       try {
-        const element = runWithOwner(owner!, () => (
-          <CommandPalette
+        overlay.replace({
+          id: "command-palette",
+          render: () => <CommandPalette
             entries={entries}
             title={t("command.palette.title")}
             searchPlaceholder={t("command.palette.search")}
-          />
-        ))
-        overlay.replace({ id: "command-palette", element })
+          />,
+        })
       } finally {
         openScheduled = false
       }
@@ -79,7 +78,6 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   const renderer = useRenderer()
   const dimensions = useTerminalDimensions()
   const overlay = useOverlay()
-  const owner = getOwner()
   const showCommandPalette = useCommandPaletteOpener(props.t)
   const [route, setRoute] = createSignal<ShellRoute>({ kind: "home" })
   const [view, setView] = createSignal<TargetViewProjection>(props.session.get())
@@ -164,10 +162,11 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     queueMicrotask(() => {
       exitScheduled = false
       if (disposed || exiting || renderer.isDestroyed || !providerFormRef?.isDirty()) return
-      const element = runWithOwner(owner!, () => (
-        <ExitConfirmation t={props.t} onConfirm={confirmExit} onCancel={cancelExit} />
-      ))
-      overlay.replace({ id: "exit-confirmation", element, dismissOnEscape: false })
+      overlay.replace({
+        id: "exit-confirmation",
+        render: () => <ExitConfirmation t={props.t} onConfirm={confirmExit} onCancel={cancelExit} />,
+        dismissOnEscape: false,
+      })
     })
   }
   const unknownCommand = (input: string) => {
@@ -328,6 +327,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
                     <text fg={notice()?.kind === "error" ? theme.error : theme.success}>{notice()?.text}</text>
                   </Show>
                   <ProviderForm
+                    t={props.t}
                     ref={(value) => { providerFormRef = value }}
                     pending={saving()}
                     onDirtyChange={() => {}}

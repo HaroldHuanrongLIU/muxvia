@@ -53,10 +53,45 @@ test("unknown placeholders retain stable text", () => {
 })
 
 test("target states have localized known and unknown labels", () => {
-  const t = createTranslator("en")
+  const en = createTranslator("en")
+  const zhCN = createTranslator("zh-CN")
 
-  expect(labelTargetState(t, "takeover")).toBe("Takeover")
-  expect(labelTargetState(t, "custom-state")).toBe("Unknown (custom-state)")
+  expect(labelTargetState(en, "takeover")).toBe("Takeover")
+  expect(labelTargetState(en, "managed")).toBe("Managed")
+  expect(labelTargetState(zhCN, "managed")).toBe("受管理")
+  expect(labelTargetState(en, "custom-state")).toBe("Unknown (custom-state)")
+})
+
+test("status labels use the canonical domain concepts in both locales", () => {
+  const en = createTranslator("en")
+  const zhCN = createTranslator("zh-CN")
+
+  expect([
+    en("status.current"),
+    en("status.serving"),
+    en("status.service"),
+    en("status.config"),
+    en("status.snapshot"),
+  ]).toEqual([
+    "Current Target Provider",
+    "Serving Provider",
+    "Routing Service",
+    "Managed Configuration",
+    "Activated Snapshot",
+  ])
+  expect([
+    zhCN("status.current"),
+    zhCN("status.serving"),
+    zhCN("status.service"),
+    zhCN("status.config"),
+    zhCN("status.snapshot"),
+  ]).toEqual([
+    "当前 Target Provider",
+    "服务中 Provider",
+    "路由服务",
+    "受管理配置",
+    "已激活快照",
+  ])
 })
 
 test("command presenter translates a command title and description", () => {

@@ -37,7 +37,10 @@ export function TargetView(props: TargetViewProps) {
     const provider = providerName(props.view, props.view.activatedSnapshot.providerId, props.t)
     return `${provider} · ${props.view.activatedSnapshot.model}`
   }
-  const status = (key: MessageKey, value: string) => `${props.t(key).padEnd(11)}${value}`
+  const status = (key: MessageKey, value: string) => {
+    const label = props.t(key)
+    return `${label}${" ".repeat(Math.max(2, 11 - label.length))}${value}`
+  }
   const declaration = (key: MessageKey, value: string) => `${props.t(key).padEnd(12)}${value}`
   const problemText = (code: string) => {
     const key = messageKeyForProblem(code)

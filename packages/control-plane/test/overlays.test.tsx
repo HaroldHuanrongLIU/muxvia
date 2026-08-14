@@ -2,7 +2,7 @@
 import { expect, test } from "bun:test"
 import type { InputRenderable } from "@opentui/core"
 import { testRender } from "@opentui/solid"
-import { createSignal, onMount, type JSX } from "solid-js"
+import { createSignal, onCleanup, onMount, type JSX } from "solid-js"
 
 import { MuxviaKeymapProvider, useCommandLayer, useMuxviaKeymap } from "../src/commands/keymap"
 import { ActionPrompt } from "../src/ui/action-prompt"
@@ -19,14 +19,14 @@ function ConfirmationOverlay(props: { onCancel: () => void }) {
 
 function StackHarness(props: {
   expose: (overlay: ReturnType<typeof useOverlay>) => void
-  exposeEntries?: (entries: { a: JSX.Element; b: JSX.Element }) => void
+  exposeEntries?: (entries: { a: () => JSX.Element; b: () => JSX.Element }) => void
   executed: string[]
 }) {
   const overlay = useOverlay()
   const keymap = useMuxviaKeymap()
   const [route, setRoute] = createSignal<"home" | "codex">("codex")
   props.expose(overlay)
-  props.exposeEntries?.({ a: <text>Overlay A</text>, b: <text>Overlay B</text> })
+  props.exposeEntries?.({ a: () => <text>Overlay A</text>, b: () => <text>Overlay B</text> })
   useCommandLayer({
     scope: "global",
     priority: 0,
@@ -59,7 +59,7 @@ function StackHarness(props: {
 
 test("renders only the top overlay and restores the original focus after two closes", async () => {
   let overlay: ReturnType<typeof useOverlay> | undefined
-  let entries!: { a: JSX.Element; b: JSX.Element }
+  let entries!: { a: () => JSX.Element; b: () => JSX.Element }
   const closed: string[] = []
   const setup = await testRender(() => (
     <MuxviaKeymapProvider>
@@ -77,8 +77,8 @@ test("renders only the top overlay and restores the original focus after two clo
     const original = setup.renderer.currentFocusedRenderable as InputRenderable
     expect(original).toBeTruthy()
 
-    overlay!.push({ id: "a", element: entries.a, onClose: () => closed.push("a") })
-    overlay!.push({ id: "b", element: entries.b, onClose: () => closed.push("b") })
+    overlay!.push({ id: "a", render: entries.a, onClose: () => closed.push("a") })
+    overlay!.push({ id: "b", render: entries.b, onClose: () => closed.push("b") })
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("Overlay B")
     expect(setup.captureCharFrame()).not.toContain("Overlay A")
@@ -100,7 +100,7 @@ test("renders only the top overlay and restores the original focus after two clo
 
 test("nested overlays block unrelated route and global shortcuts and direct dispatch", async () => {
   let overlay: ReturnType<typeof useOverlay> | undefined
-  let entries!: { a: JSX.Element; b: JSX.Element }
+  let entries!: { a: () => JSX.Element; b: () => JSX.Element }
   const executed: string[] = []
   let keymap!: ReturnType<typeof useMuxviaKeymap>
   function ExposeKeymap() {
@@ -121,8 +121,8 @@ test("nested overlays block unrelated route and global shortcuts and direct disp
   ), { width: 80, height: 24, useThread: false, kittyKeyboard: true })
   try {
     await setup.renderOnce()
-    overlay!.push({ id: "a", element: entries.a })
-    overlay!.push({ id: "b", element: entries.b })
+    overlay!.push({ id: "a", render: entries.a })
+    overlay!.push({ id: "b", render: entries.b })
     await setup.renderOnce()
 
     setup.mockInput.pressKey("1")
@@ -149,11 +149,11 @@ test("nested overlays block unrelated route and global shortcuts and direct disp
 
 test("clear closes every detached entry exactly once under reentrant callbacks", async () => {
   let overlay: ReturnType<typeof useOverlay> | undefined
-  let entries!: { a: JSX.Element; b: JSX.Element }
+  let entries!: { a: () => JSX.Element; b: () => JSX.Element }
   const closed: string[] = []
   function Expose() {
     const value = useOverlay()
-    entries = { a: <text>A</text>, b: <text>B</text> }
+    entries = { a: () => <text>A</text>, b: () => <text>B</text> }
     onMount(() => { overlay = value })
     return null
   }
@@ -162,8 +162,8 @@ test("clear closes every detached entry exactly once under reentrant callbacks",
   ), { width: 20, height: 5, useThread: false })
   try {
     await setup.renderOnce()
-    overlay!.push({ id: "a", element: entries.a, onClose: () => { closed.push("a"); overlay!.clear() } })
-    overlay!.push({ id: "b", element: entries.b, onClose: () => closed.push("b") })
+    overlay!.push({ id: "a", render: entries.a, onClose: () => { closed.push("a"); overlay!.clear() } })
+    overlay!.push({ id: "b", render: entries.b, onClose: () => closed.push("b") })
     overlay!.clear()
     expect(closed).toEqual(["a", "b"])
     expect(overlay!.depth).toBe(0)
@@ -172,16 +172,48 @@ test("clear closes every detached entry exactly once under reentrant callbacks",
   }
 })
 
+test("replace close and clear each dispose the mounted overlay component exactly once", async () => {
+  let overlay: ReturnType<typeof useOverlay> | undefined
+  const disposed: string[] = []
+  function Tracked(props: { id: string }) {
+    onCleanup(() => disposed.push(props.id))
+    return <text>{props.id}</text>
+  }
+  function Expose() {
+    overlay = useOverlay()
+    return null
+  }
+  const setup = await testRender(() => (
+    <MuxviaKeymapProvider><OverlayProvider><Expose /></OverlayProvider></MuxviaKeymapProvider>
+  ), { width: 20, height: 5, useThread: false })
+  try {
+    await setup.renderOnce()
+    overlay!.replace({ id: "a", render: () => <Tracked id="a" /> })
+    await setup.renderOnce()
+    overlay!.replace({ id: "b", render: () => <Tracked id="b" /> })
+    await setup.renderOnce()
+    expect(disposed).toEqual(["a"])
+
+    overlay!.closeTop()
+    await setup.renderOnce()
+    expect(disposed).toEqual(["a", "b"])
+
+    overlay!.replace({ id: "c", render: () => <Tracked id="c" /> })
+    await setup.renderOnce()
+    overlay!.clear()
+    overlay!.clear()
+    await setup.renderOnce()
+    expect(disposed).toEqual(["a", "b", "c"])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
 test("a nondismissible overlay leaves Escape exclusively to its modal command", async () => {
   let overlay: ReturnType<typeof useOverlay> | undefined
-  let confirmation!: JSX.Element
   const closed: string[] = []
   function Expose() {
     overlay = useOverlay()
-    confirmation = <ConfirmationOverlay onCancel={() => {
-      closed.push("confirm")
-      overlay!.closeTop()
-    }} />
     return null
   }
   const setup = await testRender(() => (
@@ -191,7 +223,10 @@ test("a nondismissible overlay leaves Escape exclusively to its modal command", 
     await setup.renderOnce()
     overlay!.push({
       id: "confirmation",
-      element: confirmation,
+      render: () => <ConfirmationOverlay onCancel={() => {
+        closed.push("confirm")
+        overlay!.closeTop()
+      }} />,
       dismissOnEscape: false,
       onClose: () => closed.push("entry"),
     })

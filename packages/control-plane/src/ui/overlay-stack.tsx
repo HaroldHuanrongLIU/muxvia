@@ -1,14 +1,14 @@
 /** @jsxImportSource @opentui/solid */
 import { RGBA, type Renderable } from "@opentui/core"
 import { useRenderer, useTerminalDimensions } from "@opentui/solid"
-import { createContext, createMemo, createSignal, onCleanup, useContext, type JSX } from "solid-js"
+import { createContext, createMemo, createSignal, onCleanup, Show, useContext, type JSX } from "solid-js"
 
 import { useCommandLayer } from "../commands/keymap"
 import { theme } from "../theme"
 
 export interface OverlayEntry {
   id: string
-  element: JSX.Element
+  render: () => JSX.Element
   dismissOnEscape?: boolean
   onClose?: () => void
 }
@@ -131,7 +131,7 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
 
   return <OverlayContext.Provider value={controller}>
     {props.children}
-    {top() && (
+    <Show when={top()} keyed>{(entry: OverlayEntry) => (
       <box
         position="absolute"
         top={0}
@@ -148,10 +148,10 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
           backgroundColor={theme.panel}
           flexDirection="column"
         >
-          {top()!.element}
+          {entry.render()}
         </box>
       </box>
-    )}
+    )}</Show>
   </OverlayContext.Provider>
 }
 

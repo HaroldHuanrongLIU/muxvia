@@ -111,7 +111,7 @@ test("Codex renders the exact extreme-size matrix and folds its contextual sideb
     setup.mockInput.pressKey("b")
     const toggled = await setup.waitForFrame((frame) => !frame.includes("Target context"))
     expect(toggled).toContain("Mode       Unmanaged")
-    expect(toggled).toContain("Snapshot   —")
+    expect(toggled).toContain("Activated Snapshot  —")
   } finally {
     setup.renderer.destroy()
   }

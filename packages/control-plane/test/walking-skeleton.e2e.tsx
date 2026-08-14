@@ -209,7 +209,7 @@ test("real processes prove the Codex takeover walking skeleton", async () => {
     await setup.waitForFrame((frame) => frame.includes("Run a target action"))
     await setup.mockInput.typeText("/provider")
     setup.mockInput.pressEnter()
-    await setup.waitForFrame((frame) => frame.includes("[Enter] save"))
+    await setup.waitForFrame((frame) => frame.includes("Enter save"))
     await setup.mockInput.typeText("Fixture Provider")
     setup.mockInput.pressTab()
     await setup.mockInput.typeText(upstream.baseUrl)
@@ -230,7 +230,7 @@ test("real processes prove the Codex takeover walking skeleton", async () => {
     await waitFor(() => session.get().takeover.state === "active", "Takeover activation")
     await setup.renderOnce()
     const activeFrame = setup.captureCharFrame()
-    expect(activeFrame.includes("Mode       Takeover") && activeFrame.includes("Current    Fixture Provider")).toBeTrue()
+    expect(activeFrame.includes("Mode       Takeover") && activeFrame.includes("Current Target Provider  Fixture Provider")).toBeTrue()
     expect(activeFrame.includes("Restart Codex")).toBeTrue()
 
     const configText = await readFile(join(userHome, ".codex/config.toml"), "utf8")
@@ -253,7 +253,7 @@ test("real processes prove the Codex takeover walking skeleton", async () => {
     await waitFor(() => views.some((view) => view.servingProviderId !== null), "Serving push")
     await setup.renderOnce()
     const servedFrame = setup.captureCharFrame()
-    expect(servedFrame.includes("Serving    Fixture Provider")).toBeTrue()
+    expect(servedFrame.includes("Serving Provider  Fixture Provider")).toBeTrue()
 
     unsubscribe()
     setup.renderer.destroy()

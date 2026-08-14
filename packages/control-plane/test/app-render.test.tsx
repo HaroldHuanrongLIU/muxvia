@@ -16,6 +16,12 @@ type RecordedAction =
   | Omit<SaveProviderAction, "credential"> & { credentialPresent: boolean }
   | Exclude<TargetAction, SaveProviderAction>
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((next) => { resolve = next })
+  return { promise, resolve }
+}
+
 function projectAction(action: TargetAction): RecordedAction {
   if (action.kind !== "save-provider") return action
   return {
@@ -163,11 +169,11 @@ test("starts on Home and routes to and from the Codex context", async () => {
       "MUXVIA",
       "Codex",
       "Mode       Unmanaged",
-      "Current    —",
-      "Serving    —",
-      "Service    Running",
-      "Config     Unmanaged",
-      "Snapshot   —",
+      "Current Target Provider  —",
+      "Serving Provider  —",
+      "Routing Service  Running",
+      "Managed Configuration  Unmanaged",
+      "Activated Snapshot  —",
       "Run a target action",
       "Codex · Control Plane",
     ])
@@ -214,6 +220,42 @@ test("opens the localized Claude context without operating the Codex session", a
     expect(session.actions).toEqual([])
     expect(session.subscribeCalls).toBe(1)
   } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("renders every visible Provider editor string through the Chinese catalog", async () => {
+  const pending = deferred<ActionOutcome>()
+  const initial = view()
+  const session = new MemoryTargetSession(initial, async () => await pending.promise)
+  const setup = await testRender(() => <App session={session} locale="zh-CN" />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("p")
+    const editor = await setup.waitForFrame((frame) => frame.includes("Enter 保存 · Esc 取消"))
+
+    expectInOrder(editor, [
+      "Provider",
+      "名称",
+      "示例 Provider",
+      "基础 URL",
+      "https://provider.example/v1",
+      "模型",
+      "gpt-model",
+      "凭据",
+      "API 凭据",
+      "Enter 保存 · Esc 取消",
+    ])
+
+    await enterProvider(setup.mockInput)
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 1)
+    expect(await setup.waitForFrame((frame) => frame.includes("正在保存…"))).not.toContain("Saving…")
+  } finally {
+    pending.resolve({ status: "applied", view: initial })
     setup.renderer.destroy()
   }
 })
@@ -271,6 +313,27 @@ test("maps known and unknown problems without rendering backend messages", async
   }
 })
 
+test("renders canonical Chinese status concepts and the managed configuration state", async () => {
+  const session = new MemoryTargetSession(view({
+    managedConfiguration: { state: "managed", path: "/tmp/home/.codex/config.toml", restartRequired: false },
+  }))
+  const setup = await testRender(() => <App session={session} locale="zh-CN" />, { width: 80, height: 24, useThread: false })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    const frame = await setup.waitForFrame((next) => next.includes("受管理配置"))
+    expect(frame).toContain("当前 Target Provider")
+    expect(frame).toContain("服务中 Provider")
+    expect(frame).toContain("路由服务")
+    expect(frame).toContain("受管理配置")
+    expect(frame).toContain("受管理")
+    expect(frame).toContain("已激活快照")
+    expect(frame).not.toContain("未知（managed）")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
 test("dirty Provider fields require localized confirmation before Ctrl+C exits", async () => {
   const session = new MemoryTargetSession(view())
   const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
@@ -313,6 +376,37 @@ test("declining dirty exit keeps the Provider draft and restores editor focus", 
     expectSecretFree(setup, session)
   } finally {
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("closing dirty exit disposes its command layer before later Provider save and cancel keys", async () => {
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    await enterProvider(setup.mockInput)
+
+    setup.mockInput.pressCtrlC()
+    await setup.waitForFrame((frame) => frame.includes("Discard Provider draft?"))
+    setup.mockInput.pressKey("n")
+    await flushUi(setup)
+    await setup.waitForFrame((frame) => frame.includes("Fixture Provider") && !frame.includes("Discard Provider draft?"))
+
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 1)
+    await setup.waitForFrame((frame) => frame.includes("Provider saved: Fixture Provider"))
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("p")
+    await setup.waitForFrame((frame) => frame.includes("Enter save"))
+    setup.mockInput.pressEscape()
+    await flushUi(setup)
+    expect(setup.captureCharFrame()).toContain("Run a target action")
+    expect(session.actions).toHaveLength(1)
+  } finally {
+    setup.renderer.destroy()
   }
 })
 
@@ -474,10 +568,10 @@ test("saves a masked Provider, applies its visible identity, and follows pushed 
       activatedSnapshot: { id: snapshotId, providerId: "provider-1", model: "gpt-test", epoch: snapshotEpoch },
     })
     session.push(active)
-    await setup.waitForFrame((frame) => frame.includes("Mode       Takeover") && frame.includes("Current    Fixture Provider"))
+    await setup.waitForFrame((frame) => frame.includes("Mode       Takeover") && frame.includes("Current Target Provider  Fixture Provider"))
 
     session.push({ ...active, viewSequence: 3, servingProviderId: "provider-1" })
-    const served = await setup.waitForFrame((frame) => frame.includes("Serving    Fixture Provider"))
+    const served = await setup.waitForFrame((frame) => frame.includes("Serving Provider  Fixture Provider"))
     expect(served).toContain("Restart Codex")
     expectInOrder(served, [
       "Provider saved: Fixture Provider",
@@ -549,7 +643,7 @@ test("a stale action installs the authoritative Target View and asks for an expl
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("a")
     const frame = await setup.waitForFrame((next) => next.includes("Retry the action"))
-    expect(frame).toContain("Current    Authoritative Provider")
+    expect(frame).toContain("Current Target Provider  Authoritative Provider")
     expect(frame).toContain("Target state changed")
     expect(frame.match(/Target state changed\. Retry the action\./g)?.length).toBe(1)
     expect(frame).not.toContain(problemMessageSentinel)

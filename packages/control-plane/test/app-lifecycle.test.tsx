@@ -455,16 +455,23 @@ test("a startup signal finishes cleanup without waiting for a stalled connection
   const session = new LifecycleSession()
   const signals = new ManualSignalSource()
   const connection = deferred<TargetSession>()
+  const clock = new ManualClock()
+  let connectorSignal: AbortSignal | undefined
   let renderCalls = 0
   let spawnCalls = 0
   const running = run(options, ports(setup, session, {
     signals,
-    connect: async () => await connection.promise,
+    connect: async (_socketPath, _release, signal) => {
+      connectorSignal = signal
+      return await connection.promise
+    },
     spawn: () => { spawnCalls++ },
     render: async () => { renderCalls++ },
+    clock,
   }))
   try {
     await flushMicrotasks()
+    expect(clock.pendingTimers()).toBe(1)
     signals.emit("SIGTERM")
     await Promise.race([
       running,
@@ -477,6 +484,8 @@ test("a startup signal finishes cleanup without waiting for a stalled connection
     expect(signals.unlistenCalls).toBe(3)
     expect(titles.at(-1)).toBe("")
     expect(destroyCalls()).toBe(1)
+    expect(connectorSignal?.aborted).toBeTrue()
+    expect(clock.pendingTimers()).toBe(0)
 
     connection.resolve(session)
     await flushMicrotasks()

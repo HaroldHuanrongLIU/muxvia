@@ -4,6 +4,7 @@ import { createSignal, onCleanup } from "solid-js"
 
 import { useCommandLayer } from "../commands/keymap"
 import type { TargetAction } from "../control/types"
+import type { Translator } from "../i18n"
 import { theme } from "../theme"
 import { useOverlay } from "./overlay-stack"
 
@@ -11,6 +12,7 @@ type ProviderDraft = Extract<TargetAction, { kind: "save-provider" }>
 
 export interface ProviderFormProps {
   pending: boolean
+  t: Translator
   ref?: (value: ProviderFormRef | undefined) => void
   onDirtyChange: (dirty: boolean) => void
   onCancel: () => void
@@ -150,24 +152,24 @@ export function ProviderForm(props: ProviderFormProps) {
 
   return (
     <box backgroundColor={theme.panel} flexDirection="column" padding={1} rowGap={1}>
-      <text fg={theme.text}>Provider</text>
+      <text fg={theme.text}>{props.t("provider.editor.title")}</text>
       <box flexDirection="column">
-        <text fg={focus() === 0 ? theme.primary : theme.muted}>Name</text>
-        <input ref={(input: InputRenderable) => { inputs[0] = input }} {...inputStyle} focused={focus() === 0} value={name()} onInput={update(name, setName)} placeholder="Fixture Provider" />
+        <text fg={focus() === 0 ? theme.primary : theme.muted}>{props.t("provider.field.name")}</text>
+        <input ref={(input: InputRenderable) => { inputs[0] = input }} {...inputStyle} focused={focus() === 0} value={name()} onInput={update(name, setName)} placeholder={props.t("provider.placeholder.name")} />
       </box>
       <box flexDirection="column">
-        <text fg={focus() === 1 ? theme.primary : theme.muted}>Base URL</text>
-        <input ref={(input: InputRenderable) => { inputs[1] = input }} {...inputStyle} focused={focus() === 1} value={baseUrl()} onInput={update(baseUrl, setBaseUrl)} placeholder="https://provider.example/v1" />
+        <text fg={focus() === 1 ? theme.primary : theme.muted}>{props.t("provider.field.base-url")}</text>
+        <input ref={(input: InputRenderable) => { inputs[1] = input }} {...inputStyle} focused={focus() === 1} value={baseUrl()} onInput={update(baseUrl, setBaseUrl)} placeholder={props.t("provider.placeholder.base-url")} />
       </box>
       <box flexDirection="column">
-        <text fg={focus() === 2 ? theme.primary : theme.muted}>Model</text>
-        <input ref={(input: InputRenderable) => { inputs[2] = input }} {...inputStyle} focused={focus() === 2} value={model()} onInput={update(model, setModel)} placeholder="gpt-model" />
+        <text fg={focus() === 2 ? theme.primary : theme.muted}>{props.t("provider.field.model")}</text>
+        <input ref={(input: InputRenderable) => { inputs[2] = input }} {...inputStyle} focused={focus() === 2} value={model()} onInput={update(model, setModel)} placeholder={props.t("provider.placeholder.model")} />
       </box>
       <box flexDirection="column">
-        <text fg={focus() === 3 ? theme.primary : theme.muted}>Credential</text>
-        <text fg={theme.text} bg={theme.element}>{credential() ? "•".repeat(credential().length) : "API credential"}</text>
+        <text fg={focus() === 3 ? theme.primary : theme.muted}>{props.t("provider.field.credential")}</text>
+        <text fg={theme.text} bg={theme.element}>{credential() ? "•".repeat(credential().length) : props.t("provider.placeholder.credential")}</text>
       </box>
-      <text fg={theme.muted}>{props.pending ? "Saving…" : "[Enter] save   [Esc] cancel"}</text>
+      <text fg={theme.muted}>{props.t(props.pending ? "provider.editor.saving" : "provider.editor.help")}</text>
     </box>
   )
 }

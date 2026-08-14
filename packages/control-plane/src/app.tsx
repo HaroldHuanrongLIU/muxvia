@@ -152,9 +152,9 @@ async function connectBeforeDeadline(
   options: RunOptions,
   ports: RunPorts,
   deadline: number,
-  cancelled: () => boolean = () => false,
+  cancellation: AbortSignal,
 ): Promise<TargetSession> {
-  if (cancelled()) throw new ConnectionCancelledError()
+  if (cancellation.aborted) throw new ConnectionCancelledError()
   const remaining = deadline - ports.clock.now()
   if (remaining <= 0) throw new ConnectionDeadlineError()
 
@@ -168,10 +168,21 @@ async function connectBeforeDeadline(
       reject(new ConnectionDeadlineError())
     })
   })
+  let removeCancellation = () => {}
+  const cancelled = new Promise<never>((_, reject) => {
+    const onCancel = () => {
+      cancelTimeout()
+      controller.abort()
+      reject(new ConnectionCancelledError())
+    }
+    cancellation.addEventListener("abort", onCancel, { once: true })
+    removeCancellation = () => cancellation.removeEventListener("abort", onCancel)
+    if (cancellation.aborted) onCancel()
+  })
   const connection = Promise.resolve()
     .then(() => ports.connect(options.socketPath, options.release, controller.signal))
     .then(async (session) => {
-      if (cancelled()) {
+      if (cancellation.aborted) {
         try {
           await session.close()
         } catch {
@@ -189,9 +200,10 @@ async function connectBeforeDeadline(
     })
 
   try {
-    return await Promise.race([connection, timeout])
+    return await Promise.race([connection, timeout, cancelled])
   } finally {
-    if (!expired) cancelTimeout()
+    removeCancellation()
+    cancelTimeout()
   }
 }
 
@@ -200,18 +212,19 @@ class ConnectionCancelledError extends Error {}
 async function connectOrStart(
   options: RunOptions,
   ports: RunPorts,
-  cancelled: () => boolean = () => false,
+  cancellation: AbortSignal,
 ): Promise<TargetSession | undefined> {
   const deadline = ports.clock.now() + readinessTimeoutMs
   try {
-    return await connectBeforeDeadline(options, ports, deadline, cancelled)
+    return await connectBeforeDeadline(options, ports, deadline, cancellation)
   } catch (error) {
+    if (cancellation.aborted) return undefined
     if (error instanceof ConnectionCancelledError) return undefined
     if (error instanceof ConnectionDeadlineError) throw error
     if (!socketUnavailable(error)) throw error
   }
 
-  if (cancelled()) return undefined
+  if (cancellation.aborted) return undefined
 
   if (!isAbsolute(options.servicePath)) {
     throw new Error("Routing Service path must be absolute")
@@ -219,15 +232,16 @@ async function connectOrStart(
   ports.spawn(options.servicePath, ["--home", muxviaHomeForSocket(options.socketPath)], { shell: false })
 
   while (ports.clock.now() < deadline) {
-    if (cancelled()) return undefined
+    if (cancellation.aborted) return undefined
     try {
-      return await connectBeforeDeadline(options, ports, deadline, cancelled)
+      return await connectBeforeDeadline(options, ports, deadline, cancellation)
     } catch (error) {
+      if (cancellation.aborted) return undefined
       if (error instanceof ConnectionCancelledError) return undefined
       if (error instanceof ConnectionDeadlineError) throw error
       if (!socketUnavailable(error)) throw error
     }
-    if (cancelled()) return undefined
+    if (cancellation.aborted) return undefined
     await ports.clock.sleep(retryIntervalMs)
   }
   throw new ControlError("service-unavailable", "Routing Service did not become ready")
@@ -239,6 +253,8 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
   const destroyed = renderer.isDestroyed
     ? Promise.resolve()
     : new Promise<void>((resolve) => renderer.once("destroy", resolve))
+  const startup = new AbortController()
+  void destroyed.then(() => startup.abort())
   const stopListening = (["SIGHUP", "SIGINT", "SIGTERM"] as const).map((name) =>
     ports.signals.listen(name, () => {
       if (!renderer.isDestroyed) renderer.destroy()
@@ -247,10 +263,7 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
   let session: TargetSession | undefined
   try {
     if (renderer.isDestroyed) return
-    session = await Promise.race([
-      connectOrStart(options, ports, () => renderer.isDestroyed),
-      destroyed.then(() => undefined),
-    ])
+    session = await connectOrStart(options, ports, startup.signal)
     if (!session || renderer.isDestroyed) return
     await ports.render(() => <App session={session!} locale={locale} />, renderer)
     const sessionClosed = session.whenClosed().then(

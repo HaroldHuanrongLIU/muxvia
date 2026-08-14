@@ -198,7 +198,8 @@ impl ActivationService {
                 TargetAction::CreateProvider { .. }
                 | TargetAction::UpdateProvider { .. }
                 | TargetAction::ReorderProviders { .. }
-                | TargetAction::DeleteProvider { .. },
+                | TargetAction::DeleteProvider { .. }
+                | TargetAction::DuplicateProvider { .. },
             ) => {
                 let outcome = self
                     .store

@@ -615,6 +615,94 @@ async fn reorder_and_delete_actions_are_receipt_first_and_publish_once_per_appli
 }
 
 #[tokio::test]
+async fn duplicate_provider_is_receipt_first_and_publishes_one_secret_free_view() {
+    let fixture = ControlFixture::start().await;
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    request(
+        &mut stream,
+        "open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+
+    let created = request(
+        &mut stream,
+        "create",
+        json!({
+            "kind": "act", "target": "codex",
+            "actionId": "00000000-0000-4000-8000-000000000071",
+            "expectedRevision": 0,
+            "action": create_action("Source", "source-secret")
+        }),
+    )
+    .await;
+    let _create_push = read_frame(&mut stream).await.unwrap();
+    let source = created["result"]["outcome"]["view"]["providers"][0].clone();
+
+    let duplicate_id = "00000000-0000-4000-8000-000000000072";
+    let duplicated = request(
+        &mut stream,
+        "duplicate",
+        json!({
+            "kind": "act", "target": "codex", "actionId": duplicate_id,
+            "expectedRevision": 1,
+            "action": {
+                "kind": "duplicate-provider",
+                "sourceProviderId": source["id"],
+                "sourceProviderRevision": source["providerRevision"],
+                "name": "Detached Copy",
+                "baseUrl": "https://copy.example/v1",
+                "model": "copy-model",
+                "credential": { "kind": "replace", "value": "duplicate-secret-must-not-escape" }
+            }
+        }),
+    )
+    .await;
+    let duplicate_push = read_frame(&mut stream).await.unwrap();
+    assert_eq!(duplicated["result"]["outcome"]["status"], "applied");
+    assert_eq!(
+        duplicate_push["view"],
+        duplicated["result"]["outcome"]["view"]
+    );
+    assert_eq!(
+        duplicated["result"]["outcome"]["view"]["providers"][0]["id"],
+        source["id"]
+    );
+    assert_ne!(
+        duplicated["result"]["outcome"]["view"]["providers"][1]["id"],
+        source["id"]
+    );
+    assert!(!format!("{duplicated}{duplicate_push}").contains("duplicate-secret-must-not-escape"));
+
+    let replay = request(
+        &mut stream,
+        "duplicate-replay",
+        json!({
+            "kind": "act", "target": "codex", "actionId": duplicate_id,
+            "expectedRevision": 999,
+            "action": { "malformed": "duplicate-replay-secret-must-not-escape" }
+        }),
+    )
+    .await;
+    assert_eq!(replay["result"]["outcome"]["status"], "replayed");
+    assert!(
+        !replay
+            .to_string()
+            .contains("duplicate-replay-secret-must-not-escape")
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            read_frame(&mut stream)
+        )
+        .await
+        .is_err(),
+        "a replay must not publish a Target View",
+    );
+}
+
+#[tokio::test]
 async fn zero_provider_revisions_are_rejected_before_mutation_but_do_not_beat_receipts() {
     let fixture = ControlFixture::start().await;
     let mut stream = fixture.connect().await;

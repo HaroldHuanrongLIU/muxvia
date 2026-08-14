@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use muxvia_routing::control::{
     framing::{FrameError, read_frame, write_frame},
     protocol::{
-        ClientFrame, CredentialEdit, ProviderCompleteness, ProviderProtocol, ProviderRequirement,
-        ServerFrame, TargetAction, TargetView,
+        ClientFrame, CredentialEdit, DuplicateCredential, ProviderCompleteness, ProviderProtocol,
+        ProviderRequirement, ServerFrame, TargetAction, TargetView,
     },
 };
 use serde_json::Value;
@@ -31,7 +31,11 @@ fn fixtures_round_trip_as_their_protocol_types() {
     let action: TargetAction = serde_json::from_value(save_provider.clone()).unwrap();
     assert_eq!(serde_json::to_value(action).unwrap(), save_provider);
 
-    for name in ["reorder-providers.json", "delete-provider.json"] {
+    for name in [
+        "reorder-providers.json",
+        "delete-provider.json",
+        "duplicate-provider.json",
+    ] {
         let action = fixture(name);
         let parsed: TargetAction = serde_json::from_value(action.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), action);
@@ -60,6 +64,19 @@ fn provider_lifecycle_actions_use_revision_guarded_secret_free_wire_shapes() {
         serde_json::to_value(delete).unwrap(),
         fixture("delete-provider.json")
     );
+
+    let duplicate = TargetAction::DuplicateProvider {
+        source_provider_id: "00000000-0000-4000-8000-000000000101".parse().unwrap(),
+        source_provider_revision: 7,
+        name: "Copied Provider".into(),
+        base_url: "https://copied.example/v1".into(),
+        model: "copied-model".into(),
+        credential: DuplicateCredential::ReuseSource,
+    };
+    assert_eq!(
+        serde_json::to_value(duplicate).unwrap(),
+        fixture("duplicate-provider.json")
+    );
 }
 
 #[test]
@@ -79,9 +96,34 @@ fn provider_action_revisions_must_be_positive_on_the_wire() {
             "providerId": "00000000-0000-4000-8000-000000000101",
             "providerRevision": 0,
         }),
+        serde_json::json!({
+            "kind": "duplicate-provider",
+            "sourceProviderId": "00000000-0000-4000-8000-000000000101",
+            "sourceProviderRevision": 0,
+            "name": "Copied Provider",
+            "baseUrl": "https://copied.example/v1",
+            "model": "copied-model",
+            "credential": { "kind": "without" },
+        }),
     ] {
         assert!(serde_json::from_value::<TargetAction>(action).is_err());
     }
+}
+
+#[test]
+fn duplicate_credential_debug_redacts_replacement_values() {
+    let sentinel = "duplicate-credential-sentinel-must-not-escape";
+    let action = TargetAction::DuplicateProvider {
+        source_provider_id: "00000000-0000-4000-8000-000000000101".parse().unwrap(),
+        source_provider_revision: 1,
+        name: "Copied Provider".into(),
+        base_url: "https://copied.example/v1".into(),
+        model: "copied-model".into(),
+        credential: DuplicateCredential::Replace {
+            value: sentinel.into(),
+        },
+    };
+    assert!(!format!("{action:?}").contains(sentinel));
 }
 
 #[test]

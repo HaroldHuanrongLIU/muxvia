@@ -1,0 +1,9 @@
+{
+  "kind": "duplicate-provider",
+  "sourceProviderId": "00000000-0000-4000-8000-000000000101",
+  "sourceProviderRevision": 7,
+  "name": "Copied Provider",
+  "baseUrl": "https://copied.example/v1",
+  "model": "copied-model",
+  "credential": { "kind": "reuse-source" }
+}

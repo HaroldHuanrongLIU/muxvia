@@ -546,6 +546,24 @@ impl StateStore {
                 },
                 "delete-provider",
             ),
+            Ok(TargetAction::DuplicateProvider {
+                source_provider_id,
+                source_provider_revision,
+                name,
+                base_url,
+                model,
+                credential,
+            }) => (
+                super::providers::ProviderAction::Duplicate {
+                    source_provider_id,
+                    source_provider_revision,
+                    name,
+                    base_url,
+                    model,
+                    credential,
+                },
+                "duplicate-provider",
+            ),
             Ok(_) => {
                 return Err(self
                     .failure("unsupported-operation", "Provider action is not supported")

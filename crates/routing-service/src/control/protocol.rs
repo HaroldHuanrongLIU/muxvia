@@ -196,6 +196,15 @@ pub enum TargetAction {
         #[serde(deserialize_with = "deserialize_positive_provider_revision")]
         provider_revision: u64,
     },
+    DuplicateProvider {
+        source_provider_id: Uuid,
+        #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+        source_provider_revision: u64,
+        name: String,
+        base_url: String,
+        model: String,
+        credential: DuplicateCredential,
+    },
     ActivateProvider {
         provider_id: String,
         mode: TakeoverMode,
@@ -258,6 +267,22 @@ impl fmt::Debug for TargetAction {
                 .field("provider_id", provider_id)
                 .field("provider_revision", provider_revision)
                 .finish(),
+            Self::DuplicateProvider {
+                source_provider_id,
+                source_provider_revision,
+                name,
+                base_url,
+                model,
+                credential,
+            } => formatter
+                .debug_struct("DuplicateProvider")
+                .field("source_provider_id", source_provider_id)
+                .field("source_provider_revision", source_provider_revision)
+                .field("name", name)
+                .field("base_url", base_url)
+                .field("model", model)
+                .field("credential", credential)
+                .finish(),
             Self::ActivateProvider { provider_id, mode } => formatter
                 .debug_struct("ActivateProvider")
                 .field("provider_id", provider_id)
@@ -277,6 +302,31 @@ pub enum CredentialEdit {
     Keep,
     Remove,
     Replace { value: String },
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DuplicateCredential {
+    Without,
+    ReuseSource,
+    Replace { value: String },
+}
+
+impl fmt::Debug for DuplicateCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Without => formatter.write_str("Without"),
+            Self::ReuseSource => formatter.write_str("ReuseSource"),
+            Self::Replace { .. } => formatter
+                .debug_struct("Replace")
+                .field("value", &Redacted)
+                .finish(),
+        }
+    }
 }
 
 impl fmt::Debug for CredentialEdit {

@@ -23,6 +23,7 @@ test.each([
   ["save-provider.json", parseTargetAction],
   ["reorder-providers.json", parseTargetAction],
   ["delete-provider.json", parseTargetAction],
+  ["duplicate-provider.json", parseTargetAction],
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)
@@ -122,6 +123,24 @@ test("round-trips schema-v2 Provider declarations, Presets, and credential inten
     model: "",
     credential: { kind: "remove" },
     presetKey: "openai-api-responses",
+  })
+
+  expect(parseTargetAction({
+    kind: "duplicate-provider",
+    sourceProviderId: "00000000-0000-4000-8000-000000000101",
+    sourceProviderRevision: 1,
+    name: "Copied Provider",
+    baseUrl: "https://copied.example/v1",
+    model: "copied-model",
+    credential: { kind: "reuse-source" },
+  })).toEqual({
+    kind: "duplicate-provider",
+    sourceProviderId: "00000000-0000-4000-8000-000000000101",
+    sourceProviderRevision: 1,
+    name: "Copied Provider",
+    baseUrl: "https://copied.example/v1",
+    model: "copied-model",
+    credential: { kind: "reuse-source" },
   })
 })
 

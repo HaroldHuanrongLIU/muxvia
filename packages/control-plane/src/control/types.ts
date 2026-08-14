@@ -83,6 +83,12 @@ const credentialEditSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("replace"), value: z.string() }),
 ])
 
+const duplicateCredentialSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("without") }),
+  z.object({ kind: z.literal("reuse-source") }),
+  z.object({ kind: z.literal("replace"), value: z.string() }),
+])
+
 const targetActionSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("create-provider"),
@@ -109,6 +115,15 @@ const targetActionSchema = z.discriminatedUnion("kind", [
     kind: z.literal("delete-provider"),
     providerId: z.string().uuid(),
     providerRevision: z.number().int().positive(),
+  }),
+  z.object({
+    kind: z.literal("duplicate-provider"),
+    sourceProviderId: z.string().uuid(),
+    sourceProviderRevision: z.number().int().positive(),
+    name: z.string(),
+    baseUrl: z.string(),
+    model: z.string(),
+    credential: duplicateCredentialSchema,
   }),
   z.object({
     kind: z.literal("activate-provider"),

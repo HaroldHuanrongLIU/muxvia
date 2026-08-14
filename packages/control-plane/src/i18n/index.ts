@@ -49,6 +49,11 @@ export function messageKeyForProblem(code: string): MessageKey {
   return problemMessageKeys.get(code) ?? "error.generic"
 }
 
+export function inspectionErrorKey(category: string): MessageKey {
+  const key = `inspection.error.${category}`
+  return isMessageKey(key) ? key : "inspection.error.connect"
+}
+
 export function labelTargetState(t: Translator, value: string): string {
   switch (value) {
     case "unmanaged": return t("state.unmanaged")

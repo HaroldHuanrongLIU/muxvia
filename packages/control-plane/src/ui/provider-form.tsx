@@ -1,12 +1,13 @@
 import type { InputRenderable } from "@opentui/core"
 import { useKeyboard, usePaste } from "@opentui/solid"
-import { createSignal, onCleanup } from "solid-js"
+import { createSignal, onCleanup, onMount, Show } from "solid-js"
 
 import { useCommandLayer } from "../commands/keymap"
-import type { TargetAction } from "../control/types"
-import type { Translator } from "../i18n"
+import type { DiscoverySource, ModelDiscoveryResult, TargetAction } from "../control/types"
+import { inspectionErrorKey, type Translator } from "../i18n"
 import { theme } from "../theme"
 import { useOverlay } from "./overlay-stack"
+import { ProviderModelPicker } from "./provider-model-picker"
 
 export interface ProviderDraft {
   name: string
@@ -14,6 +15,7 @@ export interface ProviderDraft {
   model: string
   providerId?: string
   providerRevision?: number
+  presetKey?: "openai-api-responses" | null
 }
 
 export type ProviderFormResult = Extract<TargetAction,
@@ -24,6 +26,8 @@ export interface ProviderFormProps {
   mode: "create" | "edit" | "duplicate"
   initialDraft: ProviderDraft
   credentialPresence: "present" | "missing"
+  duplicateCredentialChoice?: "without" | "reuse-source"
+  discoverModels?: (source: DiscoverySource, signal?: AbortSignal) => Promise<ModelDiscoveryResult>
   pending: boolean
   t: Translator
   ref?: (value: ProviderFormRef | undefined) => void
@@ -48,12 +52,19 @@ export function ProviderForm(props: ProviderFormProps) {
   const [model, setModel] = createSignal(props.initialDraft.model)
   const [credential, setCredential] = createSignal("")
   const [credentialIntent, setCredentialIntent] = createSignal<CredentialIntent>(
-    props.mode === "create" ? "remove" : "keep",
+    props.mode === "create" || props.duplicateCredentialChoice === "without" ? "remove" : "keep",
   )
   const [dirty, setDirtySignal] = createSignal(false)
+  const [discovery, setDiscovery] = createSignal<
+    | { status: "idle" | "pending" }
+    | { status: "success"; models: Extract<ModelDiscoveryResult, { status: "success" }>["models"] }
+    | { status: "failure"; category: Extract<ModelDiscoveryResult, { status: "failure" }>["failure"]["category"] }
+  >({ status: "idle" })
   const inputs: Array<InputRenderable | undefined> = []
   let cancelScheduled = false
   let disposed = false
+  let discoveryAbort: AbortController | undefined
+  let discoveryGeneration = 0
 
   const setDirty = (next: boolean) => {
     if (dirty() === next) return
@@ -68,7 +79,7 @@ export function ProviderForm(props: ProviderFormProps) {
   const clearSensitive = () => {
     if (credential()) setCredential("")
     if (credentialIntent() === "replace") {
-      setCredentialIntent(props.mode === "create" ? "remove" : "keep")
+      setCredentialIntent(props.mode === "create" || props.duplicateCredentialChoice === "without" ? "remove" : "keep")
     }
   }
   const formRef: ProviderFormRef = {
@@ -83,8 +94,42 @@ export function ProviderForm(props: ProviderFormProps) {
   props.ref?.(formRef)
   onCleanup(() => {
     disposed = true
+    discoveryGeneration++
+    discoveryAbort?.abort()
     clearSensitive()
     props.ref?.(undefined)
+  })
+
+  const runDiscovery = async (source: DiscoverySource) => {
+    if (!props.discoverModels) return
+    discoveryAbort?.abort()
+    const controller = new AbortController()
+    discoveryAbort = controller
+    const generation = ++discoveryGeneration
+    setDiscovery({ status: "pending" })
+    try {
+      const result = await props.discoverModels(source, controller.signal)
+      if (disposed || generation !== discoveryGeneration || controller.signal.aborted) return
+      if (result.status === "success") {
+        setDiscovery({ status: "success", models: result.models })
+      } else if (result.failure.category !== "cancelled") {
+        setDiscovery({ status: "failure", category: result.failure.category })
+      }
+    } catch (error) {
+      if (disposed || generation !== discoveryGeneration || controller.signal.aborted) return
+      const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "connect"
+      if (code !== "cancelled") setDiscovery({ status: "failure", category: "connect" })
+    }
+  }
+
+  onMount(() => {
+    if (props.mode === "edit" && props.discoverModels) {
+      void runDiscovery({
+        kind: "saved",
+        providerId: props.initialDraft.providerId!,
+        providerRevision: props.initialDraft.providerRevision!,
+      })
+    }
   })
 
   const credentialEdit = (): Extract<TargetAction, { kind: "create-provider" }> ["credential"] => {
@@ -96,7 +141,7 @@ export function ProviderForm(props: ProviderFormProps) {
     if (props.pending) return
     const fields = { name: name(), baseUrl: baseUrl(), model: model() }
     const result: ProviderFormResult = props.mode === "create"
-      ? { kind: "create-provider", ...fields, credential: credentialEdit(), presetKey: null }
+      ? { kind: "create-provider", ...fields, credential: credentialEdit(), presetKey: props.initialDraft.presetKey ?? null }
       : props.mode === "edit"
         ? {
           kind: "update-provider",
@@ -127,6 +172,36 @@ export function ProviderForm(props: ProviderFormProps) {
     setCredentialIntent("remove")
     setDirty(true)
   }
+  const refreshModels = () => {
+    const credentialSource: Extract<DiscoverySource, { kind: "draft" }>["credentialSource"] = credentialIntent() === "replace"
+      ? { kind: "ephemeral", value: credential() }
+      : credentialIntent() === "keep" && props.credentialPresence === "present" && props.initialDraft.providerId && props.initialDraft.providerRevision
+        ? {
+          kind: "saved",
+          providerId: props.initialDraft.providerId,
+          providerRevision: props.initialDraft.providerRevision,
+        }
+        : { kind: "missing" }
+    void runDiscovery({ kind: "draft", baseUrl: baseUrl(), credentialSource })
+  }
+  const openModelPicker = () => {
+    const current = discovery()
+    if (current.status !== "success" || current.models.length === 0) return
+    overlay.push({
+      id: "provider-model-picker",
+      render: () => <ProviderModelPicker
+        models={current.models}
+        t={props.t}
+        onSelect={(modelId) => {
+          if (modelId !== model()) {
+            setModel(modelId)
+            setDirty(true)
+          }
+          overlay.closeTop()
+        }}
+      />,
+    })
+  }
   const cancel = () => {
     if (cancelScheduled) return
     cancelScheduled = true
@@ -144,6 +219,8 @@ export function ProviderForm(props: ProviderFormProps) {
       "provider.save": () => { void submit() },
       "provider.cancel": cancel,
       "provider.credential.remove": removeCredential,
+      "provider.models.refresh": refreshModels,
+      "provider.models.select": openModelPicker,
     },
   })
 
@@ -217,6 +294,17 @@ export function ProviderForm(props: ProviderFormProps) {
         <text fg={focus() === 3 ? theme.primary : theme.muted}>{props.t("provider.field.credential")}</text>
         <text fg={theme.text} bg={theme.element}>{credential() ? "•".repeat(credential().length) : credentialPlaceholder()}</text>
       </box>
+      <Show when={discovery().status !== "idle"}>
+        <text fg={discovery().status === "failure" ? theme.error : theme.muted}>{(() => {
+          const current = discovery()
+          if (current.status === "pending") return props.t("provider.models.loading")
+          if (current.status === "success") return props.t("provider.models.available", { count: current.models.length })
+          if (current.status === "failure") {
+            return props.t("provider.models.failure", { reason: props.t(inspectionErrorKey(current.category)) })
+          }
+          return ""
+        })()}</text>
+      </Show>
       <text fg={theme.muted}>{props.t(props.pending ? "provider.editor.saving" : "provider.editor.help")}</text>
     </box>
   )

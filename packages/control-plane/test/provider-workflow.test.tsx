@@ -461,10 +461,192 @@ test("blank edits Keep credentials for either saved presence while creates start
     setup.mockInput.pressKey("1")
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("p")
-    await setup.renderOnce()
+    await setup.waitForFrame((frame) => frame.includes("Blank"))
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Enter save"))
     setup.mockInput.pressEnter()
     await setup.waitFor(() => session.actions.length === 1)
     expect(session.actions[0]).toMatchObject({ kind: "create-provider", credential: { kind: "remove" } })
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Preset source selection copies an ordinary draft without discovery and saves provenance", async () => {
+  const session = new MemoryTargetSession(view({
+    providerPresets: [{
+      key: "openai-api-responses",
+      baseUrl: "https://api.openai.com/v1",
+      model: "",
+      protocol: "openai-responses",
+    }],
+  }))
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("p")
+    const sources = await setup.waitForFrame((frame) => frame.includes("Blank"))
+    expect(sources).toContain("OpenAI API (Responses)")
+
+    setup.mockInput.pressKey("down")
+    setup.mockInput.pressEnter()
+    const editor = await setup.waitForFrame((frame) => frame.includes("https://api.openai.com/v1"))
+    expect(editor).toContain("API credential")
+    expect(editor).not.toContain(credentialSecret)
+
+    await setup.mockInput.typeText("Official Copy")
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 1)
+    expect(session.actions).toEqual([{
+      kind: "create-provider",
+      name: "Official Copy",
+      baseUrl: "https://api.openai.com/v1",
+      model: "",
+      credential: { kind: "remove" },
+      presetKey: "openai-api-responses",
+    }])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("duplicate credential confirmation keeps cancel without and reuse distinct and replacement wins", async () => {
+  const source = provider({
+    id: "00000000-0000-4000-8000-000000000011",
+    name: "Source Provider",
+    credential: "present",
+  })
+  const tail = provider({
+    id: "00000000-0000-4000-8000-000000000012",
+    position: 1,
+    name: "Tail Provider",
+  })
+  const createdIds = [
+    "00000000-0000-4000-8000-000000000021",
+    "00000000-0000-4000-8000-000000000022",
+    "00000000-0000-4000-8000-000000000023",
+  ]
+  let session!: MemoryTargetSession
+  session = new MemoryTargetSession(view({ providers: [source, tail] }), async (action): Promise<ActionOutcome> => {
+    if (action.kind !== "duplicate-provider") throw new Error("unexpected action")
+    const duplicate = provider({
+      id: createdIds[session.actions.length - 1]!,
+      position: 1,
+      name: action.name,
+      baseUrl: action.baseUrl,
+      model: action.model,
+      credential: action.credential.kind === "without" ? "missing" : "present",
+    })
+    return {
+      status: "applied",
+      view: view({
+        viewSequence: session.actions.length + 1,
+        providers: [source, duplicate, { ...tail, position: 2 }],
+      }),
+    }
+  })
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+
+  const openPicker = async () => {
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Enter edit ·") && frame.includes("Source Provider"))
+  }
+  const requestDuplicate = async () => {
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("c")
+    return await setup.waitForFrame((frame) => frame.includes("Credential Reference"))
+  }
+
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await openPicker()
+
+    const confirmation = await requestDuplicate()
+    expect(confirmation).toContain("Source Provider")
+    expect(confirmation).toContain("Credential Reference present")
+    expect(confirmation).not.toContain(credentialUuid)
+    expect(confirmation).not.toContain(credentialSecret)
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Providers") && !frame.includes("Reuse Credential Reference?"))
+    expect(session.actions).toEqual([])
+
+    await requestDuplicate()
+    setup.mockInput.pressKey("n")
+    const withoutEditor = await setup.waitForFrame((frame) => frame.includes("Source Provider Copy"))
+    expect(withoutEditor).toContain("https://first.example/v1")
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 1)
+    expect(session.actions[0]).toEqual({
+      kind: "duplicate-provider",
+      sourceProviderId: source.id,
+      sourceProviderRevision: source.providerRevision,
+      name: "Source Provider Copy",
+      baseUrl: source.baseUrl,
+      model: source.model,
+      credential: { kind: "without" },
+    })
+
+    await openPicker()
+    await requestDuplicate()
+    setup.mockInput.pressKey("y")
+    await setup.waitForFrame((frame) => frame.includes("Source Provider Copy"))
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 2)
+    expect(session.actions[1]).toMatchObject({
+      kind: "duplicate-provider",
+      sourceProviderId: source.id,
+      sourceProviderRevision: source.providerRevision,
+      credential: { kind: "reuse-source" },
+    })
+
+    await openPicker()
+    await requestDuplicate()
+    setup.mockInput.pressKey("y")
+    await setup.waitForFrame((frame) => frame.includes("Source Provider Copy"))
+    setup.mockInput.pressTab()
+    setup.mockInput.pressTab()
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(credentialSecret)
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 3)
+    expect(session.actions[2]).toMatchObject({
+      kind: "duplicate-provider",
+      credential: { kind: "replace", value: credentialSecret },
+    })
+    expect(setup.captureCharFrame()).not.toContain(credentialSecret)
+
+    await openPicker()
+    const rows = setup.captureCharFrame()
+    expectInOrder(rows, ["Source Provider ·", "Source Provider Copy ·", "Tail Provider ·"])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("duplicate without a source credential opens directly with an explicit without intent", async () => {
+  const source = provider({ credential: "missing" })
+  const session = new MemoryTargetSession(view({ providers: [source] }))
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Enter edit ·") && frame.includes("First Provider"))
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("c")
+    const editor = await setup.waitForFrame((frame) => frame.includes("First Provider Copy"))
+    expect(editor).not.toContain("Reuse Credential Reference?")
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 1)
+    expect(session.actions[0]).toMatchObject({
+      kind: "duplicate-provider",
+      credential: { kind: "without" },
+    })
   } finally {
     setup.renderer.destroy()
   }

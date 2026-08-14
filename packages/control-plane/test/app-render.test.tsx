@@ -153,12 +153,10 @@ function expectInOrder(frame: string, expected: string[]): void {
   }
 }
 
-async function enterProvider(
+async function fillProvider(
   mockInput: Awaited<ReturnType<typeof testRender>>["mockInput"],
   fields = ["Fixture Provider", "https://fixture.example/v1", "gpt-test", credentialSentinel],
 ): Promise<void> {
-  mockInput.pressKey("x", { ctrl: true })
-  mockInput.pressKey("p")
   await mockInput.typeText(fields[0]!)
   mockInput.pressTab()
   await mockInput.typeText(fields[1]!)
@@ -166,6 +164,18 @@ async function enterProvider(
   await mockInput.typeText(fields[2]!)
   mockInput.pressTab()
   await mockInput.typeText(fields[3]!)
+}
+
+async function enterProvider(
+  setup: Awaited<ReturnType<typeof testRender>>,
+  fields = ["Fixture Provider", "https://fixture.example/v1", "gpt-test", credentialSentinel],
+): Promise<void> {
+  setup.mockInput.pressKey("x", { ctrl: true })
+  setup.mockInput.pressKey("p")
+  await setup.waitForFrame((frame) => frame.includes("Blank"))
+  setup.mockInput.pressEnter()
+  await setup.waitForFrame((frame) => frame.includes("Enter save"))
+  await fillProvider(setup.mockInput, fields)
 }
 
 test("starts on Home and routes to and from the Codex context", async () => {
@@ -261,6 +271,8 @@ test("renders every visible Provider editor string through the Chinese catalog",
     await setup.renderOnce()
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("p")
+    await setup.waitForFrame((frame) => frame.includes("空白"))
+    setup.mockInput.pressEnter()
     const editor = await setup.waitForFrame((frame) => frame.includes("Enter 保存 · Esc 取消"))
 
     expectInOrder(editor, [
@@ -276,7 +288,7 @@ test("renders every visible Provider editor string through the Chinese catalog",
       "Enter 保存 · Esc 取消",
     ])
 
-    await enterProvider(setup.mockInput)
+    await fillProvider(setup.mockInput)
     setup.mockInput.pressEnter()
     await setup.waitFor(() => session.actions.length === 1)
     expect(await setup.waitForFrame((frame) => frame.includes("正在保存…"))).not.toContain("Saving…")
@@ -369,7 +381,7 @@ test("dirty Provider fields require localized confirmation before Ctrl+C exits",
     await setup.renderOnce()
     setup.mockInput.pressKey("1")
     await setup.renderOnce()
-    await enterProvider(setup.mockInput)
+    await enterProvider(setup)
     setup.mockInput.pressCtrlC()
     const frame = await setup.waitForFrame((next) => next.includes("Discard Provider draft?"))
     expect(frame).toContain("Unsaved Provider fields will be lost.")
@@ -387,7 +399,7 @@ test("declining dirty exit keeps the Provider draft and restores editor focus", 
     await setup.renderOnce()
     setup.mockInput.pressKey("1")
     await setup.renderOnce()
-    await enterProvider(setup.mockInput)
+    await enterProvider(setup)
     await setup.renderOnce()
     const maskedBefore = (setup.captureCharFrame().match(/•/g) ?? []).length
 
@@ -414,7 +426,7 @@ test("closing dirty exit disposes its command layer before later Provider save a
     await setup.renderOnce()
     setup.mockInput.pressKey("1")
     await setup.renderOnce()
-    await enterProvider(setup.mockInput)
+    await enterProvider(setup)
 
     setup.mockInput.pressCtrlC()
     await setup.waitForFrame((frame) => frame.includes("Discard Provider draft?"))
@@ -428,6 +440,8 @@ test("closing dirty exit disposes its command layer before later Provider save a
 
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("p")
+    await setup.waitForFrame((frame) => frame.includes("Blank"))
+    setup.mockInput.pressEnter()
     await setup.waitForFrame((frame) => frame.includes("Enter save"))
     setup.mockInput.pressEscape()
     await flushUi(setup)
@@ -445,7 +459,7 @@ test("Esc declines dirty exit and keeps the Provider editor", async () => {
     await setup.renderOnce()
     setup.mockInput.pressKey("1")
     await setup.renderOnce()
-    await enterProvider(setup.mockInput)
+    await enterProvider(setup)
     setup.mockInput.pressCtrlC()
     await setup.waitForFrame((frame) => frame.includes("Discard Provider draft?"))
     setup.mockInput.pressEscape()
@@ -465,7 +479,7 @@ test("exit confirmation blocks hidden credential key, backspace, and paste mutat
     await setup.renderOnce()
     setup.mockInput.pressKey("1")
     await setup.renderOnce()
-    await enterProvider(setup.mockInput)
+    await enterProvider(setup)
     await setup.renderOnce()
     const maskedBefore = (setup.captureCharFrame().match(/•/g) ?? []).length
     setup.mockInput.pressCtrlC()
@@ -497,7 +511,7 @@ test("reopening dirty exit after cancel confirms exactly once without retaining 
     await setup.renderOnce()
     setup.mockInput.pressKey("1")
     await setup.renderOnce()
-    await enterProvider(setup.mockInput)
+    await enterProvider(setup)
     setup.mockInput.pressCtrlC()
     await setup.waitForFrame((frame) => frame.includes("Discard Provider draft?"))
     setup.mockInput.pressKey("n")
@@ -549,7 +563,7 @@ test("saves a masked Provider, applies its visible identity, and follows pushed 
     await setup.renderOnce()
     setup.mockInput.pressKey("1")
     await setup.renderOnce()
-    await enterProvider(setup.mockInput)
+    await enterProvider(setup)
     await setup.renderOnce()
     const draftFrame = setup.captureCharFrame()
     expect(draftFrame).toContain("Credential")
@@ -628,7 +642,7 @@ test("invalid Provider guidance clears the credential without echoing it", async
     await setup.renderOnce()
     setup.mockInput.pressKey("1")
     await setup.renderOnce()
-    await enterProvider(setup.mockInput)
+    await enterProvider(setup)
     setup.mockInput.pressEnter()
     const frame = await setup.waitForFrame((next) => next.includes("Check the fields and retry"))
     expect(frame).toContain("Provider details are invalid")
@@ -699,7 +713,7 @@ test("a replayed Provider save appends one success activity", async () => {
     await setup.renderOnce()
     setup.mockInput.pressKey("1")
     await setup.renderOnce()
-    await enterProvider(setup.mockInput)
+    await enterProvider(setup)
     setup.mockInput.pressEnter()
     const frame = await setup.waitForFrame((next) => next.includes("Provider saved: Fixture Provider"))
     expect(frame.match(/Provider saved: Fixture Provider/g)?.length).toBe(1)

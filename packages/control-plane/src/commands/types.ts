@@ -10,7 +10,14 @@ export type CommandId =
   | "provider.move-up"
   | "provider.move-down"
   | "provider.delete"
+  | "provider.duplicate"
+  | "provider.models.refresh"
+  | "provider.models.select"
+  | "provider.reachability.check"
   | "provider.credential.remove"
+  | "provider.credential.reuse"
+  | "provider.credential.without"
+  | "provider.credential.confirmation.cancel"
   | "provider.save"
   | "provider.cancel"
   | "provider.delete.confirm"
@@ -21,7 +28,7 @@ export type CommandId =
   | "app.exit.confirm"
   | "app.exit.cancel"
 
-export type CommandScope = "global" | "home" | "codex" | "claude" | "editor" | "provider-picker" | "provider-delete-confirm" | "overlay" | "confirm"
+export type CommandScope = "global" | "home" | "codex" | "claude" | "editor" | "provider-picker" | "provider-source-picker" | "provider-model-picker" | "provider-credential-confirm" | "provider-delete-confirm" | "overlay" | "confirm"
 
 export type CommandTextKey = `command.${string}`
 

@@ -2,8 +2,8 @@ import type { InputRenderable, KeyEvent } from "@opentui/core"
 import { createSignal, For, onMount, type Accessor } from "solid-js"
 
 import { useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
-import type { TargetView } from "../control/types"
-import type { Translator } from "../i18n"
+import type { ReachabilityResult, TargetView } from "../control/types"
+import { inspectionErrorKey, type Translator } from "../i18n"
 import { theme } from "../theme"
 import { useOverlay } from "./overlay-stack"
 
@@ -16,6 +16,9 @@ export interface ProviderPickerProps {
   pending: Accessor<boolean>
   onSelectedIdChange: (id: string) => void
   onEdit: () => void
+  onDuplicate: () => void
+  reachability: Accessor<{ pending: boolean; result?: ReachabilityResult } | undefined>
+  onCheckReachability: () => void
   onMove: (delta: -1 | 1) => void
   onDelete: () => void
 }
@@ -38,6 +41,8 @@ export function ProviderPicker(props: ProviderPickerProps) {
     enabled: () => overlay.depth === 1,
     handlers: {
       "provider.edit": props.onEdit,
+      "provider.duplicate": props.onDuplicate,
+      "provider.reachability.check": props.onCheckReachability,
       "provider.move-up": () => props.onMove(-1),
       "provider.move-down": () => props.onMove(1),
       "provider.delete": props.onDelete,
@@ -132,6 +137,24 @@ export function ProviderPicker(props: ProviderPickerProps) {
       <text fg={theme.muted}>{provider.activeReferences.length
         ? provider.activeReferences.map((reference) => props.t(`provider.reference.${reference}`)).join(" · ")
         : props.t("provider.reference.none")}</text>
+      <For each={props.reachability() ? [props.reachability()!] : []}>{(state) => <text fg={theme.muted}>{
+        state.pending
+          ? props.t("provider.reachability.checking")
+          : state.result?.status === "reachable"
+            ? props.t("provider.reachability.reachable", {
+              status: state.result.httpStatus,
+              ttfb: state.result.ttfbMs,
+              retries: state.result.retryCount,
+              slow: state.result.slow ? props.t("provider.reachability.slow") : "",
+            })
+            : state.result?.status === "unreachable"
+              ? props.t("provider.reachability.unreachable", {
+                reason: props.t(inspectionErrorKey(state.result.failure.category)),
+                status: state.result.failure.httpStatus === null ? "" : ` · HTTP ${state.result.failure.httpStatus}`,
+                retries: state.result.retryCount,
+              })
+              : ""
+      }</text>}</For>
     </box>}</For>
     <text fg={theme.muted}>{props.t("provider.list.help")}</text>
   </box>

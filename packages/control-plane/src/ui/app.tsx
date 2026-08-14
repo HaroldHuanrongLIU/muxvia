@@ -3,7 +3,7 @@ import { createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js"
 
 import { MuxviaKeymapProvider, useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
 import type { TargetSession } from "../control/target-session"
-import type { TargetAction, TargetView as TargetViewProjection } from "../control/types"
+import type { ReachabilityResult, TargetAction, TargetView as TargetViewProjection } from "../control/types"
 import { createCommandPresenter, createTranslator, messageKeyForProblem, type Locale, type Translator } from "../i18n"
 import { theme } from "../theme"
 import { ActionPrompt } from "./action-prompt"
@@ -13,8 +13,10 @@ import { ExitConfirmation } from "./exit-confirmation"
 import { Home } from "./home"
 import { OverlayProvider, useOverlay } from "./overlay-stack"
 import { ProviderDeleteConfirmation } from "./provider-delete-confirmation"
+import { ProviderCredentialConfirmation } from "./provider-credential-confirmation"
 import { ProviderForm, type ProviderDraft, type ProviderFormRef, type ProviderFormResult } from "./provider-form"
 import { ProviderPicker } from "./provider-picker"
+import { ProviderSourcePicker, type ProviderSource } from "./provider-source-picker"
 import { TargetSidebar } from "./target-sidebar"
 import { TargetView, type ActivityEntry } from "./target-view"
 
@@ -29,7 +31,12 @@ export interface AppProps {
 
 type Notice = { kind: "error" | "success"; text: string }
 type ActivityDraft = Omit<ActivityEntry, "id">
-type Editor = { mode: "create" | "edit"; draft: ProviderDraft; credentialPresence: "present" | "missing" }
+type Editor = {
+  mode: "create" | "edit" | "duplicate"
+  draft: ProviderDraft
+  credentialPresence: "present" | "missing"
+  duplicateCredentialChoice?: "without" | "reuse-source"
+}
 
 function moveIdentity(ids: readonly string[], id: string | undefined, delta: -1 | 1): string[] | undefined {
   if (!id) return undefined
@@ -99,6 +106,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   const [selectedProviderId, setSelectedProviderId] = createSignal<string>()
   const [saving, setSaving] = createSignal(false)
   const [providerMutationPending, setProviderMutationPending] = createSignal(false)
+  const [reachability, setReachability] = createSignal<{ providerId: string; pending: boolean; result?: ReachabilityResult }>()
   const [applying, setApplying] = createSignal(false)
   const [notice, setNotice] = createSignal<Notice>()
   const [activities, setActivities] = createSignal<ActivityEntry[]>([])
@@ -109,6 +117,9 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   let editorGeneration = 0
   let exitScheduled = false
   let providerPickerScheduled = false
+  let providerSourcePickerScheduled = false
+  let reachabilityAbort: AbortController | undefined
+  let reachabilityGeneration = 0
   let exiting = false
   let disposed = false
 
@@ -238,15 +249,22 @@ function Shell(props: { session: TargetSession; t: Translator }) {
   }
 
   const selectedProvider = () => view().providers.find((provider) => provider.id === selectedProviderId())
-  const openEditor = (mode: Editor["mode"], provider?: TargetViewProjection["providers"][number]) => {
+  const openEditor = (
+    mode: Editor["mode"],
+    provider?: TargetViewProjection["providers"][number],
+    options: Pick<Editor, "duplicateCredentialChoice"> & { source?: ProviderSource } = {},
+  ) => {
     if (saving() || providerMutationPending()) return
     setNotice()
     editorGeneration++
+    const source = options.source
     setEditor({
       mode,
-      draft: provider
+      draft: source?.kind === "preset"
+        ? { name: "", baseUrl: source.preset.baseUrl, model: source.preset.model, presetKey: source.preset.key }
+        : provider
         ? {
-          name: provider.name,
+          name: mode === "duplicate" ? props.t("provider.duplicate.copy-name", { name: provider.name }) : provider.name,
           baseUrl: provider.baseUrl,
           model: provider.model,
           providerId: provider.id,
@@ -254,6 +272,26 @@ function Shell(props: { session: TargetSession; t: Translator }) {
         }
         : { name: "", baseUrl: "", model: "" },
       credentialPresence: provider?.credential ?? "missing",
+      duplicateCredentialChoice: options.duplicateCredentialChoice,
+    })
+  }
+  const openProviderSourcePicker = () => {
+    if (saving() || applying() || providerSourcePickerScheduled) return
+    providerSourcePickerScheduled = true
+    queueMicrotask(() => {
+      providerSourcePickerScheduled = false
+      if (disposed || saving() || applying()) return
+      overlay.replace({
+        id: "provider-source-picker",
+        render: () => <ProviderSourcePicker
+          presets={view().providerPresets}
+          t={props.t}
+          onSelect={(source) => {
+            overlay.closeTop()
+            openEditor("create", undefined, { source })
+          }}
+        />,
+      })
     })
   }
   const openProviderPicker = () => {
@@ -279,11 +317,62 @@ function Shell(props: { session: TargetSession; t: Translator }) {
             overlay.closeTop()
             openEditor("edit", provider)
           }}
+          onDuplicate={() => requestDuplicate()}
+          reachability={() => {
+            const current = reachability()
+            return current?.providerId === selectedProviderId() ? current : undefined
+          }}
+          onCheckReachability={() => { void checkSelectedReachability() }}
           onMove={(delta) => moveSelected(delta)}
           onDelete={() => requestDelete()}
         />,
+        onClose: () => {
+          reachabilityGeneration++
+          reachabilityAbort?.abort()
+        },
       })
     })
+  }
+
+  const openDuplicateEditor = (provider: TargetViewProjection["providers"][number], choice: "without" | "reuse-source") => {
+    overlay.clear()
+    openEditor("duplicate", provider, { duplicateCredentialChoice: choice })
+  }
+  const requestDuplicate = () => {
+    const provider = selectedProvider()
+    if (!provider || providerMutationPending()) return
+    if (provider.credential === "missing") {
+      openDuplicateEditor(provider, "without")
+      return
+    }
+    overlay.push({
+      id: "provider-credential-confirmation",
+      dismissOnEscape: false,
+      render: () => <ProviderCredentialConfirmation
+        sourceName={provider.name}
+        t={props.t}
+        onReuse={() => openDuplicateEditor(provider, "reuse-source")}
+        onWithout={() => openDuplicateEditor(provider, "without")}
+        onCancel={() => overlay.closeTop()}
+      />,
+    })
+  }
+
+  const checkSelectedReachability = async () => {
+    const provider = selectedProvider()
+    if (!provider) return
+    reachabilityAbort?.abort()
+    const controller = new AbortController()
+    reachabilityAbort = controller
+    const generation = ++reachabilityGeneration
+    setReachability({ providerId: provider.id, pending: true })
+    try {
+      const result = await props.session.checkReachability(provider.id, provider.providerRevision, controller.signal)
+      if (disposed || controller.signal.aborted || generation !== reachabilityGeneration) return
+      setReachability({ providerId: provider.id, pending: false, result })
+    } catch {
+      if (disposed || controller.signal.aborted || generation !== reachabilityGeneration) return
+    }
   }
 
   const runProviderMutation = async (action: Extract<TargetAction, { kind: "reorder-providers" | "delete-provider" }>) => {
@@ -402,7 +491,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
       "target.sidebar.toggle": () => setSidebarOpen((open) => !open),
       "provider.create": () => {
         if (saving() || applying()) return
-        openEditor("create")
+        openProviderSourcePicker()
       },
       "provider.list": openProviderPicker,
       "target.takeover.apply": () => { void applyTakeover() },
@@ -457,6 +546,8 @@ function Shell(props: { session: TargetSession; t: Translator }) {
                     mode={editor()?.mode ?? "create"}
                     initialDraft={editor()?.draft ?? { name: "", baseUrl: "", model: "" }}
                     credentialPresence={editor()?.credentialPresence ?? "missing"}
+                    duplicateCredentialChoice={editor()?.duplicateCredentialChoice}
+                    discoverModels={(source, signal) => props.session.discoverModels(source, signal)}
                     t={props.t}
                     ref={(value) => { providerFormRef = value }}
                     pending={saving()}

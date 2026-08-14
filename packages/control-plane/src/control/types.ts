@@ -89,6 +89,29 @@ const duplicateCredentialSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("replace"), value: z.string() }),
 ])
 
+const draftCredentialSourceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("missing") }),
+  z.object({ kind: z.literal("ephemeral"), value: z.string() }),
+  z.object({
+    kind: z.literal("saved"),
+    providerId: z.string().uuid(),
+    providerRevision: z.number().int().positive(),
+  }),
+])
+
+const discoverySourceSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("saved"),
+    providerId: z.string().uuid(),
+    providerRevision: z.number().int().positive(),
+  }),
+  z.object({
+    kind: z.literal("draft"),
+    baseUrl: z.string(),
+    credentialSource: draftCredentialSourceSchema,
+  }),
+])
+
 const targetActionSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("create-provider"),
@@ -144,6 +167,17 @@ const controlOperationSchema = z.discriminatedUnion("kind", [
     expectedRevision: z.number().int().nonnegative(),
     action: z.unknown(),
   }),
+  z.object({
+    kind: z.literal("discover-models"),
+    target: targetSchema,
+    source: discoverySourceSchema,
+  }),
+  z.object({
+    kind: z.literal("check-reachability"),
+    target: targetSchema,
+    providerId: z.string().uuid(),
+    providerRevision: z.number().int().positive(),
+  }),
 ])
 
 const actionOutcomeSchema = z.object({
@@ -151,14 +185,79 @@ const actionOutcomeSchema = z.object({
   view: targetViewSchema,
 })
 
+const inspectionCategorySchema = z.enum([
+  "invalid-endpoint",
+  "missing-credential",
+  "missing-provider",
+  "stale-provider-revision",
+  "authentication-rejected",
+  "endpoint-unsupported",
+  "rate-limited",
+  "upstream-status",
+  "timeout",
+  "dns",
+  "connect",
+  "tls",
+  "cancelled",
+  "malformed-response",
+  "response-too-large",
+  "too-many-models",
+])
+
+const inspectionFailureSchema = z.object({
+  category: inspectionCategorySchema,
+  httpStatus: z.number().int().nullable(),
+  attempts: z.number().int().nonnegative(),
+  elapsedMs: z.number().int().nonnegative(),
+  endpointOrigin: z.string().nullable(),
+})
+
+const modelDiscoveryResultSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("success"),
+    models: z.array(z.object({
+      id: z.string(),
+      displayName: z.string().nullable(),
+    })).max(2_048),
+    attempts: z.number().int().positive(),
+    elapsedMs: z.number().int().nonnegative(),
+    endpointOrigin: z.string(),
+  }),
+  z.object({
+    status: z.literal("failure"),
+    failure: inspectionFailureSchema,
+  }),
+])
+
+const reachabilityResultSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("reachable"),
+    httpStatus: z.number().int().min(100).max(599),
+    ttfbMs: z.number().int().nonnegative(),
+    checkedAtUnixMs: z.number().int().nonnegative(),
+    retryCount: z.number().int().min(0).max(1),
+    slow: z.boolean(),
+    endpointOrigin: z.string(),
+  }),
+  z.object({
+    status: z.literal("unreachable"),
+    failure: inspectionFailureSchema,
+    checkedAtUnixMs: z.number().int().nonnegative(),
+    retryCount: z.number().int().min(0).max(1),
+  }),
+])
+
 const controlResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("target-view"), view: targetViewSchema }),
   z.object({ kind: z.literal("action-outcome"), outcome: actionOutcomeSchema }),
+  z.object({ kind: z.literal("model-discovery"), result: modelDiscoveryResultSchema }),
+  z.object({ kind: z.literal("reachability"), result: reachabilityResultSchema }),
 ])
 
 const clientFrameSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("hello"), rpc: rpcSchema, release: z.string() }),
   z.object({ type: z.literal("request"), requestId: z.string(), operation: controlOperationSchema }),
+  z.object({ type: z.literal("cancel"), requestId: z.string() }),
 ])
 
 const serverFrameSchema = z.discriminatedUnion("type", [
@@ -187,6 +286,9 @@ export type ActionOutcome = z.infer<typeof actionOutcomeSchema>
 export type ControlProblem = z.infer<typeof controlProblemSchema>
 export type ControlOperation = z.infer<typeof controlOperationSchema>
 export type ControlResult = z.infer<typeof controlResultSchema>
+export type DiscoverySource = z.infer<typeof discoverySourceSchema>
+export type ModelDiscoveryResult = z.infer<typeof modelDiscoveryResultSchema>
+export type ReachabilityResult = z.infer<typeof reachabilityResultSchema>
 
 export const parseClientFrame = (value: unknown): ClientFrame => clientFrameSchema.parse(value)
 export const parseServerFrame = (value: unknown): ServerFrame => serverFrameSchema.parse(value)

@@ -1,11 +1,15 @@
 use std::path::PathBuf;
 
-use muxvia_routing::control::{
-    framing::{FrameError, read_frame, write_frame},
-    protocol::{
-        ClientFrame, CredentialEdit, DuplicateCredential, ProviderCompleteness, ProviderProtocol,
-        ProviderRequirement, ServerFrame, TargetAction, TargetView,
+use muxvia_routing::{
+    control::{
+        framing::{FrameError, read_frame, write_frame},
+        protocol::{
+            ClientFrame, ControlResult, CredentialEdit, DiscoverySource, DraftCredentialSource,
+            DuplicateCredential, ProviderCompleteness, ProviderProtocol, ProviderRequirement,
+            ServerFrame, TargetAction, TargetView,
+        },
     },
+    service::provider_inspector::{DiscoveredModel, ModelDiscoveryResult, ReachabilityResult},
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -39,6 +43,95 @@ fn fixtures_round_trip_as_their_protocol_types() {
         let action = fixture(name);
         let parsed: TargetAction = serde_json::from_value(action.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), action);
+    }
+
+    for name in [
+        "discover-models.json",
+        "check-reachability.json",
+        "cancel-inspection.json",
+    ] {
+        let frame = fixture(name);
+        let parsed: ClientFrame = serde_json::from_value(frame.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), frame);
+    }
+}
+
+#[test]
+fn inspection_protocol_round_trips_all_sources_cancellation_and_view_free_results() {
+    let saved = DiscoverySource::Saved {
+        provider_id: "00000000-0000-4000-8000-000000000101".parse().unwrap(),
+        provider_revision: 7,
+    };
+    let sources = [
+        saved,
+        DiscoverySource::Draft {
+            base_url: "https://draft.example/v1".into(),
+            credential_source: DraftCredentialSource::Missing,
+        },
+        DiscoverySource::Draft {
+            base_url: "https://draft.example/v1?token=endpoint-query-must-not-escape".into(),
+            credential_source: DraftCredentialSource::Ephemeral {
+                value: "ephemeral-secret-must-not-escape".into(),
+            },
+        },
+        DiscoverySource::Draft {
+            base_url: "https://draft.example/v1".into(),
+            credential_source: DraftCredentialSource::Saved {
+                provider_id: "00000000-0000-4000-8000-000000000101".parse().unwrap(),
+                provider_revision: 7,
+            },
+        },
+    ];
+    for source in sources {
+        let operation = muxvia_routing::control::protocol::ControlOperation::DiscoverModels {
+            target: muxvia_routing::control::protocol::Target::Codex,
+            source,
+        };
+        let wire = serde_json::to_value(&operation).unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                serde_json::from_value::<muxvia_routing::control::protocol::ControlOperation>(
+                    wire.clone()
+                )
+                .unwrap()
+            )
+            .unwrap(),
+            wire,
+        );
+        assert!(!format!("{operation:?}").contains("ephemeral-secret-must-not-escape"));
+        assert!(!format!("{operation:?}").contains("endpoint-query-must-not-escape"));
+    }
+
+    let discovery = ControlResult::ModelDiscovery {
+        result: ModelDiscoveryResult::Success {
+            models: vec![DiscoveredModel {
+                id: "model-a".into(),
+                display_name: Some("Owner A".into()),
+            }],
+            attempts: 1,
+            elapsed_ms: 4,
+            endpoint_origin: "https://provider.example".into(),
+        },
+    };
+    let reachability = ControlResult::Reachability {
+        result: ReachabilityResult::Reachable {
+            http_status: 503,
+            ttfb_ms: 12,
+            checked_at_unix_ms: 1_775_000_000_000,
+            retry_count: 0,
+            slow: false,
+            endpoint_origin: "https://provider.example".into(),
+        },
+    };
+    for result in [discovery, reachability] {
+        let wire = serde_json::to_value(&result).unwrap();
+        assert!(wire.get("view").is_none());
+        assert!(!wire.to_string().contains("targetView"));
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<ControlResult>(wire.clone()).unwrap())
+                .unwrap(),
+            wire,
+        );
     }
 }
 

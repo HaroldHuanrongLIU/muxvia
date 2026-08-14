@@ -6,14 +6,15 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::{broadcast, oneshot, watch},
-    task::{JoinHandle, JoinSet},
+    sync::{broadcast, mpsc, oneshot, watch},
+    task::{AbortHandle, JoinHandle, JoinSet},
 };
 
 use crate::{
@@ -27,7 +28,7 @@ use crate::{
     },
     home::MuxviaHome,
     model::ReqwestUpstream,
-    service::activate::ActivationService,
+    service::{activate::ActivationService, provider_inspector::ProviderInspector},
     state::{ManagedWriteStatus, StateStore},
 };
 
@@ -50,6 +51,7 @@ pub struct ControlServerHandle {
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
     completed: watch::Receiver<bool>,
+    lifecycle: Arc<ServerLifecycle>,
 }
 
 #[derive(Default)]
@@ -57,6 +59,7 @@ struct ServerLifecycle {
     accepted: AtomicBool,
     active_sessions: AtomicUsize,
     pending_actions: AtomicUsize,
+    pending_inspections: AtomicUsize,
 }
 
 struct SessionGuard(Arc<ServerLifecycle>);
@@ -72,6 +75,14 @@ struct ActionGuard(Arc<ServerLifecycle>);
 impl Drop for ActionGuard {
     fn drop(&mut self) {
         self.0.pending_actions.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct InspectionGuard(Arc<ServerLifecycle>);
+
+impl Drop for InspectionGuard {
+    fn drop(&mut self) {
+        self.0.pending_inspections.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -121,6 +132,9 @@ impl ControlServer {
         activation: Arc<ActivationService>,
         exit_when_idle: bool,
     ) -> Result<ControlServerHandle, ControlServerError> {
+        let inspector = Arc::new(
+            ProviderInspector::new(Arc::clone(&store)).map_err(|_| ControlServerError::State)?,
+        );
         let codec = CodexConfigCodec::for_user_home(home.user_home())
             .map_err(|_| ControlServerError::State)?;
         let reconciliation = codec.reconcile_pending(&store).await;
@@ -151,6 +165,7 @@ impl ControlServer {
         let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
         let (completed_tx, completed) = watch::channel(false);
         let lifecycle = Arc::new(ServerLifecycle::default());
+        let handle_lifecycle = Arc::clone(&lifecycle);
         let task_path = socket_path.clone();
         let task = tokio::spawn(async move {
             let mut sessions = JoinSet::new();
@@ -173,6 +188,7 @@ impl ControlServer {
                         lifecycle.active_sessions.fetch_add(1, Ordering::AcqRel);
                         let store = Arc::clone(&store);
                         let activation = Arc::clone(&activation);
+                        let inspector = Arc::clone(&inspector);
                         let release = release.clone();
                         let lifecycle = Arc::clone(&lifecycle);
                         let session_shutdown = session_shutdown_rx.clone();
@@ -182,6 +198,7 @@ impl ControlServer {
                                 stream,
                                 store,
                                 activation,
+                                inspector,
                                 release,
                                 lifecycle,
                                 session_shutdown,
@@ -201,6 +218,7 @@ impl ControlServer {
             shutdown: Some(shutdown_tx),
             task: Some(task),
             completed,
+            lifecycle: handle_lifecycle,
         })
     }
 }
@@ -208,6 +226,11 @@ impl ControlServer {
 impl ControlServerHandle {
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    #[doc(hidden)]
+    pub fn tracked_inspections(&self) -> usize {
+        self.lifecycle.pending_inspections.load(Ordering::Acquire)
     }
 
     pub fn request_shutdown(&mut self) {
@@ -267,6 +290,7 @@ async fn serve_authorized(
     mut stream: UnixStream,
     store: Arc<StateStore>,
     activation: Arc<ActivationService>,
+    inspector: Arc<ProviderInspector>,
     release: String,
     lifecycle: Arc<ServerLifecycle>,
     shutdown: watch::Receiver<bool>,
@@ -287,29 +311,33 @@ async fn serve_authorized(
         return;
     }
 
-    serve_session(&mut stream, store, activation, release, lifecycle, shutdown).await;
+    serve_session(
+        stream, store, activation, inspector, release, lifecycle, shutdown,
+    )
+    .await;
 }
 
 async fn serve_session(
-    stream: &mut UnixStream,
+    mut stream: UnixStream,
     store: Arc<StateStore>,
     activation: Arc<ActivationService>,
+    inspector: Arc<ProviderInspector>,
     release: String,
     lifecycle: Arc<ServerLifecycle>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let first = match read_frame(stream).await {
+    let first = match read_frame(&mut stream).await {
         Ok(first) => first,
         Err(FrameError::EndOfStream | FrameError::Io) => return,
         Err(_) => {
-            let _ = write_frame_invalid(stream).await;
+            let _ = write_frame_invalid(&mut stream).await;
             return;
         }
     };
     if first.get("type").and_then(Value::as_str) != Some("hello") {
         let request_id = request_id(&first);
         let _ = write_problem(
-            stream,
+            &mut stream,
             request_id,
             "handshake-required",
             "Hello must be the first frame",
@@ -320,7 +348,7 @@ async fn serve_session(
     }
     if !compatible_hello(&first) {
         let _ = write_problem(
-            stream,
+            &mut stream,
             None,
             "protocol-mismatch",
             "Unsupported control protocol version",
@@ -331,7 +359,7 @@ async fn serve_session(
     }
     if serde_json::from_value::<ClientFrame>(first).is_err() {
         let _ = write_problem(
-            stream,
+            &mut stream,
             None,
             "invalid-request",
             "Malformed hello frame",
@@ -343,7 +371,7 @@ async fn serve_session(
 
     let Ok(initial_view) = store.target_view().await else {
         let _ = write_problem(
-            stream,
+            &mut stream,
             None,
             "state-store-error",
             "State store unavailable",
@@ -358,56 +386,76 @@ async fn serve_session(
         service_epoch: initial_view.service.epoch,
         frame_limit: FrameLimit::V1,
     };
-    if write_frame(stream, &ack).await.is_err() {
+    if write_frame(&mut stream, &ack).await.is_err() {
         return;
     }
 
+    let (mut reader, writer) = stream.into_split();
+    let (responses, response_rx) = mpsc::channel(32);
+    let mut writer_task = tokio::spawn(write_responses(writer, response_rx));
     let mut subscribed = false;
     let mut update_rx = store.subscribe_target_views();
-    loop {
+    let mut inspections = JoinSet::new();
+    let mut inspection_aborts = std::collections::HashMap::<String, AbortHandle>::new();
+    'session: loop {
         tokio::select! {
+            biased;
             changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() { return; }
+                if changed.is_err() || *shutdown.borrow() { break 'session; }
             }
-            incoming = read_frame(stream) => {
+            completed = inspections.join_next(), if !inspections.is_empty() => {
+                if let Some(Ok(request_id)) = completed {
+                    inspection_aborts.remove(&request_id);
+                }
+            }
+            incoming = read_frame(&mut reader) => {
                 let raw = match incoming {
                     Ok(raw) => raw,
-                    Err(FrameError::EndOfStream | FrameError::Io) => return,
+                    Err(FrameError::EndOfStream | FrameError::Io) => break 'session,
                     Err(_) => {
-                        let _ = write_frame_invalid(stream).await;
-                        return;
+                        let _ = responses.send(problem_frame(None, "frame-invalid", "Control frame is invalid", None)).await;
+                        break 'session;
                     }
                 };
                 if raw.get("type").and_then(Value::as_str) == Some("hello") {
-                    if write_problem(stream, None, "unexpected-hello", "Hello was already negotiated", None).await.is_err() {
-                        return;
+                    if responses.send(problem_frame(None, "unexpected-hello", "Hello was already negotiated", None)).await.is_err() {
+                        break 'session;
                     }
                     continue;
                 }
                 let request_id = request_id(&raw);
                 let parsed = serde_json::from_value::<ClientFrame>(raw.clone());
-                let Ok(ClientFrame::Request { request_id, operation }) = parsed else {
-                    let code = if raw
-                        .get("operation")
-                        .and_then(|operation| operation.get("kind"))
-                        .and_then(Value::as_str)
-                        .is_some()
-                    {
-                        "unsupported-operation"
-                    } else {
-                        "invalid-request"
-                    };
-                    if write_problem(stream, request_id, code, "Unsupported or malformed request", None).await.is_err() {
-                        return;
+                let (request_id, operation) = match parsed {
+                    Ok(ClientFrame::Cancel { request_id }) => {
+                        if let Some(abort) = inspection_aborts.remove(&request_id) {
+                            abort.abort();
+                        }
+                        continue;
                     }
-                    continue;
+                    Ok(ClientFrame::Request { request_id, operation }) => (request_id, operation),
+                    _ => {
+                        let code = if raw
+                            .get("operation")
+                            .and_then(|operation| operation.get("kind"))
+                            .and_then(Value::as_str)
+                            .is_some()
+                        {
+                            "unsupported-operation"
+                        } else {
+                            "invalid-request"
+                        };
+                        if responses.send(problem_frame(request_id, code, "Unsupported or malformed request", None)).await.is_err() {
+                            break 'session;
+                        }
+                        continue;
+                    }
                 };
 
                 match operation {
                     ControlOperation::OpenTarget { .. } => {
                         let Ok(view) = store.target_view().await else {
-                            if write_problem(stream, Some(request_id), "state-store-error", "State store unavailable", None).await.is_err() {
-                                return;
+                            if responses.send(problem_frame(Some(request_id), "state-store-error", "State store unavailable", None)).await.is_err() {
+                                break 'session;
                             }
                             continue;
                         };
@@ -416,7 +464,7 @@ async fn serve_session(
                             request_id,
                             result: ControlResult::TargetView { view },
                         };
-                        if write_frame(stream, &response).await.is_err() { return; }
+                        if responses.send(response).await.is_err() { break 'session; }
                     }
                     ControlOperation::Act { action_id, expected_revision, action, .. } => {
                         lifecycle.pending_actions.fetch_add(1, Ordering::AcqRel);
@@ -427,34 +475,120 @@ async fn serve_session(
                                     request_id,
                                     result: ControlResult::ActionOutcome { outcome },
                                 };
-                                if write_frame(stream, &response).await.is_err() { return; }
+                                if responses.send(response).await.is_err() { break 'session; }
                             }
                             Err(failure) => {
-                                if write_problem(
-                                    stream,
+                                if responses.send(problem_frame(
                                     Some(request_id),
                                     &failure.problem.code,
                                     &failure.problem.message,
                                     Some(failure.authoritative_view),
-                                ).await.is_err() { return; }
+                                )).await.is_err() { break 'session; }
                             }
                         }
+                    }
+                    operation @ (ControlOperation::DiscoverModels { .. }
+                    | ControlOperation::CheckReachability { .. }) => {
+                        if inspection_aborts.contains_key(&request_id) {
+                            if responses.send(problem_frame(
+                                Some(request_id),
+                                "request-in-progress",
+                                "Request identifier is already in progress",
+                                None,
+                            )).await.is_err() {
+                                break 'session;
+                            }
+                            continue;
+                        }
+                        lifecycle.pending_inspections.fetch_add(1, Ordering::AcqRel);
+                        let guard = InspectionGuard(Arc::clone(&lifecycle));
+                        let task_request_id = request_id.clone();
+                        let response_request_id = request_id.clone();
+                        let inspector = Arc::clone(&inspector);
+                        let responses = responses.clone();
+                        let abort = inspections.spawn(async move {
+                            let _guard = guard;
+                            let result = match operation {
+                                ControlOperation::DiscoverModels { source, .. } => {
+                                    ControlResult::ModelDiscovery {
+                                        result: inspector.discover_models(source).await,
+                                    }
+                                }
+                                ControlOperation::CheckReachability {
+                                    provider_id,
+                                    provider_revision,
+                                    ..
+                                } => ControlResult::Reachability {
+                                    result: inspector
+                                        .check_reachability(provider_id, provider_revision)
+                                        .await,
+                                },
+                                _ => unreachable!(),
+                            };
+                            let _ = responses
+                                .send(ServerFrame::Response {
+                                    request_id: response_request_id,
+                                    result,
+                                })
+                                .await;
+                            task_request_id
+                        });
+                        inspection_aborts.insert(request_id, abort);
                     }
                 }
             }
             update = update_rx.recv(), if subscribed => {
                 match update {
                     Ok(view) => {
-                        if write_frame(stream, &ServerFrame::TargetView { view }).await.is_err() { return; }
+                        if responses.send(ServerFrame::TargetView { view }).await.is_err() { break 'session; }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let Ok(view) = store.target_view().await else { continue };
-                        if write_frame(stream, &ServerFrame::TargetView { view }).await.is_err() { return; }
+                        if responses.send(ServerFrame::TargetView { view }).await.is_err() { break 'session; }
                     }
-                    Err(broadcast::error::RecvError::Closed) => return,
+                    Err(broadcast::error::RecvError::Closed) => break 'session,
                 }
             }
         }
+    }
+
+    inspections.abort_all();
+    inspection_aborts.clear();
+    while inspections.join_next().await.is_some() {}
+    drop(responses);
+    if tokio::time::timeout(Duration::from_millis(250), &mut writer_task)
+        .await
+        .is_err()
+    {
+        writer_task.abort();
+        let _ = writer_task.await;
+    }
+}
+
+async fn write_responses(
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    mut responses: mpsc::Receiver<ServerFrame>,
+) {
+    while let Some(response) = responses.recv().await {
+        if write_frame(&mut writer, &response).await.is_err() {
+            return;
+        }
+    }
+}
+
+fn problem_frame(
+    request_id: Option<String>,
+    code: &str,
+    message: &str,
+    authoritative_view: Option<TargetView>,
+) -> ServerFrame {
+    ServerFrame::Error {
+        request_id,
+        problem: ControlProblem {
+            code: code.to_owned(),
+            message: message.to_owned(),
+        },
+        authoritative_view,
     }
 }
 

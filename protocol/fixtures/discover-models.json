@@ -1,0 +1,13 @@
+{
+  "type": "request",
+  "requestId": "discover-1",
+  "operation": {
+    "kind": "discover-models",
+    "target": "codex",
+    "source": {
+      "kind": "saved",
+      "providerId": "00000000-0000-4000-8000-000000000101",
+      "providerRevision": 7
+    }
+  }
+}

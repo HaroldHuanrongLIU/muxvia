@@ -1,7 +1,14 @@
 import { randomUUID } from "node:crypto"
 
 import { ControlError, type RpcTransport } from "./rpc-client"
-import type { ActionOutcome, TargetAction, TargetView } from "./types"
+import type {
+  ActionOutcome,
+  DiscoverySource,
+  ModelDiscoveryResult,
+  ReachabilityResult,
+  TargetAction,
+  TargetView,
+} from "./types"
 
 export interface MuxviaControl {
   openTarget(target: "codex"): Promise<TargetSession>
@@ -10,6 +17,12 @@ export interface MuxviaControl {
 export interface TargetSession {
   get(): Readonly<TargetView>
   act(action: TargetAction): Promise<ActionOutcome>
+  discoverModels(source: DiscoverySource, signal?: AbortSignal): Promise<ModelDiscoveryResult>
+  checkReachability(
+    providerId: string,
+    providerRevision: number,
+    signal?: AbortSignal,
+  ): Promise<ReachabilityResult>
   subscribe(listener: (next: TargetView) => void): () => void
   whenClosed(): Promise<void>
   close(): Promise<void>
@@ -64,6 +77,44 @@ class TargetSessionImpl implements TargetSession {
     })
     this.#actions = result.then(() => undefined, () => undefined)
     return result
+  }
+
+  async discoverModels(
+    source: DiscoverySource,
+    signal?: AbortSignal,
+  ): Promise<ModelDiscoveryResult> {
+    if (this.#closed) {
+      throw new ControlError("connection-closed", "Target session is closed")
+    }
+    const response = await this.#rpc.request({
+      kind: "discover-models",
+      target: "codex",
+      source,
+    }, { signal })
+    if (response.kind !== "model-discovery") {
+      throw new ControlError("invalid-response", "Expected a model discovery result")
+    }
+    return response.result
+  }
+
+  async checkReachability(
+    providerId: string,
+    providerRevision: number,
+    signal?: AbortSignal,
+  ): Promise<ReachabilityResult> {
+    if (this.#closed) {
+      throw new ControlError("connection-closed", "Target session is closed")
+    }
+    const response = await this.#rpc.request({
+      kind: "check-reachability",
+      target: "codex",
+      providerId,
+      providerRevision,
+    }, { signal })
+    if (response.kind !== "reachability") {
+      throw new ControlError("invalid-response", "Expected a reachability result")
+    }
+    return response.result
   }
 
   subscribe(listener: (next: TargetView) => void): () => void {

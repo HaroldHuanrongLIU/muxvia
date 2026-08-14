@@ -97,6 +97,9 @@ class MemoryTargetSession implements TargetSession {
     return this.#view
   }
 
+  async discoverModels(): Promise<never> { throw new Error("not used by this fixture") }
+  async checkReachability(): Promise<never> { throw new Error("not used by this fixture") }
+
   async act(action: TargetAction): Promise<ActionOutcome> {
     this.actions.push(projectAction(action))
     const outcome = await this.#handler(action)

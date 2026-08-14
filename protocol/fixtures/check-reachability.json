@@ -1,0 +1,10 @@
+{
+  "type": "request",
+  "requestId": "reachability-1",
+  "operation": {
+    "kind": "check-reachability",
+    "target": "codex",
+    "providerId": "00000000-0000-4000-8000-000000000101",
+    "providerRevision": 7
+  }
+}

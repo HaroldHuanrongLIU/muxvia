@@ -14,7 +14,11 @@ import {
 type Pending = {
   resolve: (result: ControlResult) => void
   reject: (error: ControlError) => void
+  signal?: AbortSignal
+  onAbort?: () => void
 }
+
+export type RequestOptions = { signal?: AbortSignal }
 
 type SocketFactory = (socketPath: string) => Socket
 
@@ -33,7 +37,7 @@ export class ControlError extends Error {
 }
 
 export interface RpcTransport {
-  request(operation: ControlOperation): Promise<ControlResult>
+  request(operation: ControlOperation, options?: RequestOptions): Promise<ControlResult>
   onTargetView(listener: (view: TargetView) => void): () => void
   whenClosed(): Promise<void>
   close(): Promise<void>
@@ -120,17 +124,31 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     return createTargetSession(this, result.view)
   }
 
-  request(operation: ControlOperation): Promise<ControlResult> {
+  request(operation: ControlOperation, options: RequestOptions = {}): Promise<ControlResult> {
     if (this.#closed) {
       return Promise.reject(new ControlError("connection-closed", "Control socket closed"))
     }
+    if (options.signal?.aborted) {
+      return Promise.reject(new ControlError("cancelled", "Control request was cancelled"))
+    }
     const requestId = randomUUID()
     return new Promise<ControlResult>((resolve, reject) => {
-      this.#pending.set(requestId, { resolve, reject })
+      const onAbort = () => {
+        const pending = this.#takePending(requestId)
+        if (!pending) return
+        this.#socket.write(encodeFrame({ type: "cancel", requestId }))
+        pending.reject(new ControlError("cancelled", "Control request was cancelled"))
+      }
+      const pending: Pending = { resolve, reject, signal: options.signal, onAbort }
+      this.#pending.set(requestId, pending)
+      options.signal?.addEventListener("abort", onAbort, { once: true })
+      if (options.signal?.aborted) {
+        onAbort()
+        return
+      }
       this.#socket.write(encodeFrame({ type: "request", requestId, operation }), (error) => {
         if (!error) return
-        this.#pending.delete(requestId)
-        reject(asControlError(error))
+        this.#takePending(requestId)?.reject(asControlError(error))
       })
     })
   }
@@ -184,9 +202,8 @@ export class RpcClient implements RpcTransport, MuxviaControl {
       return
     }
     if (frame.type === "response") {
-      const pending = this.#pending.get(frame.requestId)
+      const pending = this.#takePending(frame.requestId)
       if (!pending) return
-      this.#pending.delete(frame.requestId)
       pending.resolve(frame.result)
       return
     }
@@ -197,9 +214,8 @@ export class RpcClient implements RpcTransport, MuxviaControl {
         this.#fail(failure)
         return
       }
-      const pending = this.#pending.get(frame.requestId)
+      const pending = this.#takePending(frame.requestId)
       if (!pending) return
-      this.#pending.delete(frame.requestId)
       pending.reject(failure)
     }
   }
@@ -211,10 +227,20 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     const handshake = this.#handshake
     this.#handshake = undefined
     handshake?.reject(failure)
-    for (const pending of this.#pending.values()) pending.reject(failure)
+    for (const requestId of [...this.#pending.keys()]) this.#takePending(requestId)?.reject(failure)
     this.#pending.clear()
     this.#viewListeners.clear()
     this.#resolveClosed()
+  }
+
+  #takePending(requestId: string): Pending | undefined {
+    const pending = this.#pending.get(requestId)
+    if (!pending) return undefined
+    this.#pending.delete(requestId)
+    if (pending.signal && pending.onAbort) {
+      pending.signal.removeEventListener("abort", pending.onAbort)
+    }
+    return pending
   }
 }
 

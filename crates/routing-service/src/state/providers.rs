@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use secrecy::SecretString;
 use tokio_rusqlite::rusqlite::{OptionalExtension, Transaction, params};
 use uuid::Uuid;
 
@@ -21,6 +22,49 @@ struct SourceDeclaration {
     provenance_kind: Option<String>,
     provenance_key: Option<String>,
     generated_owner_id: Option<String>,
+}
+
+pub(crate) struct ProviderInspectionSnapshot {
+    pub base_url: String,
+    pub credential: Option<SecretString>,
+}
+
+pub(crate) enum ProviderInspectionRead {
+    Found(ProviderInspectionSnapshot),
+    Missing,
+    StaleRevision,
+}
+
+pub(crate) fn read_provider_for_inspection(
+    connection: &tokio_rusqlite::rusqlite::Connection,
+    provider_id: Uuid,
+    provider_revision: u64,
+) -> Result<ProviderInspectionRead, tokio_rusqlite::rusqlite::Error> {
+    let provider = connection
+        .query_row(
+            "SELECT p.base_url, p.provider_revision, c.bearer_token
+             FROM providers p LEFT JOIN credentials c ON c.id = p.credential_id
+             WHERE p.id = ?1 AND p.target = 'codex'",
+            [provider_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((base_url, actual_revision, credential)) = provider else {
+        return Ok(ProviderInspectionRead::Missing);
+    };
+    if actual_revision != provider_revision {
+        return Ok(ProviderInspectionRead::StaleRevision);
+    }
+    Ok(ProviderInspectionRead::Found(ProviderInspectionSnapshot {
+        base_url,
+        credential: credential.map(SecretString::from),
+    }))
 }
 
 pub(crate) fn provider_presets() -> Vec<ProviderPresetView> {

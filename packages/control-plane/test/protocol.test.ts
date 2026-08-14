@@ -24,9 +24,79 @@ test.each([
   ["reorder-providers.json", parseTargetAction],
   ["delete-provider.json", parseTargetAction],
   ["duplicate-provider.json", parseTargetAction],
+  ["discover-models.json", parseClientFrame],
+  ["check-reachability.json", parseClientFrame],
+  ["cancel-inspection.json", parseClientFrame],
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)
+})
+
+test("round-trips draft discovery sources and view-free inspection results", () => {
+  const sources = [
+    { kind: "missing" },
+    { kind: "ephemeral", value: "test-ephemeral-value" },
+    {
+      kind: "saved",
+      providerId: "00000000-0000-4000-8000-000000000101",
+      providerRevision: 7,
+    },
+  ] as const
+  for (const credentialSource of sources) {
+    const frame = {
+      type: "request",
+      requestId: "discover-draft",
+      operation: {
+        kind: "discover-models",
+        target: "codex",
+        source: {
+          kind: "draft",
+          baseUrl: "https://draft.example/v1",
+          credentialSource,
+        },
+      },
+    } as const
+    expect(parseClientFrame(frame)).toEqual(frame)
+  }
+
+  const frames: unknown[] = [
+    {
+      type: "response",
+      requestId: "discover-draft",
+      result: {
+        kind: "model-discovery",
+        result: {
+          status: "success",
+          models: [{ id: "model-a", displayName: "Owner A" }],
+          attempts: 1,
+          elapsedMs: 4,
+          endpointOrigin: "https://provider.example",
+        },
+      },
+    },
+    {
+      type: "response",
+      requestId: "reachability",
+      result: {
+        kind: "reachability",
+        result: {
+          status: "reachable",
+          httpStatus: 503,
+          ttfbMs: 12,
+          checkedAtUnixMs: 1_775_000_000_000,
+          retryCount: 0,
+          slow: false,
+          endpointOrigin: "https://provider.example",
+        },
+      },
+    },
+  ]
+  for (const frame of frames) {
+    const parsed = parseServerFrame(frame)
+    expect(parsed as unknown).toEqual(frame)
+    expect(JSON.stringify(parsed)).not.toContain("TargetView")
+    expect((parsed as { result: Record<string, unknown> }).result).not.toHaveProperty("view")
+  }
 })
 
 test("decodes a frame split across arbitrary chunks", () => {

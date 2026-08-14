@@ -4,6 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::Se
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::service::provider_inspector::{ModelDiscoveryResult, ReachabilityResult};
+
 pub const FRAME_LIMIT: u32 = 1_048_576;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -94,6 +96,9 @@ pub enum ClientFrame {
         request_id: String,
         operation: ControlOperation,
     },
+    Cancel {
+        request_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -140,6 +145,95 @@ pub enum ControlOperation {
         expected_revision: u64,
         action: Value,
     },
+    DiscoverModels {
+        target: Target,
+        source: DiscoverySource,
+    },
+    CheckReachability {
+        target: Target,
+        provider_id: Uuid,
+        #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+        provider_revision: u64,
+    },
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DiscoverySource {
+    Saved {
+        provider_id: Uuid,
+        #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+        provider_revision: u64,
+    },
+    Draft {
+        base_url: String,
+        credential_source: DraftCredentialSource,
+    },
+}
+
+impl fmt::Debug for DiscoverySource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Saved {
+                provider_id,
+                provider_revision,
+            } => formatter
+                .debug_struct("Saved")
+                .field("provider_id", provider_id)
+                .field("provider_revision", provider_revision)
+                .finish(),
+            Self::Draft {
+                base_url: _,
+                credential_source,
+            } => formatter
+                .debug_struct("Draft")
+                .field("base_url", &Redacted)
+                .field("credential_source", credential_source)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DraftCredentialSource {
+    Missing,
+    Ephemeral {
+        value: String,
+    },
+    Saved {
+        provider_id: Uuid,
+        #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+        provider_revision: u64,
+    },
+}
+
+impl fmt::Debug for DraftCredentialSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("Missing"),
+            Self::Ephemeral { .. } => formatter
+                .debug_struct("Ephemeral")
+                .field("value", &Redacted)
+                .finish(),
+            Self::Saved {
+                provider_id,
+                provider_revision,
+            } => formatter
+                .debug_struct("Saved")
+                .field("provider_id", provider_id)
+                .field("provider_revision", provider_revision)
+                .finish(),
+        }
+    }
 }
 
 impl fmt::Debug for ControlOperation {
@@ -160,6 +254,21 @@ impl fmt::Debug for ControlOperation {
                 .field("action_id", action_id)
                 .field("expected_revision", expected_revision)
                 .field("action", &Redacted)
+                .finish(),
+            Self::DiscoverModels { target, source } => formatter
+                .debug_struct("DiscoverModels")
+                .field("target", target)
+                .field("source", source)
+                .finish(),
+            Self::CheckReachability {
+                target,
+                provider_id,
+                provider_revision,
+            } => formatter
+                .debug_struct("CheckReachability")
+                .field("target", target)
+                .field("provider_id", provider_id)
+                .field("provider_revision", provider_revision)
                 .finish(),
         }
     }
@@ -365,6 +474,8 @@ pub enum TakeoverMode {
 pub enum ControlResult {
     TargetView { view: TargetView },
     ActionOutcome { outcome: ActionOutcome },
+    ModelDiscovery { result: ModelDiscoveryResult },
+    Reachability { result: ReachabilityResult },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

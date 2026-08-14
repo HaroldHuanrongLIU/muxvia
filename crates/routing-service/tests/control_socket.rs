@@ -5,6 +5,7 @@ use std::{
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use muxvia_routing::{
@@ -16,7 +17,12 @@ use muxvia_routing::{
     state::StateStore,
 };
 use serde_json::{Value, json};
-use tokio::{io::AsyncWriteExt, net::UnixStream};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, UnixStream},
+    sync::mpsc,
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
 struct ControlFixture {
@@ -66,6 +72,123 @@ impl Drop for ControlFixture {
     }
 }
 
+struct HeldInspectionServer {
+    base_url: String,
+    started: mpsc::UnboundedReceiver<()>,
+    dropped: mpsc::UnboundedReceiver<()>,
+    task: JoinHandle<()>,
+}
+
+impl HeldInspectionServer {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (started_tx, started) = mpsc::unbounded_channel();
+        let (dropped_tx, dropped) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else { break };
+                        let started_tx = started_tx.clone();
+                        let dropped_tx = dropped_tx.clone();
+                        connections.spawn(async move {
+                            let mut request = Vec::new();
+                            let mut chunk = [0_u8; 1024];
+                            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                let Ok(read) = stream.read(&mut chunk).await else { return };
+                                if read == 0 { return; }
+                                request.extend_from_slice(&chunk[..read]);
+                            }
+                            let _ = started_tx.send(());
+                            loop {
+                                match stream.read(&mut chunk).await {
+                                    Ok(0) | Err(_) => {
+                                        let _ = dropped_tx.send(());
+                                        return;
+                                    }
+                                    Ok(_) => {}
+                                }
+                            }
+                        });
+                    }
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                }
+            }
+        });
+        Self {
+            base_url,
+            started,
+            dropped,
+            task,
+        }
+    }
+
+    async fn wait_started(&mut self) {
+        tokio::time::timeout(Duration::from_secs(1), self.started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn wait_dropped(&mut self) {
+        tokio::time::timeout(Duration::from_secs(1), self.dropped.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+impl Drop for HeldInspectionServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+struct CompletedInspectionServer {
+    base_url: String,
+    task: JoinHandle<()>,
+}
+
+impl CompletedInspectionServer {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body = br#"{"data":[{"id":"model-complete"}]}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        Self { base_url, task }
+    }
+}
+
+impl Drop for CompletedInspectionServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 async fn hello(stream: &mut UnixStream) -> Value {
     write_frame(
         stream,
@@ -92,6 +215,19 @@ async fn request(stream: &mut UnixStream, request_id: &str, operation: Value) ->
     .await
     .unwrap();
     read_frame(stream).await.unwrap()
+}
+
+async fn wait_for_zero_inspections(fixture: &ControlFixture) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if fixture.handle.as_ref().unwrap().tracked_inspections() == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 fn create_action(name: &str, secret: &str) -> Value {
@@ -406,6 +542,197 @@ async fn open_target_subscribes_and_action_responds_before_complete_push() {
     assert_eq!(push["type"], "target-view");
     assert_eq!(push["view"], response["result"]["outcome"]["view"]);
     assert!(!format!("{response}{push}").contains("server-secret-must-not-escape"));
+}
+
+#[tokio::test]
+async fn discovery_is_concurrent_cancellable_and_shutdown_drains_session_work() {
+    let mut upstream = HeldInspectionServer::start().await;
+    let mut fixture = ControlFixture::start().await;
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    let created = request(
+        &mut stream,
+        "create-inspected",
+        json!({
+            "kind": "act", "target": "codex",
+            "actionId": "00000000-0000-4000-8000-000000000081",
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-provider",
+                "name": "Inspected",
+                "baseUrl": upstream.base_url,
+                "model": "model-test",
+                "credential": { "kind": "replace", "value": "uds-secret-must-not-escape" },
+                "presetKey": null
+            }
+        }),
+    )
+    .await;
+    let provider = created["result"]["outcome"]["view"]["providers"][0].clone();
+
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "discover-held",
+            "operation": {
+                "kind": "discover-models", "target": "codex",
+                "source": {
+                    "kind": "saved",
+                    "providerId": provider["id"],
+                    "providerRevision": provider["providerRevision"]
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    upstream.wait_started().await;
+
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request", "requestId": "open-while-held",
+            "operation": { "kind": "open-target", "target": "codex" }
+        }),
+    )
+    .await
+    .unwrap();
+    let opened = tokio::time::timeout(Duration::from_millis(200), read_frame(&mut stream))
+        .await
+        .expect("open-target was blocked behind discovery")
+        .unwrap();
+    assert_eq!(opened["requestId"], "open-while-held");
+    assert_eq!(opened["result"]["kind"], "target-view");
+    let queued_push = tokio::time::timeout(Duration::from_millis(200), read_frame(&mut stream))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(queued_push["type"], "target-view");
+    assert_eq!(fixture.handle.as_ref().unwrap().tracked_inspections(), 1,);
+
+    write_frame(
+        &mut stream,
+        &json!({ "type": "cancel", "requestId": "discover-held" }),
+    )
+    .await
+    .unwrap();
+    upstream.wait_dropped().await;
+    wait_for_zero_inspections(&fixture).await;
+    let late = tokio::time::timeout(Duration::from_millis(80), read_frame(&mut stream)).await;
+    assert!(
+        late.is_err(),
+        "cancelled discovery wrote a result: {late:?}"
+    );
+
+    let usable = request(
+        &mut stream,
+        "open-after-cancel",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    assert_eq!(usable["result"]["kind"], "target-view");
+
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "discover-shutdown",
+            "operation": {
+                "kind": "discover-models", "target": "codex",
+                "source": {
+                    "kind": "saved",
+                    "providerId": provider["id"],
+                    "providerRevision": provider["providerRevision"]
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    upstream.wait_started().await;
+    fixture.handle.as_mut().unwrap().request_shutdown();
+    upstream.wait_dropped().await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn completed_and_disconnected_inspections_are_reaped_without_orphans() {
+    let completed_upstream = CompletedInspectionServer::start().await;
+    let mut fixture = ControlFixture::start().await;
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    let created = request(
+        &mut stream,
+        "create-completed",
+        json!({
+            "kind": "act", "target": "codex",
+            "actionId": "00000000-0000-4000-8000-000000000091",
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-provider", "name": "Completed",
+                "baseUrl": completed_upstream.base_url, "model": "model-test",
+                "credential": { "kind": "replace", "value": "completed-secret" },
+                "presetKey": null
+            }
+        }),
+    )
+    .await;
+    let provider = created["result"]["outcome"]["view"]["providers"][0].clone();
+    let completed = request(
+        &mut stream,
+        "discover-completed",
+        json!({
+            "kind": "discover-models", "target": "codex",
+            "source": {
+                "kind": "saved", "providerId": provider["id"],
+                "providerRevision": provider["providerRevision"]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(completed["result"]["kind"], "model-discovery");
+    assert_eq!(completed["result"]["result"]["status"], "success");
+    wait_for_zero_inspections(&fixture).await;
+
+    let mut held_upstream = HeldInspectionServer::start().await;
+    let updated = request(
+        &mut stream,
+        "move-to-held",
+        json!({
+            "kind": "act", "target": "codex",
+            "actionId": "00000000-0000-4000-8000-000000000092",
+            "expectedRevision": 1,
+            "action": {
+                "kind": "update-provider", "providerId": provider["id"],
+                "providerRevision": provider["providerRevision"], "name": "Held",
+                "baseUrl": held_upstream.base_url, "model": "model-test",
+                "credential": { "kind": "keep" }
+            }
+        }),
+    )
+    .await;
+    let updated_provider = updated["result"]["outcome"]["view"]["providers"][0].clone();
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request", "requestId": "discover-disconnect",
+            "operation": {
+                "kind": "discover-models", "target": "codex",
+                "source": {
+                    "kind": "saved", "providerId": updated_provider["id"],
+                    "providerRevision": updated_provider["providerRevision"]
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    held_upstream.wait_started().await;
+    drop(stream);
+    held_upstream.wait_dropped().await;
+    wait_for_zero_inspections(&fixture).await;
+    fixture.shutdown().await;
 }
 
 #[tokio::test]

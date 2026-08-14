@@ -98,6 +98,8 @@ class LifecycleSession implements TargetSession {
   pendingSave?: Promise<ActionOutcome>
 
   get(): Readonly<TargetView> { return initialView }
+  async discoverModels(): Promise<never> { throw new Error("not used by this fixture") }
+  async checkReachability(): Promise<never> { throw new Error("not used by this fixture") }
   async act(action: TargetAction): Promise<ActionOutcome> {
     if (action.kind === "create-provider") {
       this.saveCalls++

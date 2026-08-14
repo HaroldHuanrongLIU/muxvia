@@ -101,12 +101,24 @@ class ScriptedServer {
     }
   }
 
+  async waitForFrames(count: number): Promise<void> {
+    while (this.frames.length < count) {
+      await new Promise<void>((resolve) => this.#waiters.push(resolve))
+    }
+  }
+
   requests(): Extract<ClientFrame, { type: "request" }>[] {
     return this.frames.filter((frame): frame is Extract<ClientFrame, { type: "request" }> => frame.type === "request")
   }
 
   receivedActionCount(): number {
     return this.requests().filter((frame) => frame.operation.kind === "act").length
+  }
+
+  cancels(): Extract<ClientFrame, { type: "cancel" }>[] {
+    return this.frames.filter(
+      (frame): frame is Extract<ClientFrame, { type: "cancel" }> => frame.type === "cancel",
+    )
   }
 
   replyOpen(index: number, view: TargetView): void {
@@ -131,6 +143,24 @@ class ScriptedServer {
       requestId: frame.requestId,
       problem: { code: "stale-revision", message: "Target state changed" },
       authoritativeView: view,
+    })
+  }
+
+  replyDiscovery(index: number, models: string[]): void {
+    const frame = this.requests()[index]!
+    this.send({
+      type: "response",
+      requestId: frame.requestId,
+      result: {
+        kind: "model-discovery",
+        result: {
+          status: "success",
+          models: models.map((id) => ({ id, displayName: null })),
+          attempts: 1,
+          elapsedMs: 1,
+          endpointOrigin: "https://draft.example",
+        },
+      },
     })
   }
 
@@ -241,5 +271,79 @@ test("close is idempotent, removes subscriptions, and closes the socket", async 
     kind: "create-provider", name: "P", baseUrl: "https://p.test/v1", model: "m", credential: { kind: "replace", value: "s" }, presetKey: null,
   })).rejects.toMatchObject({ code: "connection-closed" })
 
+  await server.close()
+})
+
+test("aborted discovery sends one cancel, ignores a late result, and preserves a newer push", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1, 1))
+  const controller = new AbortController()
+  const discovery = session.discoverModels({
+    kind: "draft",
+    baseUrl: "https://draft.example/v1",
+    credentialSource: { kind: "ephemeral", value: "ephemeral-test-value" },
+  }, controller.signal)
+  await server.waitForRequests(2)
+  const discoveryRequest = server.requests()[1]!
+
+  server.push(viewAtRevision(2, 2))
+  await Bun.sleep(10)
+  controller.abort()
+  await expect(discovery).rejects.toMatchObject({ code: "cancelled" })
+  await server.waitForFrames(4)
+  expect(server.cancels()).toEqual([{ type: "cancel", requestId: discoveryRequest.requestId }])
+
+  server.replyDiscovery(1, ["late-model"])
+  await Bun.sleep(10)
+  expect(session.get()).toEqual(viewAtRevision(2, 2))
+  expect(server.cancels()).toHaveLength(1)
+
+  await session.close()
+  await server.close()
+})
+
+test("explicit refresh accepts unsaved Blank and Preset drafts without Provider identity", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(0))
+  const blank = session.discoverModels({
+    kind: "draft",
+    baseUrl: "",
+    credentialSource: { kind: "missing" },
+  })
+  const preset = session.discoverModels({
+    kind: "draft",
+    baseUrl: "https://api.openai.com/v1",
+    credentialSource: { kind: "ephemeral", value: "preset-test-value" },
+  })
+  await server.waitForRequests(3)
+
+  const inspections = server.requests().slice(1)
+  expect(inspections.map((request) => request.operation)).toEqual([
+    {
+      kind: "discover-models",
+      target: "codex",
+      source: {
+        kind: "draft",
+        baseUrl: "",
+        credentialSource: { kind: "missing" },
+      },
+    },
+    {
+      kind: "discover-models",
+      target: "codex",
+      source: {
+        kind: "draft",
+        baseUrl: "https://api.openai.com/v1",
+        credentialSource: { kind: "ephemeral", value: "preset-test-value" },
+      },
+    },
+  ])
+  expect(JSON.stringify(inspections.map((request) => request.operation))).not.toContain("providerId")
+
+  server.replyDiscovery(1, [])
+  server.replyDiscovery(2, ["model-a"])
+  expect((await blank).status).toBe("success")
+  expect((await preset).status).toBe("success")
+  expect(session.get()).toEqual(viewAtRevision(0))
+
+  await session.close()
   await server.close()
 })

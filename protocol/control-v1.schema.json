@@ -17,13 +17,14 @@
     "clientFrame": {
       "oneOf": [
         { "type": "object", "properties": { "type": { "const": "hello" }, "rpc": { "$ref": "#/$defs/rpc" }, "release": { "type": "string" } }, "required": ["type", "rpc", "release"] },
-        { "type": "object", "properties": { "type": { "const": "request" }, "requestId": { "type": "string" }, "operation": { "$ref": "#/$defs/controlOperation" } }, "required": ["type", "requestId", "operation"] }
+        { "type": "object", "properties": { "type": { "const": "request" }, "requestId": { "type": "string" }, "operation": { "$ref": "#/$defs/controlOperation" } }, "required": ["type", "requestId", "operation"] },
+        { "type": "object", "properties": { "type": { "const": "cancel" }, "requestId": { "type": "string" } }, "required": ["type", "requestId"] }
       ]
     },
     "serverFrame": {
       "oneOf": [
         { "type": "object", "properties": { "type": { "const": "hello-ack" }, "rpc": { "$ref": "#/$defs/rpc" }, "release": { "type": "string" }, "serviceEpoch": { "type": "string", "format": "uuid" }, "frameLimit": { "const": 1048576 } }, "required": ["type", "rpc", "release", "serviceEpoch", "frameLimit"] },
-        { "type": "object", "properties": { "type": { "const": "response" }, "requestId": { "type": "string" }, "result": {} }, "required": ["type", "requestId", "result"] },
+        { "type": "object", "properties": { "type": { "const": "response" }, "requestId": { "type": "string" }, "result": { "$ref": "#/$defs/controlResult" } }, "required": ["type", "requestId", "result"] },
         { "type": "object", "properties": { "type": { "const": "error" }, "requestId": { "type": ["string", "null"] }, "problem": { "$ref": "#/$defs/controlProblem" }, "authoritativeView": { "$ref": "#/$defs/targetView" } }, "required": ["type", "requestId", "problem"] },
         { "type": "object", "properties": { "type": { "const": "target-view" }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["type", "view"] }
       ]
@@ -31,7 +32,50 @@
     "controlOperation": {
       "oneOf": [
         { "type": "object", "properties": { "kind": { "const": "open-target" }, "target": { "const": "codex" } }, "required": ["kind", "target"] },
-        { "type": "object", "properties": { "kind": { "const": "act" }, "target": { "const": "codex" }, "actionId": { "type": "string", "format": "uuid" }, "expectedRevision": { "type": "integer", "minimum": 0 }, "action": {} }, "required": ["kind", "target", "actionId", "expectedRevision", "action"] }
+        { "type": "object", "properties": { "kind": { "const": "act" }, "target": { "const": "codex" }, "actionId": { "type": "string", "format": "uuid" }, "expectedRevision": { "type": "integer", "minimum": 0 }, "action": {} }, "required": ["kind", "target", "actionId", "expectedRevision", "action"] },
+        { "type": "object", "properties": { "kind": { "const": "discover-models" }, "target": { "const": "codex" }, "source": { "$ref": "#/$defs/discoverySource" } }, "required": ["kind", "target", "source"] },
+        { "type": "object", "properties": { "kind": { "const": "check-reachability" }, "target": { "const": "codex" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "target", "providerId", "providerRevision"] }
+      ]
+    },
+    "discoverySource": {
+      "oneOf": [
+        { "type": "object", "properties": { "kind": { "const": "saved" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"] },
+        { "type": "object", "properties": { "kind": { "const": "draft" }, "baseUrl": { "type": "string" }, "credentialSource": { "$ref": "#/$defs/draftCredentialSource" } }, "required": ["kind", "baseUrl", "credentialSource"] }
+      ]
+    },
+    "draftCredentialSource": {
+      "oneOf": [
+        { "type": "object", "properties": { "kind": { "const": "missing" } }, "required": ["kind"] },
+        { "type": "object", "properties": { "kind": { "const": "ephemeral" }, "value": { "type": "string" } }, "required": ["kind", "value"] },
+        { "type": "object", "properties": { "kind": { "const": "saved" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"] }
+      ]
+    },
+    "controlResult": {
+      "oneOf": [
+        { "type": "object", "properties": { "kind": { "const": "target-view" }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["kind", "view"] },
+        { "type": "object", "properties": { "kind": { "const": "action-outcome" }, "outcome": { "type": "object", "properties": { "status": { "enum": ["applied", "replayed"] }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["status", "view"] } }, "required": ["kind", "outcome"] },
+        { "type": "object", "properties": { "kind": { "const": "model-discovery" }, "result": { "$ref": "#/$defs/modelDiscoveryResult" } }, "required": ["kind", "result"] },
+        { "type": "object", "properties": { "kind": { "const": "reachability" }, "result": { "$ref": "#/$defs/reachabilityResult" } }, "required": ["kind", "result"] }
+      ]
+    },
+    "inspectionCategory": {
+      "enum": ["invalid-endpoint", "missing-credential", "missing-provider", "stale-provider-revision", "authentication-rejected", "endpoint-unsupported", "rate-limited", "upstream-status", "timeout", "dns", "connect", "tls", "cancelled", "malformed-response", "response-too-large", "too-many-models"]
+    },
+    "inspectionFailure": {
+      "type": "object",
+      "properties": { "category": { "$ref": "#/$defs/inspectionCategory" }, "httpStatus": { "type": ["integer", "null"] }, "attempts": { "type": "integer", "minimum": 0 }, "elapsedMs": { "type": "integer", "minimum": 0 }, "endpointOrigin": { "type": ["string", "null"] } },
+      "required": ["category", "httpStatus", "attempts", "elapsedMs", "endpointOrigin"]
+    },
+    "modelDiscoveryResult": {
+      "oneOf": [
+        { "type": "object", "properties": { "status": { "const": "success" }, "models": { "type": "array", "maxItems": 2048, "items": { "type": "object", "properties": { "id": { "type": "string" }, "displayName": { "type": ["string", "null"] } }, "required": ["id", "displayName"] } }, "attempts": { "type": "integer", "minimum": 1 }, "elapsedMs": { "type": "integer", "minimum": 0 }, "endpointOrigin": { "type": "string" } }, "required": ["status", "models", "attempts", "elapsedMs", "endpointOrigin"] },
+        { "type": "object", "properties": { "status": { "const": "failure" }, "failure": { "$ref": "#/$defs/inspectionFailure" } }, "required": ["status", "failure"] }
+      ]
+    },
+    "reachabilityResult": {
+      "oneOf": [
+        { "type": "object", "properties": { "status": { "const": "reachable" }, "httpStatus": { "type": "integer", "minimum": 100, "maximum": 599 }, "ttfbMs": { "type": "integer", "minimum": 0 }, "checkedAtUnixMs": { "type": "integer", "minimum": 0 }, "retryCount": { "type": "integer", "minimum": 0, "maximum": 1 }, "slow": { "type": "boolean" }, "endpointOrigin": { "type": "string" } }, "required": ["status", "httpStatus", "ttfbMs", "checkedAtUnixMs", "retryCount", "slow", "endpointOrigin"] },
+        { "type": "object", "properties": { "status": { "const": "unreachable" }, "failure": { "$ref": "#/$defs/inspectionFailure" }, "checkedAtUnixMs": { "type": "integer", "minimum": 0 }, "retryCount": { "type": "integer", "minimum": 0, "maximum": 1 } }, "required": ["status", "failure", "checkedAtUnixMs", "retryCount"] }
       ]
     },
     "targetAction": {

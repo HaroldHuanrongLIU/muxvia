@@ -47,6 +47,8 @@ class FixtureSession implements TargetSession {
   readonly #whenClosed = deferred<void>()
 
   get(): Readonly<TargetView> { return initialView }
+  async discoverModels(): Promise<never> { throw new Error("not used by this fixture") }
+  async checkReachability(): Promise<never> { throw new Error("not used by this fixture") }
   async act(_action: TargetAction): Promise<ActionOutcome> {
     return { status: "applied", view: initialView }
   }

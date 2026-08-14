@@ -33,6 +33,9 @@ class StaticTargetSession implements TargetSession {
     return this.#view
   }
 
+  async discoverModels(): Promise<never> { throw new Error("not used by this fixture") }
+  async checkReachability(): Promise<never> { throw new Error("not used by this fixture") }
+
   async act(_action: TargetAction): Promise<ActionOutcome> {
     return { status: "applied", view: this.#view }
   }

@@ -135,6 +135,23 @@ impl StateStore {
             .map_err(map_call_error)
     }
 
+    pub(crate) async fn provider_for_inspection(
+        &self,
+        provider_id: Uuid,
+        provider_revision: u64,
+    ) -> Result<super::providers::ProviderInspectionRead, StateError> {
+        self.connection
+            .call(move |connection| {
+                super::providers::read_provider_for_inspection(
+                    connection,
+                    provider_id,
+                    provider_revision,
+                )
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
     pub fn subscribe_target_views(&self) -> broadcast::Receiver<TargetView> {
         self.target_views.subscribe()
     }

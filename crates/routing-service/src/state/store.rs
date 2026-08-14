@@ -58,6 +58,7 @@ type ActivationPreparationRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 pub struct ActivationPreparation {
@@ -245,17 +246,19 @@ impl StateStore {
         self.connection
             .call(move |connection| -> Result<Result<ActivationPreparation, ActionFailure>, StateError> {
                 let (revision, recovery_state, takeover_state, route_port, routing_credential,
-                    prior_snapshot_id, prior_base_url, prior_model, prior_provider_credential):
+                    raw_snapshot_id, joined_snapshot_id, prior_base_url, prior_model,
+                    prior_provider_credential):
                     ActivationPreparationRow = connection.query_row(
                         "SELECT r.management_revision, r.recovery_state, r.takeover_state,
-                                r.route_port, r.routing_credential, s.id, s.base_url, s.model,
-                                s.provider_bearer_token
+                                r.route_port, r.routing_credential, r.activated_snapshot_id,
+                                s.id, s.base_url, s.model, s.provider_bearer_token
                          FROM target_route_state r
                          LEFT JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
                          WHERE r.target = 'codex'",
                         [],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
-                            row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
+                            row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?,
+                            row.get(9)?)),
                     )?;
                 let failure = |code: &str, message: &str| -> ActionFailure {
                     ActionFailure {
@@ -270,9 +273,15 @@ impl StateStore {
                 if revision != expected_revision {
                     return Ok(Err(failure("stale-revision", "Target state changed; refresh and retry")));
                 }
+                if raw_snapshot_id != joined_snapshot_id {
+                    return Ok(Err(failure(
+                        "recovery-required",
+                        "Managed configuration requires recovery",
+                    )));
+                }
                 let (prior_snapshot, prior_route_runtime) = match (
                     takeover_state.as_str(),
-                    prior_snapshot_id,
+                    joined_snapshot_id,
                     prior_base_url,
                     prior_model,
                     prior_provider_credential,

@@ -274,6 +274,33 @@ impl Fixture {
             .unwrap();
     }
 
+    async fn overwrite_route_state(
+        &self,
+        takeover_state: &str,
+        route_port: Option<u16>,
+        routing_credential: Option<&str>,
+        snapshot_id: Option<Uuid>,
+    ) {
+        let database = tokio_rusqlite::Connection::open(self.home.database_path())
+            .await
+            .unwrap();
+        let takeover_state = takeover_state.to_owned();
+        let routing_credential = routing_credential.map(str::to_owned);
+        let snapshot_id = snapshot_id.map(|id| id.to_string());
+        database
+            .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                connection.execute(
+                    "UPDATE target_route_state SET takeover_state = ?1, route_port = ?2,
+                            routing_credential = ?3, activated_snapshot_id = ?4
+                     WHERE target = 'codex'",
+                    (takeover_state, route_port, routing_credential, snapshot_id),
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
     async fn mutation_fingerprint(&self) -> MutationFingerprint {
         let database = tokio_rusqlite::Connection::open(self.home.database_path())
             .await
@@ -375,12 +402,29 @@ async fn assert_direct_pre_mutation_failure(
     revision: u64,
     expected_code: &str,
 ) {
+    assert_activation_pre_mutation_failure(
+        fixture,
+        service,
+        revision,
+        direct_action(provider_id),
+        expected_code,
+    )
+    .await;
+}
+
+async fn assert_activation_pre_mutation_failure(
+    fixture: &Fixture,
+    service: &ActivationService,
+    revision: u64,
+    action: serde_json::Value,
+    expected_code: &str,
+) {
     let action_id = Uuid::new_v4();
     let before = fixture.mutation_fingerprint().await;
     let endpoint_before = service.model_endpoint().await;
     let mut updates = fixture.store.subscribe_target_views();
     let failure = service
-        .apply_raw(action_id, revision, direct_action(provider_id))
+        .apply_raw(action_id, revision, action)
         .await
         .unwrap_err();
 
@@ -393,6 +437,124 @@ async fn assert_direct_pre_mutation_failure(
     assert_eq!(service.model_endpoint().await, endpoint_before);
     assert!(fixture.store.receipt(action_id).await.unwrap().is_none());
     assert!(updates.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn inactive_dangling_snapshot_pointer_requires_recovery_before_activation() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture
+        .save("Direct", "gpt-direct", "provider-secret")
+        .await;
+    fixture
+        .overwrite_route_state("inactive", None, None, Some(Uuid::new_v4()))
+        .await;
+    let service = fixture.service(ActivationHooks::default());
+
+    assert_direct_pre_mutation_failure(
+        &fixture,
+        &service,
+        provider_id,
+        revision,
+        "recovery-required",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn active_dangling_snapshot_pointer_requires_recovery_before_activation() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture
+        .save("Direct", "gpt-direct", "provider-secret")
+        .await;
+    fixture
+        .overwrite_route_state(
+            "active",
+            Some(43123),
+            Some("routing-secret"),
+            Some(Uuid::new_v4()),
+        )
+        .await;
+    let service = fixture.service(ActivationHooks::default());
+
+    assert_activation_pre_mutation_failure(
+        &fixture,
+        &service,
+        revision,
+        takeover_action(provider_id),
+        "recovery-required",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn incomplete_takeover_runtime_requires_recovery_before_activation() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture
+        .save("Direct", "gpt-direct", "provider-secret")
+        .await;
+    let service = fixture.service(ActivationHooks::default());
+    let activated = service
+        .apply_raw(Uuid::new_v4(), revision, direct_action(provider_id))
+        .await
+        .unwrap();
+    let activated_revision = activated.view.management_revision;
+    let snapshot_id = activated.view.activated_snapshot.unwrap().id;
+    fixture
+        .overwrite_route_state("active", Some(43123), None, Some(snapshot_id))
+        .await;
+
+    assert_activation_pre_mutation_failure(
+        &fixture,
+        &service,
+        activated_revision,
+        takeover_action(provider_id),
+        "recovery-required",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn managed_direct_drift_blocks_direct_and_takeover_transitions_before_mutation() {
+    for mode in [ActivationMode::Direct, ActivationMode::Takeover] {
+        let fixture = Fixture::new().await;
+        let config_home = fixture.home.user_home().join(".codex");
+        fs::create_dir_all(&config_home).unwrap();
+        let auth_before = br#"{"tokens":"drift-auth-sentinel"}"#;
+        fs::write(config_home.join("auth.json"), auth_before).unwrap();
+        let (first_id, revision) = fixture.save("First", "gpt-first", "first-secret").await;
+        let service = fixture.service(ActivationHooks::default());
+        service
+            .apply_raw(Uuid::new_v4(), revision, direct_action(first_id))
+            .await
+            .unwrap();
+        let (second_id, second_revision) =
+            fixture.save("Second", "gpt-second", "second-secret").await;
+        let config_path = config_home.join("config.toml");
+        let managed = fs::read_to_string(&config_path).unwrap();
+        let drifted = managed.replacen("model = \"gpt-first\"", "model = \"drifted\"", 1);
+        assert!(
+            managed != drifted,
+            "test failed to mutate a managed Codex field"
+        );
+        fs::write(&config_path, drifted).unwrap();
+        let action = match mode {
+            ActivationMode::Direct => direct_action(second_id),
+            ActivationMode::Takeover => takeover_action(second_id),
+        };
+
+        assert_activation_pre_mutation_failure(
+            &fixture,
+            &service,
+            second_revision,
+            action,
+            "recovery-required",
+        )
+        .await;
+        assert!(
+            fs::read(config_home.join("auth.json")).unwrap() == auth_before,
+            "managed drift handling changed Codex authentication state"
+        );
+    }
 }
 
 #[tokio::test]
@@ -837,6 +999,45 @@ async fn direct_final_stale_rollback_and_rolled_back_action_retry_preserve_order
     assert!(retry.model_endpoint().await.is_none());
     assert_eq!(updates.recv().await.unwrap(), applied.view);
     assert!(updates.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn paused_direct_final_commit_does_not_block_model_control() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture
+        .save("Direct", "gpt-direct", "provider-secret")
+        .await;
+    let pause = Arc::new(ActivationPause::default());
+    let service = Arc::new(fixture.service(ActivationHooks::pausing_final_commit(pause.clone())));
+    let activation = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move {
+            service
+                .apply_raw(Uuid::new_v4(), revision, direct_action(provider_id))
+                .await
+        })
+    };
+    pause.wait_until_reached().await;
+
+    let endpoint =
+        tokio::time::timeout(std::time::Duration::from_secs(1), service.model_endpoint()).await;
+    let shutdown =
+        tokio::time::timeout(std::time::Duration::from_secs(1), service.shutdown_model()).await;
+    pause.release();
+    let applied = activation.await.unwrap().unwrap();
+
+    assert!(
+        endpoint.is_ok(),
+        "Direct final commit blocked Model Server inspection"
+    );
+    assert!(endpoint.unwrap().is_none());
+    assert!(
+        shutdown.is_ok(),
+        "Direct final commit blocked Model Server shutdown"
+    );
+    assert!(shutdown.unwrap().is_ok());
+    assert_eq!(applied.status, ActionStatus::Applied);
+    assert_eq!(applied.view.mode, "direct");
 }
 
 #[tokio::test]

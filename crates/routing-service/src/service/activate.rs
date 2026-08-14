@@ -318,8 +318,7 @@ impl ActivationService {
             Err(code) => return Err(self.codex_failure(code).await),
         };
 
-        let mut model = self.model.lock().await;
-        let (runtime, desired, started_new) = match command.mode {
+        let (runtime, desired, started_new, mut takeover_model) = match command.mode {
             ActivationMode::Direct => (
                 ActivationRuntime::Direct,
                 codec.desired_direct(
@@ -328,8 +327,10 @@ impl ActivationService {
                     preparation.provider_credential.expose_secret(),
                 ),
                 false,
+                None,
             ),
             ActivationMode::Takeover => {
+                let mut model = self.model.lock().await;
                 let persisted_port = preparation.preferred_route_port;
                 let (route_port, started_new) =
                     match self.ensure_model_listener(&mut model, persisted_port).await {
@@ -354,7 +355,7 @@ impl ActivationService {
                     None => match random_credential() {
                         Ok(credential) => credential,
                         Err(()) => {
-                            self.stop_new_listener(&mut model, started_new).await;
+                            self.stop_new_listener(Some(&mut model), started_new).await;
                             return Err(self
                                 .activation_failure("internal-failure", "Activation failed")
                                 .await);
@@ -377,6 +378,7 @@ impl ActivationService {
                     },
                     desired,
                     started_new,
+                    Some(model),
                 )
             }
         };
@@ -400,7 +402,8 @@ impl ActivationService {
             command.expected_revision,
         );
         if self.store.insert_recovery_intent(&intent).await.is_err() {
-            self.stop_new_listener(&mut model, started_new).await;
+            self.stop_new_listener(takeover_model.as_deref_mut(), started_new)
+                .await;
             return Err(self
                 .activation_failure("internal-failure", "Activation failed")
                 .await);
@@ -449,12 +452,12 @@ impl ActivationService {
                 Ok(outcome)
             }
             Ok(ActivationCommit::Replayed(outcome)) => {
-                self.rollback(&codec, &intent, started_new, &mut model)
+                self.rollback(&codec, &intent, started_new, takeover_model.as_deref_mut())
                     .await?;
                 Ok(outcome)
             }
             Ok(ActivationCommit::Stale(view)) => {
-                self.rollback(&codec, &intent, started_new, &mut model)
+                self.rollback(&codec, &intent, started_new, takeover_model.as_deref_mut())
                     .await?;
                 Err(ActionFailure {
                     problem: crate::control::protocol::ControlProblem {
@@ -465,7 +468,8 @@ impl ActivationService {
                 })
             }
             Ok(ActivationCommit::RecoveryRequired(view)) => {
-                self.mark_required(&intent, started_new, &mut model).await;
+                self.mark_required(&intent, started_new, takeover_model.as_deref_mut())
+                    .await;
                 Err(ActionFailure {
                     problem: crate::control::protocol::ControlProblem {
                         code: "recovery-required".into(),
@@ -475,7 +479,7 @@ impl ActivationService {
                 })
             }
             Err(code) => {
-                self.rollback(&codec, &intent, started_new, &mut model)
+                self.rollback(&codec, &intent, started_new, takeover_model.as_deref_mut())
                     .await?;
                 Err(self.codex_failure(code).await)
             }
@@ -561,10 +565,12 @@ impl ActivationService {
                     &format!("http://127.0.0.1:{}/v1", runtime.route_port),
                     runtime.routing_credential.expose_secret(),
                 );
-                match codec
-                    .inspect_managed_state(&expected)
-                    .map_err(|problem| problem.code())?
-                {
+                match codec.inspect_managed_state(&expected).map_err(|problem| {
+                    match problem.code() {
+                        "configuration-collision" => "recovery-required",
+                        code => code,
+                    }
+                })? {
                     ManagedCodexState::Takeover { snapshot } => Ok(snapshot),
                     _ => Err("recovery-required"),
                 }
@@ -575,10 +581,12 @@ impl ActivationService {
                     &snapshot.base_url,
                     snapshot.provider_credential.expose_secret(),
                 );
-                match codec
-                    .inspect_managed_state(&expected)
-                    .map_err(|problem| problem.code())?
-                {
+                match codec.inspect_managed_state(&expected).map_err(|problem| {
+                    match problem.code() {
+                        "configuration-collision" => "recovery-required",
+                        code => code,
+                    }
+                })? {
                     ManagedCodexState::Direct { snapshot } => Ok(snapshot),
                     _ => Err("recovery-required"),
                 }
@@ -626,7 +634,7 @@ impl ActivationService {
         codec: &CodexConfigCodec,
         intent: &RecoveryIntent,
         started_new: bool,
-        model: &mut Option<ModelServerHandle>,
+        takeover_model: Option<&mut Option<ModelServerHandle>>,
     ) -> Result<(), ActionFailure> {
         let restored = self.hooks.failpoint != Some(ActivationFailpoint::RestoreVerify)
             && codec
@@ -639,10 +647,11 @@ impl ActivationService {
                 .await
                 .is_ok()
         {
-            self.stop_new_listener(model, started_new).await;
+            self.stop_new_listener(takeover_model, started_new).await;
             return Ok(());
         }
-        self.mark_required(intent, started_new, model).await;
+        self.mark_required(intent, started_new, takeover_model)
+            .await;
         Err(self
             .store
             .failure(
@@ -656,17 +665,21 @@ impl ActivationService {
         &self,
         intent: &RecoveryIntent,
         started_new: bool,
-        model: &mut Option<ModelServerHandle>,
+        takeover_model: Option<&mut Option<ModelServerHandle>>,
     ) {
         let _ = self
             .store
             .set_recovery_state(intent.id(), RecoveryState::RecoveryRequired)
             .await;
-        self.stop_new_listener(model, started_new).await;
+        self.stop_new_listener(takeover_model, started_new).await;
     }
 
-    async fn stop_new_listener(&self, slot: &mut Option<ModelServerHandle>, started_new: bool) {
-        if started_new && let Some(handle) = slot.take() {
+    async fn stop_new_listener(
+        &self,
+        slot: Option<&mut Option<ModelServerHandle>>,
+        started_new: bool,
+    ) {
+        if started_new && let Some(handle) = slot.and_then(Option::take) {
             let _ = handle.shutdown().await;
         }
     }

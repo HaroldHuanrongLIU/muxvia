@@ -13,6 +13,16 @@ import { ProviderForm, type ProviderFormResult } from "../src/ui/provider-form"
 const credentialSecret = "provider-secret-must-not-render"
 const credentialUuid = "00000000-0000-4000-8000-000000000099"
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((next, fail) => {
+    resolve = next
+    reject = fail
+  })
+  return { promise, resolve, reject }
+}
+
 function provider(overrides: Partial<TargetView["providers"][number]>): TargetView["providers"][number] {
   return {
     id: "00000000-0000-4000-8000-000000000011",
@@ -721,6 +731,122 @@ test("Provider Direct Activation defaults to Current and dispatches the selected
       }])
       expect(setup.captureCharFrame()).not.toContain(credentialSecret)
       expect(JSON.stringify(session.actions)).not.toContain(credentialSecret)
+    } finally {
+      setup.renderer.destroy()
+    }
+  }
+})
+
+test("Provider Direct Activation disables picker actions while pending then closes onto restart guidance", async () => {
+  const selected = provider({ id: "00000000-0000-4000-8000-000000000011", name: "Pending Direct Provider" })
+  const initial = view({ providers: [selected] })
+  const applied = view({
+    ...initial,
+    managementRevision: 2,
+    viewSequence: 2,
+    mode: "direct",
+    currentProviderId: selected.id,
+    managedConfiguration: { state: "managed", path: "/tmp/home/.codex/config.toml", restartRequired: true },
+    activatedSnapshot: {
+      id: "00000000-0000-4000-8000-000000000021",
+      providerId: selected.id,
+      model: selected.model,
+      epoch: "00000000-0000-4000-8000-000000000022",
+    },
+  })
+  const pending = deferred<ActionOutcome>()
+  const session = new MemoryTargetSession(initial, async () => await pending.promise)
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Pending Direct Provider"))
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("a")
+    await setup.waitFor(() => session.actions.length === 1)
+    const pendingFrame = await setup.waitForFrame((frame) => frame.includes("Applying Direct Activation…"))
+    expect(pendingFrame).toContain("Providers")
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("d")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Applying Direct Activation…")
+    expect(setup.captureCharFrame()).not.toContain("Delete Provider?")
+    expect(setup.captureCharFrame()).not.toContain("Edit Provider")
+    expect(session.actions).toHaveLength(1)
+
+    pending.resolve({ status: "applied", view: applied })
+    const completed = await setup.waitForFrame((frame) =>
+      frame.includes("Direct Activation applied: Pending Direct Provider")
+      && frame.includes("Restart Codex to use the managed configuration.")
+    )
+    expect(completed).toContain("Mode       Direct")
+    expect(completed).not.toContain("Providers")
+    expect(completed).not.toContain(credentialSecret)
+    expect(session.actions).toEqual([{
+      kind: "activate-provider",
+      providerId: selected.id,
+      mode: "direct",
+    }])
+  } finally {
+    pending.resolve({ status: "applied", view: applied })
+    setup.renderer.destroy()
+  }
+})
+
+test("picker Direct failures close onto localized stable guidance without raw backend text", async () => {
+  const cases = [
+    {
+      selected: provider({
+        id: "00000000-0000-4000-8000-000000000011",
+        name: "Incomplete Picker Provider",
+        credential: "missing",
+        completeness: "incomplete",
+        missingFields: ["credential"],
+      }),
+      expected: "Complete the required Provider fields and retry.",
+      backend: false,
+    },
+    {
+      selected: provider({
+        id: "00000000-0000-4000-8000-000000000012",
+        name: "Active Takeover Provider",
+      }),
+      expected: "Disable Target Takeover before using Direct Activation.",
+      backend: true,
+    },
+  ] as const
+
+  for (const testCase of cases) {
+    const initial = view({ providers: [testCase.selected] })
+    let session!: MemoryTargetSession
+    session = new MemoryTargetSession(initial, async () => {
+      session.setView(view({
+        ...initial,
+        managementRevision: 2,
+        viewSequence: 2,
+        providers: [{ ...testCase.selected, name: "Authoritative Active Provider" }],
+      }))
+      throw { code: "takeover-active", message: "backend-picker-secret-must-not-render" }
+    })
+    const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("1")
+      await setup.mockInput.typeText("/providers")
+      setup.mockInput.pressEnter()
+      await setup.waitForFrame((frame) => frame.includes(testCase.selected.name))
+      setup.mockInput.pressKey("x", { ctrl: true })
+      setup.mockInput.pressKey("a")
+      const failure = await setup.waitForFrame((frame) => frame.includes(testCase.expected))
+
+      expect(failure).not.toContain("Providers")
+      expect(failure).not.toContain("backend-picker-secret-must-not-render")
+      expect(failure).not.toContain(credentialSecret)
+      expect(session.actions).toHaveLength(testCase.backend ? 1 : 0)
     } finally {
       setup.renderer.destroy()
     }

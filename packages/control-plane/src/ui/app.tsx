@@ -353,7 +353,8 @@ function Shell(props: { session: TargetSession; t: Translator }) {
           providers={() => view().providers}
           selectedId={selectedProviderId}
           t={props.t}
-          pending={providerMutationPending}
+          pending={() => providerMutationPending() || applying() !== undefined}
+          activationMode={applying}
           onSelectedIdChange={setSelectedProviderId}
           onEdit={() => {
             const provider = selectedProvider()
@@ -364,7 +365,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
           onActivateDirect={() => {
             const provider = selectedProvider()
             if (!provider || applying()) return
-            void activateProvider(provider.id, "direct")
+            void activateProvider(provider.id, "direct", true)
           }}
           onDuplicate={() => requestDuplicate()}
           reachability={() => {
@@ -495,7 +496,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     })
   }
 
-  const openTakeoverConfirmation = (providerId: string, providerName: string) => {
+  const openTakeoverConfirmation = (providerId: string, providerName: string, pickerOrigin: boolean) => {
     overlay.push({
       id: "takeover-required-confirm",
       dismissOnEscape: false,
@@ -504,7 +505,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
         t={props.t}
         onConfirm={() => {
           overlay.closeTop()
-          void activateProvider(providerId, "takeover")
+          void activateProvider(providerId, "takeover", pickerOrigin)
         }}
         onCancel={() => overlay.closeTop()}
       />,
@@ -517,19 +518,29 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) })
   }
 
-  const activateProvider = async (providerId: string, mode: "direct" | "takeover") => {
+  const closeOriginPicker = (pickerOrigin: boolean) => {
+    if (pickerOrigin && overlay.depth > 0) overlay.closeTop()
+  }
+
+  const activateProvider = async (
+    providerId: string,
+    mode: "direct" | "takeover",
+    pickerOrigin = false,
+  ) => {
     if (applying()) return
     const provider = view().providers.find((candidate) => candidate.id === providerId)
     if (!provider) {
+      closeOriginPicker(pickerOrigin)
       showActivationProblem("missing-provider")
       return
     }
     if (mode === "direct" && provider.completeness === "incomplete") {
+      closeOriginPicker(pickerOrigin)
       showActivationProblem("incomplete-provider")
       return
     }
     if (mode === "direct" && provider.routingRequirement === "takeover-required") {
-      openTakeoverConfirmation(provider.id, provider.name)
+      openTakeoverConfirmation(provider.id, provider.name, pickerOrigin)
       return
     }
     const providerName = provider.name
@@ -542,6 +553,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
         mode,
       })
       if (disposed || exiting) return
+      closeOriginPicker(pickerOrigin)
       installView(outcome.view, "action")
       const activity: ActivityDraft = {
         kind: "success",
@@ -553,15 +565,17 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     } catch (error) {
       if (disposed || exiting) return
       const authoritative = props.session.get() as TargetViewProjection
-      installView(authoritative, "action")
       const code = typeof error === "object" && error !== null && "code" in error
         ? String(error.code)
         : "internal-failure"
       if (mode === "direct" && code === "takeover-required") {
+        installView(authoritative, "action")
         const authoritativeProvider = authoritative.providers.find((candidate) => candidate.id === providerId)
-        openTakeoverConfirmation(providerId, authoritativeProvider?.name ?? providerName)
+        openTakeoverConfirmation(providerId, authoritativeProvider?.name ?? providerName, pickerOrigin)
         return
       }
+      closeOriginPicker(pickerOrigin)
+      installView(authoritative, "action")
       const activity = actionProblem(error)
       appendActivity(activity)
       setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) })

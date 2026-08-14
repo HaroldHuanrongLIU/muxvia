@@ -1,5 +1,5 @@
 import type { InputRenderable, KeyEvent } from "@opentui/core"
-import { createSignal, For, onMount, type Accessor } from "solid-js"
+import { createSignal, For, onMount, Show, type Accessor } from "solid-js"
 
 import { useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
 import type { ReachabilityResult, TargetView } from "../control/types"
@@ -14,6 +14,7 @@ export interface ProviderPickerProps {
   selectedId: Accessor<string | undefined>
   t: Translator
   pending: Accessor<boolean>
+  activationMode: Accessor<"direct" | "takeover" | undefined>
   onSelectedIdChange: (id: string) => void
   onEdit: () => void
   onActivateDirect: () => void
@@ -43,7 +44,7 @@ export function ProviderPicker(props: ProviderPickerProps) {
   useCommandLayer({
     scope: "provider-picker",
     priority: 300,
-    enabled: () => overlay.depth === 1,
+    enabled: () => overlay.depth === 1 && !props.pending(),
     handlers: {
       "provider.edit": props.onEdit,
       "provider.activate.direct": props.onActivateDirect,
@@ -65,6 +66,11 @@ export function ProviderPicker(props: ProviderPickerProps) {
     props.onSelectedIdChange(nextId)
   }
   const onKeyDown = (event: KeyEvent) => {
+    if (props.pending()) {
+      event.preventDefault()
+      event.stopPropagation()
+      return
+    }
     if (event.name === "up") {
       event.preventDefault()
       event.stopPropagation()
@@ -84,6 +90,10 @@ export function ProviderPicker(props: ProviderPickerProps) {
     }
   }
   const captureNavigation = (value: string) => {
+    if (props.pending()) {
+      setKeyCapture("")
+      return
+    }
     if (value === "up") {
       setKeyCapture("")
       moveSelection(-1)
@@ -107,6 +117,9 @@ export function ProviderPicker(props: ProviderPickerProps) {
 
   return <box flexDirection="column" padding={1} rowGap={1} backgroundColor={theme.panel}>
     <text fg={theme.text}>{props.t("provider.list.title")}</text>
+    <Show when={props.activationMode()}>
+      <text fg={theme.warning}>{props.t(props.activationMode() === "direct" ? "activity.direct.applying" : "activity.applying")}</text>
+    </Show>
     <box height={1}>
       <input
         ref={(value: InputRenderable) => {

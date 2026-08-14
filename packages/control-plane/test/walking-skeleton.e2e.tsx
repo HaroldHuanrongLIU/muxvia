@@ -49,6 +49,21 @@ async function controlledTreeFingerprint(path: string): Promise<string> {
   }
 }
 
+async function safeFileFingerprint(path: string): Promise<{
+  digest: string
+  mode: number
+  mtimeMs: number
+  size: number
+}> {
+  const metadata = await stat(path)
+  return {
+    digest: sensitiveDigest(await readFile(path))!,
+    mode: metadata.mode & 0o777,
+    mtimeMs: metadata.mtimeMs,
+    size: metadata.size,
+  }
+}
+
 async function waitFor(predicate: () => boolean | Promise<boolean>, label: string): Promise<void> {
   const deadline = Date.now() + deadlineMs
   while (!(await predicate())) {
@@ -123,6 +138,39 @@ function extractManagedConfig(text: string, expectedModel: string): { endpoint: 
   const credential = text.match(/X-Muxvia-Routing-Credential"\s*=\s*"([a-f0-9]{64})"/)?.[1]
   if (!endpoint || !credential) throw new Error("managed endpoint or credential missing")
   return { endpoint, credential }
+}
+
+function assertExactDirectManagedConfig(
+  text: string,
+  expected: { baseUrl: string; model: string; providerCredential: string },
+): void {
+  const lines = text.split("\n")
+  const directTableStart = lines.indexOf("[model_providers.muxvia_codex]")
+  const directTableEnd = lines.findIndex((line, index) => index > directTableStart && line.startsWith("["))
+  const directTable = directTableStart === -1
+    ? []
+    : lines.slice(
+        directTableStart,
+        directTableEnd === -1 ? lines.length : directTableEnd,
+      ).filter((line) => line !== "")
+  const expectedTable = [
+    "[model_providers.muxvia_codex]",
+    'name = "Muxvia Direct"',
+    `base_url = "${expected.baseUrl}"`,
+    'wire_api = "responses"',
+    `http_headers = { Authorization = "Bearer ${expected.providerCredential}" }`,
+    "supports_websockets = false",
+  ]
+  const hasExactTopLevelModel = lines.filter((line) => line === `model = "${expected.model}"`).length === 1
+  const hasExactTopLevelProvider = lines.filter((line) => line === 'model_provider = "muxvia_codex"').length === 1
+  const hasExactTable = directTable.length === expectedTable.length
+    && directTable.every((line) => expectedTable.includes(line))
+  const hasNoTakeoverFields = !text.includes("X-Muxvia-Routing-Credential")
+    && !text.includes('name = "Muxvia"\n')
+
+  if (!hasExactTopLevelModel || !hasExactTopLevelProvider || !hasExactTable || !hasNoTakeoverFields) {
+    throw new Error("direct-managed-configuration-mismatch")
+  }
 }
 
 function assertBytesContainNoSecrets(bytes: Buffer, secrets: readonly string[], label: string): void {
@@ -971,6 +1019,402 @@ test("fake upstream quiesce audits a delayed forbidden seventh request before cl
   expect(finalDiagnostic === "secret-scan-failed:captured-request-routing-credential").toBeTrue()
   expect(finalDiagnostic.includes(wrongRoutingSecret)).toBeFalse()
   expect(finalDiagnostic.includes(requestBody)).toBeFalse()
+})
+
+test("real processes prove Codex direct activation is control-only and survives restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "muxvia-direct-e2e-"))
+  roots.push(root)
+  const userHome = join(root, "home")
+  const muxviaHome = join(userHome, ".muxvia")
+  const codexHome = join(userHome, ".codex")
+  const socketPath = join(muxviaHome, "run/control.sock")
+  const databasePath = join(muxviaHome, "state/muxvia.db")
+  const configPath = join(codexHome, "config.toml")
+  const authPath = join(codexHome, "auth.json")
+  const authSentinel = "auth-sentinel-must-not-escape"
+  const directModel = "gpt-direct"
+  const editedModel = "gpt-direct-edited"
+  await mkdir(codexHome, { recursive: true, mode: 0o700 })
+  await writeFile(configPath, [
+    "# operator comment survives",
+    'unrelated = "keep-me"',
+    "",
+    "[operator_settings]",
+    'theme = "dark"',
+    "nested = { enabled = true, count = 2 }",
+    "",
+  ].join("\n"), { mode: 0o640 })
+  await writeFile(authPath, `{"tokens":"${authSentinel}"}\n`, { mode: 0o600 })
+  await chmod(fakeCodex, 0o755)
+  const originalConfigMode = (await stat(configPath)).mode & 0o777
+  const authFingerprint = await safeFileFingerprint(authPath)
+  expect(originalConfigMode).toBe(0o640)
+  expect(authFingerprint.mode).toBe(0o600)
+
+  const requestAudit = createCapturedRequestAudit({
+    providerCredential: providerSecret,
+    forbiddenRoutingCredentials: () => [wrongRoutingSecret, authSentinel],
+    expectedRequestCount: 0,
+  })
+  const upstream = await startFakeUpstream(providerSecret, requestAudit.observe)
+  const rpcStreams: Buffer[][] = []
+  const outboundAudits: ReturnType<typeof createOutboundOperationAudit>[] = []
+  const outboundOperationKinds: string[] = []
+  const decodedInboundFrames: unknown[] = []
+  const views: TargetView[] = []
+  const activitySurfaces: string[] = []
+  const selectedRenderedFrames: string[] = []
+  const nativeRenderedFrames: string[] = []
+  const services: Array<{
+    child: ReturnType<typeof spawn>
+    output: ReturnType<typeof captureProcessOutput>
+  }> = []
+  let client: RpcClient | undefined
+  let session: TargetSession | undefined
+  let unsubscribe: (() => void) | undefined
+  let setup: Awaited<ReturnType<typeof testRender>> | undefined
+  let rendererAudit: ReturnType<typeof createRendererAudit> | undefined
+
+  const startService = async () => {
+    const child = spawn(serviceBinary, [
+      "--home", muxviaHome,
+      "--test-codex-executable", fakeCodex,
+    ], {
+      cwd: root,
+      env: {
+        HOME: userHome,
+        PATH: `${dirname(fakeCodex)}:/usr/bin:/bin`,
+        MUXVIA_INTEGRATION_TEST: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    const record = { child, output: captureProcessOutput(child) }
+    services.push(record)
+    await waitFor(async () => {
+      try {
+        await stat(socketPath)
+        return true
+      } catch { return false }
+    }, "Direct control socket")
+    return record
+  }
+  const connect = async (release: string) => {
+    const stream: Buffer[] = []
+    const decoder = new FrameDecoder()
+    rpcStreams.push(stream)
+    return await RpcClient.connect(socketPath, release, undefined, (path) => {
+      const socket = createConnection({ path })
+      const outboundAudit = createOutboundOperationAudit()
+      outboundAudits.push(outboundAudit)
+      const write = socket.write.bind(socket)
+      socket.write = ((chunk: Uint8Array, callback?: (error?: Error | null) => void) => {
+        const beforeCount = outboundAudit.operationKinds.length
+        outboundAudit.observe(chunk)
+        outboundOperationKinds.push(...outboundAudit.operationKinds.slice(beforeCount))
+        return write(chunk, callback)
+      }) as typeof socket.write
+      socket.on("data", (chunk) => {
+        const bytes = Buffer.from(chunk)
+        stream.push(bytes)
+        decodedInboundFrames.push(...decoder.push(bytes))
+      })
+      return socket
+    })
+  }
+  const waitForCleanServiceExit = async (
+    record: { child: ReturnType<typeof spawn>; output: ReturnType<typeof captureProcessOutput> },
+    label: string,
+  ) => {
+    const result = await Promise.race([
+      record.output.completed,
+      Bun.sleep(deadlineMs).then(() => undefined),
+    ])
+    if (!result) throw new Error(`Timed out waiting for ${label}`)
+    expect(result).toEqual({ code: 0, signal: null })
+    expect(record.child.exitCode).toBe(0)
+    await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" })
+  }
+  const leader = (key: string) => {
+    setup!.mockInput.pressKey("x", { ctrl: true })
+    setup!.mockInput.pressKey(key)
+  }
+  const closeControlPlane = async () => {
+    setup!.mockInput.pressCtrlC()
+    await setup!.waitFor(() => setup!.renderer.isDestroyed)
+    rendererAudit!.stop()
+    nativeRenderedFrames.push(...rendererAudit!.frames())
+    setup = undefined
+    rendererAudit = undefined
+    unsubscribe?.()
+    unsubscribe = undefined
+    await session!.close()
+    session = undefined
+    client = undefined
+  }
+
+  try {
+    const firstService = await startService()
+    client = await connect("direct-e2e")
+    session = await client.openTarget("codex")
+    views.push(session.get() as TargetView)
+    unsubscribe = session.subscribe((view) => views.push(view))
+    setup = await testRender(() => <App session={session!} />, {
+      width: 80,
+      height: 24,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    rendererAudit = createRendererAudit(setup)
+    rendererAudit.start()
+    await setup.renderOnce()
+    captureFrame(setup, selectedRenderedFrames)
+    await setup.mockInput.typeText("/codex")
+    setup.mockInput.pressEnter()
+    const codexFrame = await setup.waitForFrame((frame) => frame.includes("Run a target action"))
+    selectedRenderedFrames.push(codexFrame)
+
+    await setup.mockInput.typeText("/provider")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("OpenAI API (Responses)"))
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Enter save"))
+    await setup.mockInput.typeText("Direct Provider")
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(upstream.baseUrl)
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(directModel)
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(providerSecret)
+    await setup.renderOnce()
+    captureFrame(setup, selectedRenderedFrames)
+    setup.mockInput.pressEnter()
+    await waitForSession(session, (view) => view.providers.length === 1, "Direct Provider save")
+    await setup.waitForFrame((frame) => frame.includes("Provider saved: Direct Provider"))
+    const savedProvider = session.get().providers[0]!
+    expect(savedProvider).toMatchObject({
+      name: "Direct Provider",
+      baseUrl: upstream.baseUrl,
+      model: directModel,
+      routingRequirement: "direct-compatible",
+      credential: "present",
+      completeness: "complete",
+    })
+    expect(upstream.calls.length === 0).toBeTrue()
+
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    const providerPickerFrame = await setup.waitForFrame((frame) =>
+      frame.includes("Providers") && frame.includes("Direct Provider")
+    )
+    selectedRenderedFrames.push(providerPickerFrame)
+    leader("a")
+    await waitForSession(session, (view) => view.mode === "direct", "Direct Activation")
+    const directFrame = await setup.waitForFrame((frame) =>
+      frame.includes("Mode       Direct")
+      && frame.includes("Current Target Provider  Direct Provider")
+      && frame.includes("Direct Activation applied: Direct Provider")
+      && frame.includes("Restart Codex to use the managed configuration.")
+    )
+    selectedRenderedFrames.push(directFrame)
+    activitySurfaces.push(
+      "Direct Activation applied: Direct Provider",
+      "Restart Codex to use the managed configuration.",
+    )
+
+    const directView = session.get()
+    views.push(directView as TargetView)
+    expect(directView).toMatchObject({
+      mode: "direct",
+      takeover: { state: "inactive", endpoint: null },
+      currentProviderId: savedProvider.id,
+      servingProviderId: null,
+      managedConfiguration: { state: "applied", path: configPath, restartRequired: true },
+      recovery: { state: "committed" },
+      activatedSnapshot: { providerId: savedProvider.id, model: directModel },
+    })
+
+    const directConfigBytes = await readFile(configPath)
+    assertExactDirectManagedConfig(directConfigBytes.toString("utf8"), {
+      baseUrl: upstream.baseUrl,
+      model: directModel,
+      providerCredential: providerSecret,
+    })
+    expect(directConfigBytes.toString("utf8").includes("# operator comment survives")).toBeTrue()
+    expect(directConfigBytes.toString("utf8").includes('unrelated = "keep-me"')).toBeTrue()
+    expect(directConfigBytes.toString("utf8").includes("[operator_settings]")).toBeTrue()
+    expect(directConfigBytes.toString("utf8").includes('theme = "dark"')).toBeTrue()
+    expect(directConfigBytes.toString("utf8").includes("nested = { enabled = true, count = 2 }")).toBeTrue()
+    expect((await stat(configPath)).mode & 0o777).toBe(originalConfigMode)
+    expect(await safeFileFingerprint(authPath)).toEqual(authFingerprint)
+
+    const directDatabase = new Database(databasePath, { readonly: true })
+    const route = directDatabase.query(`SELECT current_provider_id AS currentProviderId,
+      serving_provider_id IS NULL AS servingAbsent,
+      takeover_state AS takeoverState,
+      route_port IS NULL AS routePortAbsent,
+      routing_credential IS NULL AS routingCredentialAbsent,
+      activated_snapshot_id AS snapshotId,
+      managed_config_path AS managedConfigPath,
+      recovery_state AS recoveryState
+      FROM target_route_state WHERE target = 'codex'`).get() as Record<string, unknown>
+    const snapshot = directDatabase.query(`SELECT id, provider_id AS providerId, base_url AS baseUrl,
+      model, provider_bearer_token = ? AS providerCredentialMatches, epoch
+      FROM activated_snapshots WHERE target = 'codex'`).get(providerSecret) as Record<string, unknown>
+    directDatabase.close()
+    expect(route).toMatchObject({
+      currentProviderId: savedProvider.id,
+      servingAbsent: 1,
+      takeoverState: "inactive",
+      routePortAbsent: 1,
+      routingCredentialAbsent: 1,
+      snapshotId: directView.activatedSnapshot!.id,
+      managedConfigPath: configPath,
+      recoveryState: "clean",
+    })
+    expect(snapshot).toMatchObject({
+      id: directView.activatedSnapshot!.id,
+      providerId: savedProvider.id,
+      baseUrl: upstream.baseUrl,
+      model: directModel,
+      providerCredentialMatches: 1,
+    })
+
+    const updateOutcome = await session.act({
+      kind: "update-provider",
+      providerId: savedProvider.id,
+      providerRevision: savedProvider.providerRevision,
+      name: "Direct Provider Edited",
+      baseUrl: `${upstream.baseUrl}/edited`,
+      model: editedModel,
+      credential: { kind: "keep" },
+    })
+    views.push(updateOutcome.view)
+    expect(updateOutcome.view.providers[0]).toMatchObject({
+      id: savedProvider.id,
+      baseUrl: `${upstream.baseUrl}/edited`,
+      model: editedModel,
+    })
+    expect(updateOutcome.view.activatedSnapshot).toMatchObject({
+      id: directView.activatedSnapshot!.id,
+      providerId: savedProvider.id,
+      model: directModel,
+    })
+    expect(sensitiveDigest(await readFile(configPath))).toBe(sensitiveDigest(directConfigBytes))
+
+    const immutableDatabase = new Database(databasePath, { readonly: true })
+    const immutableSnapshot = immutableDatabase.query(`SELECT id, provider_id AS providerId,
+      base_url AS baseUrl, model, provider_bearer_token = ? AS providerCredentialMatches
+      FROM activated_snapshots WHERE target = 'codex'`).get(providerSecret) as Record<string, unknown>
+    const editedDeclaration = immutableDatabase.query(`SELECT id, base_url AS baseUrl, model
+      FROM providers WHERE id = ?`).get(savedProvider.id) as Record<string, unknown>
+    immutableDatabase.close()
+    expect(immutableSnapshot).toMatchObject({
+      id: directView.activatedSnapshot!.id,
+      providerId: savedProvider.id,
+      baseUrl: upstream.baseUrl,
+      model: directModel,
+      providerCredentialMatches: 1,
+    })
+    expect(editedDeclaration).toMatchObject({
+      id: savedProvider.id,
+      baseUrl: `${upstream.baseUrl}/edited`,
+      model: editedModel,
+    })
+    expect(session.get().takeover.endpoint).toBeNull()
+    expect(upstream.calls.length === 0).toBeTrue()
+
+    await closeControlPlane()
+    await waitForCleanServiceExit(firstService, "Direct Routing Service idle exit")
+
+    const restartedService = await startService()
+    client = await connect("direct-e2e-restart")
+    session = await client.openTarget("codex")
+    const restartedView = session.get()
+    views.push(restartedView as TargetView)
+    expect(restartedView).toMatchObject({
+      managementRevision: updateOutcome.view.managementRevision,
+      mode: "direct",
+      takeover: { state: "inactive", endpoint: null },
+      currentProviderId: savedProvider.id,
+      servingProviderId: null,
+      managedConfiguration: { state: "applied", path: configPath, restartRequired: true },
+      activatedSnapshot: {
+        id: directView.activatedSnapshot!.id,
+        providerId: savedProvider.id,
+        model: directModel,
+      },
+    })
+    expect(restartedView.service.epoch === directView.service.epoch).toBeFalse()
+    unsubscribe = session.subscribe((view) => views.push(view))
+    setup = await testRender(() => <App session={session!} />, {
+      width: 80,
+      height: 24,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    rendererAudit = createRendererAudit(setup)
+    rendererAudit.start()
+    await setup.renderOnce()
+    await setup.mockInput.typeText("/codex")
+    setup.mockInput.pressEnter()
+    const restartedFrame = await setup.waitForFrame((frame) =>
+      frame.includes("Mode       Direct")
+      && frame.includes("Current Target Provider  Direct Provider Edited")
+      && frame.includes(`Activated Snapshot  Direct Provider Edited · ${directModel}`)
+      && frame.includes("Restart Codex to use the managed configuration.")
+    )
+    selectedRenderedFrames.push(restartedFrame)
+    activitySurfaces.push("Restart Codex to use the managed configuration.")
+    expect(restartedView.takeover.endpoint).toBeNull()
+    expect(sensitiveDigest(await readFile(configPath))).toBe(sensitiveDigest(directConfigBytes))
+    expect((await stat(configPath)).mode & 0o777).toBe(originalConfigMode)
+    expect(await safeFileFingerprint(authPath)).toEqual(authFingerprint)
+    expect(upstream.calls.length === 0).toBeTrue()
+
+    await closeControlPlane()
+    await waitForCleanServiceExit(restartedService, "restarted Direct Routing Service idle exit")
+
+    await upstream.quiesce()
+    requestAudit.assertComplete(upstream.calls.length)
+    expect(upstream.calls.length === 0).toBeTrue()
+    const receiptDatabase = new Database(databasePath, { readonly: true })
+    const receipts = receiptDatabase.query(`SELECT action_kind AS actionKind,
+      outcome_json AS outcomeJson FROM action_receipts ORDER BY committed_revision, action_id`).all()
+    const finalRoute = receiptDatabase.query(`SELECT takeover_state AS takeoverState,
+      route_port IS NULL AS routePortAbsent,
+      routing_credential IS NULL AS routingCredentialAbsent
+      FROM target_route_state WHERE target = 'codex'`).get()
+    receiptDatabase.close()
+    expect(receipts.some((receipt) => (receipt as { actionKind: string }).actionKind === "activate-provider")).toBeTrue()
+    expect(finalRoute).toEqual({
+      takeoverState: "inactive",
+      routePortAbsent: 1,
+      routingCredentialAbsent: 1,
+    })
+    for (const audit of outboundAudits) audit.finish()
+    expect(outboundOperationKinds.some((kind) =>
+      kind === "discover-models" || kind === "check-reachability"
+    )).toBeFalse()
+    const secrets = [providerSecret, wrongRoutingSecret, authSentinel]
+    scanRawRpcFramesNoSecrets(rpcStreams, secrets)
+    scanNoSecrets(
+      [decodedInboundFrames, receipts, views, activitySurfaces, selectedRenderedFrames, nativeRenderedFrames],
+      secrets,
+      "direct-inbound-and-rendered-surfaces",
+    )
+    scanProcessOutputNoSecrets(services.map(({ output }) => output.streams).flat(), secrets)
+  } finally {
+    rendererAudit?.stop()
+    if (setup && !setup.renderer.isDestroyed) setup.renderer.destroy()
+    unsubscribe?.()
+    await session?.close().catch(() => {})
+    await client?.close().catch(() => {})
+    for (const { child } of services) {
+      if (child.exitCode === null) child.kill("SIGKILL")
+    }
+    await Promise.all(services.map(({ output }) => output.completed.catch(() => undefined)))
+    await upstream.stop()
+  }
 })
 
 test("real processes prove the complete Target Provider workflow without leaking secrets or mutating inspections", async () => {

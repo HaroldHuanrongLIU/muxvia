@@ -19,6 +19,7 @@ import { ProviderPicker } from "./provider-picker"
 import { ProviderSourcePicker, type ProviderSource } from "./provider-source-picker"
 import { TargetSidebar } from "./target-sidebar"
 import { TargetView, type ActivityEntry } from "./target-view"
+import { TakeoverRequiredConfirm } from "./takeover-required-confirm"
 
 export type ShellRoute =
   | { kind: "home" }
@@ -139,7 +140,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     result?: ReachabilityResult
     errorCategory?: InspectionCategory
   }>()
-  const [applying, setApplying] = createSignal(false)
+  const [applying, setApplying] = createSignal<"direct" | "takeover">()
   const [notice, setNotice] = createSignal<Notice>()
   const [activities, setActivities] = createSignal<ActivityEntry[]>([])
   const [sidebarOpen, setSidebarOpen] = createSignal(true)
@@ -342,8 +343,10 @@ function Shell(props: { session: TargetSession; t: Translator }) {
       providerPickerScheduled = false
       if (disposed || saving() || providerMutationPending()) return
       setNotice()
-      const first = view().providers[0]
-      setSelectedProviderId((current) => view().providers.some((provider) => provider.id === current) ? current : first?.id)
+      const preferred = view().providers.find((provider) => provider.id === view().currentProviderId) ?? view().providers[0]
+      setSelectedProviderId((selected) => view().providers.some((provider) => provider.id === selected)
+        ? selected
+        : preferred?.id)
       overlay.replace({
         id: "provider-picker",
         render: () => <ProviderPicker
@@ -357,6 +360,11 @@ function Shell(props: { session: TargetSession; t: Translator }) {
             if (!provider || providerMutationPending()) return
             overlay.closeTop()
             openEditor("edit", provider)
+          }}
+          onActivateDirect={() => {
+            const provider = selectedProvider()
+            if (!provider || applying()) return
+            void activateProvider(provider.id, "direct")
           }}
           onDuplicate={() => requestDuplicate()}
           reachability={() => {
@@ -487,43 +495,91 @@ function Shell(props: { session: TargetSession; t: Translator }) {
     })
   }
 
-  const applyTakeover = async () => {
+  const openTakeoverConfirmation = (providerId: string, providerName: string) => {
+    overlay.push({
+      id: "takeover-required-confirm",
+      dismissOnEscape: false,
+      render: () => <TakeoverRequiredConfirm
+        providerName={providerName}
+        t={props.t}
+        onConfirm={() => {
+          overlay.closeTop()
+          void activateProvider(providerId, "takeover")
+        }}
+        onCancel={() => overlay.closeTop()}
+      />,
+    })
+  }
+
+  const showActivationProblem = (code: string) => {
+    const activity = actionProblem({ code })
+    appendActivity(activity)
+    setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) })
+  }
+
+  const activateProvider = async (providerId: string, mode: "direct" | "takeover") => {
     if (applying()) return
-    const current = view().providers.find((provider) => provider.id === view().currentProviderId)
-    const visible = current ?? view().providers[0]
-    if (!visible) {
-      const activity: ActivityDraft = { kind: "warning", messageKey: "activity.provider.required" }
-      appendActivity(activity)
-      setNotice({ kind: "error", text: props.t(activity.messageKey) })
+    const provider = view().providers.find((candidate) => candidate.id === providerId)
+    if (!provider) {
+      showActivationProblem("missing-provider")
       return
     }
-    const providerName = visible.name
-    setApplying(true)
+    if (mode === "direct" && provider.completeness === "incomplete") {
+      showActivationProblem("incomplete-provider")
+      return
+    }
+    if (mode === "direct" && provider.routingRequirement === "takeover-required") {
+      openTakeoverConfirmation(provider.id, provider.name)
+      return
+    }
+    const providerName = provider.name
+    setApplying(mode)
     setNotice()
     try {
       const outcome = await props.session.act({
         kind: "activate-provider",
-        providerId: visible.id,
-        mode: "takeover",
+        providerId,
+        mode,
       })
       if (disposed || exiting) return
       installView(outcome.view, "action")
       const activity: ActivityDraft = {
         kind: "success",
-        messageKey: "activity.takeover.applied",
+        messageKey: mode === "direct" ? "activity.direct.applied" : "activity.takeover.applied",
         values: { name: providerName },
       }
       appendActivity(activity)
       setNotice({ kind: "success", text: props.t(activity.messageKey, activity.values) })
     } catch (error) {
       if (disposed || exiting) return
-      installView(props.session.get() as TargetViewProjection, "action")
+      const authoritative = props.session.get() as TargetViewProjection
+      installView(authoritative, "action")
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? String(error.code)
+        : "internal-failure"
+      if (mode === "direct" && code === "takeover-required") {
+        const authoritativeProvider = authoritative.providers.find((candidate) => candidate.id === providerId)
+        openTakeoverConfirmation(providerId, authoritativeProvider?.name ?? providerName)
+        return
+      }
       const activity = actionProblem(error)
       appendActivity(activity)
       setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) })
     } finally {
-      if (!disposed && !exiting) setApplying(false)
+      if (!disposed && !exiting) setApplying()
     }
+  }
+
+  const applyDefaultProvider = (mode: "direct" | "takeover") => {
+    const current = view().providers.find((provider) => provider.id === view().currentProviderId)
+    const provider = current ?? view().providers[0]
+    if (!provider) {
+      const activity: ActivityDraft = { kind: "warning", messageKey: "activity.provider.required" }
+      appendActivity(activity)
+      setNotice({ kind: "error", text: props.t(activity.messageKey) })
+      return
+    }
+    void activateProvider(provider.id, mode)
   }
 
   useCommandLayer({
@@ -556,7 +612,8 @@ function Shell(props: { session: TargetSession; t: Translator }) {
         openProviderSourcePicker()
       },
       "provider.list": openProviderPicker,
-      "target.takeover.apply": () => { void applyTakeover() },
+      "target.direct.apply": () => applyDefaultProvider("direct"),
+      "target.takeover.apply": () => applyDefaultProvider("takeover"),
     },
   })
   useCommandLayer({
@@ -636,7 +693,7 @@ function Shell(props: { session: TargetSession; t: Translator }) {
               placeholder={props.t("prompt.target")}
               focusEnabled={() => overlay.depth === 0}
               metadata={applying()
-                ? props.t("activity.applying")
+                ? props.t(applying() === "direct" ? "activity.direct.applying" : "activity.applying")
                 : `${props.t("prompt.meta.codex")} · ${props.t("prompt.hint.sidebar")} · ${props.t("prompt.hint.back")} · ${props.t("prompt.hint.exit")}`}
               onUnknown={unknownCommand}
             />

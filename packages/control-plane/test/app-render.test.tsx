@@ -630,6 +630,153 @@ test("saves a masked Provider, applies its visible identity, and follows pushed 
   }
 })
 
+test("Codex Direct Activation chooses Current or first and renders one restart-guided success", async () => {
+  const first = provider({ id: "provider-first", name: "First Provider" })
+  const current = provider({ id: "provider-current", position: 1, name: "Current Provider" })
+  for (const testCase of [
+    { currentProviderId: current.id, expected: current, invocation: "slash" },
+    { currentProviderId: null, expected: first, invocation: "leader" },
+  ] as const) {
+    const initial = view({
+      managementRevision: 1,
+      viewSequence: 1,
+      providers: [first, current],
+      currentProviderId: testCase.currentProviderId,
+    })
+    const direct = view({
+      ...initial,
+      managementRevision: 2,
+      viewSequence: 2,
+      mode: "direct",
+      currentProviderId: testCase.expected.id,
+      managedConfiguration: { state: "managed", path: "/tmp/home/.codex/config.toml", restartRequired: true },
+      activatedSnapshot: {
+        id: snapshotId,
+        providerId: testCase.expected.id,
+        model: testCase.expected.model,
+        epoch: snapshotEpoch,
+      },
+    })
+    const session = new MemoryTargetSession(initial, async () => ({ status: "applied", view: direct }))
+    const setup = await testRender(() => <App session={session} />, { width: 80, height: 30, useThread: false, kittyKeyboard: true })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("1")
+      await setup.renderOnce()
+      if (testCase.invocation === "slash") {
+        await setup.mockInput.typeText("/direct")
+        setup.mockInput.pressEnter()
+      } else {
+        setup.mockInput.pressKey("x", { ctrl: true })
+        setup.mockInput.pressKey("d")
+      }
+
+      await setup.waitFor(() => session.actions.length === 1)
+      const frame = await setup.waitForFrame((next) => next.includes(`Direct Activation applied: ${testCase.expected.name}`))
+      expect(session.actions).toEqual([{
+        kind: "activate-provider",
+        providerId: testCase.expected.id,
+        mode: "direct",
+      }])
+      expect(frame.match(/Direct Activation applied:/g)?.length).toBe(1)
+      expect(frame).toContain("Mode       Direct")
+      expect(frame).toContain("Restart Codex to use the managed configuration.")
+      expect(frame).not.toContain(credentialSentinel)
+      expect(frame).not.toContain(problemMessageSentinel)
+    } finally {
+      setup.renderer.destroy()
+    }
+  }
+})
+
+test("a pending Direct Activation is labeled as Direct rather than Takeover", async () => {
+  const pending = deferred<ActionOutcome>()
+  const initial = view({ providers: [provider()] })
+  const session = new MemoryTargetSession(initial, async () => await pending.promise)
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/direct")
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 1)
+    const frame = await setup.waitForFrame((next) => next.includes("Applying Direct Activation…"))
+
+    expect(frame).not.toContain("Applying Target Takeover…")
+    expect(frame).not.toContain(credentialSentinel)
+  } finally {
+    pending.resolve({ status: "applied", view: initial })
+    setup.renderer.destroy()
+  }
+})
+
+test("Direct preflight requires a complete Provider without sending an action", async () => {
+  for (const testCase of [
+    {
+      initial: view(),
+      expected: "Create a Provider before applying a managed configuration.",
+    },
+    {
+      initial: view({
+        providers: [provider({
+          credential: "missing",
+          completeness: "incomplete",
+          missingFields: ["credential"],
+        })],
+      }),
+      expected: "Complete the required Provider fields and retry.",
+    },
+  ]) {
+    const session = new MemoryTargetSession(testCase.initial)
+    const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("1")
+      await setup.mockInput.typeText("/direct")
+      setup.mockInput.pressEnter()
+      const frame = await setup.waitForFrame((next) => next.includes(testCase.expected))
+      expect(session.actions).toEqual([])
+      expect(frame).not.toContain(credentialSentinel)
+    } finally {
+      setup.renderer.destroy()
+    }
+  }
+})
+
+test("a failed Direct Activation installs the authoritative view and localizes stable codes", async () => {
+  const initialProvider = provider({ id: "provider-1", name: "Before" })
+  const authoritative = view({
+    managementRevision: 2,
+    viewSequence: 2,
+    providers: [{ ...initialProvider, name: "Authoritative Provider" }],
+    currentProviderId: initialProvider.id,
+  })
+  let session!: MemoryTargetSession
+  session = new MemoryTargetSession(view({
+    managementRevision: 1,
+    viewSequence: 1,
+    providers: [initialProvider],
+  }), async () => {
+    session.setAuthoritative(authoritative)
+    throw { code: "takeover-active", message: problemMessageSentinel }
+  })
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/direct")
+    setup.mockInput.pressEnter()
+    const frame = await setup.waitForFrame((next) => next.includes("Disable Target Takeover before using Direct Activation."))
+
+    expect(frame).toContain("Current Target Provider  Authoritative Provider")
+    expect(frame.match(/Disable Target Takeover before using Direct Activation\./g)?.length).toBe(1)
+    expect(frame).not.toContain(problemMessageSentinel)
+    expect(frame).not.toContain(credentialSentinel)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
 test("invalid Provider guidance clears the credential without echoing it", async () => {
   const initial = view()
   const session = new MemoryTargetSession(initial, async () => {

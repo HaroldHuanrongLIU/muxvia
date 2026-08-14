@@ -36,7 +36,41 @@ test("stable backend codes map to localized copy without backend messages", () =
   const t = createTranslator("zh-CN")
 
   expect(t(messageKeyForProblem("stale-revision"))).toContain("状态")
+  expect(t(messageKeyForProblem("takeover-required"))).toBe("此 Provider 需要 Target Takeover。")
+  expect(t(messageKeyForProblem("takeover-active"))).toBe("使用直接激活前，请先停用 Target Takeover。")
   expect(messageKeyForProblem("unrecognized-code")).toBe("error.generic")
+})
+
+test("Direct Activation and Takeover confirmation copy is complete in both locales", () => {
+  const en = createTranslator("en")
+  const zhCN = createTranslator("zh-CN")
+
+  expect([
+    en("command.direct.apply"),
+    en("activity.direct.applied", { name: "Provider" }),
+    en("takeover-required.title"),
+    en("takeover-required.confirm"),
+    en("takeover-required.cancel"),
+  ]).toEqual([
+    "Apply Direct Activation",
+    "Direct Activation applied: Provider",
+    "Enable Target Takeover?",
+    "Enable Takeover",
+    "Cancel",
+  ])
+  expect([
+    zhCN("command.direct.apply"),
+    zhCN("activity.direct.applied", { name: "Provider" }),
+    zhCN("takeover-required.title"),
+    zhCN("takeover-required.confirm"),
+    zhCN("takeover-required.cancel"),
+  ]).toEqual([
+    "应用直接激活",
+    "已直接激活：Provider",
+    "启用 Target Takeover？",
+    "启用 Takeover",
+    "取消",
+  ])
 })
 
 test("interpolation preserves operator values verbatim", () => {

@@ -16,6 +16,7 @@ export interface ProviderPickerProps {
   pending: Accessor<boolean>
   onSelectedIdChange: (id: string) => void
   onEdit: () => void
+  onActivateDirect: () => void
   onDuplicate: () => void
   reachability: Accessor<{
     pending: boolean
@@ -45,6 +46,7 @@ export function ProviderPicker(props: ProviderPickerProps) {
     enabled: () => overlay.depth === 1,
     handlers: {
       "provider.edit": props.onEdit,
+      "provider.activate.direct": props.onActivateDirect,
       "provider.duplicate": props.onDuplicate,
       "provider.reachability.check": props.onCheckReachability,
       "provider.move-up": () => props.onMove(-1),

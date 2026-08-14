@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import type { InputRenderable } from "@opentui/core"
 import { testRender } from "@opentui/solid"
 
 import { MuxviaKeymapProvider, useMuxviaKeymap } from "../src/commands/keymap"
@@ -687,6 +688,154 @@ test("duplicate without a source credential opens directly with an explicit with
       kind: "duplicate-provider",
       credential: { kind: "without" },
     })
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Provider Direct Activation defaults to Current and dispatches the selected row exact identity", async () => {
+  const first = provider({ id: "00000000-0000-4000-8000-000000000011", name: "First Provider" })
+  const second = provider({ id: "00000000-0000-4000-8000-000000000012", position: 1, name: "Second Provider" })
+  for (const testCase of [
+    { currentProviderId: second.id, moveDown: false, expectedId: second.id },
+    { currentProviderId: first.id, moveDown: true, expectedId: second.id },
+  ]) {
+    const initial = view({ providers: [first, second], currentProviderId: testCase.currentProviderId })
+    const session = new MemoryTargetSession(initial, async () => ({ status: "applied", view: initial }))
+    const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("1")
+      await setup.mockInput.typeText("/providers")
+      setup.mockInput.pressEnter()
+      await setup.waitForFrame((frame) => frame.includes("First Provider") && frame.includes("Second Provider"))
+      if (testCase.moveDown) setup.mockInput.pressKey("down")
+      setup.mockInput.pressKey("x", { ctrl: true })
+      setup.mockInput.pressKey("a")
+      await setup.waitFor(() => session.actions.length === 1)
+
+      expect(session.actions).toEqual([{
+        kind: "activate-provider",
+        providerId: testCase.expectedId,
+        mode: "direct",
+      }])
+      expect(setup.captureCharFrame()).not.toContain(credentialSecret)
+      expect(JSON.stringify(session.actions)).not.toContain(credentialSecret)
+    } finally {
+      setup.renderer.destroy()
+    }
+  }
+})
+
+test("a Takeover-required Provider offers only Takeover or cancel with scoped single dispatch", async () => {
+  const selected = provider({
+    id: "00000000-0000-4000-8000-000000000011",
+    name: "Bridge Provider",
+    routingRequirement: "takeover-required",
+  })
+  const initial = view({ providers: [selected], currentProviderId: selected.id })
+  const session = new MemoryTargetSession(initial, async () => ({ status: "applied", view: initial }))
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Bridge Provider"))
+    const pickerFocus = setup.renderer.currentFocusedRenderable as InputRenderable
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("a")
+    const confirmation = await setup.waitForFrame((frame) => frame.includes("Enable Target Takeover?"))
+    expect(confirmation).toContain("Bridge Provider requires Target Takeover for activation.")
+    expect(confirmation).toContain("Enable Takeover")
+    expect(confirmation).toContain("Cancel")
+    expect(confirmation).not.toContain(credentialSecret)
+    expect(session.actions).toEqual([])
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("d")
+    setup.mockInput.pressEscape()
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    await setup.renderOnce()
+    expect(session.actions).toEqual([])
+    expect(setup.captureCharFrame()).toContain("Providers")
+    const restoredFocus = setup.renderer.currentFocusedRenderable as InputRenderable
+    expect(pickerFocus.isDestroyed).toBeTrue()
+    expect(restoredFocus.isDestroyed).toBeFalse()
+    expect(restoredFocus.placeholder).toBe("Navigate Providers")
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("a")
+    await setup.waitForFrame((frame) => frame.includes("Enable Target Takeover?"))
+    setup.mockInput.pressKey("y")
+    setup.mockInput.pressKey("y")
+    await setup.waitFor(() => session.actions.length === 1)
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    setup.mockInput.pressKey("y")
+    await setup.renderOnce()
+
+    expect(session.actions).toEqual([{
+      kind: "activate-provider",
+      providerId: selected.id,
+      mode: "takeover",
+    }])
+    expect(JSON.stringify(session.actions)).not.toContain(credentialSecret)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("authoritative takeover-required opens the same confirmation without retaining its error", async () => {
+  const selected = provider({
+    id: "00000000-0000-4000-8000-000000000011",
+    name: "Changed Requirement Provider",
+    routingRequirement: "direct-compatible",
+  })
+  const authoritative = view({
+    managementRevision: 2,
+    viewSequence: 2,
+    providers: [{ ...selected, routingRequirement: "takeover-required" }],
+    currentProviderId: selected.id,
+  })
+  let attempts = 0
+  let session!: MemoryTargetSession
+  session = new MemoryTargetSession(view({ providers: [selected] }), async () => {
+    attempts++
+    if (attempts === 1) {
+      session.setView(authoritative)
+      throw { code: "takeover-required", message: "backend-takeover-secret-must-not-render" }
+    }
+    return { status: "applied", view: authoritative }
+  })
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Changed Requirement Provider"))
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("a")
+    const confirmation = await setup.waitForFrame((frame) => frame.includes("Enable Target Takeover?"))
+
+    expect(session.actions).toEqual([{
+      kind: "activate-provider",
+      providerId: selected.id,
+      mode: "direct",
+    }])
+    expect(confirmation).not.toContain("backend-takeover-secret-must-not-render")
+    expect(confirmation).not.toContain("Action failed")
+    expect(confirmation).not.toContain(credentialSecret)
+
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 2)
+    expect(session.actions[1]).toEqual({
+      kind: "activate-provider",
+      providerId: selected.id,
+      mode: "takeover",
+    })
+    expect(JSON.stringify(session.actions)).not.toContain("backend-takeover-secret-must-not-render")
   } finally {
     setup.renderer.destroy()
   }

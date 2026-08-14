@@ -42,6 +42,8 @@ const problemMessageKeys = new Map<string, MessageKey>([
   ["unsupported-configuration-home", "error.unsupported-configuration-home"],
   ["configuration-collision", "error.configuration-collision"],
   ["configuration-write-failed", "error.configuration-write-failed"],
+  ["takeover-required", "error.takeover-required"],
+  ["takeover-active", "error.takeover-active"],
   ["internal-failure", "error.internal-failure"],
 ])
 

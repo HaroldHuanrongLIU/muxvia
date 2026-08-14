@@ -241,6 +241,28 @@ test("leader sequence resolves the scoped sidebar command", async () => {
   }
 })
 
+test("slash and leader resolve one exact Codex Direct Activation command", async () => {
+  const executed: string[] = []
+  const setup = await commandHarness({
+    handlers: { "target.direct.apply": () => executed.push("target.direct.apply") } as Handlers,
+    onDispatch: () => {},
+    scope: "codex",
+  })
+  try {
+    expect(resolveSlash("/direct", "codex")).toBe("target.direct.apply")
+    expect(resolveSlash("/direct", "claude")).toBeUndefined()
+
+    setup.keymap.dispatchCommand(resolveSlash("/direct", "codex")!)
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("d")
+    await setup.renderOnce()
+
+    expect(executed).toEqual(["target.direct.apply", "target.direct.apply"])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
 test("slash commands reject names outside the active scope", () => {
   expect(resolveSlash("/provider", "claude")).toBeUndefined()
 })

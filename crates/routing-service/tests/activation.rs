@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fmt, fs,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -29,6 +29,8 @@ use muxvia_routing::{
     state::StateStore,
 };
 use tempfile::TempDir;
+use tokio_rusqlite::rusqlite::OptionalExtension;
+use toml_edit::DocumentMut;
 use uuid::Uuid;
 
 struct GoodProbe(AtomicUsize);
@@ -99,6 +101,19 @@ struct Fixture {
     probe: Arc<GoodProbe>,
 }
 
+#[derive(PartialEq, Eq)]
+struct MutationFingerprint {
+    sqlite: Vec<u8>,
+    config: Option<Vec<u8>>,
+    auth: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for MutationFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MutationFingerprint(<redacted>)")
+    }
+}
+
 impl Fixture {
     async fn new() -> Self {
         let temp = TempDir::new().unwrap();
@@ -162,6 +177,24 @@ impl Fixture {
             .unwrap();
     }
 
+    async fn mutate_provider_credential(&self, provider_id: Uuid, credential: &str) {
+        let database = tokio_rusqlite::Connection::open(self.home.database_path())
+            .await
+            .unwrap();
+        let credential = credential.to_owned();
+        database
+            .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                connection.execute(
+                    "UPDATE credentials SET bearer_token = ?1
+                     WHERE id = (SELECT credential_id FROM providers WHERE id = ?2)",
+                    (credential, provider_id.to_string()),
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
     async fn count(&self, table: &'static str) -> u64 {
         let database = tokio_rusqlite::Connection::open(self.home.database_path())
             .await
@@ -207,6 +240,107 @@ impl Fixture {
             .await
             .unwrap();
     }
+
+    async fn set_provider_routing_requirement(&self, provider_id: Uuid, requirement: &str) {
+        let database = tokio_rusqlite::Connection::open(self.home.database_path())
+            .await
+            .unwrap();
+        let requirement = requirement.to_owned();
+        database
+            .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                connection.execute(
+                    "UPDATE providers SET routing_requirement = ?1 WHERE id = ?2",
+                    (requirement, provider_id.to_string()),
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn set_recovery_required(&self) {
+        let database = tokio_rusqlite::Connection::open(self.home.database_path())
+            .await
+            .unwrap();
+        database
+            .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                connection.execute(
+                    "UPDATE target_route_state SET recovery_state = 'recovery-required' WHERE target = 'codex'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn mutation_fingerprint(&self) -> MutationFingerprint {
+        let database = tokio_rusqlite::Connection::open(self.home.database_path())
+            .await
+            .unwrap();
+        let sqlite = database
+            .call(|connection| -> tokio_rusqlite::rusqlite::Result<Vec<u8>> {
+                let queries = [
+                    "SELECT id,target,position,provider_revision,name,base_url,model,protocol,credential_id,provenance_kind,provenance_key,generated_owner_id,routing_requirement FROM providers ORDER BY id",
+                    "SELECT id,target,bearer_token FROM credentials ORDER BY id",
+                    "SELECT target,management_revision,view_sequence,current_provider_id,serving_provider_id,takeover_state,route_port,routing_credential,activated_snapshot_id,managed_config_path,recovery_state FROM target_route_state ORDER BY target",
+                    "SELECT id,target,provider_id,base_url,model,provider_bearer_token,epoch FROM activated_snapshots ORDER BY id",
+                    "SELECT action_id,action_kind,committed_revision,outcome_json FROM action_receipts ORDER BY action_id",
+                    "SELECT id,target,action_id,config_path,file_identity_json,before_owned_json,desired_owned_json,state,created_revision FROM activation_recovery ORDER BY id",
+                    "SELECT target,code,message FROM target_problems ORDER BY target,code",
+                ];
+                let mut fingerprint = Vec::new();
+                for query in queries {
+                    fingerprint.extend_from_slice(query.as_bytes());
+                    let mut statement = connection.prepare(query)?;
+                    let column_count = statement.column_count();
+                    let mut rows = statement.query([])?;
+                    while let Some(row) = rows.next()? {
+                        for column in 0..column_count {
+                            use tokio_rusqlite::rusqlite::types::ValueRef;
+                            match row.get_ref(column)? {
+                                ValueRef::Null => fingerprint.extend_from_slice(b"null"),
+                                ValueRef::Integer(value) => fingerprint
+                                    .extend_from_slice(value.to_string().as_bytes()),
+                                ValueRef::Real(value) => fingerprint
+                                    .extend_from_slice(value.to_bits().to_string().as_bytes()),
+                                ValueRef::Text(value) | ValueRef::Blob(value) => {
+                                    fingerprint.extend_from_slice(value)
+                                }
+                            }
+                            fingerprint.push(0);
+                        }
+                        fingerprint.push(b'\n');
+                    }
+                }
+                Ok(fingerprint)
+            })
+            .await
+            .unwrap();
+        MutationFingerprint {
+            sqlite,
+            config: fs::read(self.home.user_home().join(".codex/config.toml")).ok(),
+            auth: fs::read(self.home.user_home().join(".codex/auth.json")).ok(),
+        }
+    }
+
+    async fn recovery_state_for_action(&self, action_id: Uuid) -> Option<String> {
+        let database = tokio_rusqlite::Connection::open(self.home.database_path())
+            .await
+            .unwrap();
+        database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT state FROM activation_recovery WHERE action_id = ?1",
+                        [action_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .optional()
+            })
+            .await
+            .unwrap()
+    }
 }
 
 fn command(provider_id: Uuid, revision: u64, action_id: Uuid) -> ActivateProviderCommand {
@@ -216,6 +350,582 @@ fn command(provider_id: Uuid, revision: u64, action_id: Uuid) -> ActivateProvide
         provider_id,
         mode: ActivationMode::Takeover,
     }
+}
+
+fn direct_action(provider_id: Uuid) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "activate-provider",
+        "providerId": provider_id,
+        "mode": "direct",
+    })
+}
+
+fn takeover_action(provider_id: Uuid) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "activate-provider",
+        "providerId": provider_id,
+        "mode": "takeover",
+    })
+}
+
+async fn assert_direct_pre_mutation_failure(
+    fixture: &Fixture,
+    service: &ActivationService,
+    provider_id: Uuid,
+    revision: u64,
+    expected_code: &str,
+) {
+    let action_id = Uuid::new_v4();
+    let before = fixture.mutation_fingerprint().await;
+    let endpoint_before = service.model_endpoint().await;
+    let mut updates = fixture.store.subscribe_target_views();
+    let failure = service
+        .apply_raw(action_id, revision, direct_action(provider_id))
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.problem.code, expected_code);
+    assert_eq!(
+        fixture.mutation_fingerprint().await,
+        before,
+        "pre-mutation Direct failure changed protected state"
+    );
+    assert_eq!(service.model_endpoint().await, endpoint_before);
+    assert!(fixture.store.receipt(action_id).await.unwrap().is_none());
+    assert!(updates.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn direct_activation_commits_config_snapshot_and_receipt_without_model_route() {
+    let fixture = Fixture::new().await;
+    let config_home = fixture.home.user_home().join(".codex");
+    fs::create_dir_all(&config_home).unwrap();
+    fs::write(
+        config_home.join("config.toml"),
+        "# operator-owned\napproval_policy = \"never\"\n",
+    )
+    .unwrap();
+    let auth_path = config_home.join("auth.json");
+    let auth_before = br#"{"tokens":"auth-sentinel-must-not-change"}"#;
+    fs::write(&auth_path, auth_before).unwrap();
+    let provider_secret = "provider-secret-must-not-escape";
+    let (provider_id, revision) = fixture.save("Direct", "gpt-direct", provider_secret).await;
+    let observer = Arc::new(Steps::default());
+    let service = fixture.service(ActivationHooks::observed(observer.clone()));
+    let action_id = Uuid::new_v4();
+    let mut updates = fixture.store.subscribe_target_views();
+
+    let outcome = service
+        .apply_raw(action_id, revision, direct_action(provider_id))
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ActionStatus::Applied);
+    assert_eq!(outcome.view.management_revision, revision + 1);
+    assert_eq!(outcome.view.view_sequence, revision + 1);
+    assert_eq!(
+        outcome.view.current_provider_id.as_deref(),
+        Some(provider_id.to_string().as_str())
+    );
+    assert!(outcome.view.serving_provider_id.is_none());
+    assert_eq!(outcome.view.mode, "direct");
+    assert_eq!(outcome.view.takeover.state, "inactive");
+    assert!(outcome.view.takeover.endpoint.is_none());
+    assert_eq!(outcome.view.managed_configuration.state, "applied");
+    assert_eq!(
+        outcome.view.managed_configuration.path.as_deref(),
+        Some(config_home.join("config.toml").to_string_lossy().as_ref())
+    );
+    assert!(outcome.view.managed_configuration.restart_required);
+    let snapshot = outcome.view.activated_snapshot.as_ref().unwrap();
+    assert_eq!(snapshot.provider_id, provider_id);
+    assert_eq!(snapshot.model, "gpt-direct");
+    assert_eq!(snapshot.epoch, fixture.store.service_epoch());
+    assert_eq!(
+        observer.0.lock().unwrap().as_slice(),
+        &[
+            ActivationStep::Validate,
+            ActivationStep::Snapshot,
+            ActivationStep::RecoveryIntent,
+            ActivationStep::AtomicConfigWrite,
+            ActivationStep::ConfigVerify,
+            ActivationStep::StateAndReceiptCommit,
+            ActivationStep::PublishView,
+        ]
+    );
+
+    let config_before_replay = fs::read_to_string(config_home.join("config.toml")).unwrap();
+    let config = config_before_replay.parse::<DocumentMut>().unwrap();
+    assert_eq!(config["model"].as_str(), Some("gpt-direct"));
+    assert_eq!(config["model_provider"].as_str(), Some("muxvia_codex"));
+    assert_eq!(config["approval_policy"].as_str(), Some("never"));
+    let provider = &config["model_providers"]["muxvia_codex"];
+    assert_eq!(provider["name"].as_str(), Some("Muxvia Direct"));
+    assert_eq!(
+        provider["base_url"].as_str(),
+        Some("https://upstream.example/v1")
+    );
+    assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+    assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
+    assert!(
+        provider["http_headers"]["Authorization"].as_str()
+            == Some("Bearer provider-secret-must-not-escape"),
+        "Direct Authorization did not match the saved Provider credential"
+    );
+    assert!(
+        fs::read(&auth_path).unwrap() == auth_before,
+        "Direct activation changed Codex authentication state"
+    );
+    assert!(fixture.store.routing_credential().await.unwrap().is_none());
+    assert!(service.model_endpoint().await.is_none());
+    assert_eq!(fixture.count("activated_snapshots").await, 1);
+    assert_eq!(fixture.count("activation_recovery").await, 1);
+    assert_eq!(fixture.count("action_receipts").await, 2);
+
+    let published = updates.recv().await.unwrap();
+    assert_eq!(published, outcome.view);
+    assert!(updates.try_recv().is_err());
+    let steps_before_replay = observer.0.lock().unwrap().len();
+    let probe_before_replay = fixture.probe.0.load(Ordering::SeqCst);
+    let replay = service
+        .apply_raw(action_id, u64::MAX, serde_json::json!({"malformed": true}))
+        .await
+        .unwrap();
+    assert_eq!(replay.status, ActionStatus::Replayed);
+    assert_eq!(replay.view, outcome.view);
+    assert_eq!(observer.0.lock().unwrap().len(), steps_before_replay);
+    assert_eq!(fixture.probe.0.load(Ordering::SeqCst), probe_before_replay);
+    assert!(
+        fs::read_to_string(config_home.join("config.toml")).unwrap() == config_before_replay,
+        "receipt-first replay changed Managed Configuration"
+    );
+    assert_eq!(fixture.count("activated_snapshots").await, 1);
+    assert_eq!(fixture.count("activation_recovery").await, 1);
+    assert_eq!(fixture.count("action_receipts").await, 2);
+    assert!(updates.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn direct_activation_validation_failures_are_authoritative_and_pre_mutation() {
+    for case in [
+        "takeover-required",
+        "incomplete",
+        "stale",
+        "recovery",
+        "unsupported-home",
+        "incompatible",
+        "collision",
+        "symlink",
+    ] {
+        let fixture = Fixture::new().await;
+        let config_home = fixture.home.user_home().join(".codex");
+        fs::create_dir_all(&config_home).unwrap();
+        if case != "symlink" {
+            fs::write(
+                config_home.join("config.toml"),
+                "approval_policy = \"never\"\n",
+            )
+            .unwrap();
+        }
+        fs::write(
+            config_home.join("auth.json"),
+            br#"{"tokens":"pre-mutation-auth-sentinel"}"#,
+        )
+        .unwrap();
+        let (provider_id, revision) = fixture.save("Direct", "gpt", "provider-secret").await;
+        match case {
+            "takeover-required" => {
+                fixture
+                    .set_provider_routing_requirement(provider_id, "takeover-required")
+                    .await;
+            }
+            "incomplete" => fixture.remove_provider_credential(provider_id).await,
+            "recovery" => fixture.set_recovery_required().await,
+            "collision" => fs::write(
+                config_home.join("config.toml"),
+                "[model_providers.muxvia_codex]\nname = \"operator-owned\"\n",
+            )
+            .unwrap(),
+            "symlink" => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::symlink;
+                    let outside = fixture.home.user_home().join("outside.toml");
+                    fs::write(&outside, "model = \"outside\"\n").unwrap();
+                    symlink(&outside, config_home.join("config.toml")).unwrap();
+                }
+            }
+            _ => {}
+        }
+        let service = match case {
+            "unsupported-home" => fixture
+                .service(ActivationHooks::default())
+                .with_configuration_home_override(Some(fixture.home.user_home().join("elsewhere"))),
+            "incompatible" => ActivationService::new(
+                Arc::clone(&fixture.store),
+                fixture.home.clone(),
+                Arc::new(BadProbe),
+                "/usr/bin/codex".into(),
+                Arc::new(NoopUpstream),
+            ),
+            _ => fixture.service(ActivationHooks::default()),
+        };
+        let expected_revision = if case == "stale" {
+            revision - 1
+        } else {
+            revision
+        };
+        let expected_code = match case {
+            "takeover-required" => "takeover-required",
+            "incomplete" => "incomplete-provider",
+            "stale" => "stale-revision",
+            "recovery" => "recovery-required",
+            "unsupported-home" => "unsupported-configuration-home",
+            "incompatible" => "incompatible-target-cli",
+            "collision" => "configuration-collision",
+            "symlink" => "configuration-write-failed",
+            _ => unreachable!(),
+        };
+
+        assert_direct_pre_mutation_failure(
+            &fixture,
+            &service,
+            provider_id,
+            expected_revision,
+            expected_code,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn direct_activation_rejects_active_takeover_before_mutation() {
+    let fixture = Fixture::new().await;
+    let (takeover_id, revision) = fixture
+        .save("Takeover", "gpt-route", "route-provider")
+        .await;
+    let service = fixture.service(ActivationHooks::default());
+    service
+        .activate(command(takeover_id, revision, Uuid::new_v4()))
+        .await
+        .unwrap();
+    let (direct_id, direct_revision) = fixture
+        .save("Direct", "gpt-direct", "direct-provider")
+        .await;
+
+    assert_direct_pre_mutation_failure(
+        &fixture,
+        &service,
+        direct_id,
+        direct_revision,
+        "takeover-active",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn direct_transitions_verify_the_committed_snapshot_instead_of_the_editable_provider() {
+    let fixture = Fixture::new().await;
+    let config_home = fixture.home.user_home().join(".codex");
+    fs::create_dir_all(&config_home).unwrap();
+    fs::write(
+        config_home.join("config.toml"),
+        "approval_policy = \"never\"\n",
+    )
+    .unwrap();
+    let (first_id, revision) = fixture.save("First", "gpt-first", "first-secret").await;
+    let service = fixture.service(ActivationHooks::default());
+    let first = service
+        .apply_raw(Uuid::new_v4(), revision, direct_action(first_id))
+        .await
+        .unwrap();
+    let first_snapshot_id = first.view.activated_snapshot.unwrap().id;
+    fixture
+        .mutate_provider(
+            first_id,
+            "https://edited-after-activation.invalid/v1",
+            "edited-after-activation",
+        )
+        .await;
+    fixture
+        .mutate_provider_credential(first_id, "edited-first-secret")
+        .await;
+
+    let (second_id, second_revision) = fixture.save("Second", "gpt-second", "second-secret").await;
+    let second = service
+        .apply_raw(Uuid::new_v4(), second_revision, direct_action(second_id))
+        .await
+        .unwrap();
+
+    assert_eq!(second.view.mode, "direct");
+    assert_eq!(
+        second.view.current_provider_id.as_deref(),
+        Some(second_id.to_string().as_str())
+    );
+    assert!(second.view.serving_provider_id.is_none());
+    assert!(second.view.takeover.endpoint.is_none());
+    assert!(fixture.store.routing_credential().await.unwrap().is_none());
+    assert!(service.model_endpoint().await.is_none());
+    assert_eq!(fixture.count("activated_snapshots").await, 2);
+    assert_ne!(
+        second.view.activated_snapshot.as_ref().unwrap().id,
+        first_snapshot_id
+    );
+    let direct_config = fs::read_to_string(config_home.join("config.toml")).unwrap();
+    assert!(direct_config.contains("gpt-second"));
+    assert!(direct_config.contains("https://upstream.example/v1"));
+    assert!(!direct_config.contains("edited-after-activation.invalid"));
+    fixture
+        .mutate_provider(
+            second_id,
+            "https://second-edited.invalid/v1",
+            "second-edited",
+        )
+        .await;
+    fixture
+        .mutate_provider_credential(second_id, "edited-second-secret")
+        .await;
+
+    let (takeover_id, takeover_revision) = fixture
+        .save("Takeover", "gpt-takeover", "takeover-secret")
+        .await;
+    let takeover = service
+        .apply_raw(
+            Uuid::new_v4(),
+            takeover_revision,
+            takeover_action(takeover_id),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(takeover.view.mode, "takeover");
+    assert_eq!(takeover.view.takeover.state, "active");
+    assert!(takeover.view.takeover.endpoint.is_some());
+    assert_eq!(
+        takeover.view.current_provider_id.as_deref(),
+        Some(takeover_id.to_string().as_str())
+    );
+    assert!(fixture.store.routing_credential().await.unwrap().is_some());
+    assert!(service.model_endpoint().await.is_some());
+    assert_eq!(fixture.count("activated_snapshots").await, 3);
+}
+
+#[tokio::test]
+async fn direct_post_intent_failures_restore_exact_prior_state_without_runtime_or_publication() {
+    for (failpoint, expected_code) in [
+        (
+            ActivationFailpoint::AtomicConfigWrite,
+            "configuration-write-failed",
+        ),
+        (
+            ActivationFailpoint::ConfigVerify,
+            "configuration-write-failed",
+        ),
+        (ActivationFailpoint::FinalCommit, "internal-failure"),
+    ] {
+        let fixture = Fixture::new().await;
+        let config_home = fixture.home.user_home().join(".codex");
+        fs::create_dir_all(&config_home).unwrap();
+        let config_before = "# keep\nmodel = \"operator\"\n[features]\nfoo = true\n";
+        fs::write(config_home.join("config.toml"), config_before).unwrap();
+        let auth_before = br#"{"tokens":"rollback-auth-sentinel"}"#;
+        fs::write(config_home.join("auth.json"), auth_before).unwrap();
+        let (provider_id, revision) = fixture
+            .save("Direct", "gpt-direct", "provider-secret")
+            .await;
+        let action_id = Uuid::new_v4();
+        let mut updates = fixture.store.subscribe_target_views();
+        let service = fixture.service(ActivationHooks::failing(failpoint));
+
+        let failure = service
+            .apply_raw(action_id, revision, direct_action(provider_id))
+            .await
+            .unwrap_err();
+
+        assert_eq!(failure.problem.code, expected_code);
+        assert!(
+            fs::read_to_string(config_home.join("config.toml")).unwrap() == config_before,
+            "Direct rollback did not restore exact prior Managed Configuration"
+        );
+        assert!(
+            fs::read(config_home.join("auth.json")).unwrap() == auth_before,
+            "Direct rollback changed Codex authentication state"
+        );
+        let view = fixture.store.target_view().await.unwrap();
+        assert_eq!(view.management_revision, revision);
+        assert_eq!(view.view_sequence, revision);
+        assert_eq!(view.mode, "unmanaged");
+        assert!(view.current_provider_id.is_none());
+        assert!(view.serving_provider_id.is_none());
+        assert!(view.activated_snapshot.is_none());
+        assert_eq!(view.takeover.state, "inactive");
+        assert!(view.takeover.endpoint.is_none());
+        assert!(fixture.store.routing_credential().await.unwrap().is_none());
+        assert!(fixture.store.receipt(action_id).await.unwrap().is_none());
+        assert_eq!(fixture.count("activated_snapshots").await, 0);
+        assert_eq!(
+            fixture
+                .recovery_state_for_action(action_id)
+                .await
+                .as_deref(),
+            Some("rolled-back")
+        );
+        assert!(service.model_endpoint().await.is_none());
+        assert!(updates.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn direct_final_stale_rollback_and_rolled_back_action_retry_preserve_ordering() {
+    let fixture = Fixture::new().await;
+    let config_home = fixture.home.user_home().join(".codex");
+    fs::create_dir_all(&config_home).unwrap();
+    let config_before = "# keep\napproval_policy = \"never\"\n";
+    fs::write(config_home.join("config.toml"), config_before).unwrap();
+    let (provider_id, revision) = fixture
+        .save("Direct", "gpt-direct", "provider-secret")
+        .await;
+    let action_id = Uuid::new_v4();
+    let pause = Arc::new(ActivationPause::default());
+    let service = Arc::new(fixture.service(ActivationHooks::pausing_final_commit(pause.clone())));
+    let mut updates = fixture.store.subscribe_target_views();
+    let activation = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move {
+            service
+                .apply_raw(action_id, revision, direct_action(provider_id))
+                .await
+        })
+    };
+    pause.wait_until_reached().await;
+    let (_, saved_revision) = fixture
+        .save("Concurrent", "gpt-other", "other-secret")
+        .await;
+    pause.release();
+
+    let failure = activation.await.unwrap().unwrap_err();
+    assert_eq!(failure.problem.code, "stale-revision");
+    assert!(
+        fs::read_to_string(config_home.join("config.toml")).unwrap() == config_before,
+        "stale Direct final commit did not restore prior Managed Configuration"
+    );
+    let view = fixture.store.target_view().await.unwrap();
+    assert_eq!(view.management_revision, saved_revision);
+    assert_eq!(view.mode, "unmanaged");
+    assert!(view.current_provider_id.is_none());
+    assert!(view.activated_snapshot.is_none());
+    assert!(fixture.store.receipt(action_id).await.unwrap().is_none());
+    assert_eq!(
+        fixture
+            .recovery_state_for_action(action_id)
+            .await
+            .as_deref(),
+        Some("rolled-back")
+    );
+    assert!(service.model_endpoint().await.is_none());
+    assert!(updates.try_recv().is_err());
+
+    let retry = fixture.service(ActivationHooks::default());
+    let applied = retry
+        .apply_raw(action_id, saved_revision, direct_action(provider_id))
+        .await
+        .unwrap();
+    assert_eq!(applied.status, ActionStatus::Applied);
+    assert_eq!(applied.view.mode, "direct");
+    assert_eq!(fixture.count("activation_recovery").await, 1);
+    assert_eq!(fixture.count("activated_snapshots").await, 1);
+    assert!(retry.model_endpoint().await.is_none());
+    assert_eq!(updates.recv().await.unwrap(), applied.view);
+    assert!(updates.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn direct_restore_verification_failure_enters_recovery_required_without_advertising_direct() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture
+        .save("Direct", "gpt-direct", "provider-secret")
+        .await;
+    let action_id = Uuid::new_v4();
+    let mut updates = fixture.store.subscribe_target_views();
+    let service = fixture.service(ActivationHooks::failing(ActivationFailpoint::RestoreVerify));
+
+    let failure = service
+        .apply_raw(action_id, revision, direct_action(provider_id))
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.problem.code, "recovery-required");
+    let view = fixture.store.target_view().await.unwrap();
+    assert_eq!(view.mode, "unmanaged");
+    assert_eq!(view.recovery.state, "recovery-required");
+    assert_eq!(view.managed_configuration.state, "recovery-required");
+    assert!(view.current_provider_id.is_none());
+    assert!(view.activated_snapshot.is_none());
+    assert_eq!(view.takeover.state, "inactive");
+    assert!(view.takeover.endpoint.is_none());
+    assert!(fixture.store.routing_credential().await.unwrap().is_none());
+    assert!(fixture.store.receipt(action_id).await.unwrap().is_none());
+    assert_eq!(
+        fixture
+            .recovery_state_for_action(action_id)
+            .await
+            .as_deref(),
+        Some("recovery-required")
+    );
+    assert!(service.model_endpoint().await.is_none());
+    assert!(updates.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn committed_direct_restart_opens_control_only_and_exits_after_last_session() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture
+        .save("Direct", "gpt-direct", "provider-secret")
+        .await;
+    let first = fixture.service(ActivationHooks::default());
+    first
+        .apply_raw(Uuid::new_v4(), revision, direct_action(provider_id))
+        .await
+        .unwrap();
+    assert!(first.model_endpoint().await.is_none());
+    drop(first);
+
+    let reopened = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+    let activation = Arc::new(ActivationService::new(
+        Arc::clone(&reopened),
+        fixture.home.clone(),
+        fixture.probe.clone(),
+        "/usr/bin/codex".into(),
+        Arc::new(SuccessfulUpstream),
+    ));
+    let mut handle = ControlServer::bind_process(
+        &fixture.home,
+        Arc::clone(&reopened),
+        "test",
+        Arc::clone(&activation),
+    )
+    .await
+    .unwrap();
+    assert!(activation.model_endpoint().await.is_none());
+    let mut stream = tokio::net::UnixStream::connect(handle.socket_path())
+        .await
+        .unwrap();
+    write_frame(
+        &mut stream,
+        &serde_json::json!({
+            "type":"hello", "rpc":{"major":1,"minor":0}, "release":"test"
+        }),
+    )
+    .await
+    .unwrap();
+    read_frame(&mut stream).await.unwrap();
+    drop(stream);
+    tokio::time::timeout(std::time::Duration::from_secs(1), handle.wait_for_exit())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!handle.socket_path().exists());
+    assert!(activation.model_endpoint().await.is_none());
 }
 
 #[tokio::test]

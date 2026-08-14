@@ -307,16 +307,6 @@ impl CodexConfigCodec {
         }
     }
 
-    #[doc(hidden)]
-    pub fn desired(
-        &self,
-        model: &str,
-        base_url: &str,
-        routing_credential: &str,
-    ) -> DesiredCodexState {
-        self.desired_takeover(model, base_url, routing_credential)
-    }
-
     pub fn atomic_apply(
         &self,
         before: &ConfigSnapshot,

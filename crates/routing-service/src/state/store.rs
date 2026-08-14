@@ -1,13 +1,13 @@
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::broadcast;
-use tokio_rusqlite::{
-    Connection,
-    rusqlite::{OptionalExtension, params},
-};
+use tokio_rusqlite::{Connection, rusqlite::params};
 use uuid::Uuid;
 
 use crate::{
-    control::protocol::{ActionOutcome, ActionStatus, ControlProblem, TargetAction, TargetView},
+    control::protocol::{
+        ActionOutcome, ActionStatus, ControlProblem, ProviderRoutingRequirement, TargetAction,
+        TargetView,
+    },
     domain::{
         activation::ActivatedSnapshot,
         view::{empty_target_view, project_target_view},
@@ -38,6 +38,8 @@ pub enum StateError {
     MissingRecoveryIntent,
     #[error("state store contains an invalid activated snapshot")]
     InvalidActivatedSnapshot,
+    #[error("state store contains an invalid Provider routing requirement")]
+    InvalidProviderRoutingRequirement,
 }
 
 pub struct StateStore {
@@ -46,14 +48,46 @@ pub struct StateStore {
     target_views: broadcast::Sender<TargetView>,
 }
 
+type ActivationPreparationRow = (
+    u64,
+    String,
+    String,
+    Option<u16>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 pub struct ActivationPreparation {
     pub provider_id: Uuid,
     pub base_url: String,
     pub model: String,
     pub provider_credential: SecretString,
-    pub route_port: Option<u16>,
-    pub routing_credential: Option<SecretString>,
-    pub active_model: Option<String>,
+    pub routing_requirement: ProviderRoutingRequirement,
+    pub prior_snapshot: Option<CommittedActivationSnapshot>,
+    pub prior_route_runtime: Option<CommittedRouteRuntime>,
+    pub preferred_route_port: Option<u16>,
+}
+
+pub struct CommittedActivationSnapshot {
+    pub base_url: String,
+    pub model: String,
+    pub provider_credential: SecretString,
+}
+
+pub struct CommittedRouteRuntime {
+    pub route_port: u16,
+    pub routing_credential: SecretString,
+}
+
+pub enum ActivationRuntime {
+    Direct,
+    Takeover {
+        route_port: u16,
+        routing_credential: SecretString,
+    },
 }
 
 pub enum ActivationCommit {
@@ -210,12 +244,18 @@ impl StateStore {
         let service_epoch = self.service_epoch.clone();
         self.connection
             .call(move |connection| -> Result<Result<ActivationPreparation, ActionFailure>, StateError> {
-                let (revision, recovery_state, route_port, routing_credential):
-                    (u64, String, Option<u16>, Option<String>) = connection.query_row(
-                        "SELECT management_revision, recovery_state, route_port, routing_credential
-                         FROM target_route_state WHERE target = 'codex'",
+                let (revision, recovery_state, takeover_state, route_port, routing_credential,
+                    prior_snapshot_id, prior_base_url, prior_model, prior_provider_credential):
+                    ActivationPreparationRow = connection.query_row(
+                        "SELECT r.management_revision, r.recovery_state, r.takeover_state,
+                                r.route_port, r.routing_credential, s.id, s.base_url, s.model,
+                                s.provider_bearer_token
+                         FROM target_route_state r
+                         LEFT JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
+                         WHERE r.target = 'codex'",
                         [],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                            row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
                     )?;
                 let failure = |code: &str, message: &str| -> ActionFailure {
                     ActionFailure {
@@ -230,14 +270,51 @@ impl StateStore {
                 if revision != expected_revision {
                     return Ok(Err(failure("stale-revision", "Target state changed; refresh and retry")));
                 }
+                let (prior_snapshot, prior_route_runtime) = match (
+                    takeover_state.as_str(),
+                    prior_snapshot_id,
+                    prior_base_url,
+                    prior_model,
+                    prior_provider_credential,
+                    route_port,
+                    routing_credential,
+                ) {
+                    ("inactive", None, None, None, None, None, None) => (None, None),
+                    ("inactive", None, None, None, None, Some(_), None) => (None, None),
+                    ("inactive", Some(_), Some(base_url), Some(model), Some(credential), None, None) => (
+                        Some(CommittedActivationSnapshot {
+                            base_url,
+                            model,
+                            provider_credential: SecretString::from(credential),
+                        }),
+                        None,
+                    ),
+                    ("active", Some(_), Some(base_url), Some(model), Some(provider_credential),
+                        Some(route_port), Some(routing_credential)) => (
+                            Some(CommittedActivationSnapshot {
+                                base_url,
+                                model,
+                                provider_credential: SecretString::from(provider_credential),
+                            }),
+                            Some(CommittedRouteRuntime {
+                                route_port,
+                                routing_credential: SecretString::from(routing_credential),
+                            }),
+                        ),
+                    _ => return Ok(Err(failure(
+                        "recovery-required",
+                        "Managed configuration requires recovery",
+                    ))),
+                };
                 let provider = connection.query_row(
-                    "SELECT p.base_url, p.model, c.bearer_token
+                    "SELECT p.base_url, p.model, c.bearer_token, p.routing_requirement
                      FROM providers p LEFT JOIN credentials c ON c.id = p.credential_id
                      WHERE p.id = ?1 AND p.target = 'codex'",
                     [provider_id.to_string()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?)),
                 );
-                let (base_url, model, credential) = match provider {
+                let (base_url, model, credential, routing_requirement) = match provider {
                     Ok(values) => values,
                     Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => {
                         return Ok(Err(failure("incomplete-provider", "Provider is missing or incomplete")));
@@ -248,21 +325,20 @@ impl StateStore {
                     return Ok(Err(failure("incomplete-provider", "Provider is missing or incomplete")));
                 }
                 let credential = credential.expect("credential is present after completeness check");
-                let active_model = connection.query_row(
-                    "SELECT s.model FROM target_route_state r
-                     JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
-                     WHERE r.target = 'codex'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                ).optional()?;
+                let routing_requirement = match routing_requirement.as_str() {
+                    "direct-compatible" => ProviderRoutingRequirement::DirectCompatible,
+                    "takeover-required" => ProviderRoutingRequirement::TakeoverRequired,
+                    _ => return Err(StateError::InvalidProviderRoutingRequirement),
+                };
                 Ok(Ok(ActivationPreparation {
                     provider_id,
                     base_url,
                     model,
                     provider_credential: SecretString::from(credential),
-                    route_port,
-                    routing_credential: routing_credential.map(SecretString::from),
-                    active_model,
+                    routing_requirement,
+                    prior_snapshot,
+                    prior_route_runtime,
+                    preferred_route_port: route_port,
                 }))
             })
             .await
@@ -275,14 +351,23 @@ impl StateStore {
         action_id: Uuid,
         expected_revision: u64,
         snapshot: ActivatedSnapshot,
-        route_port: u16,
-        routing_credential: SecretString,
+        runtime: ActivationRuntime,
         recovery_id: Uuid,
         config_path: String,
         capability_problem: Option<ControlProblem>,
     ) -> Result<ActivationCommit, StateError> {
         let service_epoch = self.service_epoch.clone();
-        let routing_credential = routing_credential.expose_secret().to_owned();
+        let (takeover_state, route_port, routing_credential) = match runtime {
+            ActivationRuntime::Direct => ("inactive", None, None),
+            ActivationRuntime::Takeover {
+                route_port,
+                routing_credential,
+            } => (
+                "active",
+                Some(route_port),
+                Some(routing_credential.expose_secret().to_owned()),
+            ),
+        };
         let provider_credential = snapshot.provider_credential.expose_secret().to_owned();
         self.connection.call(move |connection| -> Result<ActivationCommit, StateError> {
             let transaction = connection.transaction_with_behavior(
@@ -334,12 +419,12 @@ impl StateStore {
                     view_sequence = view_sequence + 1,
                     current_provider_id = ?1,
                     serving_provider_id = NULL,
-                    takeover_state = 'active', route_port = ?2,
-                    routing_credential = ?3, activated_snapshot_id = ?4,
-                    managed_config_path = ?5, recovery_state = 'clean'
+                    takeover_state = ?2, route_port = ?3,
+                    routing_credential = ?4, activated_snapshot_id = ?5,
+                    managed_config_path = ?6, recovery_state = 'clean'
                  WHERE target = 'codex'",
-                params![snapshot.provider_id.to_string(), route_port, routing_credential,
-                    snapshot.id.to_string(), config_path],
+                params![snapshot.provider_id.to_string(), takeover_state, route_port,
+                    routing_credential, snapshot.id.to_string(), config_path],
             )?;
             transaction.execute(
                 "DELETE FROM target_problems

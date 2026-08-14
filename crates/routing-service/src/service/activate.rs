@@ -7,6 +7,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::codex::config::ManagedCodexState;
 use crate::{
     codex::{CodexCapability, CodexConfigCodec, CodexProbe},
     control::protocol::{
@@ -18,8 +19,8 @@ use crate::{
         ModelServer, ModelServerError, ModelServerHandle, ReservedListener, UpstreamTransport,
     },
     state::{
-        ActionFailure, ActivationCommit, ActivationPreparation, RecoveryIntent, RecoveryState,
-        StateStore,
+        ActionFailure, ActivationCommit, ActivationPreparation, ActivationRuntime, RecoveryIntent,
+        RecoveryState, StateStore,
     },
 };
 
@@ -246,11 +247,6 @@ impl ActivationService {
         if let Some(outcome) = self.receipt_or_failure(command.action_id).await? {
             return Ok(outcome);
         }
-        if command.mode != ActivationMode::Takeover {
-            return Err(self
-                .activation_failure("internal-failure", "Activation failed")
-                .await);
-        }
         self.hooks.observer.reached(ActivationStep::Validate);
         if self
             .configuration_home_override
@@ -278,6 +274,28 @@ impl ActivationService {
                     .await);
             }
         };
+        if command.mode == ActivationMode::Direct {
+            if preparation.routing_requirement
+                == crate::control::protocol::ProviderRoutingRequirement::TakeoverRequired
+            {
+                return Err(self
+                    .store
+                    .failure(
+                        "takeover-required",
+                        "Provider requires Target Takeover for activation",
+                    )
+                    .await);
+            }
+            if preparation.prior_route_runtime.is_some() {
+                return Err(self
+                    .store
+                    .failure(
+                        "takeover-active",
+                        "Direct Activation is unavailable while Target Takeover is active",
+                    )
+                    .await);
+            }
+        }
         let capability_problem = match self.probe.probe(&self.codex_executable) {
             Ok(CodexCapability::Tested { .. }) => None,
             Ok(CodexCapability::UnknownCompatible { warning, .. }) => Some(ControlProblem {
@@ -301,37 +319,67 @@ impl ActivationService {
         };
 
         let mut model = self.model.lock().await;
-        let (port, started_new) = match self
-            .ensure_model_listener(&mut model, preparation.route_port)
-            .await
-        {
-            Ok(result) => result,
-            Err(()) => {
-                return Err(self
-                    .store
-                    .failure(
-                        "configuration-write-failed",
-                        "Could not reserve the local model route",
-                    )
-                    .await);
+        let (runtime, desired, started_new) = match command.mode {
+            ActivationMode::Direct => (
+                ActivationRuntime::Direct,
+                codec.desired_direct(
+                    &preparation.model,
+                    &preparation.base_url,
+                    preparation.provider_credential.expose_secret(),
+                ),
+                false,
+            ),
+            ActivationMode::Takeover => {
+                let persisted_port = preparation.preferred_route_port;
+                let (route_port, started_new) =
+                    match self.ensure_model_listener(&mut model, persisted_port).await {
+                        Ok(result) => result,
+                        Err(()) => {
+                            return Err(self
+                                .store
+                                .failure(
+                                    "configuration-write-failed",
+                                    "Could not reserve the local model route",
+                                )
+                                .await);
+                        }
+                    };
+                self.hooks.observer.reached(ActivationStep::BindListener);
+                let routing_credential = match preparation
+                    .prior_route_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.routing_credential.clone())
+                {
+                    Some(credential) => credential,
+                    None => match random_credential() {
+                        Ok(credential) => credential,
+                        Err(()) => {
+                            self.stop_new_listener(&mut model, started_new).await;
+                            return Err(self
+                                .activation_failure("internal-failure", "Activation failed")
+                                .await);
+                        }
+                    },
+                };
+                self.hooks
+                    .observer
+                    .reached(ActivationStep::PersistRoutingCredential);
+                let route_base = format!("http://127.0.0.1:{route_port}/v1");
+                let desired = codec.desired_takeover(
+                    &preparation.model,
+                    &route_base,
+                    routing_credential.expose_secret(),
+                );
+                (
+                    ActivationRuntime::Takeover {
+                        route_port,
+                        routing_credential,
+                    },
+                    desired,
+                    started_new,
+                )
             }
         };
-        self.hooks.observer.reached(ActivationStep::BindListener);
-        let routing_credential = match preparation.routing_credential.clone() {
-            Some(credential) => credential,
-            None => match random_credential() {
-                Ok(credential) => credential,
-                Err(()) => {
-                    self.stop_new_listener(&mut model, started_new).await;
-                    return Err(self
-                        .activation_failure("internal-failure", "Activation failed")
-                        .await);
-                }
-            },
-        };
-        self.hooks
-            .observer
-            .reached(ActivationStep::PersistRoutingCredential);
         let snapshot = ActivatedSnapshot {
             id: Uuid::new_v4(),
             target: Target::Codex,
@@ -342,12 +390,6 @@ impl ActivationService {
             epoch: self.store.service_epoch(),
         };
         self.hooks.observer.reached(ActivationStep::Snapshot);
-        let route_base = format!("http://127.0.0.1:{port}/v1");
-        let desired = codec.desired(
-            &preparation.model,
-            &route_base,
-            routing_credential.expose_secret(),
-        );
         let recovery_id = Uuid::new_v4();
         let intent = RecoveryIntent::pending(
             recovery_id,
@@ -390,8 +432,7 @@ impl ActivationService {
                     command.action_id,
                     command.expected_revision,
                     snapshot,
-                    port,
-                    routing_credential,
+                    runtime,
                     recovery_id,
                     codec.config_path().to_string_lossy().into_owned(),
                     capability_problem,
@@ -511,22 +552,39 @@ impl ActivationService {
         preparation: &ActivationPreparation,
     ) -> Result<crate::codex::ConfigSnapshot, &'static str> {
         match (
-            &preparation.active_model,
-            preparation.route_port,
-            &preparation.routing_credential,
+            &preparation.prior_snapshot,
+            &preparation.prior_route_runtime,
         ) {
-            (Some(model), Some(port), Some(credential)) => {
-                let expected = codec.desired(
-                    model,
-                    &format!("http://127.0.0.1:{port}/v1"),
-                    credential.expose_secret(),
+            (Some(snapshot), Some(runtime)) => {
+                let expected = codec.desired_takeover(
+                    &snapshot.model,
+                    &format!("http://127.0.0.1:{}/v1", runtime.route_port),
+                    runtime.routing_credential.expose_secret(),
                 );
-                codec
-                    .inspect_managed(&expected)
-                    .map_err(|problem| problem.code())
+                match codec
+                    .inspect_managed_state(&expected)
+                    .map_err(|problem| problem.code())?
+                {
+                    ManagedCodexState::Takeover { snapshot } => Ok(snapshot),
+                    _ => Err("recovery-required"),
+                }
             }
-            (None, _, _) => codec.inspect().map_err(|problem| problem.code()),
-            _ => Err("recovery-required"),
+            (Some(snapshot), None) => {
+                let expected = codec.desired_direct(
+                    &snapshot.model,
+                    &snapshot.base_url,
+                    snapshot.provider_credential.expose_secret(),
+                );
+                match codec
+                    .inspect_managed_state(&expected)
+                    .map_err(|problem| problem.code())?
+                {
+                    ManagedCodexState::Direct { snapshot } => Ok(snapshot),
+                    _ => Err("recovery-required"),
+                }
+            }
+            (None, None) => codec.inspect().map_err(|problem| problem.code()),
+            (None, Some(_)) => Err("recovery-required"),
         }
     }
 
@@ -631,6 +689,8 @@ impl ActivationService {
             | "incomplete-provider"
             | "incompatible-target-cli"
             | "unsupported-configuration-home"
+            | "takeover-required"
+            | "takeover-active"
             | "configuration-collision"
             | "configuration-write-failed"
             | "recovery-required" => code,

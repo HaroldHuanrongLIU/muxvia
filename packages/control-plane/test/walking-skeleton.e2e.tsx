@@ -5,9 +5,9 @@ import { TestRecorder } from "@opentui/core/testing"
 import { testRender } from "@opentui/solid"
 import { createHash } from "node:crypto"
 import { spawn } from "node:child_process"
-import { createConnection } from "node:net"
+import { createConnection, createServer as createTcpServer } from "node:net"
 import { request as httpRequest } from "node:http"
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises"
+import { chmod, mkdir, mkdtemp, readFile, readdir, readlink, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { finished } from "node:stream/promises"
@@ -140,37 +140,14 @@ function extractManagedConfig(text: string, expectedModel: string): { endpoint: 
   return { endpoint, credential }
 }
 
-function assertExactDirectManagedConfig(
-  text: string,
-  expected: { baseUrl: string; model: string; providerCredential: string },
-): void {
-  const lines = text.split("\n")
-  const directTableStart = lines.indexOf("[model_providers.muxvia_codex]")
-  const directTableEnd = lines.findIndex((line, index) => index > directTableStart && line.startsWith("["))
-  const directTable = directTableStart === -1
-    ? []
-    : lines.slice(
-        directTableStart,
-        directTableEnd === -1 ? lines.length : directTableEnd,
-      ).filter((line) => line !== "")
-  const expectedTable = [
-    "[model_providers.muxvia_codex]",
-    'name = "Muxvia Direct"',
-    `base_url = "${expected.baseUrl}"`,
-    'wire_api = "responses"',
-    `http_headers = { Authorization = "Bearer ${expected.providerCredential}" }`,
-    "supports_websockets = false",
-  ]
-  const hasExactTopLevelModel = lines.filter((line) => line === `model = "${expected.model}"`).length === 1
-  const hasExactTopLevelProvider = lines.filter((line) => line === 'model_provider = "muxvia_codex"').length === 1
-  const hasExactTable = directTable.length === expectedTable.length
-    && directTable.every((line) => expectedTable.includes(line))
-  const hasNoTakeoverFields = !text.includes("X-Muxvia-Routing-Credential")
-    && !text.includes('name = "Muxvia"\n')
-
-  if (!hasExactTopLevelModel || !hasExactTopLevelProvider || !hasExactTable || !hasNoTakeoverFields) {
+function assertExactDirectManagedConfig(text: string, expectedText: string): void {
+  if (text !== expectedText) {
     throw new Error("direct-managed-configuration-mismatch")
   }
+}
+
+function assertExactFileMode(actual: number, expected: number): void {
+  if (actual !== expected) throw new Error("direct-managed-configuration-mode-mismatch")
 }
 
 function assertBytesContainNoSecrets(bytes: Buffer, secrets: readonly string[], label: string): void {
@@ -286,6 +263,91 @@ function captureProcessOutput(child: ReturnType<typeof spawn>): {
       }
       return result
     }),
+  }
+}
+
+async function observeDarwinTcpListenerPorts(pid: number): Promise<number[]> {
+  const child = spawn("/usr/sbin/lsof", [
+    "-nP",
+    "-a",
+    "-p", String(pid),
+    "-iTCP",
+    "-sTCP:LISTEN",
+    "-Fn",
+  ], { stdio: ["ignore", "pipe", "pipe"] })
+  const output = captureProcessOutput(child)
+  const completed = await Promise.race([
+    output.completed,
+    Bun.sleep(5_000).then(() => undefined),
+  ])
+  if (!completed) {
+    child.kill("SIGKILL")
+    await output.completed.catch(() => {})
+    throw new Error("tcp-listener-observation-timeout")
+  }
+  if (completed.signal !== null || (completed.code !== 0 && completed.code !== 1)) {
+    throw new Error("tcp-listener-observation-failed")
+  }
+  const ports = Buffer.concat(output.streams[0]).toString("utf8").split("\n").flatMap((line) => {
+    const match = line.match(/^n.*:(\d+)$/)
+    return match ? [Number(match[1])] : []
+  })
+  return [...new Set(ports)].sort((left, right) => left - right)
+}
+
+async function readLinuxTcpTable(path: string, socketInodes: ReadonlySet<string>): Promise<number[]> {
+  let table: string
+  try {
+    table = await readFile(path, "utf8")
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return []
+    throw new Error("tcp-listener-observation-failed")
+  }
+  return table.split("\n").slice(1).flatMap((line) => {
+    const fields = line.trim().split(/\s+/)
+    if (fields.length < 10 || fields[3] !== "0A" || !socketInodes.has(fields[9]!)) return []
+    const portHex = fields[1]?.split(":").at(-1)
+    const port = portHex ? Number.parseInt(portHex, 16) : Number.NaN
+    return Number.isInteger(port) ? [port] : []
+  })
+}
+
+async function observeLinuxTcpListenerPorts(pid: number): Promise<number[]> {
+  let descriptors: string[]
+  try {
+    descriptors = await readdir(`/proc/${pid}/fd`)
+  } catch {
+    throw new Error("tcp-listener-observation-failed")
+  }
+  const socketInodes = new Set<string>()
+  await Promise.all(descriptors.map(async (descriptor) => {
+    try {
+      const target = await readlink(`/proc/${pid}/fd/${descriptor}`)
+      const match = target.match(/^socket:\[(\d+)]$/)
+      if (match) socketInodes.add(match[1]!)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error("tcp-listener-observation-failed")
+      }
+    }
+  }))
+  const ports = [
+    ...await readLinuxTcpTable(`/proc/${pid}/net/tcp`, socketInodes),
+    ...await readLinuxTcpTable(`/proc/${pid}/net/tcp6`, socketInodes),
+  ]
+  return [...new Set(ports)].sort((left, right) => left - right)
+}
+
+async function observeTcpListenerPorts(pid: number): Promise<number[]> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("tcp-listener-observation-invalid-pid")
+  if (process.platform === "darwin") return await observeDarwinTcpListenerPorts(pid)
+  if (process.platform === "linux") return await observeLinuxTcpListenerPorts(pid)
+  throw new Error("tcp-listener-observation-unsupported")
+}
+
+async function assertNoTcpListeners(pid: number): Promise<void> {
+  if ((await observeTcpListenerPorts(pid)).length !== 0) {
+    throw new Error("direct-service-unexpected-tcp-listener")
   }
 }
 
@@ -659,6 +721,78 @@ test("secret scanning catches additive RPC sentinels split across valid frame ch
   expect(() => scanRawRpcFramesNoSecrets(
     [splitEncodedFrameWithin(routingFrame, wrongRoutingSecret)],
   )).toThrow()
+})
+
+test("Direct configuration audit rejects every unrelated TOML mutation with fixed diagnostics", () => {
+  const credential = "controlled-direct-provider-credential"
+  const expected = [
+    "# operator comment survives",
+    'unrelated = "keep-me"',
+    'model = "controlled-direct-model"',
+    'model_provider = "muxvia_codex"',
+    "",
+    "[operator_settings]",
+    'theme = "dark"',
+    "nested = { enabled = true, count = 2 }",
+    "",
+    "[model_providers]",
+    "",
+    "[model_providers.muxvia_codex]",
+    'name = "Muxvia Direct"',
+    'base_url = "https://controlled.invalid/v1"',
+    'wire_api = "responses"',
+    `http_headers = { Authorization = "Bearer ${credential}" }`,
+    "supports_websockets = false",
+    "",
+  ].join("\n")
+  const mutations = [
+    expected.replace("# operator comment survives", "# operator comment changed"),
+    expected.replace('unrelated = "keep-me"', 'unrelated = "changed"'),
+    expected.replace('unrelated = "keep-me"\n', ""),
+    expected.replace('unrelated = "keep-me"\n', 'unrelated = "keep-me"\nadded = true\n'),
+    expected.replace('theme = "dark"', 'theme = "light"'),
+    expected.replace("nested = { enabled = true, count = 2 }\n", ""),
+    expected.replace("[operator_settings]\n", "[operator_settings]\nadded = true\n"),
+    `${expected}[unexpected]\nvalue = true\n`,
+  ]
+
+  for (const mutation of mutations) {
+    let diagnostic = ""
+    try {
+      assertExactDirectManagedConfig(mutation, expected)
+    } catch (error) {
+      diagnostic = error instanceof Error ? error.message : String(error)
+    }
+    expect(diagnostic === "direct-managed-configuration-mismatch").toBeTrue()
+    expect(diagnostic.includes(credential)).toBeFalse()
+    expect(diagnostic.includes(mutation)).toBeFalse()
+  }
+})
+
+test("Direct configuration audit rejects a changed file mode with fixed diagnostics", () => {
+  let diagnostic = ""
+  try {
+    assertExactFileMode(0o600, 0o640)
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(diagnostic === "direct-managed-configuration-mode-mismatch").toBeTrue()
+})
+
+test("TCP listener observation detects a known current-process listener", async () => {
+  const server = createTcpServer()
+  await new Promise<void>((resolveListen, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolveListen)
+  })
+  try {
+    const address = server.address()
+    if (!address || typeof address === "string") throw new Error("tcp-listener-fixture-address-missing")
+    const ports = await observeTcpListenerPorts(process.pid)
+    expect(ports.includes(address.port)).toBeTrue()
+  } finally {
+    await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
+  }
 })
 
 test("outbound operation audit catches a preset-phase discovery without retaining its payload", () => {
@@ -1048,7 +1182,7 @@ test("real processes prove Codex direct activation is control-only and survives 
   await chmod(fakeCodex, 0o755)
   const originalConfigMode = (await stat(configPath)).mode & 0o777
   const authFingerprint = await safeFileFingerprint(authPath)
-  expect(originalConfigMode).toBe(0o640)
+  assertExactFileMode(originalConfigMode, 0o640)
   expect(authFingerprint.mode).toBe(0o600)
 
   const requestAudit = createCapturedRequestAudit({
@@ -1062,7 +1196,6 @@ test("real processes prove Codex direct activation is control-only and survives 
   const outboundOperationKinds: string[] = []
   const decodedInboundFrames: unknown[] = []
   const views: TargetView[] = []
-  const activitySurfaces: string[] = []
   const selectedRenderedFrames: string[] = []
   const nativeRenderedFrames: string[] = []
   const services: Array<{
@@ -1216,10 +1349,6 @@ test("real processes prove Codex direct activation is control-only and survives 
       && frame.includes("Restart Codex to use the managed configuration.")
     )
     selectedRenderedFrames.push(directFrame)
-    activitySurfaces.push(
-      "Direct Activation applied: Direct Provider",
-      "Restart Codex to use the managed configuration.",
-    )
 
     const directView = session.get()
     views.push(directView as TargetView)
@@ -1234,17 +1363,28 @@ test("real processes prove Codex direct activation is control-only and survives 
     })
 
     const directConfigBytes = await readFile(configPath)
-    assertExactDirectManagedConfig(directConfigBytes.toString("utf8"), {
-      baseUrl: upstream.baseUrl,
-      model: directModel,
-      providerCredential: providerSecret,
-    })
-    expect(directConfigBytes.toString("utf8").includes("# operator comment survives")).toBeTrue()
-    expect(directConfigBytes.toString("utf8").includes('unrelated = "keep-me"')).toBeTrue()
-    expect(directConfigBytes.toString("utf8").includes("[operator_settings]")).toBeTrue()
-    expect(directConfigBytes.toString("utf8").includes('theme = "dark"')).toBeTrue()
-    expect(directConfigBytes.toString("utf8").includes("nested = { enabled = true, count = 2 }")).toBeTrue()
-    expect((await stat(configPath)).mode & 0o777).toBe(originalConfigMode)
+    const expectedDirectConfig = [
+      "# operator comment survives",
+      'unrelated = "keep-me"',
+      `model = "${directModel}"`,
+      'model_provider = "muxvia_codex"',
+      "",
+      "[operator_settings]",
+      'theme = "dark"',
+      "nested = { enabled = true, count = 2 }",
+      "",
+      "[model_providers]",
+      "",
+      "[model_providers.muxvia_codex]",
+      'name = "Muxvia Direct"',
+      `base_url = "${upstream.baseUrl}"`,
+      'wire_api = "responses"',
+      `http_headers = { Authorization = "Bearer ${providerSecret}" }`,
+      "supports_websockets = false",
+      "",
+    ].join("\n")
+    assertExactDirectManagedConfig(directConfigBytes.toString("utf8"), expectedDirectConfig)
+    assertExactFileMode((await stat(configPath)).mode & 0o777, originalConfigMode)
     expect(await safeFileFingerprint(authPath)).toEqual(authFingerprint)
 
     const directDatabase = new Database(databasePath, { readonly: true })
@@ -1278,6 +1418,9 @@ test("real processes prove Codex direct activation is control-only and survives 
       model: directModel,
       providerCredentialMatches: 1,
     })
+    if (!firstService.child.pid) throw new Error("direct-service-pid-missing")
+    await assertNoTcpListeners(firstService.child.pid)
+    expect((await stat(socketPath)).isSocket()).toBeTrue()
 
     const updateOutcome = await session.act({
       kind: "update-provider",
@@ -1364,10 +1507,12 @@ test("real processes prove Codex direct activation is control-only and survives 
       && frame.includes("Restart Codex to use the managed configuration.")
     )
     selectedRenderedFrames.push(restartedFrame)
-    activitySurfaces.push("Restart Codex to use the managed configuration.")
     expect(restartedView.takeover.endpoint).toBeNull()
+    if (!restartedService.child.pid) throw new Error("direct-service-pid-missing")
+    await assertNoTcpListeners(restartedService.child.pid)
+    expect((await stat(socketPath)).isSocket()).toBeTrue()
     expect(sensitiveDigest(await readFile(configPath))).toBe(sensitiveDigest(directConfigBytes))
-    expect((await stat(configPath)).mode & 0o777).toBe(originalConfigMode)
+    assertExactFileMode((await stat(configPath)).mode & 0o777, originalConfigMode)
     expect(await safeFileFingerprint(authPath)).toEqual(authFingerprint)
     expect(upstream.calls.length === 0).toBeTrue()
 
@@ -1398,7 +1543,7 @@ test("real processes prove Codex direct activation is control-only and survives 
     const secrets = [providerSecret, wrongRoutingSecret, authSentinel]
     scanRawRpcFramesNoSecrets(rpcStreams, secrets)
     scanNoSecrets(
-      [decodedInboundFrames, receipts, views, activitySurfaces, selectedRenderedFrames, nativeRenderedFrames],
+      [decodedInboundFrames, receipts, views, selectedRenderedFrames, nativeRenderedFrames],
       secrets,
       "direct-inbound-and-rendered-surfaces",
     )

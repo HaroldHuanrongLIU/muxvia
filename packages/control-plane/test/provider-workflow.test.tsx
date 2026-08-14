@@ -201,7 +201,7 @@ test("provider move commands send an exact identity permutation and wait for the
     }])
     expectInOrder(setup.captureCharFrame(), ["First Provider ·", "Second Provider ·", "Third Provider ·"])
 
-    resolve({ status: "applied", view: view({ providers: [second, first, third], viewSequence: 2 }) })
+    resolve({ status: "applied", view: view({ providers: [{ ...second }, { ...first }, { ...third }], viewSequence: 2 }) })
     for (let pass = 0; pass < 4; pass++) await Promise.resolve()
     await setup.renderOnce()
     expectInOrder(setup.captureCharFrame(), ["Second Provider ·", "First Provider ·", "Third Provider ·"])
@@ -254,6 +254,167 @@ test("deletion confirms before dispatching and keeps the picker open with author
     expect(picker).toContain("Current")
     expect(picker).toContain("Activated Snapshot")
     expect(picker).not.toContain("backend-message-must-not-render")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("a failed credential replacement keeps dirty fields but retries an edit with Keep", async () => {
+  const savedSecret = "replacement-secret-must-not-render"
+  const selected = provider({ credential: "missing", completeness: "incomplete", missingFields: ["credential"] })
+  let attempts = 0
+  const session = new MemoryTargetSession(view({ providers: [selected] }), async (action) => {
+    attempts++
+    if (attempts === 1) throw { code: "invalid-provider", message: "server-message-must-not-render" }
+    return { status: "applied", view: view({ providers: [selected], viewSequence: 2 }) }
+  })
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    await setup.mockInput.typeText(" dirty")
+    setup.mockInput.pressTab()
+    setup.mockInput.pressTab()
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(savedSecret)
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 1)
+    await setup.renderOnce()
+
+    expect(setup.captureCharFrame()).toContain("First Provider dirty")
+    expect(setup.captureCharFrame()).not.toContain(savedSecret)
+    expect(setup.captureCharFrame()).not.toContain("server-message-must-not-render")
+    expect(session.actions[0]).toMatchObject({
+      kind: "update-provider",
+      credential: { kind: "replace", value: savedSecret },
+    })
+
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 2)
+    expect(session.actions[1]).toMatchObject({
+      kind: "update-provider",
+      name: "First Provider dirty",
+      credential: { kind: "keep" },
+    })
+    expect(JSON.stringify(session.actions[1])).not.toContain(savedSecret)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("a successful delete selects a remaining Provider for the next named action", async () => {
+  const first = provider({ id: "00000000-0000-4000-8000-000000000011", name: "Deleted Provider" })
+  const second = provider({ id: "00000000-0000-4000-8000-000000000012", position: 1, name: "Remaining Provider", model: "remaining-model" })
+  const afterDelete = view({ providers: [second], viewSequence: 2 })
+  const session = new MemoryTargetSession(view({ providers: [first, second] }), async (action) => {
+    if (action.kind === "delete-provider") return { status: "applied", view: afterDelete }
+    return { status: "applied", view: afterDelete }
+  })
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("d")
+    await setup.waitForFrame((frame) => frame.includes("Delete Provider?"))
+    setup.mockInput.pressKey("y")
+    await setup.waitFor(() => session.actions.length === 1)
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    await setup.renderOnce()
+
+    expect(setup.captureCharFrame()).toContain("Remaining Provider")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Edit Provider")
+    expect(setup.captureCharFrame()).toContain("remaining-model")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("a stale Provider edit refreshes its revision before the next save", async () => {
+  const stale = provider({ providerRevision: 1 })
+  const authoritative = provider({ providerRevision: 2, name: "Authoritative Provider" })
+  const authoritativeView = view({ providers: [{ ...authoritative }], viewSequence: 2 })
+  let attempts = 0
+  const session = new MemoryTargetSession(view({ providers: [stale] }), async (action) => {
+    attempts++
+    if (attempts === 1) {
+      session.setView(authoritativeView)
+      throw { code: "stale-provider-revision", message: "stale-server-message-must-not-render" }
+    }
+    return { status: "applied", view: view({ providers: [{ ...authoritative }], viewSequence: 3 }) }
+  })
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    await setup.mockInput.typeText(" dirty")
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 1)
+    await setup.renderOnce()
+
+    expect(setup.captureCharFrame()).toContain("First Provider dirty")
+    expect(setup.captureCharFrame()).not.toContain("stale-server-message-must-not-render")
+    expect(session.actions[0]).toMatchObject({ kind: "update-provider", providerRevision: 1 })
+
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 2)
+    expect(session.actions[1]).toMatchObject({
+      kind: "update-provider",
+      name: "First Provider dirty",
+      providerRevision: 2,
+    })
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("blank edits Keep credentials for either saved presence while creates start with Remove", async () => {
+  for (const credential of ["present", "missing"] as const) {
+    const selected = provider({ credential })
+    const session = new MemoryTargetSession(view({ providers: [selected] }))
+    const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("1")
+      await setup.mockInput.typeText("/providers")
+      setup.mockInput.pressEnter()
+      await setup.renderOnce()
+      setup.mockInput.pressEnter()
+      await setup.renderOnce()
+      setup.mockInput.pressEnter()
+      await setup.waitFor(() => session.actions.length === 1)
+      expect(session.actions[0]).toMatchObject({ kind: "update-provider", credential: { kind: "keep" } })
+    } finally {
+      setup.renderer.destroy()
+    }
+  }
+
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("p")
+    await setup.renderOnce()
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 1)
+    expect(session.actions[0]).toMatchObject({ kind: "create-provider", credential: { kind: "remove" } })
   } finally {
     setup.renderer.destroy()
   }

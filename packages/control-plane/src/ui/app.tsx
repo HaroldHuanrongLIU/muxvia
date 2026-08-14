@@ -215,7 +215,19 @@ function Shell(props: { session: TargetSession; t: Translator }) {
       return true
     } catch (error) {
       if (disposed || exiting || generation !== editorGeneration) return false
-      installView(props.session.get() as TargetViewProjection, "action")
+      const authoritative = props.session.get() as TargetViewProjection
+      installView(authoritative, "action")
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? String(error.code)
+        : "internal-failure"
+      if (action.kind === "update-provider" && code === "stale-provider-revision") {
+        const latest = authoritative.providers.find((provider) => provider.id === action.providerId)
+        if (latest) {
+          setEditor((current) => current && current.mode === "edit" && current.draft.providerId === latest.id
+            ? { ...current, draft: { ...current.draft, providerRevision: latest.providerRevision } }
+            : current)
+        }
+      }
       const activity = actionProblem(error)
       appendActivity(activity)
       setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) })
@@ -282,6 +294,9 @@ function Shell(props: { session: TargetSession; t: Translator }) {
       const outcome = await props.session.act(action)
       if (disposed || exiting) return false
       installView(outcome.view, "action")
+      if (action.kind === "delete-provider" && selectedProviderId() === action.providerId) {
+        setSelectedProviderId(outcome.view.providers[0]?.id)
+      }
       return true
     } catch (error) {
       if (disposed || exiting) return false
@@ -439,9 +454,9 @@ function Shell(props: { session: TargetSession; t: Translator }) {
                     <text fg={notice()?.kind === "error" ? theme.error : theme.success}>{notice()?.text}</text>
                   </Show>
                   <ProviderForm
-                    mode={editor()!.mode}
-                    initialDraft={editor()!.draft}
-                    credentialPresence={editor()!.credentialPresence}
+                    mode={editor()?.mode ?? "create"}
+                    initialDraft={editor()?.draft ?? { name: "", baseUrl: "", model: "" }}
+                    credentialPresence={editor()?.credentialPresence ?? "missing"}
                     t={props.t}
                     ref={(value) => { providerFormRef = value }}
                     pending={saving()}

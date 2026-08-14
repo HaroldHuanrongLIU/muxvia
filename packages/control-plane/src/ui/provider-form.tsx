@@ -48,7 +48,7 @@ export function ProviderForm(props: ProviderFormProps) {
   const [model, setModel] = createSignal(props.initialDraft.model)
   const [credential, setCredential] = createSignal("")
   const [credentialIntent, setCredentialIntent] = createSignal<CredentialIntent>(
-    props.mode === "create" || props.credentialPresence === "missing" ? "remove" : "keep",
+    props.mode === "create" ? "remove" : "keep",
   )
   const [dirty, setDirtySignal] = createSignal(false)
   const inputs: Array<InputRenderable | undefined> = []
@@ -67,6 +67,7 @@ export function ProviderForm(props: ProviderFormProps) {
   }
   const clearSensitive = () => {
     if (credential()) setCredential("")
+    setCredentialIntent(props.mode === "create" ? "remove" : "keep")
   }
   const formRef: ProviderFormRef = {
     isDirty: dirty,

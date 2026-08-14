@@ -1,4 +1,7 @@
-use std::fs;
+use std::{fs, path::Path};
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use muxvia_routing::{
     codex::CodexConfigCodec,
@@ -33,7 +36,7 @@ impl Fixture {
 
     async fn pending(&self) -> RecoveryIntent {
         let before = self.codec.inspect().unwrap();
-        let desired = self.codec.desired(
+        let desired = self.codec.desired_takeover(
             "gpt-test",
             "http://127.0.0.1:43123/v1",
             "recovery-route-secret",
@@ -48,6 +51,138 @@ impl Fixture {
         );
         self.store.insert_recovery_intent(&intent).await.unwrap();
         intent
+    }
+
+    async fn pending_direct(&self) -> RecoveryIntent {
+        let before = self.codec.inspect().unwrap();
+        let desired = self.codec.desired_direct(
+            "model-a",
+            "https://provider.example/api/v1",
+            "provider-secret",
+        );
+        let intent = RecoveryIntent::pending(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            self.codec.config_path().to_owned(),
+            before,
+            desired,
+            0,
+        );
+        self.store.insert_recovery_intent(&intent).await.unwrap();
+        intent
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct FileFingerprint {
+    bytes: Vec<u8>,
+    mode: u32,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+fn fingerprint(path: &Path) -> FileFingerprint {
+    let metadata = fs::metadata(path).unwrap();
+    FileFingerprint {
+        bytes: fs::read(path).unwrap(),
+        mode: metadata.permissions().mode() & 0o777,
+        size: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn direct_pending_reconciliation_restores_before_without_touching_auth_json() {
+    let fixture = Fixture::new("approval_policy = \"never\"\n").await;
+    let auth_path = fixture.codec.config_path().with_file_name("auth.json");
+    fs::write(&auth_path, b"operator-auth-sentinel\n").unwrap();
+    fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o640)).unwrap();
+    let auth_before = fingerprint(&auth_path);
+    let intent = fixture.pending_direct().await;
+    fixture
+        .codec
+        .atomic_apply(intent.before(), intent.desired())
+        .unwrap();
+
+    fixture
+        .codec
+        .reconcile_pending(&fixture.store)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(fixture.codec.config_path()).unwrap(),
+        "approval_policy = \"never\"\n"
+    );
+    assert_eq!(fingerprint(&auth_path), auth_before);
+    assert_eq!(
+        fixture
+            .store
+            .recovery_intent(intent.id())
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        RecoveryState::RolledBack
+    );
+}
+
+#[tokio::test]
+async fn direct_pending_owned_or_unrelated_third_state_requires_recovery() {
+    for changed in [
+        "model = \"operator-owned-third-state\"\n",
+        "approval_policy = \"never\"\noperator_changed = true\n",
+    ] {
+        let fixture = Fixture::new("approval_policy = \"never\"\n").await;
+        let intent = fixture.pending_direct().await;
+        fs::write(fixture.codec.config_path(), changed).unwrap();
+
+        let error = fixture
+            .codec
+            .reconcile_pending(&fixture.store)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), "recovery-required");
+        assert_eq!(
+            fixture
+                .store
+                .recovery_intent(intent.id())
+                .await
+                .unwrap()
+                .unwrap()
+                .state(),
+            RecoveryState::RecoveryRequired
+        );
+        assert!(!format!("{error:?}\n{error}").contains("provider-secret"));
+    }
+}
+
+#[test]
+fn direct_and_legacy_takeover_desired_payloads_remain_mode_free_and_round_trip() {
+    let root = TempDir::new().unwrap();
+    let codec = CodexConfigCodec::for_user_home(root.path()).unwrap();
+    for desired in [
+        codec.desired_takeover(
+            "gpt-test",
+            "http://127.0.0.1:43123/v1",
+            "recovery-route-secret",
+        ),
+        codec.desired_direct(
+            "model-a",
+            "https://provider.example/api/v1",
+            "provider-secret",
+        ),
+    ] {
+        let encoded = serde_json::to_value(&desired).unwrap();
+        assert!(encoded.get("mode").is_none());
+        let decoded = serde_json::from_value(encoded).unwrap();
+        assert_eq!(desired, decoded);
     }
 }
 
@@ -136,7 +271,7 @@ async fn recovery_required_startup_opens_read_only_control_without_resuming_comm
     drop(listener);
     let routing_credential = "a".repeat(64);
     let before_takeover = fixture.codec.inspect().unwrap();
-    let active = fixture.codec.desired(
+    let active = fixture.codec.desired_takeover(
         "gpt-active",
         &format!("http://127.0.0.1:{port}/v1"),
         &routing_credential,
@@ -198,7 +333,7 @@ async fn recovery_required_startup_opens_read_only_control_without_resuming_comm
         Uuid::new_v4(),
         fixture.codec.config_path().to_owned(),
         active_snapshot,
-        fixture.codec.desired(
+        fixture.codec.desired_takeover(
             "gpt-next",
             &format!("http://127.0.0.1:{port}/v1"),
             &routing_credential,

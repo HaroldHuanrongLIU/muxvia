@@ -64,8 +64,21 @@ impl fmt::Debug for OwnedCodexState {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DesiredCodexState(OwnedCodexState);
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DesiredCodexState {
+    owned: OwnedCodexState,
+    #[serde(skip)]
+    mode: Option<ManagedCodexMode>,
+}
+
+impl PartialEq for DesiredCodexState {
+    fn eq(&self, other: &Self) -> bool {
+        self.owned == other.owned
+    }
+}
+
+impl Eq for DesiredCodexState {}
 
 impl fmt::Debug for DesiredCodexState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -89,6 +102,29 @@ pub struct ConfigSnapshot {
     identity: FileIdentity,
     owned: OwnedCodexState,
     unrelated: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedCodexMode {
+    Direct,
+    Takeover,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ManagedCodexState {
+    Unmanaged { snapshot: ConfigSnapshot },
+    Direct { snapshot: ConfigSnapshot },
+    Takeover { snapshot: ConfigSnapshot },
+}
+
+impl ManagedCodexState {
+    fn into_snapshot(self) -> ConfigSnapshot {
+        match self {
+            Self::Unmanaged { snapshot }
+            | Self::Direct { snapshot }
+            | Self::Takeover { snapshot } => snapshot,
+        }
+    }
 }
 
 impl fmt::Debug for ConfigSnapshot {
@@ -165,35 +201,63 @@ impl CodexConfigCodec {
     }
 
     pub fn inspect(&self) -> Result<ConfigSnapshot, CodexProblem> {
+        self.inspect_state(None)
+            .map(ManagedCodexState::into_snapshot)
+    }
+
+    pub(crate) fn inspect_state(
+        &self,
+        committed: Option<(ManagedCodexMode, &DesiredCodexState)>,
+    ) -> Result<ManagedCodexState, CodexProblem> {
         let (snapshot, document) = self.read_snapshot()?;
-        if document
-            .get("model_providers")
-            .and_then(|providers| providers.get("muxvia_codex"))
-            .is_some()
-        {
-            return Err(CodexProblem::new(
-                "configuration-collision",
-                Some(&self.config_path),
-            ));
+        match committed {
+            None => {
+                if document
+                    .get("model_providers")
+                    .and_then(|providers| providers.get("muxvia_codex"))
+                    .is_some()
+                {
+                    return Err(CodexProblem::new(
+                        "configuration-collision",
+                        Some(&self.config_path),
+                    ));
+                }
+                Ok(ManagedCodexState::Unmanaged { snapshot })
+            }
+            Some((mode, expected)) => {
+                if !owned_semantically_matches(&snapshot.owned, &expected.owned) {
+                    return Err(CodexProblem::new(
+                        "configuration-collision",
+                        Some(&self.config_path),
+                    ));
+                }
+                Ok(match mode {
+                    ManagedCodexMode::Direct => ManagedCodexState::Direct { snapshot },
+                    ManagedCodexMode::Takeover => ManagedCodexState::Takeover { snapshot },
+                })
+            }
         }
-        Ok(snapshot)
     }
 
     pub fn inspect_managed(
         &self,
         expected: &DesiredCodexState,
     ) -> Result<ConfigSnapshot, CodexProblem> {
-        let (snapshot, _) = self.read_snapshot()?;
-        if !owned_semantically_matches(&snapshot.owned, &expected.0) {
-            return Err(CodexProblem::new(
-                "configuration-collision",
-                Some(&self.config_path),
-            ));
-        }
-        Ok(snapshot)
+        self.inspect_managed_state(expected)
+            .map(ManagedCodexState::into_snapshot)
     }
 
-    pub fn desired(
+    pub(crate) fn inspect_managed_state(
+        &self,
+        expected: &DesiredCodexState,
+    ) -> Result<ManagedCodexState, CodexProblem> {
+        let mode = expected
+            .mode
+            .ok_or_else(|| CodexProblem::new("configuration-collision", Some(&self.config_path)))?;
+        self.inspect_state(Some((mode, expected)))
+    }
+
+    pub fn desired_takeover(
         &self,
         model: &str,
         base_url: &str,
@@ -201,17 +265,54 @@ impl CodexConfigCodec {
     ) -> DesiredCodexState {
         let header = serde_json::to_string(routing_credential)
             .expect("serializing a routing credential string cannot fail");
-        DesiredCodexState(OwnedCodexState {
-            model: desired_item(value(model)),
-            model_provider: desired_item(value("muxvia_codex")),
-            provider_name: desired_item(value("Muxvia")),
-            provider_base_url: desired_item(value(base_url)),
-            provider_wire_api: desired_item(value("responses")),
-            provider_http_headers: parse_owned_item(&format!(
-                " {{ \"X-Muxvia-Routing-Credential\" = {header} }}"
-            )),
-            provider_supports_websockets: desired_item(value(false)),
-        })
+        DesiredCodexState {
+            owned: OwnedCodexState {
+                model: desired_item(value(model)),
+                model_provider: desired_item(value("muxvia_codex")),
+                provider_name: desired_item(value("Muxvia")),
+                provider_base_url: desired_item(value(base_url)),
+                provider_wire_api: desired_item(value("responses")),
+                provider_http_headers: parse_owned_item(&format!(
+                    " {{ \"X-Muxvia-Routing-Credential\" = {header} }}"
+                )),
+                provider_supports_websockets: desired_item(value(false)),
+            },
+            mode: Some(ManagedCodexMode::Takeover),
+        }
+    }
+
+    pub fn desired_direct(
+        &self,
+        model: &str,
+        base_url: &str,
+        provider_credential: &str,
+    ) -> DesiredCodexState {
+        let authorization = serde_json::to_string(&format!("Bearer {provider_credential}"))
+            .expect("serializing a Provider credential string cannot fail");
+        DesiredCodexState {
+            owned: OwnedCodexState {
+                model: desired_item(value(model)),
+                model_provider: desired_item(value("muxvia_codex")),
+                provider_name: desired_item(value("Muxvia Direct")),
+                provider_base_url: desired_item(value(base_url)),
+                provider_wire_api: desired_item(value("responses")),
+                provider_http_headers: parse_owned_item(&format!(
+                    " {{ Authorization = {authorization} }}"
+                )),
+                provider_supports_websockets: desired_item(value(false)),
+            },
+            mode: Some(ManagedCodexMode::Direct),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn desired(
+        &self,
+        model: &str,
+        base_url: &str,
+        routing_credential: &str,
+    ) -> DesiredCodexState {
+        self.desired_takeover(model, base_url, routing_credential)
     }
 
     pub fn atomic_apply(
@@ -219,7 +320,7 @@ impl CodexConfigCodec {
         before: &ConfigSnapshot,
         desired: &DesiredCodexState,
     ) -> Result<(), CodexProblem> {
-        self.write_owned(before, &desired.0, false, true)?;
+        self.write_owned(before, &desired.owned, false, true)?;
         self.verify(before, desired)
     }
 
@@ -229,7 +330,7 @@ impl CodexConfigCodec {
         expected_current: &DesiredCodexState,
     ) -> Result<(), CodexProblem> {
         let current = self.read_snapshot()?.0;
-        if !owned_semantically_matches(&current.owned, &expected_current.0) {
+        if !owned_semantically_matches(&current.owned, &expected_current.owned) {
             return Err(CodexProblem::new(
                 "recovery-required",
                 Some(&self.config_path),
@@ -276,7 +377,7 @@ impl CodexConfigCodec {
         desired: &DesiredCodexState,
     ) -> Result<(), CodexProblem> {
         let current = self.read_snapshot()?.0;
-        if !owned_semantically_matches(&current.owned, &desired.0)
+        if !owned_semantically_matches(&current.owned, &desired.owned)
             || current.unrelated != before.unrelated
         {
             return Err(CodexProblem::new(
@@ -330,7 +431,7 @@ impl CodexConfigCodec {
                 .await
                 .map_err(|_| CodexProblem::new("recovery-required", Some(&self.config_path)));
         }
-        if owned_semantically_matches(&current.owned, &intent.desired().0)
+        if owned_semantically_matches(&current.owned, &intent.desired().owned)
             && current.unrelated == intent.before().unrelated
             && self.restore(intent.before(), intent.desired()).is_ok()
             && self.matches_before(intent.before())
@@ -936,13 +1037,61 @@ fn create_private_parent(parent: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::permission_bits;
+    use super::{CodexConfigCodec, ManagedCodexMode, ManagedCodexState, permission_bits};
     use rustix::fs::Mode;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn permission_bits_project_to_portable_u32() {
         let raw_mode = (Mode::RUSR | Mode::WUSR | Mode::RGRP).as_raw_mode();
 
         assert_eq!(permission_bits(raw_mode), 0o640);
+    }
+
+    #[test]
+    fn managed_state_is_typed_only_by_the_callers_committed_expectation() {
+        let root = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(root.path()).unwrap();
+        fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+        fs::write(codec.config_path(), "approval_policy = \"never\"\n").unwrap();
+
+        assert!(matches!(
+            codec.inspect_state(None).unwrap(),
+            ManagedCodexState::Unmanaged { .. }
+        ));
+
+        let before = codec.inspect().unwrap();
+        let direct = codec.desired_direct(
+            "model-a",
+            "https://provider.example/api/v1",
+            "provider-secret",
+        );
+        codec.atomic_apply(&before, &direct).unwrap();
+        assert!(matches!(
+            codec
+                .inspect_state(Some((ManagedCodexMode::Direct, &direct)))
+                .unwrap(),
+            ManagedCodexState::Direct { .. }
+        ));
+        assert_eq!(
+            codec.inspect_state(None).unwrap_err().code(),
+            "configuration-collision"
+        );
+
+        let direct_snapshot = codec.inspect_managed(&direct).unwrap();
+        let takeover =
+            codec.desired_takeover("model-b", "http://127.0.0.1:43123/v1", "route-secret");
+        codec.restore(&before, &direct).unwrap();
+        let unmanaged = codec.inspect().unwrap();
+        codec.atomic_apply(&unmanaged, &takeover).unwrap();
+        assert!(matches!(
+            codec
+                .inspect_state(Some((ManagedCodexMode::Takeover, &takeover)))
+                .unwrap(),
+            ManagedCodexState::Takeover { .. }
+        ));
+
+        assert!(!format!("{direct_snapshot:?}").contains("provider-secret"));
     }
 }

@@ -14,6 +14,7 @@ use tempfile::TempDir;
 
 const ORIGINAL: &str = r#"# keep this comment
 approval_policy = "on-request"
+operator_models = ["keep-a", "keep-b"] # keep this array
 model = "old-model"
 model_provider = "old-provider"
 
@@ -35,7 +36,178 @@ fn fixture() -> (TempDir, CodexConfigCodec) {
 }
 
 fn desired(codec: &CodexConfigCodec) -> muxvia_routing::codex::DesiredCodexState {
-    codec.desired("gpt-test", "http://127.0.0.1:43123/v1", "route-secret")
+    codec.desired_takeover("gpt-test", "http://127.0.0.1:43123/v1", "route-secret")
+}
+
+fn desired_direct(codec: &CodexConfigCodec) -> muxvia_routing::codex::DesiredCodexState {
+    codec.desired_direct(
+        "model-a",
+        "https://provider.example/api/v1",
+        "provider-secret",
+    )
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct FileFingerprint {
+    bytes: Vec<u8>,
+    mode: u32,
+    size: u64,
+    modified: std::time::SystemTime,
+}
+
+#[cfg(unix)]
+fn fingerprint(path: &Path) -> FileFingerprint {
+    let metadata = fs::metadata(path).unwrap();
+    FileFingerprint {
+        bytes: fs::read(path).unwrap(),
+        mode: metadata.permissions().mode() & 0o777,
+        size: metadata.len(),
+        modified: metadata.modified().unwrap(),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_apply_writes_exact_owned_semantics_and_never_touches_auth_json() {
+    let (_home, codec) = fixture();
+    fs::set_permissions(codec.config_path(), fs::Permissions::from_mode(0o640)).unwrap();
+    let auth_path = codec.config_path().with_file_name("auth.json");
+    fs::write(&auth_path, br#"{"sentinel":"operator-auth"}\n"#).unwrap();
+    fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o640)).unwrap();
+    let auth_before = fingerprint(&auth_path);
+    let before = codec.inspect().unwrap();
+    let direct = desired_direct(&codec);
+
+    codec.atomic_apply(&before, &direct).unwrap();
+
+    let document = fs::read_to_string(codec.config_path())
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    assert_eq!(document["model"].as_str(), Some("model-a"));
+    assert_eq!(document["model_provider"].as_str(), Some("muxvia_codex"));
+    let provider = &document["model_providers"]["muxvia_codex"];
+    assert_eq!(provider["name"].as_str(), Some("Muxvia Direct"));
+    assert_eq!(
+        provider["base_url"].as_str(),
+        Some("https://provider.example/api/v1")
+    );
+    assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+    assert_eq!(
+        provider["http_headers"]["Authorization"].as_str(),
+        Some("Bearer provider-secret")
+    );
+    assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
+    assert_eq!(document["approval_policy"].as_str(), Some("on-request"));
+    assert_eq!(
+        document["operator_models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(toml_edit::Value::as_str)
+            .collect::<Vec<_>>(),
+        ["keep-a", "keep-b"]
+    );
+    assert_eq!(
+        document["model_providers"]["existing"]["base_url"].as_str(),
+        Some("https://existing.test/v1")
+    );
+    assert_eq!(document["features"]["web_search"].as_bool(), Some(true));
+    assert_eq!(
+        fs::metadata(codec.config_path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+    assert_eq!(fingerprint(&auth_path), auth_before);
+    assert!(!format!("{direct:?}").contains("provider-secret"));
+}
+
+#[test]
+fn direct_managed_inspection_requires_the_committed_expected_state() {
+    let (_home, codec) = fixture();
+    let before = codec.inspect().unwrap();
+    let direct = desired_direct(&codec);
+    codec.atomic_apply(&before, &direct).unwrap();
+
+    assert_eq!(
+        codec.inspect().unwrap_err().code(),
+        "configuration-collision"
+    );
+    let managed = codec.inspect_managed(&direct).unwrap();
+    assert!(!format!("{managed:?}").contains("provider-secret"));
+    let error = codec.inspect_managed(&desired(&codec)).unwrap_err();
+    assert_eq!(error.code(), "configuration-collision");
+    assert!(!format!("{error:?}\n{error}").contains("provider-secret"));
+}
+
+#[test]
+fn takeover_managed_inspection_rejects_direct_expected_state() {
+    let (_home, codec) = fixture();
+    let before = codec.inspect().unwrap();
+    let takeover = desired(&codec);
+    codec.atomic_apply(&before, &takeover).unwrap();
+
+    codec.inspect_managed(&takeover).unwrap();
+    assert_eq!(
+        codec
+            .inspect_managed(&desired_direct(&codec))
+            .unwrap_err()
+            .code(),
+        "configuration-collision"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_restore_preserves_exact_prior_items_unrelated_edits_and_auth_json() {
+    let home = TempDir::new().unwrap();
+    let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+    fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+    let original = "model=7 # keep numeric comment\nmodel_provider = [\"legacy\", 2] # keep array comment\napproval_policy = \"never\"\n";
+    fs::write(codec.config_path(), original).unwrap();
+    let auth_path = codec.config_path().with_file_name("auth.json");
+    fs::write(&auth_path, b"operator-auth-sentinel\n").unwrap();
+    fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let auth_before = fingerprint(&auth_path);
+    let before = codec.inspect().unwrap();
+    let direct = desired_direct(&codec);
+    codec.atomic_apply(&before, &direct).unwrap();
+    let rendered = fs::read_to_string(codec.config_path()).unwrap();
+    fs::write(
+        codec.config_path(),
+        format!("operator_runtime_edit = true\n{rendered}"),
+    )
+    .unwrap();
+
+    codec.restore(&before, &direct).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(codec.config_path()).unwrap(),
+        format!("operator_runtime_edit = true\n{original}")
+    );
+    assert_eq!(fingerprint(&auth_path), auth_before);
+}
+
+#[test]
+fn direct_restore_removes_owned_fields_when_they_were_absent() {
+    let home = TempDir::new().unwrap();
+    let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+    fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+    fs::write(codec.config_path(), "approval_policy = \"never\"\n").unwrap();
+    let before = codec.inspect().unwrap();
+    let direct = desired_direct(&codec);
+
+    codec.atomic_apply(&before, &direct).unwrap();
+    codec.restore(&before, &direct).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(codec.config_path()).unwrap(),
+        "approval_policy = \"never\"\n"
+    );
 }
 
 #[test]
@@ -422,7 +594,7 @@ fn exchange_mismatch_with_failed_rollback_retains_displaced_operator_artifact() 
 
 #[cfg(unix)]
 #[test]
-fn existing_mode_is_preserved_even_under_restrictive_umask() {
+fn direct_existing_mode_is_preserved_even_under_restrictive_umask() {
     let home = TempDir::new().unwrap();
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .arg("--ignored")
@@ -465,7 +637,9 @@ fn umask_subprocess_helper() {
     let previous = unsafe { libc::umask(0o077) };
     let _restore = RestoreUmask(previous);
 
-    codec.atomic_apply(&before, &desired(&codec)).unwrap();
+    codec
+        .atomic_apply(&before, &desired_direct(&codec))
+        .unwrap();
 }
 
 #[test]

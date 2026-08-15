@@ -202,22 +202,56 @@ async function claudePost(
   })
 }
 
+type SecretOccurrence = { count: number; exact: boolean; path: string }
+
+function jsonSecretOccurrences(value: unknown, secret: string, path: string[] = []): SecretOccurrence[] {
+  if (typeof value === "string") {
+    const count = value.split(secret).length - 1
+    return count > 0 ? [{ count, exact: value === secret, path: path.join(".") }] : []
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((entry, index) => jsonSecretOccurrences(entry, secret, [...path, String(index)]))
+  }
+  if (!value || typeof value !== "object") return []
+  return Object.entries(value as Record<string, unknown>)
+    .flatMap(([key, entry]) => jsonSecretOccurrences(entry, secret, [...path, key]))
+}
+
+function auditAndExtractClaudeRoutingCredential(
+  text: string,
+  forbiddenSecrets: readonly string[],
+): { credential: string; parsed: Record<string, unknown> & { env?: Record<string, unknown> } } {
+  scanNoSecrets([text], forbiddenSecrets, "claude-settings-raw")
+  let parsed: Record<string, unknown> & { env?: Record<string, unknown> }
+  try {
+    parsed = JSON.parse(text) as typeof parsed
+  } catch {
+    throw new Error("claude-managed-settings-parse-invalid")
+  }
+  const credential = parsed.env?.ANTHROPIC_AUTH_TOKEN
+  if (typeof credential !== "string" || !/^[a-f0-9]{64}$/.test(credential)) {
+    throw new Error("claude-managed-credential-invalid")
+  }
+  const occurrences = jsonSecretOccurrences(parsed, credential)
+  if (
+    occurrences.length !== 1
+    || occurrences[0]!.path !== "env.ANTHROPIC_AUTH_TOKEN"
+    || !occurrences[0]!.exact
+  ) throw new Error("secret-scan-failed:claude-settings-routing-secret")
+  return { credential, parsed }
+}
+
 function extractClaudeManagedSettings(
   text: string,
   expectedModel: string,
   forbiddenSecrets: readonly string[] = [],
 ): { endpoint: string; credential: string; semantic: unknown } {
-  scanNoSecrets([text], forbiddenSecrets, "claude-settings-raw")
-  const parsed = JSON.parse(text) as Record<string, unknown> & { env?: Record<string, unknown> }
+  const { credential, parsed } = auditAndExtractClaudeRoutingCredential(text, forbiddenSecrets)
   const env = parsed.env
   if (!env || typeof env !== "object") throw new Error("claude-managed-settings-invalid")
   const endpoint = env.ANTHROPIC_BASE_URL
-  const credential = env.ANTHROPIC_AUTH_TOKEN
   if (typeof endpoint !== "string" || !/^http:\/\/127\.0\.0\.1:\d+$/.test(endpoint)) {
     throw new Error("claude-managed-endpoint-invalid")
-  }
-  if (typeof credential !== "string" || !/^[a-f0-9]{64}$/.test(credential)) {
-    throw new Error("claude-managed-credential-invalid")
   }
   const rootKeys = Object.keys(parsed).sort()
   const envKeys = Object.keys(env).sort()
@@ -249,16 +283,10 @@ function auditClaudeSettingsSecrets(
   routingCredential: string,
   forbiddenSecrets: readonly string[],
 ): void {
-  scanNoSecrets([text], forbiddenSecrets, "claude-settings-forbidden-secret")
-  const parsed = JSON.parse(text) as { env?: Record<string, unknown> }
-  if (parsed.env?.ANTHROPIC_AUTH_TOKEN !== routingCredential) {
+  const audited = auditAndExtractClaudeRoutingCredential(text, forbiddenSecrets)
+  if (audited.credential !== routingCredential) {
     throw new Error("claude-settings-routing-location-invalid")
   }
-  const redacted = {
-    ...parsed,
-    env: { ...parsed.env, ANTHROPIC_AUTH_TOKEN: null },
-  }
-  scanNoSecrets([redacted], [routingCredential], "claude-settings-routing-secret")
 }
 
 type ClaudeRequestProjection = {
@@ -390,6 +418,14 @@ function assertExactClaudeMessagesProjection(projection: ClaudeRequestProjection
   ) throw new Error("claude-messages-envelope-mismatch")
 }
 
+function assertExactClaudeDiscoveryProjection(projection: ClaudeRequestProjection): void {
+  if (
+    projection.method !== "GET"
+    || projection.pathClass !== "models"
+    || projection.version !== "2023-06-01"
+  ) throw new Error("claude-discovery-version-mismatch")
+}
+
 function assertClaudeUpstreamResponseHeaders(headers: Record<string, string | string[] | undefined>): void {
   if (headers["x-upstream"] !== "claude-fixture") throw new Error("claude-response-header-mismatch")
 }
@@ -415,11 +451,19 @@ function assertChildVisibleEnvironment(
   ) throw new Error("claude-environment-traps-not-child-visible")
 }
 
-function runWithFinalSecurityAudit(work: () => void, audit: () => void): void {
-  let functionalFailure: unknown
-  try { work() } catch (error) { functionalFailure = error }
-  audit()
-  if (functionalFailure) throw functionalFailure
+type ClaudeSecurityFinalizerStep = {
+  name: string
+  run: () => void | Promise<void>
+}
+
+async function runClaudeSecurityFinalizer(steps: readonly ClaudeSecurityFinalizerStep[]): Promise<void> {
+  const failures: string[] = []
+  for (const step of steps) {
+    try { await step.run() } catch { failures.push(step.name) }
+  }
+  if (failures.length > 0) {
+    throw new Error(`claude-security-finalizer-failed:${failures.join(",")}`)
+  }
 }
 
 function extractManagedConfig(text: string, expectedModel: string): { endpoint: string; credential: string } {
@@ -1099,25 +1143,24 @@ type SqliteSecretPolicy = {
   routingSecrets: ReadonlyArray<{ target: "codex" | "claude"; secret: string }>
 }
 
-function jsonSecretPaths(value: unknown, secret: string, path: string[] = []): string[] {
-  if (typeof value === "string") return value.includes(secret) ? [path.join(".")] : []
-  if (Array.isArray(value)) return value.flatMap((entry, index) => jsonSecretPaths(entry, secret, [...path, String(index)]))
-  if (!value || typeof value !== "object") return []
-  return Object.entries(value as Record<string, unknown>)
-    .flatMap(([key, entry]) => jsonSecretPaths(entry, secret, [...path, key]))
-}
-
-function approvedRecoveryPaths(target: "codex" | "claude"): readonly string[] {
-  if (target === "claude") return [
-    "before.owned.auth_token",
-    "desired.owned.auth_token",
-  ]
-  return [
+function approvedRecoveryOccurrence(
+  target: "codex" | "claude",
+  occurrence: SecretOccurrence,
+): boolean {
+  if (target === "claude") {
+    return occurrence.exact && [
+      "before.owned.auth_token",
+      "desired.owned.auth_token",
+    ].includes(occurrence.path)
+  }
+  if ([
     "before.owned.provider_http_headers.rendered",
-    "before.owned.provider_http_headers.semantic.X-Muxvia-Routing-Credential",
     "desired.provider_http_headers.rendered",
+  ].includes(occurrence.path)) return occurrence.count === 1
+  return occurrence.count === 1 && occurrence.exact && [
+    "before.owned.provider_http_headers.semantic.X-Muxvia-Routing-Credential",
     "desired.provider_http_headers.semantic.X-Muxvia-Routing-Credential",
-  ]
+  ].includes(occurrence.path)
 }
 
 function auditSqliteSecretLocations(path: string, policy: SqliteSecretPolicy): void {
@@ -1170,10 +1213,10 @@ function auditSqliteSecretLocations(path: string, policy: SqliteSecretPolicy): v
               && row.target === target
               && policy.routingSecrets.some((entry) => entry.target === target && entry.secret === secret)
             ) {
-              const paths = jsonSecretPaths(recoveryPayload, secret)
+              const occurrences = jsonSecretOccurrences(recoveryPayload, secret)
               if (
-                paths.length > 0
-                && paths.every((entry) => approvedRecoveryPaths(target).includes(entry))
+                occurrences.length > 0
+                && occurrences.every((entry) => approvedRecoveryOccurrence(target, entry))
               ) continue
             }
             throw new Error("secret-scan-failed:claude-sqlite-secret-location")
@@ -1690,7 +1733,7 @@ test("CapturedRequest secret scanning precedes safe semantic projection", () => 
 test("Claude request audit rejects misplaced credentials with fixed diagnostics", () => {
   const apiKey = "controlled-claude-api-key"
   const bearer = "controlled-claude-bearer"
-  const routing = "controlled-claude-routing"
+  const routing = "c".repeat(64)
   const mutations: CapturedRequest[] = [
     {
       authorization: null,
@@ -1761,6 +1804,26 @@ test("Claude request audit rejects misplaced credentials with fixed diagnostics"
   expect(earlyDiagnostic).toBe("secret-scan-failed:claude-settings-raw")
   expect(earlyDiagnostic.includes(apiKey)).toBeFalse()
   expect(earlyDiagnostic.includes(earlyFailureMutation)).toBeFalse()
+
+  const generated = "a".repeat(64)
+  const duplicatedGeneratedMutation = JSON.stringify({
+    operator: { theme: "dark", hooks: ["keep"], duplicate: generated },
+    env: {
+      ANTHROPIC_AUTH_TOKEN: generated,
+      ANTHROPIC_BASE_URL: "http://127.0.0.1:43124",
+      ANTHROPIC_MODEL: "wrong-model",
+      OPERATOR_UNRELATED: "keep-me",
+    },
+  })
+  let duplicatedDiagnostic = ""
+  try {
+    extractClaudeManagedSettings(duplicatedGeneratedMutation, "expected-model")
+  } catch (error) {
+    duplicatedDiagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(duplicatedDiagnostic).toBe("secret-scan-failed:claude-settings-routing-secret")
+  expect(duplicatedDiagnostic.includes(generated)).toBeFalse()
+  expect(duplicatedDiagnostic.includes(duplicatedGeneratedMutation)).toBeFalse()
 })
 
 test("Claude environment trap audit rejects traps stripped before child spawn", () => {
@@ -1868,18 +1931,49 @@ test("real service keeps child-visible environment traps outside the explicit ta
   }
 }, 20_000)
 
-test("Claude final security scanner wins over an earlier functional failure", () => {
+test("Claude tracer finalizer attempts every audit and reports fixed accumulated failures", async () => {
   const leaked = "controlled-final-audit-leak"
+  const attempted: string[] = []
   let diagnostic = ""
   try {
-    runWithFinalSecurityAudit(
-      () => { throw new Error("early-functional-failure") },
-      () => scanNoSecrets([{ stdout: leaked }], [leaked], "claude-guaranteed-final-audit"),
-    )
+    try {
+      throw new Error("early-functional-failure")
+    } finally {
+      await runClaudeSecurityFinalizer([
+        { name: "credential-recovery", run: () => {
+          attempted.push("credential-recovery")
+          throw new Error(`raw-${leaked}`)
+        } },
+        { name: "raw-rpc", run: () => {
+          attempted.push("raw-rpc")
+          scanNoSecrets([{ frame: leaked }], [leaked], "controlled-raw-rpc")
+        } },
+        { name: "process-output-drain", run: async () => {
+          attempted.push("process-output-drain")
+          throw new Error(`drain-${leaked}`)
+        } },
+        { name: "native-frames", run: () => { attempted.push("native-frames") } },
+        { name: "process-output", run: () => {
+          attempted.push("process-output")
+          throw new Error(`stdout-${leaked}`)
+        } },
+        { name: "trap", run: () => { attempted.push("trap") } },
+      ])
+    }
   } catch (error) {
     diagnostic = error instanceof Error ? error.message : String(error)
   }
-  expect(diagnostic).toBe("secret-scan-failed:claude-guaranteed-final-audit")
+  expect(attempted).toEqual([
+    "credential-recovery",
+    "raw-rpc",
+    "process-output-drain",
+    "native-frames",
+    "process-output",
+    "trap",
+  ])
+  expect(diagnostic).toBe(
+    "claude-security-finalizer-failed:credential-recovery,raw-rpc,process-output-drain,process-output",
+  )
   expect(diagnostic.includes(leaked)).toBeFalse()
 })
 
@@ -1891,6 +1985,29 @@ test("Claude SQLite audit rejects a secret in an unrelated state column", async 
   database.exec("CREATE TABLE target_problems (target TEXT, code TEXT, message TEXT)")
   const secret = "controlled-sqlite-misplaced-secret"
   database.query("INSERT INTO target_problems VALUES ('claude', 'controlled', ?)").run(secret)
+  database.close()
+  let diagnostic = ""
+  try {
+    auditSqliteSecretLocations(path, { providerSecrets: [], routingSecrets: [{ target: "claude", secret }] })
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(diagnostic).toBe("secret-scan-failed:claude-sqlite-secret-location")
+  expect(diagnostic.includes(secret)).toBeFalse()
+})
+
+test("Claude SQLite recovery audit rejects a prefixed semantic token", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-recovery-audit-"))
+  roots.push(root)
+  const path = join(root, "mutation.db")
+  const secret = "controlled-recovery-routing-secret"
+  const database = new Database(path, { create: true })
+  database.exec("CREATE TABLE activation_recovery (target TEXT, payload_json TEXT)")
+  database.query("INSERT INTO activation_recovery VALUES ('claude', ?)").run(JSON.stringify({
+    target: "claude",
+    before: { owned: { auth_token: null } },
+    desired: { owned: { auth_token: `prefix-${secret}-suffix` } },
+  }))
   database.close()
   let diagnostic = ""
   try {
@@ -1938,6 +2055,11 @@ test("fake Claude upstream rejects missing version and altered schema with fixed
   const apiKey = "controlled-fake-upstream-api-key"
   const upstream = await startFakeUpstream("unused", undefined, { apiKeyCredentials: [apiKey] })
   try {
+    const missingDiscoveryVersion = await fetch(`${upstream.baseUrl}/models`, {
+      headers: { "x-api-key": apiKey },
+    })
+    expect(missingDiscoveryVersion.status).toBe(422)
+    expect(await missingDiscoveryVersion.text()).toBe('{"error":"fixture-contract-rejected"}')
     const missingVersion = await fetch(`${upstream.baseUrl}/messages`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": apiKey },
@@ -2442,6 +2564,7 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     expect(claudeRequestProjections[0]).toMatchObject({
       method: "GET", pathClass: "models", authentication: "api-key",
     })
+    assertExactClaudeDiscoveryProjection(claudeRequestProjections[0]!)
     await waitForSecretSafeFrame(setup, (frame) => frame.includes("2 models available"), allStaticSecrets, "claude-auto-discovery")
     expect(await readOnlyStateFingerprint(databasePath, claudeSettingsPath)).toEqual(beforeInspection)
     leader("f")
@@ -2450,6 +2573,7 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     expect(claudeRequestProjections[1]).toMatchObject({
       method: "GET", pathClass: "models", authentication: "api-key",
     })
+    assertExactClaudeDiscoveryProjection(claudeRequestProjections[1]!)
     expect(await readOnlyStateFingerprint(databasePath, claudeSettingsPath)).toEqual(beforeInspection)
     setup.mockInput.pressEscape()
     await setup.waitForFrame((frame) => frame.includes("Run a target action") && !frame.includes("Enter save"))
@@ -2825,60 +2949,81 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     expect((await stat(databasePath)).mode & 0o777).toBe(0o600)
     expect((await stat(muxviaHome)).mode & 0o777).toBe(0o700)
   } finally {
-    let cleanupFailed = false
-    upstream.releaseDelayed()
-    if (rendererAudit) {
-      try {
-        rendererAudit.stop()
-        nativeFrames.push(...rendererAudit.frames())
-      } catch { cleanupFailed = true }
-    }
-    if (setup && !setup.renderer.isDestroyed) {
-      try { setup.renderer.destroy() } catch { cleanupFailed = true }
-    }
-    await closeSessions().catch(() => {})
-    await writeFile(firstShutdown, "shutdown\n").catch(() => {})
-    await writeFile(secondShutdown, "shutdown\n").catch(() => {})
-    for (const { child } of services) if (child.exitCode === null) child.kill("SIGKILL")
-    await Promise.all(services.map(({ output }) => output.completed.catch(() => undefined)))
-    try { await upstream.stop() } catch { cleanupFailed = true }
-    if (!codexRoutingCredential) {
-      try {
-        const raw = await readFile(codexConfigPath, "utf8")
-        scanNoSecrets([raw], allStaticSecrets, "claude-final-codex-config-raw")
-        codexRoutingCredential = raw.match(/X-Muxvia-Routing-Credential"\s*=\s*"([a-f0-9]{64})"/)?.[1]
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-      }
-    }
-    if (!claudeRoutingCredential) {
-      try {
-        const raw = await readFile(claudeSettingsPath, "utf8")
-        scanNoSecrets([raw], [
-          ...allStaticSecrets,
-          ...(codexRoutingCredential ? [codexRoutingCredential] : []),
-        ], "claude-final-settings-raw")
-        const parsed = JSON.parse(raw) as { env?: { ANTHROPIC_AUTH_TOKEN?: unknown } }
-        if (typeof parsed.env?.ANTHROPIC_AUTH_TOKEN === "string") {
-          claudeRoutingCredential = parsed.env.ANTHROPIC_AUTH_TOKEN
-        }
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-      }
-    }
-    const completeSecrets = [
+    const completeSecrets = () => [
       ...allStaticSecrets,
       ...(claudeRoutingCredential ? [claudeRoutingCredential] : []),
       ...(codexRoutingCredential ? [codexRoutingCredential] : []),
     ]
-    assertAuditHealthy()
-    if (rpcStreams.some((stream) => stream.length > 0)) scanRawRpcFramesNoSecrets(rpcStreams, completeSecrets)
-    scanNoSecrets([decodedFrames, views, selectedFrames, nativeFrames], completeSecrets, "claude-zero-secret-observations")
-    scanProcessOutputNoSecrets(services.map(({ output }) => output.streams).flat(), completeSecrets)
-    if (await controlledTreeFingerprint(trapHome) !== trapFingerprint) {
-      throw new Error("claude-environment-trap-mutated")
-    }
-    if (cleanupFailed) throw new Error("claude-security-finalizer-cleanup-failed")
+    await runClaudeSecurityFinalizer([
+      { name: "release-delayed", run: () => upstream.releaseDelayed() },
+      { name: "native-recorder-drain", run: () => {
+        if (!rendererAudit) return
+        rendererAudit.stop()
+        nativeFrames.push(...rendererAudit.frames())
+      } },
+      { name: "renderer-destroy", run: () => {
+        if (setup && !setup.renderer.isDestroyed) setup.renderer.destroy()
+      } },
+      { name: "session-close", run: closeSessions },
+      { name: "shutdown-signal-first", run: () => writeFile(firstShutdown, "shutdown\n", { mode: 0o600 }) },
+      { name: "shutdown-signal-second", run: () => writeFile(secondShutdown, "shutdown\n", { mode: 0o600 }) },
+      { name: "process-kill", run: () => {
+        for (const { child } of services) if (child.exitCode === null) child.kill("SIGKILL")
+      } },
+      { name: "process-output-drain", run: async () => {
+        const results = await Promise.allSettled(services.map(({ output }) => Promise.race([
+          output.completed,
+          Bun.sleep(deadlineMs).then(() => { throw new Error("process-output-drain-timeout") }),
+        ])))
+        if (results.some((result) => result.status === "rejected")) {
+          throw new Error("process-output-drain-incomplete")
+        }
+      } },
+      { name: "upstream-drain", run: () => upstream.stop() },
+      { name: "codex-credential-recovery", run: async () => {
+        if (codexRoutingCredential) return
+        try {
+          const raw = await readFile(codexConfigPath, "utf8")
+          scanNoSecrets([raw], allStaticSecrets, "claude-final-codex-config-raw")
+          codexRoutingCredential = raw.match(/X-Muxvia-Routing-Credential"\s*=\s*"([a-f0-9]{64})"/)?.[1]
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+        }
+      } },
+      { name: "claude-credential-recovery", run: async () => {
+        if (claudeRoutingCredential) return
+        try {
+          const raw = await readFile(claudeSettingsPath, "utf8")
+          claudeRoutingCredential = auditAndExtractClaudeRoutingCredential(raw, [
+            ...allStaticSecrets,
+            ...(codexRoutingCredential ? [codexRoutingCredential] : []),
+          ]).credential
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+        }
+      } },
+      { name: "upstream-request-audit", run: assertAuditHealthy },
+      { name: "raw-rpc", run: () => {
+        if (rpcStreams.some((stream) => stream.length > 0)) {
+          scanRawRpcFramesNoSecrets(rpcStreams, completeSecrets())
+        }
+      } },
+      { name: "zero-secret-observations", run: () => {
+        scanNoSecrets(
+          [decodedFrames, views, selectedFrames, nativeFrames],
+          completeSecrets(),
+          "claude-zero-secret-observations",
+        )
+      } },
+      { name: "process-output", run: () => {
+        scanProcessOutputNoSecrets(services.map(({ output }) => output.streams).flat(), completeSecrets())
+      } },
+      { name: "trap", run: async () => {
+        if (await controlledTreeFingerprint(trapHome) !== trapFingerprint) {
+          throw new Error("claude-environment-trap-mutated")
+        }
+      } },
+    ])
   }
 }, 60_000)
 

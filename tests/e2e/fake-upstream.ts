@@ -95,11 +95,18 @@ export async function startFakeUpstream(
     for (const notify of callWaiters) notify()
 
     if (request.method === "GET" && request.url?.startsWith("/v1/models")) {
-      const authorized = request.headers.authorization === `Bearer ${expectedProviderCredential}`
-        || options.bearerCredentials?.includes(header(request.headers.authorization)?.replace(/^Bearer /, "") ?? "")
+      const codexAuthorized = request.headers.authorization === `Bearer ${expectedProviderCredential}`
+      const claudeAuthorized = options.bearerCredentials
+        ?.includes(header(request.headers.authorization)?.replace(/^Bearer /, "") ?? "")
         || options.apiKeyCredentials?.includes(header(request.headers["x-api-key"]) ?? "")
+      const authorized = codexAuthorized || claudeAuthorized
       if (!authorized) {
         response.writeHead(403).end()
+        return
+      }
+      if (claudeAuthorized && header(request.headers["anthropic-version"]) !== "2023-06-01") {
+        response.writeHead(422, { "content-type": "application/json" })
+        response.end('{"error":"fixture-contract-rejected"}')
         return
       }
       response.writeHead(200, { "content-type": "application/json" })

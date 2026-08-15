@@ -5,7 +5,7 @@ import type { TargetSession } from "../src/control/target-session"
 import type { ActionOutcome, TargetAction, TargetView } from "../src/control/types"
 import { App } from "../src/ui/app"
 
-const sizes = [[1, 1], [2, 2], [20, 5], [40, 10], [80, 24], [121, 30]] as const
+const sizes = [[1, 1], [2, 2], [20, 5], [40, 10], [80, 24], [120, 30], [121, 30]] as const
 
 function view(): TargetView {
   return {
@@ -28,7 +28,11 @@ function view(): TargetView {
 }
 
 class StaticTargetSession implements TargetSession {
-  readonly #view = view()
+  readonly #view: TargetView
+
+  constructor(target: "codex" | "claude" = "codex") {
+    this.#view = { ...view(), target }
+  }
 
   get(): Readonly<TargetView> {
     return this.#view
@@ -123,7 +127,10 @@ test("Codex renders the exact extreme-size matrix and folds its contextual sideb
 })
 
 test("Claude renders the exact extreme-size matrix without excluded application chrome", async () => {
-  const setup = await testRender(() => <App session={new StaticTargetSession()} />, {
+  const setup = await testRender(() => <App sessions={{
+    codex: new StaticTargetSession(),
+    claude: new StaticTargetSession("claude"),
+  }} />, {
     width: 80,
     height: 24,
     useThread: false,
@@ -132,8 +139,17 @@ test("Claude renders the exact extreme-size matrix without excluded application 
   try {
     await setup.renderOnce()
     setup.mockInput.pressKey("2")
-    await setup.waitForFrame((frame) => frame.includes("Routing Service is unavailable"))
+    await setup.waitForFrame((frame) => frame.includes("Claude · Control Plane"))
     await expectSizeMatrix(setup)
+
+    setup.resize(120, 30)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).not.toContain("Target context")
+
+    setup.resize(121, 30)
+    const wide = await setup.waitForFrame((frame) => frame.includes("Target context"))
+    expect(wide).toContain("Route Health  Unobserved")
+    expect(wide).toContain("Claude · Control Plane")
   } finally {
     setup.renderer.destroy()
   }

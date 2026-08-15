@@ -34,7 +34,9 @@ export interface ProviderFormProps {
   pending: boolean
   t: Translator
   ref?: (value: ProviderFormRef | undefined) => void
+  initialDirty?: boolean
   onDirtyChange: (dirty: boolean) => void
+  onDraftChange?: (draft: Pick<ProviderDraft, "name" | "baseUrl" | "model" | "authentication">) => void
   onCancel: () => void
   onSave(result: ProviderFormResult): Promise<boolean>
 }
@@ -49,6 +51,7 @@ type CredentialIntent = "keep" | "remove" | "replace"
 
 export function ProviderForm(props: ProviderFormProps) {
   const overlay = useOverlay()
+  const onDraftChange = props.onDraftChange
   const [focus, setFocus] = createSignal(0)
   const [name, setName] = createSignal(props.initialDraft.name)
   const [baseUrl, setBaseUrl] = createSignal(props.initialDraft.baseUrl)
@@ -60,7 +63,7 @@ export function ProviderForm(props: ProviderFormProps) {
   const [credentialIntent, setCredentialIntent] = createSignal<CredentialIntent>(
     props.mode === "create" || props.duplicateCredentialChoice === "without" ? "remove" : "keep",
   )
-  const [dirty, setDirtySignal] = createSignal(false)
+  const [dirty, setDirtySignal] = createSignal(props.initialDirty ?? false)
   const [discovery, setDiscovery] = createSignal<
     | { status: "idle" | "pending" }
     | { status: "success"; models: Extract<ModelDiscoveryResult, { status: "success" }>["models"] }
@@ -147,6 +150,15 @@ export function ProviderForm(props: ProviderFormProps) {
     discoveryAbort?.abort()
     discoveryAbort = undefined
     setDiscovery({ status: "idle" })
+  })
+
+  createEffect(() => {
+    onDraftChange?.({
+      name: name(),
+      baseUrl: baseUrl(),
+      model: model(),
+      authentication: authentication(),
+    })
   })
 
   const credentialEdit = (): Extract<TargetAction, { kind: "create-provider" }> ["credential"] => {

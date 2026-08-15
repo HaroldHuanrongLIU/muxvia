@@ -213,6 +213,7 @@ test("starts on Home and routes to and from the Codex context", async () => {
       "Routing Service  Running",
       "Managed Configuration  Unmanaged",
       "Activated Snapshot  —",
+      "Route Health  Unobserved",
       "Run a target action",
       "Codex · Control Plane",
     ])
@@ -230,6 +231,89 @@ test("starts on Home and routes to and from the Codex context", async () => {
     expect(compact).toContain("MUXVIA")
     expect(compact).toContain("Codex CLI")
     expect(compact).not.toContain("Overview")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("sidebar and activity state remain owned by their originating target", async () => {
+  const codex = new MemoryTargetSession(view())
+  const claude = new MemoryTargetSession(view({ target: "claude" }))
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
+    width: 121,
+    height: 30,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.waitForFrame((frame) => frame.includes("Target context"))
+    await setup.mockInput.typeText("/codex-only-unknown")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("codex-only-unknown"))
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("b")
+    await setup.waitForFrame((frame) => !frame.includes("Target context"))
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
+
+    setup.mockInput.pressKey("2")
+    const claudeFrame = await setup.waitForFrame((frame) => frame.includes("Claude · Control Plane"))
+    expect(claudeFrame).toContain("Target context")
+    expect(claudeFrame).not.toContain("codex-only-unknown")
+    await setup.mockInput.typeText("/claude-only-unknown")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("claude-only-unknown"))
+
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
+    setup.mockInput.pressKey("1")
+    const returned = await setup.waitForFrame((frame) => frame.includes("Codex · Control Plane"))
+    expect(returned).not.toContain("Target context")
+    expect(returned).toContain("codex-only-unknown")
+    expect(returned).not.toContain("claude-only-unknown")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("a dirty Provider draft remains owned by Codex while Claude is visited", async () => {
+  const codex = new MemoryTargetSession(view())
+  const claude = new MemoryTargetSession(view({ target: "claude" }))
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
+    width: 80,
+    height: 24,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    await enterProvider(setup)
+    expectSecretFree(setup, codex)
+
+    setup.mockInput.pressKey("p", { ctrl: true })
+    await setup.waitForFrame((frame) => frame.includes("Search commands"))
+    await setup.mockInput.typeText("Return home")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
+
+    setup.mockInput.pressKey("2")
+    const claudeFrame = await setup.waitForFrame((frame) => frame.includes("Claude · Control Plane"))
+    expect(claudeFrame).not.toContain("Fixture Provider")
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
+
+    setup.mockInput.pressKey("1")
+    const restored = await setup.waitForFrame((frame) => frame.includes("Fixture Provider"))
+    expect(restored).toContain("https://fixture.example/v1")
+    expect(restored).toContain("gpt-test")
+    expect((restored.match(/•/g) ?? []).length).toBe(0)
+    expect(codex.actions).toEqual([])
+    expect(claude.actions).toEqual([])
+    expectSecretFree(setup, codex)
   } finally {
     setup.renderer.destroy()
   }
@@ -381,6 +465,48 @@ test("switching targets suppresses stale Claude completion while retaining its t
   }
 })
 
+test("Claude localizes incomplete and unknown Takeover failures without backend text", async () => {
+  const incomplete = provider({
+    id: "claude-incomplete",
+    name: "Incomplete Claude Provider",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-api-key",
+    routingRequirement: "takeover-required",
+    credential: "missing",
+    completeness: "incomplete",
+    missingFields: ["credential"],
+  })
+  const initial = view({ target: "claude", providers: [incomplete], currentProviderId: incomplete.id })
+  let attempts = 0
+  const codex = new MemoryTargetSession(view())
+  const claude = new MemoryTargetSession(initial, async () => {
+    attempts++
+    throw {
+      code: attempts === 1 ? "incomplete-provider" : "future-claude-error",
+      message: problemMessageSentinel,
+    }
+  })
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, { width: 80, height: 24, useThread: false })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.mockInput.typeText("/takeover")
+    setup.mockInput.pressEnter()
+    const incompleteFrame = await setup.waitForFrame((frame) => frame.includes("Complete the required Provider fields"))
+    expect(incompleteFrame).not.toContain(problemMessageSentinel)
+    expect(claude.actions).toHaveLength(1)
+
+    await setup.mockInput.typeText("/takeover")
+    setup.mockInput.pressEnter()
+    const unknownFrame = await setup.waitForFrame((frame) => frame.includes("Action failed (future-claude-error)"))
+    expect(unknownFrame).not.toContain(problemMessageSentinel)
+    expect(claude.actions).toHaveLength(2)
+    expect(codex.actions).toEqual([])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
 test("renders every visible Provider editor string through the Chinese catalog", async () => {
   const pending = deferred<ActionOutcome>()
   const initial = view()
@@ -490,6 +616,55 @@ test("renders canonical Chinese status concepts and the managed configuration st
     expect(frame).toContain("受管理")
     expect(frame).toContain("已激活快照")
     expect(frame).not.toContain("未知（managed）")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("real Claude renders serving divergence, takeover, restart, recovery, and neutral health in Chinese", async () => {
+  const current = provider({ id: "claude-current", name: "当前 Claude Provider", protocol: "anthropic-messages", authentication: "anthropic-api-key" })
+  const serving = provider({ id: "claude-serving", position: 1, name: "服务中 Claude Provider", protocol: "anthropic-messages", authentication: "anthropic-bearer" })
+  const claude = new MemoryTargetSession(view({
+    target: "claude",
+    mode: "managed",
+    takeover: { state: "active", endpoint: "http://127.0.0.1:4321" },
+    routeHealth: { state: "unobserved" },
+    providers: [current, serving],
+    currentProviderId: current.id,
+    servingProviderId: serving.id,
+    managedConfiguration: { state: "managed", path: "/tmp/claude/settings.json", restartRequired: true },
+    recovery: { intentId: "intent-claude", state: "required" },
+    activatedSnapshot: {
+      id: snapshotId,
+      epoch: snapshotEpoch,
+      providerId: serving.id,
+      model: serving.model,
+      protocol: "anthropic-messages",
+      authentication: "anthropic-bearer",
+    },
+  }))
+  const setup = await testRender(() => <App sessions={{ claude }} locale="zh-CN" />, { width: 121, height: 30, useThread: false })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    const frame = await setup.waitForFrame((next) => next.includes("Claude · 控制平面"))
+    expect(frame).toContain("模式")
+    expect(frame).toContain("当前 Target Provider")
+    expect(frame).toContain("当前 Claude Provider")
+    expect(frame).toContain("服务中 Provider")
+    expect(frame).toContain("服务中 Claude Provider")
+    expect(frame).toContain("路由服务")
+    expect(frame).toContain("运行中")
+    expect(frame).toContain("受管理配置")
+    expect(frame).toContain("路由健康")
+    expect(frame).toContain("未观测")
+    expect(frame).toContain("重启 Claude Code 以使用受管理的配置")
+    expect(frame).toContain("Takeover 端点")
+    expect(frame).toContain("http://127.0.0.1:4321")
+    expect(frame).toContain("恢复")
+    expect(frame).toContain("需要恢复")
+    expect(frame).toContain("/tmp/claude/settings.json")
+    expect(frame).not.toContain("Direct")
   } finally {
     setup.renderer.destroy()
   }

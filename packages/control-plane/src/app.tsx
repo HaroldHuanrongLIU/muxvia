@@ -2,6 +2,7 @@ import { createCliRenderer, type CliRenderer } from "@opentui/core"
 import { render, type JSX } from "@opentui/solid"
 import { spawn } from "node:child_process"
 import { dirname, isAbsolute } from "node:path"
+import { createSignal } from "solid-js"
 
 import { RpcClient, ControlError } from "./control/rpc-client"
 import type { TargetSession } from "./control/target-session"
@@ -167,6 +168,7 @@ async function connectBeforeDeadline(
   cancellation: AbortSignal,
   target: Target,
   claudeContext?: ClaudePreflightContext,
+  closeSession: (session: TargetSession) => Promise<void> = (session) => session.close(),
 ): Promise<TargetSession> {
   if (cancellation.aborted) throw new ConnectionCancelledError()
   const remaining = deadline - ports.clock.now()
@@ -198,7 +200,7 @@ async function connectBeforeDeadline(
     .then(async (session) => {
       if (cancellation.aborted) {
         try {
-          await session.close()
+          await closeSession(session)
         } catch {
           // A cancelled startup owns the late session, but cleanup failure must not resume startup.
         }
@@ -206,7 +208,7 @@ async function connectBeforeDeadline(
       }
       if (!expired) return session
       try {
-        await session.close()
+        await closeSession(session)
       } catch {
         // A timed-out connection is abandoned; cleanup failure cannot replace the deadline result.
       }
@@ -230,10 +232,11 @@ async function connectOrStart(
   target: Target,
   spawnState: { started: boolean },
   claudeContext?: ClaudePreflightContext,
+  closeSession?: (session: TargetSession) => Promise<void>,
 ): Promise<TargetSession | undefined> {
   const deadline = ports.clock.now() + readinessTimeoutMs
   try {
-    return await connectBeforeDeadline(options, ports, deadline, cancellation, target, claudeContext)
+    return await connectBeforeDeadline(options, ports, deadline, cancellation, target, claudeContext, closeSession)
   } catch (error) {
     if (cancellation.aborted) return undefined
     if (error instanceof ConnectionCancelledError) return undefined
@@ -254,7 +257,7 @@ async function connectOrStart(
   while (ports.clock.now() < deadline) {
     if (cancellation.aborted) return undefined
     try {
-      return await connectBeforeDeadline(options, ports, deadline, cancellation, target, claudeContext)
+      return await connectBeforeDeadline(options, ports, deadline, cancellation, target, claudeContext, closeSession)
     } catch (error) {
       if (cancellation.aborted) return undefined
       if (error instanceof ConnectionCancelledError) return undefined
@@ -280,14 +283,20 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
       if (!renderer.isDestroyed) renderer.destroy()
     }),
   )
-  const sessions: Partial<Record<Target, TargetSession>> = {}
-  const unavailable: Partial<Record<Target, string>> = {}
+  const [sessions, setSessions] = createSignal<Partial<Record<Target, TargetSession>>>({})
+  const [unavailable, setUnavailable] = createSignal<Partial<Record<Target, string>>>({})
+  const closedSessions = new Set<TargetSession>()
+  const closeSessionOnce = async (session: TargetSession): Promise<void> => {
+    if (closedSessions.has(session)) return
+    closedSessions.add(session)
+    await session.close()
+  }
   const spawnState = { started: false }
   const claudeContext = claudePreflightContext(process.env)
   let firstConnectionFailure: unknown
   try {
     if (renderer.isDestroyed) return
-    for (const target of ["codex", "claude"] as const) {
+    await Promise.all((["codex", "claude"] as const).map(async (target) => {
       try {
         const session = await connectOrStart(
           options,
@@ -296,20 +305,32 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
           target,
           spawnState,
           target === "claude" ? claudeContext : undefined,
+          closeSessionOnce,
         )
-        if (session) sessions[target] = session
+        if (session) setSessions((current) => ({ ...current, [target]: session }))
       } catch (error) {
-        if (error instanceof ConnectionDeadlineError) throw error
         firstConnectionFailure ??= error
-        unavailable[target] = typeof error === "object" && error !== null && "code" in error
-          ? String(error.code)
-          : "service-unavailable"
+        setUnavailable((current) => ({
+          ...current,
+          [target]: typeof error === "object" && error !== null && "code" in error
+            ? String(error.code)
+            : "service-unavailable",
+        }))
       }
-    }
+    }))
     if (renderer.isDestroyed) return
-    if (Object.keys(sessions).length === 0) throw firstConnectionFailure ?? new ConnectionDeadlineError()
+    if (Object.keys(sessions()).length === 0) throw firstConnectionFailure ?? new ConnectionDeadlineError()
     await ports.render(() => <App sessions={sessions} unavailable={unavailable} locale={locale} />, renderer)
-    const uniqueSessions = [...new Set(Object.values(sessions))]
+    const opened = sessions()
+    const uniqueSessions = [...new Set(Object.values(opened))]
+    for (const target of ["codex", "claude"] as const) {
+      const targetSession = opened[target]
+      if (!targetSession) continue
+      void targetSession.whenClosed().then(
+        () => markTargetUnavailable(target, targetSession, closeSessionOnce, setSessions, setUnavailable),
+        () => markTargetUnavailable(target, targetSession, closeSessionOnce, setSessions, setUnavailable),
+      )
+    }
     const allSessionsClosed = Promise.all(uniqueSessions.map((session) => session.whenClosed().catch(() => {})))
       .then(() => { if (!renderer.isDestroyed) renderer.destroy() })
     await Promise.race([destroyed, allSessionsClosed])
@@ -317,12 +338,29 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
     for (const stop of stopListening) stop()
     try {
       renderer.setTerminalTitle("")
-      await Promise.all([...new Set(Object.values(sessions))].map((session) => session.close().catch(() => {})))
+      await Promise.all([...new Set(Object.values(sessions()))].map((session) => closeSessionOnce(session).catch(() => {})))
     } finally {
       if (!renderer.isDestroyed) renderer.destroy()
       await destroyed
     }
   }
+}
+
+function markTargetUnavailable(
+  target: Target,
+  closedSession: TargetSession,
+  closeSessionOnce: (session: TargetSession) => Promise<void>,
+  setSessions: (update: (current: Partial<Record<Target, TargetSession>>) => Partial<Record<Target, TargetSession>>) => void,
+  setUnavailable: (update: (current: Partial<Record<Target, string>>) => Partial<Record<Target, string>>) => void,
+): void {
+  void closeSessionOnce(closedSession).catch(() => {})
+  setSessions((current) => {
+    if (current[target] !== closedSession) return current
+    const next = { ...current }
+    delete next[target]
+    return next
+  })
+  setUnavailable((current) => ({ ...current, [target]: "service-unavailable" }))
 }
 
 function claudePreflightContext(environment: NodeJS.ProcessEnv): ClaudePreflightContext {

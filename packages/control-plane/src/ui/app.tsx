@@ -1,5 +1,5 @@
 import { useRenderer, useTerminalDimensions } from "@opentui/solid"
-import { createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js"
+import { createSignal, Match, onCleanup, onMount, Show, Switch, type Accessor } from "solid-js"
 
 import { MuxviaKeymapProvider, useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
 import type { TargetSession } from "../control/target-session"
@@ -27,8 +27,8 @@ export type ShellRoute =
 
 export interface AppProps {
   session?: TargetSession
-  sessions?: Partial<Record<Target, TargetSession>>
-  unavailable?: Partial<Record<Target, string>>
+  sessions?: Partial<Record<Target, TargetSession>> | Accessor<Partial<Record<Target, TargetSession>>>
+  unavailable?: Partial<Record<Target, string>> | Accessor<Partial<Record<Target, string>>>
   locale?: Locale
 }
 
@@ -40,6 +40,7 @@ type Editor = {
   draft: ProviderDraft
   credentialPresence: "present" | "missing"
   duplicateCredentialChoice?: "without" | "reuse-source"
+  dirty?: boolean
 }
 
 function safeInspectionCategory(error: unknown): InspectionCategory {
@@ -125,8 +126,8 @@ export function useCommandPaletteOpener(t: Translator, canOpen: () => boolean = 
 }
 
 function Shell(props: {
-  sessions: Partial<Record<Target, TargetSession>>
-  unavailable: Partial<Record<Target, string>>
+  sessions: Accessor<Partial<Record<Target, TargetSession>>>
+  unavailable: Accessor<Partial<Record<Target, string>>>
   t: Translator
 }) {
   const renderer = useRenderer()
@@ -134,48 +135,101 @@ function Shell(props: {
   const overlay = useOverlay()
   const [route, setRoute] = createSignal<ShellRoute>({ kind: "home" })
   const initialViews = Object.fromEntries(
-    Object.entries(props.sessions).map(([target, session]) => [target, session!.get()]),
+    Object.entries(props.sessions()).map(([target, session]) => [target, session!.get()]),
   ) as Partial<Record<Target, TargetViewProjection>>
   const [views, setViews] = createSignal(initialViews)
-  const [editor, setEditor] = createSignal<Editor>()
-  const [selectedProviderId, setSelectedProviderId] = createSignal<string>()
+  const [editors, setEditors] = createSignal<Partial<Record<Target, Editor>>>({})
+  const [selectedProviderIds, setSelectedProviderIds] = createSignal<Partial<Record<Target, string>>>({})
   const [savingByTarget, setSavingByTarget] = createSignal<Record<Target, boolean>>({ codex: false, claude: false })
   const [mutationByTarget, setMutationByTarget] = createSignal<Record<Target, boolean>>({ codex: false, claude: false })
-  const [reachability, setReachability] = createSignal<{
+  type ReachabilityState = {
     providerId: string
     providerRevision: number
     pending: boolean
     result?: ReachabilityResult
     errorCategory?: InspectionCategory
-  }>()
+  }
+  const [reachabilityByTarget, setReachabilityByTarget] = createSignal<Partial<Record<Target, ReachabilityState>>>({})
   const [applyingByTarget, setApplyingByTarget] = createSignal<Record<Target, "direct" | "takeover" | undefined>>({ codex: undefined, claude: undefined })
   const showCommandPalette = useCommandPaletteOpener(props.t, () => applying() === undefined)
-  const [notice, setNotice] = createSignal<Notice>()
-  const [activities, setActivities] = createSignal<ActivityEntry[]>([])
-  const [sidebarOpen, setSidebarOpen] = createSignal(true)
-  let providerFormRef: ProviderFormRef | undefined
+  const [notices, setNotices] = createSignal<Partial<Record<Target | "home", Notice>>>({})
+  const [activitiesByTarget, setActivitiesByTarget] = createSignal<Record<Target, ActivityEntry[]>>({ codex: [], claude: [] })
+  const [sidebarOpenByTarget, setSidebarOpenByTarget] = createSignal<Record<Target, boolean>>({ codex: true, claude: true })
+  const providerFormRefs: Partial<Record<Target, ProviderFormRef>> = {}
   let nextActivityId = 1
   const lastViewSequence: Partial<Record<Target, number>> = Object.fromEntries(
     Object.entries(initialViews).map(([target, initial]) => [target, initial!.viewSequence]),
   )
-  let editorGeneration = 0
+  const editorGenerations: Record<Target, number> = { codex: 0, claude: 0 }
   let exitScheduled = false
-  let providerPickerScheduled = false
-  let providerSourcePickerScheduled = false
-  let reachabilityAbort: AbortController | undefined
-  let reachabilityGeneration = 0
+  const providerPickerScheduled: Record<Target, boolean> = { codex: false, claude: false }
+  const providerSourcePickerScheduled: Record<Target, boolean> = { codex: false, claude: false }
+  const reachabilityAborts: Partial<Record<Target, AbortController>> = {}
+  const reachabilityGenerations: Record<Target, number> = { codex: 0, claude: 0 }
   let exiting = false
   let disposed = false
 
   onCleanup(() => { disposed = true })
 
-  const appendActivity = (activity: ActivityDraft) => {
-    if (disposed || exiting) return
-    setActivities((current) => [...current, { id: nextActivityId++, ...activity }].slice(-50))
-  }
   const activeTarget = (): Target | undefined => {
     const current = route()
     return current.kind === "target" ? current.target : undefined
+  }
+  const editor = () => {
+    const target = activeTarget()
+    return target ? editors()[target] : undefined
+  }
+  const setEditor = (next?: Editor | ((current?: Editor) => Editor | undefined), target = activeTarget()) => {
+    if (!target) return
+    setEditors((current) => {
+      const value = typeof next === "function" ? next(current[target]) : next
+      return { ...current, [target]: value }
+    })
+  }
+  const selectedProviderId = () => {
+    const target = activeTarget()
+    return target ? selectedProviderIds()[target] : undefined
+  }
+  const setSelectedProviderId = (next: string | undefined | ((current?: string) => string | undefined), target = activeTarget()) => {
+    if (!target) return
+    setSelectedProviderIds((current) => ({
+      ...current,
+      [target]: typeof next === "function" ? next(current[target]) : next,
+    }))
+  }
+  const reachability = () => {
+    const target = activeTarget()
+    return target ? reachabilityByTarget()[target] : undefined
+  }
+  const setReachability = (next?: ReachabilityState, target = activeTarget()) => {
+    if (!target) return
+    setReachabilityByTarget((current) => ({ ...current, [target]: next }))
+  }
+  const routeStateKey = (): Target | "home" => activeTarget() ?? "home"
+  const notice = () => notices()[routeStateKey()]
+  const setNotice = (next?: Notice, key: Target | "home" = routeStateKey()) =>
+    setNotices((current) => ({ ...current, [key]: next }))
+  const activities = () => activitiesByTarget()[activeTarget() ?? "codex"]
+  const sidebarOpen = () => sidebarOpenByTarget()[activeTarget() ?? "codex"]
+  const setSidebarOpen = (next: boolean | ((current: boolean) => boolean), target = activeTarget()) => {
+    if (!target) return
+    setSidebarOpenByTarget((current) => ({
+      ...current,
+      [target]: typeof next === "function" ? next(current[target]) : next,
+    }))
+  }
+  const providerFormRef = () => {
+    const target = activeTarget()
+    return target ? providerFormRefs[target] : undefined
+  }
+  const bumpEditorGeneration = (target = activeTarget()) => target === undefined ? -1 : ++editorGenerations[target]
+  const appendActivity = (activity: ActivityDraft, target = activeTarget()) => {
+    if (!target) return
+    if (disposed || exiting) return
+    setActivitiesByTarget((current) => ({
+      ...current,
+      [target]: [...current[target], { id: nextActivityId++, ...activity }].slice(-50),
+    }))
   }
   const saving = () => activeTarget() ? savingByTarget()[activeTarget()!] : false
   const setTargetSaving = (target: Target, value: boolean) =>
@@ -186,7 +240,7 @@ function Shell(props: {
   const applying = () => activeTarget() ? applyingByTarget()[activeTarget()!] : undefined
   const setTargetApplying = (target: Target, value: "direct" | "takeover" | undefined) =>
     setApplyingByTarget((current) => ({ ...current, [target]: value }))
-  const session = (target = activeTarget()) => target ? props.sessions[target] : undefined
+  const session = (target = activeTarget()) => target ? props.sessions()[target] : undefined
   const view = () => {
     const target = activeTarget()
     return target ? views()[target] : undefined
@@ -194,25 +248,25 @@ function Shell(props: {
   const installView = (next: TargetViewProjection, source: "action" | "subscription") => {
     const last = lastViewSequence[next.target] ?? -1
     if (disposed || exiting || next.viewSequence < last) return
-    const inspection = reachability()
-    if (inspection && activeTarget() === next.target) {
+    const inspection = reachabilityByTarget()[next.target]
+    if (inspection) {
       const nextProvider = next.providers.find((provider) => provider.id === inspection.providerId)
       if (!nextProvider || nextProvider.providerRevision !== inspection.providerRevision) {
-        reachabilityGeneration++
-        reachabilityAbort?.abort()
-        setReachability()
+        reachabilityGenerations[next.target]++
+        reachabilityAborts[next.target]?.abort()
+        setReachability(undefined, next.target)
       }
     }
     const increased = next.viewSequence > last
     if (increased) lastViewSequence[next.target] = next.viewSequence
     setViews((current) => ({ ...current, [next.target]: next }))
     if (source === "subscription" && increased && activeTarget() === next.target) {
-      appendActivity({ kind: "info", messageKey: "activity.state.updated" })
+      appendActivity({ kind: "info", messageKey: "activity.state.updated" }, next.target)
     }
   }
 
   onMount(() => {
-    const unsubscribes = Object.values(props.sessions).map((targetSession) =>
+    const unsubscribes = Object.values(props.sessions()).map((targetSession) =>
       targetSession.subscribe((next) => installView(next, "subscription")))
     onCleanup(() => { for (const unsubscribe of unsubscribes) unsubscribe() })
   })
@@ -222,18 +276,9 @@ function Shell(props: {
     return current.kind === "target" && current.target === target
   }
   const showHome = () => {
-    providerFormRef?.clearSensitive()
-    editorGeneration++
-    setEditor()
-    setNotice()
     setRoute({ kind: "home" })
   }
   const showTarget = (target: "codex" | "claude") => {
-    providerFormRef?.clearSensitive()
-    editorGeneration++
-    setEditor()
-    overlay.clear()
-    setNotice()
     setRoute({ kind: "target", target })
   }
   const destroyRenderer = () => {
@@ -246,27 +291,29 @@ function Shell(props: {
   }
   const cancelExit = () => {
     overlay.closeTop()
-    queueMicrotask(() => providerFormRef?.focus())
+    queueMicrotask(() => providerFormRef()?.focus())
   }
   const confirmExit = () => {
     if (exiting) return
     exiting = true
-    providerFormRef?.clearSensitive()
-    editorGeneration++
-    setEditor()
+    for (const ref of Object.values(providerFormRefs)) ref?.clearSensitive()
+    for (const target of ["codex", "claude"] as const) {
+      bumpEditorGeneration(target)
+      setEditor(undefined, target)
+    }
     overlay.clear()
     destroyRenderer()
   }
   const requestExit = () => {
     if (exitScheduled || exiting) return
-    if (!providerFormRef?.isDirty()) {
+    if (!providerFormRef()?.isDirty()) {
       destroyRenderer()
       return
     }
     exitScheduled = true
     queueMicrotask(() => {
       exitScheduled = false
-      if (disposed || exiting || renderer.isDestroyed || !providerFormRef?.isDirty()) return
+      if (disposed || exiting || renderer.isDestroyed || !providerFormRef()?.isDirty()) return
       overlay.replace({
         id: "exit-confirmation",
         render: () => <ExitConfirmation t={props.t} onConfirm={confirmExit} onCancel={cancelExit} />,
@@ -281,14 +328,14 @@ function Shell(props: {
       values: { command: input },
     }
     setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) })
-    if (isRoute("codex")) appendActivity(activity)
+    if (activeTarget()) appendActivity(activity)
   }
   const saveProvider = async (action: ProviderFormResult) => {
     if (saving()) return false
     const targetSession = session()
     const target = activeTarget()
     if (!targetSession || !target) return false
-    const generation = editorGeneration
+    const generation = editorGenerations[target]
     const providerName = action.name
     setTargetSaving(target, true)
     setNotice()
@@ -296,7 +343,7 @@ function Shell(props: {
       const outcome = await targetSession.act(action)
       if (disposed || exiting) return false
       installView(outcome.view, "action")
-      if (generation !== editorGeneration || activeTarget() !== target) return false
+      if (generation !== editorGenerations[target] || activeTarget() !== target) return false
       const activity: ActivityDraft = {
         kind: "success",
         messageKey: "activity.provider.saved",
@@ -309,7 +356,7 @@ function Shell(props: {
       const authoritative = targetSession.get() as TargetViewProjection
       if (disposed || exiting) return false
       installView(authoritative, "action")
-      if (generation !== editorGeneration || activeTarget() !== target) return false
+      if (generation !== editorGenerations[target] || activeTarget() !== target) return false
       const code = typeof error === "object" && error !== null && "code" in error
         ? String(error.code)
         : "internal-failure"
@@ -318,7 +365,7 @@ function Shell(props: {
         if (latest) {
           setEditor((current) => current && current.mode === "edit" && current.draft.providerId === latest.id
             ? { ...current, draft: { ...current.draft, providerRevision: latest.providerRevision } }
-            : current)
+            : current, target)
         }
       }
       const activity = actionProblem(error)
@@ -338,7 +385,7 @@ function Shell(props: {
   ) => {
     if (saving() || providerMutationPending()) return
     setNotice()
-    editorGeneration++
+    bumpEditorGeneration()
     const source = options.source
     setEditor({
       mode,
@@ -365,11 +412,12 @@ function Shell(props: {
     })
   }
   const openProviderSourcePicker = () => {
-    if (!session() || saving() || applying() || providerSourcePickerScheduled) return
-    providerSourcePickerScheduled = true
+    const target = activeTarget()
+    if (!target || !session(target) || saving() || applying() || providerSourcePickerScheduled[target]) return
+    providerSourcePickerScheduled[target] = true
     queueMicrotask(() => {
-      providerSourcePickerScheduled = false
-      if (disposed || saving() || applying()) return
+      providerSourcePickerScheduled[target] = false
+      if (disposed || activeTarget() !== target || saving() || applying()) return
       overlay.replace({
         id: "provider-source-picker",
         render: () => <ProviderSourcePicker
@@ -384,11 +432,12 @@ function Shell(props: {
     })
   }
   const openProviderPicker = () => {
-    if (saving() || providerMutationPending() || applying() || providerPickerScheduled) return
-    providerPickerScheduled = true
+    const target = activeTarget()
+    if (!target || saving() || providerMutationPending() || applying() || providerPickerScheduled[target]) return
+    providerPickerScheduled[target] = true
     queueMicrotask(() => {
-      providerPickerScheduled = false
-      if (disposed || saving() || providerMutationPending() || applying()) return
+      providerPickerScheduled[target] = false
+      if (disposed || activeTarget() !== target || saving() || providerMutationPending() || applying()) return
       setNotice()
       const currentView = view()
       if (!currentView) return
@@ -402,13 +451,13 @@ function Shell(props: {
         token: pickerToken,
         dismissOnEscape: () => applying() === undefined,
         render: () => <ProviderPicker
-          target={activeTarget()!}
+          target={target}
           providers={() => view()?.providers ?? []}
           selectedId={selectedProviderId}
           t={props.t}
           pending={() => providerMutationPending() || applying() !== undefined}
           activationMode={applying}
-          allowDirect={() => activeTarget() === "codex"}
+          allowDirect={() => target === "codex"}
           onSelectedIdChange={setSelectedProviderId}
           onEdit={() => {
             const provider = selectedProvider()
@@ -440,10 +489,10 @@ function Shell(props: {
           onDelete={() => requestDelete()}
         />,
         onClose: () => {
-          reachabilityGeneration++
-          reachabilityAbort?.abort()
-          reachabilityAbort = undefined
-          setReachability()
+          reachabilityGenerations[target]++
+          reachabilityAborts[target]?.abort()
+          reachabilityAborts[target] = undefined
+          setReachability(undefined, target)
         },
       })
     })
@@ -478,24 +527,24 @@ function Shell(props: {
     const targetSession = session()
     const target = activeTarget()
     if (!provider || !targetSession || !target) return
-    reachabilityAbort?.abort()
+    reachabilityAborts[target]?.abort()
     const controller = new AbortController()
-    reachabilityAbort = controller
-    const generation = ++reachabilityGeneration
-    setReachability({ providerId: provider.id, providerRevision: provider.providerRevision, pending: true })
+    reachabilityAborts[target] = controller
+    const generation = ++reachabilityGenerations[target]
+    setReachability({ providerId: provider.id, providerRevision: provider.providerRevision, pending: true }, target)
     try {
       const result = await targetSession.checkReachability(provider.id, provider.providerRevision, controller.signal)
-      if (disposed || controller.signal.aborted || generation !== reachabilityGeneration || activeTarget() !== target) return
+      if (disposed || controller.signal.aborted || generation !== reachabilityGenerations[target] || activeTarget() !== target) return
       if (result.status === "unreachable" && result.failure.category === "cancelled") {
-        setReachability()
+        setReachability(undefined, target)
         return
       }
-      setReachability({ providerId: provider.id, providerRevision: provider.providerRevision, pending: false, result })
+      setReachability({ providerId: provider.id, providerRevision: provider.providerRevision, pending: false, result }, target)
     } catch (error) {
-      if (disposed || controller.signal.aborted || generation !== reachabilityGeneration) return
+      if (disposed || controller.signal.aborted || generation !== reachabilityGenerations[target]) return
       const category = safeInspectionCategory(error)
       if (category === "cancelled") {
-        setReachability()
+        setReachability(undefined, target)
         return
       }
       setReachability({
@@ -503,7 +552,7 @@ function Shell(props: {
         providerRevision: provider.providerRevision,
         pending: false,
         errorCategory: category,
-      })
+      }, target)
     }
   }
 
@@ -520,7 +569,7 @@ function Shell(props: {
       installView(outcome.view, "action")
       if (activeTarget() !== target) return false
       if (action.kind === "delete-provider" && selectedProviderId() === action.providerId) {
-        setSelectedProviderId(outcome.view.providers[0]?.id)
+        setSelectedProviderId(outcome.view.providers[0]?.id, target)
       }
       return true
     } catch (error) {
@@ -685,6 +734,14 @@ function Shell(props: {
       "target.claude.open": () => showTarget("claude"),
     },
   })
+  for (const target of ["codex", "claude"] as const) {
+    useCommandLayer({
+      scope: target,
+      priority: 50,
+      enabled: () => overlay.depth === 0 && isRoute(target) && !!editor(),
+      handlers: { "target.home": showHome },
+    })
+  }
   useCommandLayer({
     scope: "codex",
     priority: 100,
@@ -737,7 +794,7 @@ function Shell(props: {
           <ClaudeContext
             target={activeTarget() ?? "claude"}
             t={props.t}
-            notice={props.t(messageKeyForProblem(props.unavailable[activeTarget() ?? "claude"] ?? "service-unavailable"))}
+            notice={props.t(messageKeyForProblem(props.unavailable()[activeTarget() ?? "claude"] ?? "service-unavailable"))}
             onUnknown={unknownCommand}
           />
         </Match>
@@ -768,11 +825,18 @@ function Shell(props: {
                     target={activeTarget()!}
                     discoverModels={(source, signal) => session()!.discoverModels(source, signal)}
                     t={props.t}
-                    ref={(value) => { providerFormRef = value }}
+                    ref={(value) => {
+                      const target = activeTarget()
+                      if (target && value) providerFormRefs[target] = value
+                    }}
                     pending={saving()}
-                    onDirtyChange={() => {}}
+                    initialDirty={editor()?.dirty}
+                    onDirtyChange={(dirty) => setEditor((current) => current ? { ...current, dirty } : current)}
+                    onDraftChange={(draft) => setEditor((current) => current
+                      ? { ...current, draft: { ...current.draft, ...draft } }
+                      : current)}
                     onCancel={() => {
-                      editorGeneration++
+                      bumpEditorGeneration()
                       setEditor()
                     }}
                     onSave={saveProvider}
@@ -803,11 +867,18 @@ function Shell(props: {
 
 export function App(props: AppProps) {
   const t = createTranslator(props.locale ?? "en")
-  const sessions = props.sessions ?? (props.session ? { [props.session.get().target]: props.session } : {})
+  const sessionSource = props.sessions
+  const unavailableSource = props.unavailable
+  const sessions: Accessor<Partial<Record<Target, TargetSession>>> = typeof sessionSource === "function"
+    ? sessionSource
+    : () => sessionSource ?? (props.session ? { [props.session.get().target]: props.session } : {})
+  const unavailable: Accessor<Partial<Record<Target, string>>> = typeof unavailableSource === "function"
+    ? unavailableSource
+    : () => unavailableSource ?? {}
   return (
     <MuxviaKeymapProvider presenter={createCommandPresenter(t)}>
       <OverlayProvider>
-        <Shell sessions={sessions} unavailable={props.unavailable ?? {}} t={t} />
+        <Shell sessions={sessions} unavailable={unavailable} t={t} />
       </OverlayProvider>
     </MuxviaKeymapProvider>
   )

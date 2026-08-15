@@ -67,7 +67,9 @@ export function labelTargetState(t: Translator, value: string): string {
     case "inactive": return t("state.inactive")
     case "active": return t("state.active")
     case "applied": return t("state.applied")
+    case "required":
     case "recovery-required": return t("state.recovery-required")
+    case "unobserved": return t("state.unobserved")
     default: return t("state.unknown", { value })
   }
 }

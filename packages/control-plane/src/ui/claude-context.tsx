@@ -7,14 +7,14 @@ import { theme } from "../theme"
 import { ActionPrompt } from "./action-prompt"
 import { Logo } from "./logo"
 
-export interface ClaudeContextProps {
+export interface UnavailableTargetProps {
   target: Target
   t: Translator
   notice?: string
   onUnknown: (input: string) => void
 }
 
-export function ClaudeContext(props: ClaudeContextProps) {
+export function UnavailableTarget(props: UnavailableTargetProps) {
   const dimensions = useTerminalDimensions()
 
   return (
@@ -24,19 +24,21 @@ export function ClaudeContext(props: ClaudeContextProps) {
           <box flexDirection="column" rowGap={1}>
             <Logo />
             <text fg={theme.text}>{props.t(props.target === "claude" ? "target.claude" : "target.codex")}</text>
-            <text fg={theme.muted}>{props.t("target.claude.return")}</text>
+            <text fg={theme.muted}>{props.t("target.unavailable.return")}</text>
             <Show when={props.notice}>
               <text fg={theme.error}>{props.notice}</text>
             </Show>
           </box>
         </scrollbox>
         <ActionPrompt
-          scope="claude"
+          scope={props.target}
           placeholder={props.t("prompt.target")}
-          metadata={`${props.t("prompt.meta.claude")} · ${props.t("prompt.hint.back")} · ${props.t("prompt.hint.exit")}`}
+          metadata={`${props.t(props.target === "claude" ? "prompt.meta.claude" : "prompt.meta.codex")} · ${props.t("prompt.hint.back")} · ${props.t("prompt.hint.exit")}`}
           onUnknown={props.onUnknown}
         />
       </Show>
     </box>
   )
 }
+
+export { UnavailableTarget as ClaudeContext }

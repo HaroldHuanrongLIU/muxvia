@@ -473,6 +473,94 @@ test("saved Provider Reachability renders a separate read-only observation witho
   }
 })
 
+test("Claude owns automatic and explicit Discovery plus neutral Reachability", async () => {
+  const selected = provider({
+    name: "Claude Inspection",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-api-key",
+    routingRequirement: "takeover-required",
+  })
+  const codex = new InspectionTargetSession({ initial: view() })
+  const claudeInitial = view({
+    target: "claude",
+    providers: [selected],
+    providerPresets: [{
+      key: "anthropic-api-messages",
+      baseUrl: "https://api.anthropic.com/v1",
+      model: "",
+      protocol: "anthropic-messages",
+      authentication: "anthropic-api-key",
+    }],
+  })
+  const claude = new InspectionTargetSession({
+    initial: claudeInitial,
+    discover: async () => ({
+      status: "success",
+      models: [{ id: "claude-inspection-model", displayName: "Claude Inspection Model" }],
+      attempts: 1,
+      elapsedMs: 4,
+      endpointOrigin: "https://inspection.example",
+    }),
+    reachability: async () => ({
+      status: "reachable",
+      httpStatus: 200,
+      ttfbMs: 18,
+      checkedAtUnixMs: 1_755_168_000_000,
+      retryCount: 0,
+      slow: false,
+      endpointOrigin: "https://inspection.example",
+    }),
+  })
+  const before = JSON.stringify(claude.get())
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Enter edit ·"))
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => claude.discoveries.length === 1)
+    const automatic = await setup.waitForFrame((frame) => frame.includes("1 models available"))
+    expectSecretFree(automatic)
+    expect(claude.discoveries[0]).toEqual({ kind: "saved", providerId: selected.id, providerRevision: selected.providerRevision })
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("f")
+    await setup.waitFor(() => claude.discoveries.length === 2)
+    expect(claude.discoveries[1]).toEqual({
+      kind: "draft",
+      baseUrl: selected.baseUrl,
+      credentialSource: "saved",
+      savedProviderId: selected.id,
+      savedProviderRevision: selected.providerRevision,
+    })
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Claude · Control Plane"))
+
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Enter edit ·"))
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("t")
+    const reachable = await setup.waitForFrame((frame) => frame.includes("Reachable") && frame.includes("18 ms"))
+    expectSecretFree(reachable)
+    expect(reachable).not.toContain("Route Health")
+    expect(claude.reachabilityCalls).toEqual([{ providerId: selected.id, providerRevision: selected.providerRevision }])
+    expect(JSON.stringify(claude.get())).toBe(before)
+
+    setup.mockInput.pressEscape()
+    const target = await setup.waitForFrame((frame) => frame.includes("Route Health  Unobserved"))
+    expectSecretFree(target)
+    expect(codex.discoveries).toEqual([])
+    expect(codex.reachabilityCalls).toEqual([])
+    expect(codex.actions).toEqual([])
+    expect(claude.actions).toEqual([])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
 test("Reachability pending and observations are scoped to the visible Provider revision", async () => {
   const selected = provider({ providerRevision: 7 })
   const rev7 = deferred<ReachabilityResult>()

@@ -478,11 +478,12 @@ test("a stale Provider edit refreshes its revision before the next save", async 
     expect(setup.captureCharFrame()).not.toContain("stale-server-message-must-not-render")
     expect(session.actions[0]).toMatchObject({ kind: "update-provider", providerRevision: 1 })
 
+    await setup.mockInput.typeText(" again")
     setup.mockInput.pressEnter()
     await setup.waitFor(() => session.actions.length === 2)
     expect(session.actions[1]).toMatchObject({
       kind: "update-provider",
-      name: "First Provider dirty",
+      name: "First Provider dirty again",
       providerRevision: 2,
     })
   } finally {
@@ -629,6 +630,116 @@ test("Claude Provider editor selects Bearer authentication and dispatches only i
       credential: { kind: "replace", valuePresent: true },
       presetKey: "anthropic-api-messages",
     }])
+    expect(codex.actions).toEqual([])
+    expect(JSON.stringify(claude.actions)).not.toContain(credentialSecret)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Claude owns edit reorder duplicate and delete actions without touching Codex", async () => {
+  const first = provider({
+    id: "00000000-0000-4000-8000-000000000071",
+    name: "Claude First",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-api-key",
+    routingRequirement: "takeover-required",
+  })
+  const second = provider({
+    id: "00000000-0000-4000-8000-000000000072",
+    position: 1,
+    name: "Claude Second",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-bearer",
+    routingRequirement: "takeover-required",
+  })
+  let nextView = view({ target: "claude", providers: [first, second] })
+  const codex = new MemoryTargetSession(view())
+  const claude = new MemoryTargetSession(nextView, async (action) => {
+    const providers = [...nextView.providers]
+    if (action.kind === "reorder-providers") {
+      nextView = view({
+        target: "claude",
+        viewSequence: nextView.viewSequence + 1,
+        providers: action.providerIds.map((id, position) => ({ ...providers.find((item) => item.id === id)!, position })),
+      })
+    } else if (action.kind === "duplicate-provider") {
+      const duplicate = provider({
+        id: "00000000-0000-4000-8000-000000000073",
+        position: providers.length,
+        name: action.name,
+        baseUrl: action.baseUrl,
+        model: action.model,
+        protocol: "anthropic-messages",
+        authentication: "anthropic-api-key",
+        routingRequirement: "takeover-required",
+        credential: "missing",
+      })
+      nextView = view({ target: "claude", viewSequence: nextView.viewSequence + 1, providers: [...providers, duplicate] })
+    } else if (action.kind === "update-provider") {
+      nextView = view({
+        target: "claude",
+        viewSequence: nextView.viewSequence + 1,
+        providers: providers.map((item) => item.id === action.providerId ? { ...item, name: action.name, providerRevision: item.providerRevision + 1 } : item),
+      })
+    } else if (action.kind === "delete-provider") {
+      nextView = view({
+        target: "claude",
+        viewSequence: nextView.viewSequence + 1,
+        providers: providers.filter((item) => item.id !== action.providerId).map((item, position) => ({ ...item, position })),
+      })
+    } else {
+      throw new Error(`unexpected ${action.kind}`)
+    }
+    return { status: "applied", view: nextView }
+  })
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Claude First"))
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("n")
+    await setup.waitFor(() => claude.actions.length === 1)
+    expect(claude.actions[0]).toEqual({ kind: "reorder-providers", providerIds: [second.id, first.id] })
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("c")
+    await setup.waitForFrame((frame) => frame.includes("Reuse Credential Reference?"))
+    setup.mockInput.pressKey("n")
+    await setup.waitForFrame((frame) => frame.includes("Claude First Copy"))
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => claude.actions.length === 2)
+    expect(claude.actions[1]).toMatchObject({ kind: "duplicate-provider", sourceProviderId: first.id, credential: { kind: "without" } })
+
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Claude Second"))
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Edit Provider"))
+    await setup.mockInput.typeText(" Updated")
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => claude.actions.length === 3)
+    expect(claude.actions[2]).toMatchObject({ kind: "update-provider", providerId: first.id, name: "Claude First Updated" })
+
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Claude First Updated"))
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("d")
+    await setup.waitForFrame((frame) => frame.includes("Delete Provider?"))
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Claude First Updated") && !frame.includes("Delete Provider?"))
+    expect(setup.renderer.currentFocusedRenderable?.isDestroyed).toBeFalse()
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("d")
+    await setup.waitForFrame((frame) => frame.includes("Delete Provider?"))
+    setup.mockInput.pressKey("y")
+    await setup.waitFor(() => claude.actions.length === 4)
+    expect(claude.actions[3]).toMatchObject({ kind: "delete-provider", providerId: first.id })
     expect(codex.actions).toEqual([])
     expect(JSON.stringify(claude.actions)).not.toContain(credentialSecret)
   } finally {

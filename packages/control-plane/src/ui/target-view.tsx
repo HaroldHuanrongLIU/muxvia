@@ -42,6 +42,11 @@ export function TargetView(props: TargetViewProps) {
     return `${label}${" ".repeat(Math.max(2, 11 - label.length))}${value}`
   }
   const declaration = (key: MessageKey, value: string) => `${props.t(key).padEnd(12)}${value}`
+  const managedConfiguration = () => {
+    const state = labelTargetState(props.t, props.view.managedConfiguration.state)
+    const path = props.view.managedConfiguration.path
+    return path ? `${state} · ${path}` : state
+  }
   const problemText = (code: string) => {
     const key = messageKeyForProblem(code)
     return props.t(key, key === "error.generic" ? { code } : undefined)
@@ -56,8 +61,9 @@ export function TargetView(props: TargetViewProps) {
         <text fg={theme.text}>{status("status.current", providerName(props.view, props.view.currentProviderId, props.t))}</text>
         <text fg={theme.text}>{status("status.serving", providerName(props.view, props.view.servingProviderId, props.t))}</text>
         <text fg={theme.text}>{status("status.service", labelTargetState(props.t, props.view.service.state))}</text>
-        <text fg={theme.text}>{status("status.config", labelTargetState(props.t, props.view.managedConfiguration.state))}</text>
+        <text fg={theme.text}>{status("status.config", managedConfiguration())}</text>
         <text fg={theme.text}>{status("status.snapshot", snapshot())}</text>
+        <text fg={theme.text}>{status("status.health", labelTargetState(props.t, props.view.routeHealth.state))}</text>
       </box>
 
       <For each={props.view.providers}>{(provider) => (

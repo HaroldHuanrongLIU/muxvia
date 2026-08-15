@@ -251,6 +251,73 @@ test("one unavailable target remains target-local while its peer renders and clo
   }
 })
 
+test("a stalled Claude connection times out target-locally after Codex is ready", async () => {
+  const { setup } = await rendererFixture()
+  const codex = new LifecycleSession()
+  const lateClaude = new LifecycleSession()
+  const claudeConnection = deferred<TargetSession>()
+  const clock = new ManualClock()
+  const targets: string[] = []
+  const running = run(options, ports(setup, codex, {
+    connect: async (_socketPath, _release, _signal, target) => {
+      targets.push(target)
+      return target === "codex" ? codex : await claudeConnection.promise
+    },
+    clock,
+  }))
+  try {
+    for (let pass = 0; pass < 20 && targets.length < 2; pass++) await flushMicrotasks()
+    expect(targets).toEqual(["codex", "claude"])
+    clock.advance(2_000)
+    await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
+    setup.mockInput.pressKey("2")
+    await setup.waitForFrame((frame) => frame.includes("Routing Service is unavailable"))
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
+    setup.mockInput.pressKey("1")
+    await setup.waitForFrame((frame) => frame.includes("Codex · Control Plane"))
+    expect(clock.pendingTimers()).toBe(0)
+    setup.mockInput.pressCtrlC()
+    await running
+    expect(codex.closeCalls).toBe(1)
+
+    claudeConnection.resolve(lateClaude)
+    await flushMicrotasks()
+    expect(lateClaude.closeCalls).toBe(1)
+  } finally {
+    claudeConnection.resolve(lateClaude)
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    await running.catch(() => {})
+  }
+})
+
+test("post-open Claude loss becomes unavailable without ending the Codex session", async () => {
+  const { setup } = await rendererFixture()
+  const codex = new LifecycleSession()
+  const claude = new LifecycleSession()
+  const running = run(options, ports(setup, codex, {
+    connect: async (_socketPath, _release, _signal, target) => target === "codex" ? codex : claude,
+  }))
+  try {
+    await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
+    claude.closed.resolve()
+    await flushMicrotasks()
+    setup.mockInput.pressKey("2")
+    await setup.waitForFrame((frame) => frame.includes("Routing Service is unavailable"))
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
+    setup.mockInput.pressKey("1")
+    await setup.waitForFrame((frame) => frame.includes("Codex · Control Plane"))
+    expect(codex.closeCalls).toBe(0)
+    setup.mockInput.pressCtrlC()
+    await running
+    expect(codex.closeCalls).toBe(1)
+    expect(claude.closeCalls).toBe(1)
+  } finally {
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
 test("an unavailable socket directly spawns the absolute sidecar with its Muxvia Home", async () => {
   const { setup } = await rendererFixture()
   const session = new LifecycleSession()
@@ -379,7 +446,7 @@ test("a never-resolving post-spawn connection shares the deadline and closes a l
   }))
   try {
     await flushMicrotasks()
-    expect(connects).toBe(2)
+    expect(connects).toBe(3)
     clock.advance(2_000)
     await expect(running).rejects.toMatchObject({ code: "service-unavailable" })
     expect(spawnCalls).toBe(1)
@@ -511,13 +578,13 @@ test("a startup signal finishes cleanup without waiting for a stalled connection
   const signals = new ManualSignalSource()
   const connection = deferred<TargetSession>()
   const clock = new ManualClock()
-  let connectorSignal: AbortSignal | undefined
+  const connectorSignals: AbortSignal[] = []
   let renderCalls = 0
   let spawnCalls = 0
   const running = run(options, ports(setup, session, {
     signals,
     connect: async (_socketPath, _release, signal) => {
-      connectorSignal = signal
+      connectorSignals.push(signal)
       return await connection.promise
     },
     spawn: () => { spawnCalls++ },
@@ -526,7 +593,7 @@ test("a startup signal finishes cleanup without waiting for a stalled connection
   }))
   try {
     await flushMicrotasks()
-    expect(clock.pendingTimers()).toBe(1)
+    expect(clock.pendingTimers()).toBe(2)
     signals.emit("SIGTERM")
     await Promise.race([
       running,
@@ -539,7 +606,8 @@ test("a startup signal finishes cleanup without waiting for a stalled connection
     expect(signals.unlistenCalls).toBe(3)
     expect(titles.at(-1)).toBe("")
     expect(destroyCalls()).toBe(1)
-    expect(connectorSignal?.aborted).toBeTrue()
+    expect(connectorSignals).toHaveLength(2)
+    expect(connectorSignals.every((signal) => signal.aborted)).toBeTrue()
     expect(clock.pendingTimers()).toBe(0)
 
     connection.resolve(session)

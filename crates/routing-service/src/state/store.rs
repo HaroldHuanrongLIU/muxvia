@@ -69,6 +69,7 @@ type ActivationPreparationRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    u64,
 );
 
 pub struct ActivationPreparation {
@@ -250,7 +251,10 @@ impl StateStore {
                     let row = connection.query_row(
                         "SELECT r.route_port, r.routing_credential, r.activated_snapshot_id,
                                 r.managed_config_version, r.recovery_intent_id, a.id, a.state,
-                                a.payload_json
+                                a.payload_json,
+                                (SELECT COUNT(*) FROM activation_recovery history
+                                 WHERE history.target = r.target
+                                   AND history.state = 'committed')
                          FROM target_route_state r
                          LEFT JOIN activation_recovery a
                            ON a.id = r.recovery_intent_id AND a.target = r.target
@@ -266,6 +270,7 @@ impl StateStore {
                                 row.get::<_, Option<String>>(5)?,
                                 row.get::<_, Option<String>>(6)?,
                                 row.get::<_, Option<String>>(7)?,
+                                row.get::<_, u64>(8)?,
                             ))
                         },
                     );
@@ -279,6 +284,7 @@ impl StateStore {
                             joined_recovery_id,
                             recovery_intent_state,
                             recovery_payload_json,
+                            committed_recovery_count,
                         )) if !credential.is_empty() && !snapshot.is_empty() => {
                             if !valid_committed_managed_configuration(
                                 target,
@@ -317,7 +323,7 @@ impl StateStore {
                                         joined_recovery_id.as_deref(),
                                         recovery_intent_state.as_deref(),
                                         recovery_payload_json.as_deref(),
-                                        managed_config_version == 1,
+                                        committed_recovery_count,
                                     ) {
                                         Ok(expectation) => expectation,
                                         Err(_) => {
@@ -371,14 +377,18 @@ impl StateStore {
                 let (revision, managed_config_version, recovery_state, takeover_state, route_port, routing_credential,
                     raw_snapshot_id, joined_snapshot_id, prior_base_url, prior_model,
                     prior_authentication, prior_provider_credential, raw_recovery_id,
-                    joined_recovery_id, recovery_intent_state, recovery_payload_json):
+                    joined_recovery_id, recovery_intent_state, recovery_payload_json,
+                    committed_recovery_count):
                     ActivationPreparationRow = connection.query_row(
                         "SELECT r.management_revision, r.managed_config_version,
                                 r.recovery_state, r.takeover_state,
                                 r.route_port, r.routing_credential, r.activated_snapshot_id,
                                 s.id, s.base_url, s.model, s.authentication,
                                 s.provider_bearer_token, r.recovery_intent_id,
-                                a.id, a.state, a.payload_json
+                                a.id, a.state, a.payload_json,
+                                (SELECT COUNT(*) FROM activation_recovery history
+                                 WHERE history.target = r.target
+                                   AND history.state = 'committed')
                          FROM target_route_state r
                          LEFT JOIN activated_snapshots s
                            ON s.id = r.activated_snapshot_id AND s.target = r.target
@@ -389,7 +399,7 @@ impl StateStore {
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
                             row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?,
                             row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?,
-                            row.get(13)?, row.get(14)?, row.get(15)?)),
+                            row.get(13)?, row.get(14)?, row.get(15)?, row.get(16)?)),
                     )?;
                 let failure = |connection: &tokio_rusqlite::rusqlite::Connection,
                                code: &str,
@@ -496,7 +506,7 @@ impl StateStore {
                         joined_recovery_id.as_deref(),
                         recovery_intent_state.as_deref(),
                         recovery_payload_json.as_deref(),
-                        version == 1,
+                        committed_recovery_count,
                     ) {
                         Ok(expectation) => expectation,
                         Err(_) => {
@@ -1558,7 +1568,7 @@ fn validate_committed_recovery_binding(
     joined_recovery_id: Option<&str>,
     recovery_state: Option<&str>,
     payload_json: Option<&str>,
-    allow_legacy_unbound: bool,
+    committed_recovery_count: u64,
 ) -> Result<Option<CommittedRecoveryExpectation>, StateError> {
     match (
         raw_recovery_id,
@@ -1566,7 +1576,14 @@ fn validate_committed_recovery_binding(
         recovery_state,
         payload_json,
     ) {
-        (None, None, None, None) if allow_legacy_unbound && managed_config_version == 1 => Ok(None),
+        (None, None, None, None)
+            if legacy_unbound_recovery_allowed(
+                i64::from(managed_config_version),
+                committed_recovery_count,
+            ) =>
+        {
+            Ok(None)
+        }
         (Some(raw_id), Some(joined_id), Some("committed"), Some(payload_json))
             if raw_id == joined_id =>
         {
@@ -1620,7 +1637,10 @@ fn mark_invalid_managed_configurations(
                 let mut statement = connection.prepare(
                     "SELECT r.target, r.managed_config_version, r.takeover_state,
                             r.route_port, r.routing_credential, r.activated_snapshot_id, s.id,
-                            r.recovery_intent_id, a.id, a.state
+                            r.recovery_intent_id, a.id, a.state, a.payload_json,
+                            (SELECT COUNT(*) FROM activation_recovery history
+                             WHERE history.target = r.target
+                               AND history.state = 'committed')
                      FROM target_route_state r
                      LEFT JOIN activated_snapshots s
                        ON s.id = r.activated_snapshot_id AND s.target = r.target
@@ -1639,6 +1659,8 @@ fn mark_invalid_managed_configurations(
                         row.get::<_, Option<String>>(7)?,
                         row.get::<_, Option<String>>(8)?,
                         row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, u64>(11)?,
                     ))
                 })?;
                 let mut invalid_targets = Vec::new();
@@ -1654,30 +1676,47 @@ fn mark_invalid_managed_configurations(
                         raw_recovery_id,
                         joined_recovery_id,
                         recovery_intent_state,
+                        recovery_payload_json,
+                        committed_recovery_count,
                     ) = row?;
                     let target = match target.as_str() {
                         "codex" => Target::Codex,
                         "claude" => Target::Claude,
                         _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
                     };
-                    if !valid_committed_managed_configuration(
-                        target,
-                        version,
-                        &takeover_state,
-                        JoinedValue {
-                            raw: raw_snapshot_id.as_deref(),
-                            joined: joined_snapshot_id.as_deref(),
-                        },
-                        route_port,
-                        routing_credential.as_deref(),
-                        RecoveryBinding {
-                            id: JoinedValue {
-                                raw: raw_recovery_id.as_deref(),
-                                joined: joined_recovery_id.as_deref(),
+                    let recovery_binding_is_invalid = raw_snapshot_id.is_some()
+                        && u32::try_from(version).map_or(true, |version| {
+                            validate_committed_recovery_binding(
+                                target,
+                                version,
+                                raw_recovery_id.as_deref(),
+                                joined_recovery_id.as_deref(),
+                                recovery_intent_state.as_deref(),
+                                recovery_payload_json.as_deref(),
+                                committed_recovery_count,
+                            )
+                            .is_err()
+                        });
+                    if recovery_binding_is_invalid
+                        || !valid_committed_managed_configuration(
+                            target,
+                            version,
+                            &takeover_state,
+                            JoinedValue {
+                                raw: raw_snapshot_id.as_deref(),
+                                joined: joined_snapshot_id.as_deref(),
                             },
-                            state: recovery_intent_state.as_deref(),
-                        },
-                    ) {
+                            route_port,
+                            routing_credential.as_deref(),
+                            RecoveryBinding {
+                                id: JoinedValue {
+                                    raw: raw_recovery_id.as_deref(),
+                                    joined: joined_recovery_id.as_deref(),
+                                },
+                                state: recovery_intent_state.as_deref(),
+                            },
+                        )
+                    {
                         invalid_targets.push(target);
                     }
                 }
@@ -1709,6 +1748,13 @@ fn mark_invalid_managed_configurations(
     result?;
     reset?;
     Ok(())
+}
+
+fn legacy_unbound_recovery_allowed(
+    managed_config_version: i64,
+    committed_recovery_count: u64,
+) -> bool {
+    managed_config_version == 1 && committed_recovery_count == 0
 }
 
 enum ProviderAttempt {

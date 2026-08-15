@@ -522,6 +522,20 @@ async fn schema_v7_selects_current_bindings_from_v6_receipts_after_retry_history
                 "INSERT INTO activation_recovery
                  (id, target, action_id, config_path, file_identity_json, payload_json,
                   state, created_revision)
+                 VALUES (?1, ?2, ?3, '/tmp/managed-config', 'null', ?4, 'rolled-back', 2)",
+                params![
+                    rolled_back_recovery,
+                    target,
+                    retry_action,
+                    payload_for("rolled-back-model")
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO activation_recovery
+                 (id, target, action_id, config_path, file_identity_json, payload_json,
+                  state, created_revision)
                  VALUES (?1, ?2, ?3, '/tmp/managed-config', 'null', ?4, 'committed', 4)",
                 params![
                     prior_recovery,
@@ -543,21 +557,19 @@ async fn schema_v7_selects_current_bindings_from_v6_receipts_after_retry_history
                 ],
             )
             .unwrap();
-
-        connection
-            .execute(
-                "INSERT INTO activation_recovery
-                 (id, target, action_id, config_path, file_identity_json, payload_json,
-                  state, created_revision)
-                 VALUES (?1, ?2, ?3, '/tmp/managed-config', 'null', ?4, 'rolled-back', 2)",
-                params![
-                    rolled_back_recovery,
-                    target,
-                    retry_action,
-                    payload_for("rolled-back-model")
-                ],
+        let (retry_rowid, prior_rowid): (i64, i64) = connection
+            .query_row(
+                "SELECT
+                   (SELECT rowid FROM activation_recovery
+                    WHERE target = ?1 AND action_id = ?2),
+                   (SELECT rowid FROM activation_recovery
+                    WHERE target = ?1 AND action_id = ?3)",
+                params![target, retry_action, prior_action],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
+        assert!(retry_rowid < prior_rowid);
+
         connection
             .execute(
                 "UPDATE activation_recovery

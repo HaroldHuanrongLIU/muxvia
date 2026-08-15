@@ -688,6 +688,31 @@ impl Fixture {
             .unwrap();
     }
 
+    async fn clear_current_recovery_binding_with_history(&self, target: Target) {
+        let database = tokio_rusqlite::Connection::open(self.home.database_path())
+            .await
+            .unwrap();
+        database
+            .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                let committed: u64 = connection.query_row(
+                    "SELECT COUNT(*) FROM activation_recovery
+                     WHERE target = ?1 AND state = 'committed'",
+                    [target.as_str()],
+                    |row| row.get(0),
+                )?;
+                assert!(committed > 0);
+                let changed = connection.execute(
+                    "UPDATE target_route_state SET recovery_intent_id = NULL
+                     WHERE target = ?1",
+                    [target.as_str()],
+                )?;
+                assert_eq!(changed, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
     async fn mutate_provider(&self, provider_id: Uuid, base_url: &str, model: &str) {
         let database = tokio_rusqlite::Connection::open(self.home.database_path())
             .await
@@ -4876,6 +4901,243 @@ async fn claude_bound_takeover_bootstrap_requires_exact_recovery_expectation() {
             .unwrap();
         drop(unbound);
         restarted.shutdown_models().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn legacy_null_binding_with_committed_history_is_target_scoped_at_startup() {
+    for corrupt_target in [Target::Codex, Target::Claude] {
+        let fixture = Fixture::new().await;
+        let settings_path = fixture.home.user_home().join(".claude/settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(&settings_path, br#"{"permissions":{"allow":["Read"]}}"#).unwrap();
+        let (codex_provider, codex_revision) = fixture
+            .save("Codex", "gpt-peer", "codex-provider-secret")
+            .await;
+        let (claude_provider, claude_revision) = fixture
+            .save_claude("Claude", "claude-peer", "claude-provider-secret")
+            .await;
+        let first = fixture.dual_service(
+            ActivationHooks::default(),
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+        );
+        let codex = first
+            .activate(command(codex_provider, codex_revision, Uuid::new_v4()))
+            .await
+            .expect_applied_redacted();
+        let claude = first
+            .apply_raw_for_with_context(
+                Target::Claude,
+                Uuid::new_v4(),
+                claude_revision,
+                takeover_action(claude_provider),
+                Some(&claude_context(&fixture.home)),
+            )
+            .await
+            .expect_applied_redacted();
+        let codex_endpoint: std::net::SocketAddr = codex
+            .view
+            .takeover
+            .endpoint
+            .as_deref()
+            .unwrap()
+            .trim_start_matches("http://")
+            .parse()
+            .unwrap();
+        let claude_endpoint: std::net::SocketAddr = claude
+            .view
+            .takeover
+            .endpoint
+            .as_deref()
+            .unwrap()
+            .trim_start_matches("http://")
+            .parse()
+            .unwrap();
+        first.shutdown_models().await.unwrap();
+        fixture
+            .downgrade_latest_claude_takeover_to_v1("legacy-api-key")
+            .await;
+        fixture
+            .clear_current_recovery_binding_with_history(corrupt_target)
+            .await;
+
+        let restarted_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+        let corrupt_view = restarted_store
+            .target_view_for(corrupt_target)
+            .await
+            .unwrap();
+        assert!(
+            public_surface_is_secret_free(
+                &corrupt_view,
+                &[
+                    "codex-provider-secret",
+                    "claude-provider-secret",
+                    "legacy-api-key"
+                ]
+            )
+            .is_ok(),
+            "startup recovery view exposed a credential"
+        );
+        assert_eq!(corrupt_view.recovery.state, "recovery-required");
+        assert_eq!(
+            corrupt_view.managed_configuration.state,
+            "recovery-required"
+        );
+        let peer_target = match corrupt_target {
+            Target::Codex => Target::Claude,
+            Target::Claude => Target::Codex,
+        };
+        let peer_view = restarted_store.target_view_for(peer_target).await.unwrap();
+        assert!(
+            public_surface_is_secret_free(
+                &peer_view,
+                &[
+                    "codex-provider-secret",
+                    "claude-provider-secret",
+                    "legacy-api-key"
+                ]
+            )
+            .is_ok(),
+            "healthy peer startup view exposed a credential"
+        );
+        assert_eq!(peer_view.recovery.state, "committed");
+
+        let restarted = ActivationService::new(
+            Arc::clone(&restarted_store),
+            fixture.home.clone(),
+            fixture.probe.clone(),
+            "/usr/bin/codex".into(),
+            Arc::new(NoopUpstream),
+        )
+        .with_claude_runtime(
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+            "/usr/bin/claude".into(),
+        );
+        restarted.bootstrap_committed_takeovers().await.unwrap();
+        assert!(restarted.model_endpoint_for(corrupt_target).await.is_none());
+        let expected_peer_endpoint = match peer_target {
+            Target::Codex => codex_endpoint,
+            Target::Claude => claude_endpoint,
+        };
+        assert_eq!(
+            restarted.model_endpoint_for(peer_target).await,
+            Some(expected_peer_endpoint)
+        );
+        let corrupt_endpoint = match corrupt_target {
+            Target::Codex => codex_endpoint,
+            Target::Claude => claude_endpoint,
+        };
+        let unbound = tokio::net::TcpListener::bind(corrupt_endpoint)
+            .await
+            .unwrap();
+        drop(unbound);
+        restarted.shutdown_models().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn legacy_null_binding_with_committed_history_blocks_activation_preparation() {
+    for corrupt_target in [Target::Codex, Target::Claude] {
+        let fixture = Fixture::new().await;
+        let settings_path = fixture.home.user_home().join(".claude/settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(&settings_path, br#"{"permissions":{"allow":["Read"]}}"#).unwrap();
+        let (provider_id, revision) = match corrupt_target {
+            Target::Codex => {
+                fixture
+                    .save("Codex", "gpt-blocked", "codex-provider-secret")
+                    .await
+            }
+            Target::Claude => {
+                fixture
+                    .save_claude("Claude", "claude-blocked", "claude-provider-secret")
+                    .await
+            }
+        };
+        let service = fixture.dual_service(
+            ActivationHooks::default(),
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+        );
+        let applied = match corrupt_target {
+            Target::Codex => {
+                service
+                    .activate(command(provider_id, revision, Uuid::new_v4()))
+                    .await
+            }
+            Target::Claude => {
+                service
+                    .apply_raw_for_with_context(
+                        Target::Claude,
+                        Uuid::new_v4(),
+                        revision,
+                        takeover_action(provider_id),
+                        Some(&claude_context(&fixture.home)),
+                    )
+                    .await
+            }
+        }
+        .expect_applied_redacted();
+        assert!(
+            public_surface_is_secret_free(
+                &applied,
+                &["codex-provider-secret", "claude-provider-secret"]
+            )
+            .is_ok(),
+            "initial activation exposed a credential"
+        );
+        service.shutdown_models().await.unwrap();
+        if corrupt_target == Target::Claude {
+            fixture
+                .downgrade_latest_claude_takeover_to_v1("legacy-api-key")
+                .await;
+        }
+        fixture
+            .clear_current_recovery_binding_with_history(corrupt_target)
+            .await;
+        let expected_revision = fixture
+            .store
+            .target_view_for(corrupt_target)
+            .await
+            .unwrap()
+            .management_revision;
+
+        let failure = match corrupt_target {
+            Target::Codex => {
+                service
+                    .activate(command(provider_id, expected_revision, Uuid::new_v4()))
+                    .await
+            }
+            Target::Claude => {
+                service
+                    .apply_raw_for_with_context(
+                        Target::Claude,
+                        Uuid::new_v4(),
+                        expected_revision,
+                        takeover_action(provider_id),
+                        Some(&claude_context(&fixture.home)),
+                    )
+                    .await
+            }
+        }
+        .expect_failure_redacted();
+        assert!(
+            public_surface_is_secret_free(
+                &failure,
+                &[
+                    "codex-provider-secret",
+                    "claude-provider-secret",
+                    "legacy-api-key"
+                ]
+            )
+            .is_ok(),
+            "recovery-required activation failure exposed a credential"
+        );
+        assert_eq!(failure.problem.code, "recovery-required");
+        assert_eq!(
+            failure.authoritative_view.recovery.state,
+            "recovery-required"
+        );
+        assert!(service.model_endpoint_for(corrupt_target).await.is_none());
     }
 }
 

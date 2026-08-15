@@ -15,7 +15,7 @@ export const CLAUDE_SSE_BYTES = [
 export interface CapturedRequest {
   authorization: string | null
   apiKey?: string | null
-  headers: Record<string, string | null>
+  headers: Record<string, string | string[] | null>
   contentType: string | null
   method: string
   testHeader: string | null
@@ -30,6 +30,26 @@ export interface FakeUpstreamOptions {
 
 function header(value: string | string[] | undefined): string | null {
   return Array.isArray(value) ? value.join(", ") : value ?? null
+}
+
+function distinctHeaders(rawHeaders: readonly string[]): Record<string, string | string[]> {
+  const result: Record<string, string | string[]> = {}
+  for (let index = 0; index < rawHeaders.length; index += 2) {
+    const name = rawHeaders[index]!.toLowerCase()
+    const value = rawHeaders[index + 1]!
+    const prior = result[name]
+    result[name] = prior === undefined ? value : Array.isArray(prior) ? [...prior, value] : [prior, value]
+  }
+  return result
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right))
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`
+  }
+  return JSON.stringify(value)
 }
 
 export async function startFakeUpstream(
@@ -59,10 +79,7 @@ export async function startFakeUpstream(
     for (const notify of handlerCountWaiters) notify()
     const body: Buffer[] = []
     for await (const chunk of request) body.push(Buffer.from(chunk))
-    const headers = Object.fromEntries(Object.entries(request.headers).map(([name, value]) => [
-      name,
-      header(value),
-    ]))
+    const headers = distinctHeaders(request.rawHeaders)
     const capturedRequest = {
       authorization: header(request.headers.authorization),
       apiKey: header(request.headers["x-api-key"]),
@@ -105,7 +122,43 @@ export async function startFakeUpstream(
         response.writeHead(403).end()
         return
       }
-      const parsed = JSON.parse(capturedRequest.body) as Record<string, unknown>
+      let parsed: Record<string, unknown>
+      try {
+        parsed = JSON.parse(capturedRequest.body) as Record<string, unknown>
+      } catch {
+        response.writeHead(422, { "content-type": "application/json" })
+        response.end('{"error":"fixture-contract-rejected"}')
+        return
+      }
+      if (header(request.headers["anthropic-version"]) !== "2023-06-01") {
+        response.writeHead(422, { "content-type": "application/json" })
+        response.end('{"error":"fixture-contract-rejected"}')
+        return
+      }
+      if (header(request.headers["x-claude-code-fixture"]) === "claude-contract-request") {
+        const expectedTools = [{
+          name: "fixture_tool",
+          input_schema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
+        }]
+        const beta = capturedHeaderValues(capturedRequest.headers["anthropic-beta"])
+        const contractError = request.url !== "/v1/messages?beta=true&fixture=exact"
+          ? "query"
+          : canonicalJson(parsed.tools) !== canonicalJson(expectedTools)
+            ? "tools"
+            : canonicalJson(parsed.future_extension) !== canonicalJson({ retained: true, nested: { version: 7 } })
+              ? "unknown"
+              : JSON.stringify(beta) !== JSON.stringify(["tools-2025-01-01", "context-1m-2025-08-07"])
+                ? "beta"
+                : null
+        if (contractError) {
+          response.writeHead(422, {
+            "content-type": "application/json",
+            "x-fixture-contract-error": contractError,
+          })
+          response.end('{"error":"fixture-contract-rejected"}')
+          return
+        }
+      }
       if (request.url.startsWith("/v1/messages/count_tokens")) {
         response.writeHead(200, { "content-type": "application/json", "x-upstream": "claude-fixture" })
         response.end('{"input_tokens":7}')
@@ -210,4 +263,10 @@ export async function startFakeUpstream(
       await quiesced
     },
   }
+}
+
+function capturedHeaderValues(value: string | string[] | null | undefined): string[] {
+  if (value === null || value === undefined) return []
+  return (Array.isArray(value) ? value : [value]).flatMap((entry) => entry.split(","))
+    .map((entry) => entry.trim()).filter(Boolean)
 }

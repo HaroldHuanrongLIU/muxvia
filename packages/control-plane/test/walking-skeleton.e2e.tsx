@@ -173,24 +173,41 @@ async function claudePost(
   credential: string,
   path: string,
   body: Record<string, unknown>,
-  headers: Record<string, string> = {},
-): Promise<{ status: number; headers: Headers; body: string }> {
-  const response = await fetch(`${endpoint}${path}`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${credential}`,
-      "content-type": "application/json",
-      ...headers,
-    },
-    body: JSON.stringify(body),
+  headers: Record<string, string | readonly string[]> = {},
+): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: string }> {
+  const url = new URL(`${endpoint}${path}`)
+  return await new Promise((resolveResponse, reject) => {
+    const request = httpRequest({
+      hostname: url.hostname,
+      port: url.port,
+      path: `${url.pathname}${url.search}`,
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${credential}`,
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+        ...headers,
+      },
+    }, (response) => {
+      const chunks: Buffer[] = []
+      response.on("data", (chunk) => chunks.push(Buffer.from(chunk)))
+      response.on("end", () => resolveResponse({
+        status: response.statusCode ?? 0,
+        headers: response.headers,
+        body: Buffer.concat(chunks).toString("utf8"),
+      }))
+    })
+    request.on("error", reject)
+    request.end(JSON.stringify(body))
   })
-  return { status: response.status, headers: response.headers, body: await response.text() }
 }
 
 function extractClaudeManagedSettings(
   text: string,
   expectedModel: string,
+  forbiddenSecrets: readonly string[] = [],
 ): { endpoint: string; credential: string; semantic: unknown } {
+  scanNoSecrets([text], forbiddenSecrets, "claude-settings-raw")
   const parsed = JSON.parse(text) as Record<string, unknown> & { env?: Record<string, unknown> }
   const env = parsed.env
   if (!env || typeof env !== "object") throw new Error("claude-managed-settings-invalid")
@@ -232,8 +249,8 @@ function auditClaudeSettingsSecrets(
   routingCredential: string,
   forbiddenSecrets: readonly string[],
 ): void {
+  scanNoSecrets([text], forbiddenSecrets, "claude-settings-forbidden-secret")
   const parsed = JSON.parse(text) as { env?: Record<string, unknown> }
-  scanNoSecrets([parsed], forbiddenSecrets, "claude-settings-forbidden-secret")
   if (parsed.env?.ANTHROPIC_AUTH_TOKEN !== routingCredential) {
     throw new Error("claude-settings-routing-location-invalid")
   }
@@ -252,12 +269,32 @@ type ClaudeRequestProjection = {
   stream: boolean
   delayed: boolean
   error: boolean
-  hasTools: boolean
-  hasUnknown: boolean
-  hasClaudeCodeHeader: boolean
-  hasQuery: boolean
-  beta: string | null
-  bodyDigest: string
+  version: string | null
+  betaValues: string[]
+  correlation: string | null
+  query: string
+  toolsDigest: string | null
+  unknownDigest: string | null
+}
+
+function capturedHeaderValues(value: string | string[] | null | undefined): string[] {
+  if (value === null || value === undefined) return []
+  return (Array.isArray(value) ? value : [value]).flatMap((entry) => entry.split(","))
+    .map((entry) => entry.trim()).filter(Boolean)
+}
+
+function singleCapturedHeader(value: string | string[] | null | undefined): string | null {
+  const values = capturedHeaderValues(value)
+  return values.length === 1 ? values[0]! : null
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right))
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`
+  }
+  return JSON.stringify(value)
 }
 
 function auditClaudeRequestAndProject(
@@ -321,13 +358,40 @@ function auditClaudeRequestAndProject(
     stream: parsed.stream === true,
     delayed: parsed.fixture_delay === true,
     error: parsed.fixture_error === true,
-    hasTools: Array.isArray(parsed.tools),
-    hasUnknown: parsed.future_extension !== undefined,
-    hasClaudeCodeHeader: request.headers["x-claude-code-fixture"] === "preserved",
-    hasQuery: request.path.includes("?"),
-    beta: request.headers["anthropic-beta"] ?? null,
-    bodyDigest: sensitiveDigest(request.body)!,
+    version: capturedHeaderValues(request.headers["anthropic-version"])[0] ?? null,
+    betaValues: capturedHeaderValues(request.headers["anthropic-beta"]),
+    correlation: capturedHeaderValues(request.headers["x-claude-code-fixture"])[0] ?? null,
+    query: request.path.split("?", 2)[1] ?? "",
+    toolsDigest: parsed.tools === undefined ? null : sensitiveDigest(canonicalJson(parsed.tools)),
+    unknownDigest: parsed.future_extension === undefined
+      ? null
+      : sensitiveDigest(canonicalJson(parsed.future_extension)),
   }
+}
+
+function assertExactClaudeMessagesProjection(projection: ClaudeRequestProjection): void {
+  if (projection.version !== "2023-06-01") throw new Error("claude-messages-version-mismatch")
+  if (projection.toolsDigest !== "sha256:bfcc7fa1821a5c8fba2595839a9a267926840b77999fa6f9cb70894ed48716ec") {
+    throw new Error("claude-messages-tools-mismatch")
+  }
+  if (projection.unknownDigest !== "sha256:6b6e86a08acc82a7339ef0e0c0566dc4461d882e4b5ed97b8497e0c2e3d817d2") {
+    throw new Error("claude-messages-unknown-mismatch")
+  }
+  if (
+    projection.method !== "POST"
+    || projection.pathClass !== "messages"
+    || projection.model !== "claude-api-model"
+    || projection.query !== "beta=true&fixture=exact"
+    || projection.correlation !== "claude-contract-request"
+    || JSON.stringify(projection.betaValues) !== JSON.stringify([
+      "tools-2025-01-01",
+      "context-1m-2025-08-07",
+    ])
+  ) throw new Error("claude-messages-envelope-mismatch")
+}
+
+function assertClaudeUpstreamResponseHeaders(headers: Record<string, string | string[] | undefined>): void {
+  if (headers["x-upstream"] !== "claude-fixture") throw new Error("claude-response-header-mismatch")
 }
 
 function fixedClaudeRequestAuditDiagnostic(error: unknown): string {
@@ -338,6 +402,24 @@ function fixedClaudeRequestAuditDiagnostic(error: unknown): string {
     "claude-captured-authentication-invalid",
     "claude-captured-body-invalid",
   ].includes(message) ? message : "claude-captured-request-audit-failed"
+}
+
+function assertChildVisibleEnvironment(
+  requested: Readonly<Record<"HOME" | "CODEX_HOME" | "CLAUDE_CONFIG_DIR", string>>,
+  actual: Readonly<NodeJS.ProcessEnv>,
+): void {
+  if (
+    actual.HOME !== requested.HOME
+    || actual.CODEX_HOME !== requested.CODEX_HOME
+    || actual.CLAUDE_CONFIG_DIR !== requested.CLAUDE_CONFIG_DIR
+  ) throw new Error("claude-environment-traps-not-child-visible")
+}
+
+function runWithFinalSecurityAudit(work: () => void, audit: () => void): void {
+  let functionalFailure: unknown
+  try { work() } catch (error) { functionalFailure = error }
+  audit()
+  if (functionalFailure) throw functionalFailure
 }
 
 function extractManagedConfig(text: string, expectedModel: string): { endpoint: string; credential: string } {
@@ -757,7 +839,7 @@ function projectCapturedRequest(
     hasQuery: request.path.includes("?"),
     authorizationClass: authorizationClassification(request.authorization, expectedProviderCredential),
     headerAuthorizationClass: authorizationClassification(
-      request.headers.authorization ?? null,
+      singleCapturedHeader(request.headers.authorization),
       expectedProviderCredential,
     ),
     hasAuthorizationHeader: request.headers.authorization !== undefined,
@@ -1012,6 +1094,98 @@ function readDatabaseProjection(path: string): unknown {
   }
 }
 
+type SqliteSecretPolicy = {
+  providerSecrets: ReadonlyArray<{ target: "codex" | "claude"; name: string; secret: string }>
+  routingSecrets: ReadonlyArray<{ target: "codex" | "claude"; secret: string }>
+}
+
+function jsonSecretPaths(value: unknown, secret: string, path: string[] = []): string[] {
+  if (typeof value === "string") return value.includes(secret) ? [path.join(".")] : []
+  if (Array.isArray(value)) return value.flatMap((entry, index) => jsonSecretPaths(entry, secret, [...path, String(index)]))
+  if (!value || typeof value !== "object") return []
+  return Object.entries(value as Record<string, unknown>)
+    .flatMap(([key, entry]) => jsonSecretPaths(entry, secret, [...path, key]))
+}
+
+function approvedRecoveryPaths(target: "codex" | "claude"): readonly string[] {
+  if (target === "claude") return [
+    "before.owned.auth_token",
+    "desired.owned.auth_token",
+  ]
+  return [
+    "before.owned.provider_http_headers.rendered",
+    "before.owned.provider_http_headers.semantic.X-Muxvia-Routing-Credential",
+    "desired.provider_http_headers.rendered",
+    "desired.provider_http_headers.semantic.X-Muxvia-Routing-Credential",
+  ]
+}
+
+function auditSqliteSecretLocations(path: string, policy: SqliteSecretPolicy): void {
+  const secrets = [...policy.providerSecrets, ...policy.routingSecrets]
+  const database = new Database(path, { readonly: true })
+  try {
+    const definitions = database.query(`SELECT name, sql FROM sqlite_master
+      WHERE type IN ('table', 'index', 'trigger', 'view') ORDER BY type, name`).all() as Array<{
+        name: string
+        sql: string | null
+      }>
+    scanNoSecrets(definitions, secrets.map(({ secret }) => secret), "claude-sqlite-schema")
+    const tableNames = definitions.filter(({ sql, name }) => sql && !name.startsWith("sqlite_"))
+      .map(({ name }) => name)
+    const providers = tableNames.includes("providers")
+      ? database.query("SELECT id, target, name, credential_id FROM providers").all() as Array<{
+          id: string
+          target: string
+          name: string
+          credential_id: string | null
+        }>
+      : []
+    for (const table of tableNames) {
+      const quoted = `"${table.replaceAll('"', '""')}"`
+      const rows = database.query(`SELECT * FROM ${quoted}`).all() as Array<Record<string, unknown>>
+      for (const row of rows) {
+        let recoveryPayload: unknown
+        if (table === "activation_recovery") {
+          try { recoveryPayload = JSON.parse(String(row.payload_json)) } catch {
+            throw new Error("claude-sqlite-recovery-json-invalid")
+          }
+        }
+        for (const { target, secret } of secrets) {
+          for (const [column, value] of Object.entries(row)) {
+            if (typeof value !== "string" || !value.includes(secret)) continue
+            const exactApprovedValue = (
+              table === "credentials" && column === "bearer_token"
+              && policy.providerSecrets.some((entry) => entry.target === row.target && entry.secret === value
+                && providers.some((provider) => provider.credential_id === row.id && provider.name === entry.name))
+              || table === "activated_snapshots" && column === "provider_bearer_token"
+                && policy.providerSecrets.some((entry) => entry.target === row.target && entry.secret === value
+                  && providers.some((provider) => provider.id === row.provider_id && provider.name === entry.name))
+            )
+              || table === "target_route_state" && column === "routing_credential"
+                && policy.routingSecrets.some((entry) => entry.target === row.target && entry.secret === value)
+            if (exactApprovedValue) continue
+            if (
+              table === "activation_recovery"
+              && column === "payload_json"
+              && row.target === target
+              && policy.routingSecrets.some((entry) => entry.target === target && entry.secret === secret)
+            ) {
+              const paths = jsonSecretPaths(recoveryPayload, secret)
+              if (
+                paths.length > 0
+                && paths.every((entry) => approvedRecoveryPaths(target).includes(entry))
+              ) continue
+            }
+            throw new Error("secret-scan-failed:claude-sqlite-secret-location")
+          }
+        }
+      }
+    }
+  } finally {
+    database.close()
+  }
+}
+
 async function readManagedConfigurationFingerprint(path: string): Promise<string> {
   try {
     return sensitiveDigest(await readFile(path))!
@@ -1044,6 +1218,32 @@ function readTargetDatabaseFingerprint(databasePath: string, target: "codex" | "
   } finally {
     database.close()
   }
+}
+
+function readStableTargetDatabaseFingerprint(databasePath: string, target: "codex" | "claude"): string {
+  const database = new Database(databasePath, { readonly: true })
+  try {
+    const state = [
+      database.query(`SELECT target, management_revision, current_provider_id, serving_provider_id,
+        takeover_state, route_port, routing_credential, activated_snapshot_id, managed_config_path,
+        recovery_state FROM target_route_state WHERE target = ?`).get(target),
+      database.query("SELECT * FROM target_problems WHERE target = ? ORDER BY code").all(target),
+      database.query("SELECT * FROM providers WHERE target = ? ORDER BY position").all(target),
+      database.query("SELECT * FROM credentials WHERE target = ? ORDER BY id").all(target),
+      database.query("SELECT * FROM activated_snapshots WHERE target = ? ORDER BY id").all(target),
+      database.query("SELECT * FROM action_receipts WHERE target = ? ORDER BY committed_revision, action_id").all(target),
+      database.query("SELECT * FROM activation_recovery WHERE target = ? ORDER BY created_revision, id").all(target),
+    ]
+    return sensitiveDigest(JSON.stringify(state))!
+  } finally {
+    database.close()
+  }
+}
+
+function stableTargetViewFingerprint(view: Readonly<TargetView>): string {
+  const { viewSequence: _viewSequence, service, ...stable } = view
+  const { epoch: _epoch, ...stableService } = service
+  return sensitiveDigest(canonicalJson({ ...stable, service: stableService }))!
 }
 
 function credentialReferences(databasePath: string): Array<{ name: string; credentialId: string | null }> {
@@ -1548,9 +1748,226 @@ test("Claude request audit rejects misplaced credentials with fixed diagnostics"
   expect(settingsDiagnostic === "secret-scan-failed:claude-settings-routing-secret").toBeTrue()
   expect(settingsDiagnostic.includes(routing)).toBeFalse()
   expect(settingsDiagnostic.includes(settingsMutation)).toBeFalse()
+
+  const earlyFailureMutation = JSON.stringify({
+    env: { ANTHROPIC_MODEL: "wrong", MISPLACED_PROVIDER: apiKey },
+  })
+  let earlyDiagnostic = ""
+  try {
+    extractClaudeManagedSettings(earlyFailureMutation, "expected", [apiKey])
+  } catch (error) {
+    earlyDiagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(earlyDiagnostic).toBe("secret-scan-failed:claude-settings-raw")
+  expect(earlyDiagnostic.includes(apiKey)).toBeFalse()
+  expect(earlyDiagnostic.includes(earlyFailureMutation)).toBeFalse()
 })
 
-test("Claude tracer fixture enforces restrictive umask and home traps", async () => {
+test("Claude environment trap audit rejects traps stripped before child spawn", () => {
+  const requested = {
+    HOME: "/controlled/trap-home",
+    CODEX_HOME: "/controlled/trap-codex",
+    CLAUDE_CONFIG_DIR: "/controlled/trap-claude",
+  }
+  const stripped = { HOME: "/controlled/target-home" }
+  let diagnostic = ""
+  try {
+    assertChildVisibleEnvironment(requested, stripped)
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(diagnostic).toBe("claude-environment-traps-not-child-visible")
+  expect(diagnostic.includes(requested.HOME)).toBeFalse()
+})
+
+test("real service keeps child-visible environment traps outside the explicit target home", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ce-"))
+  roots.push(root)
+  const targetHome = join(root, "h")
+  const muxviaHome = join(targetHome, ".muxvia")
+  const socketPath = join(muxviaHome, "run/control.sock")
+  const shutdown = join(root, "shutdown")
+  const requested = {
+    HOME: join(root, "th"),
+    CODEX_HOME: join(root, "tc"),
+    CLAUDE_CONFIG_DIR: join(root, "tl"),
+  }
+  await mkdir(targetHome, { recursive: true, mode: 0o700 })
+  await mkdir(requested.HOME, { recursive: true, mode: 0o700 })
+  await mkdir(requested.CODEX_HOME, { recursive: true, mode: 0o700 })
+  await mkdir(requested.CLAUDE_CONFIG_DIR, { recursive: true, mode: 0o700 })
+  await writeFile(join(requested.HOME, "canary"), "home-canary\n", { mode: 0o600 })
+  await writeFile(join(requested.CODEX_HOME, "canary"), "codex-canary\n", { mode: 0o600 })
+  await writeFile(join(requested.CLAUDE_CONFIG_DIR, "canary"), "claude-canary\n", { mode: 0o600 })
+  const fingerprints = await Promise.all(Object.values(requested).map(controlledTreeFingerprint))
+  const environment: NodeJS.ProcessEnv = {
+    ...requested,
+    PATH: `${dirname(fakeClaude)}:/usr/bin:/bin`,
+    MUXVIA_INTEGRATION_TEST: "1",
+  }
+  assertChildVisibleEnvironment(requested, environment)
+  const child = spawn(serviceBinary, [
+    "--home", muxviaHome,
+    "--test-shutdown-file", shutdown,
+    "--test-codex-executable", fakeCodex,
+    "--test-claude-executable", fakeClaude,
+  ], { cwd: root, env: environment, stdio: ["ignore", "pipe", "pipe"] })
+  const output = captureProcessOutput(child)
+  let client: RpcClient | undefined
+  let session: TargetSession | undefined
+  try {
+    await waitFor(async () => {
+      if (child.exitCode !== null) {
+        const drained = Buffer.concat(output.streams.flat()).toString("utf8")
+        const category = drained.includes("configuration home")
+          ? "configuration-home"
+          : drained.includes("control transport failed")
+            ? "control"
+          : drained.includes("state is unavailable")
+            ? "state"
+            : drained.includes("I/O failed")
+              ? "io"
+              : "unknown"
+        throw new Error(`child-visible-trap-service-exited:${category}`)
+      }
+      try { return (await stat(socketPath)).isSocket() } catch { return false }
+    }, "child-visible trap service socket")
+    client = await RpcClient.connect(socketPath, "claude-child-visible-traps")
+    session = await client.openTarget("claude", {
+      claudeConfigDir: requested.CLAUDE_CONFIG_DIR,
+      selectorState: "unset",
+      hostManagedState: "unmanaged",
+      cwd: root,
+    })
+    const saved = await session.act({
+      kind: "create-provider",
+      name: "Blocked Claude",
+      baseUrl: "http://127.0.0.1:9/v1",
+      model: "claude-blocked",
+      credential: { kind: "replace", value: "blocked-provider-secret" },
+      authentication: "anthropic-api-key",
+      presetKey: null,
+    })
+    let code = ""
+    try {
+      await session.act({ kind: "activate-provider", providerId: saved.view.providers[0]!.id, mode: "takeover" })
+    } catch (error) {
+      code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : ""
+    }
+    expect(code).toBe("unsupported-configuration-home")
+    expect((await stat(join(muxviaHome, "state/muxvia.db"))).mode & 0o777).toBe(0o600)
+    expect((await stat(muxviaHome)).mode & 0o777).toBe(0o700)
+    expect(await Promise.all(Object.values(requested).map(controlledTreeFingerprint))).toEqual(fingerprints)
+  } finally {
+    await session?.close().catch(() => {})
+    await writeFile(shutdown, "shutdown\n", { mode: 0o600 }).catch(() => {})
+    const completed = await Promise.race([output.completed, Bun.sleep(deadlineMs).then(() => undefined)])
+    if (!completed && child.exitCode === null) child.kill("SIGKILL")
+    await output.completed.catch(() => undefined)
+    scanProcessOutputNoSecrets(output.streams, ["blocked-provider-secret"])
+  }
+}, 20_000)
+
+test("Claude final security scanner wins over an earlier functional failure", () => {
+  const leaked = "controlled-final-audit-leak"
+  let diagnostic = ""
+  try {
+    runWithFinalSecurityAudit(
+      () => { throw new Error("early-functional-failure") },
+      () => scanNoSecrets([{ stdout: leaked }], [leaked], "claude-guaranteed-final-audit"),
+    )
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(diagnostic).toBe("secret-scan-failed:claude-guaranteed-final-audit")
+  expect(diagnostic.includes(leaked)).toBeFalse()
+})
+
+test("Claude SQLite audit rejects a secret in an unrelated state column", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-sqlite-audit-"))
+  roots.push(root)
+  const path = join(root, "mutation.db")
+  const database = new Database(path, { create: true })
+  database.exec("CREATE TABLE target_problems (target TEXT, code TEXT, message TEXT)")
+  const secret = "controlled-sqlite-misplaced-secret"
+  database.query("INSERT INTO target_problems VALUES ('claude', 'controlled', ?)").run(secret)
+  database.close()
+  let diagnostic = ""
+  try {
+    auditSqliteSecretLocations(path, { providerSecrets: [], routingSecrets: [{ target: "claude", secret }] })
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(diagnostic).toBe("secret-scan-failed:claude-sqlite-secret-location")
+  expect(diagnostic.includes(secret)).toBeFalse()
+})
+
+test("Claude Messages projection rejects contract mutations with fixed diagnostics", () => {
+  const exact: ClaudeRequestProjection = {
+    method: "POST",
+    pathClass: "messages",
+    authentication: "api-key",
+    model: "claude-api-model",
+    stream: false,
+    delayed: false,
+    error: false,
+    version: "2023-06-01",
+    betaValues: ["tools-2025-01-01", "context-1m-2025-08-07"],
+    correlation: "claude-contract-request",
+    query: "beta=true&fixture=exact",
+    toolsDigest: "sha256:bfcc7fa1821a5c8fba2595839a9a267926840b77999fa6f9cb70894ed48716ec",
+    unknownDigest: "sha256:6b6e86a08acc82a7339ef0e0c0566dc4461d882e4b5ed97b8497e0c2e3d817d2",
+  }
+  const mutations: Array<[ClaudeRequestProjection, string]> = [
+    [{ ...exact, toolsDigest: sensitiveDigest("altered")! }, "claude-messages-tools-mismatch"],
+    [{ ...exact, unknownDigest: sensitiveDigest("altered")! }, "claude-messages-unknown-mismatch"],
+    [{ ...exact, version: null }, "claude-messages-version-mismatch"],
+  ]
+  for (const [projection, expected] of mutations) {
+    let diagnostic = ""
+    try { assertExactClaudeMessagesProjection(projection) } catch (error) {
+      diagnostic = error instanceof Error ? error.message : String(error)
+    }
+    expect(diagnostic).toBe(expected)
+    expect(diagnostic.includes(JSON.stringify(projection))).toBeFalse()
+  }
+  expect(() => assertClaudeUpstreamResponseHeaders({})).toThrow("claude-response-header-mismatch")
+})
+
+test("fake Claude upstream rejects missing version and altered schema with fixed safe responses", async () => {
+  const apiKey = "controlled-fake-upstream-api-key"
+  const upstream = await startFakeUpstream("unused", undefined, { apiKeyCredentials: [apiKey] })
+  try {
+    const missingVersion = await fetch(`${upstream.baseUrl}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": apiKey },
+      body: '{"messages":[]}',
+    })
+    expect(missingVersion.status).toBe(422)
+    expect(await missingVersion.text()).toBe('{"error":"fixture-contract-rejected"}')
+    const alteredSchema = await fetch(`${upstream.baseUrl}/messages?beta=true&fixture=exact`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "tools-2025-01-01, context-1m-2025-08-07",
+        "x-claude-code-fixture": "claude-contract-request",
+      },
+      body: JSON.stringify({
+        messages: [],
+        tools: [{ name: "mutated", input_schema: { type: "object" } }],
+        future_extension: { retained: true, nested: { version: 7 } },
+      }),
+    })
+    expect(alteredSchema.status).toBe(422)
+    expect(await alteredSchema.text()).toBe('{"error":"fixture-contract-rejected"}')
+  } finally {
+    await upstream.stop()
+  }
+})
+
+test("Claude tracer fixture enforces restrictive umask", async () => {
   const child = spawn(process.execPath, [
     "test",
     "./packages/control-plane/test/walking-skeleton.e2e.tsx",
@@ -1956,12 +2373,22 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     }, allStaticSecrets, "codex-baseline-takeover")
     const codexConfig = extractManagedConfig(await readFile(codexConfigPath, "utf8"), "gpt-codex-baseline")
     codexRoutingCredential = codexConfig.credential
+    const codexServingResponse = await chunkedPost(codexConfig.endpoint, codexConfig.credential)
+    expect(codexServingResponse.status).toBe(201)
+    expect(codexServingResponse.body).toBe(SSE_BYTES.join(""))
+    const codexServing = await waitForSecretSafeSession(
+      codexSession!,
+      (view) => view.servingProviderId === codexProvider.id,
+      [...allStaticSecrets, codexConfig.credential],
+      "codex-authenticated-serving-baseline",
+    )
     const codexBaseline = {
       endpoint: codexApplied.view.takeover.endpoint!,
       credentialDigest: sensitiveDigest(codexConfig.credential),
       snapshotId: codexApplied.view.activatedSnapshot!.id,
       config: await safeFileFingerprint(codexConfigPath),
-      database: readTargetDatabaseFingerprint(databasePath, "codex"),
+      database: readStableTargetDatabaseFingerprint(databasePath, "codex"),
+      view: stableTargetViewFingerprint(codexServing),
     }
 
     setup = await testRender(() => <App sessions={{ codex: codexSession!, claude: claudeSession! }} />, {
@@ -2058,7 +2485,10 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     )
     selectedFrames.push(appliedFrame)
     const settingsBytes = await readFile(claudeSettingsPath, "utf8")
-    const claudeManaged = extractClaudeManagedSettings(settingsBytes, "claude-api-model")
+    const claudeManaged = extractClaudeManagedSettings(settingsBytes, "claude-api-model", [
+      ...allStaticSecrets,
+      codexConfig.credential,
+    ])
     claudeRoutingCredential = claudeManaged.credential
     auditClaudeSettingsSecrets(settingsBytes, claudeManaged.credential, [
       ...allStaticSecrets,
@@ -2073,7 +2503,8 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     })
     expect(claudeManaged.endpoint).not.toBe(codexBaseline.endpoint)
     expect(sensitiveDigest(claudeManaged.credential)).not.toBe(codexBaseline.credentialDigest)
-    expect(readTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
+    expect(readStableTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
+    expect(stableTargetViewFingerprint(codexSession!.get())).toBe(codexBaseline.view)
     expect(await safeFileFingerprint(codexConfigPath)).toEqual(codexBaseline.config)
 
     const callsBeforeRejected = upstream.calls.length
@@ -2086,16 +2517,28 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     const message = await claudePost(
       claudeManaged.endpoint,
       claudeManaged.credential,
-      "/v1/messages?beta=true",
+      "/v1/messages?beta=true&fixture=exact",
       {
         model: "client-must-be-replaced",
         messages: [{ role: "user", content: "hello" }],
-        tools: [{ name: "fixture_tool", input_schema: { type: "object" } }],
-        future_extension: { retained: true },
+        tools: [{
+          name: "fixture_tool",
+          input_schema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
+        }],
+        future_extension: { retained: true, nested: { version: 7 } },
       },
-      { "anthropic-beta": "tools-2025-01-01", "x-claude-code-fixture": "preserved" },
+      {
+        "anthropic-beta": ["tools-2025-01-01", "context-1m-2025-08-07"],
+        "x-claude-code-fixture": "claude-contract-request",
+      },
     )
+    if (message.status === 422) {
+      const reported = String(message.headers["x-fixture-contract-error"] ?? "")
+      const category = ["query", "tools", "unknown", "beta"].includes(reported) ? reported : "version"
+      throw new Error(`claude-fixture-contract-${category}`)
+    }
     expect(message.status).toBe(200)
+    assertClaudeUpstreamResponseHeaders(message.headers)
     expect(JSON.parse(message.body)).toMatchObject({ id: "msg_fixture", type: "message" })
     const counted = await claudePost(
       claudeManaged.endpoint,
@@ -2104,6 +2547,7 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
       { model: "wrong", messages: [] },
     )
     expect(counted.status).toBe(200)
+    assertClaudeUpstreamResponseHeaders(counted.headers)
     expect(JSON.parse(counted.body)).toEqual({ input_tokens: 7 })
     const errored = await claudePost(
       claudeManaged.endpoint,
@@ -2112,21 +2556,23 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
       { messages: [], fixture_error: true },
     )
     expect(errored.status).toBe(429)
+    assertClaudeUpstreamResponseHeaders(errored.headers)
     expect(errored.body).toBe('{"type":"error","error":{"type":"rate_limit_error","message":"fixture"}}')
     assertAuditHealthy()
+    assertExactClaudeMessagesProjection(claudeRequestProjections[3]!)
     expect(claudeRequestProjections.slice(3, 6)).toMatchObject([
-      {
-        pathClass: "messages", authentication: "api-key", model: "claude-api-model",
-        hasTools: true, hasUnknown: true, hasClaudeCodeHeader: true,
-        hasQuery: true, beta: "tools-2025-01-01",
-      },
+      { pathClass: "messages", authentication: "api-key", model: "claude-api-model" },
       { pathClass: "count-tokens", authentication: "api-key", model: "claude-api-model" },
       { pathClass: "messages", authentication: "api-key", model: "claude-api-model", error: true },
     ])
 
     const delayedResponse = fetch(`${claudeManaged.endpoint}/v1/messages`, {
       method: "POST",
-      headers: { authorization: `Bearer ${claudeManaged.credential}`, "content-type": "application/json" },
+      headers: {
+        authorization: `Bearer ${claudeManaged.credential}`,
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+      },
       body: JSON.stringify({ messages: [], stream: true, fixture_delay: true }),
     })
     await upstream.waitForDelayedStart()
@@ -2171,7 +2617,10 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     )
     expect(bearerApplied.takeover.endpoint).toBe(claudeManaged.endpoint)
     const switchedSettingsBytes = await readFile(claudeSettingsPath, "utf8")
-    const switchedSettings = extractClaudeManagedSettings(switchedSettingsBytes, "claude-bearer-model")
+    const switchedSettings = extractClaudeManagedSettings(switchedSettingsBytes, "claude-bearer-model", [
+      ...allStaticSecrets,
+      codexConfig.credential,
+    ])
     auditClaudeSettingsSecrets(switchedSettingsBytes, claudeManaged.credential, [
       ...allStaticSecrets,
       codexConfig.credential,
@@ -2186,9 +2635,11 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
       { messages: [], future_extension: "new-snapshot" },
     )
     expect(bearerResponse.status).toBe(200)
+    assertClaudeUpstreamResponseHeaders(bearerResponse.headers)
     upstream.releaseDelayed()
     const oldStream = await delayedResponse
     expect(oldStream.status).toBe(200)
+    expect(oldStream.headers.get("x-upstream")).toBe("claude-fixture")
     expect(await oldStream.text()).toBe(CLAUDE_SSE_BYTES.join(""))
     assertAuditHealthy()
     const delayedProjection = claudeRequestProjections.find((projection) => projection.delayed)
@@ -2196,7 +2647,8 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
       pathClass: "messages", authentication: "api-key", model: "claude-api-model", stream: true,
     })
     expect(claudeRequestProjections.at(-1)).toMatchObject({
-      pathClass: "messages", authentication: "bearer", model: "claude-bearer-model", hasUnknown: true,
+      pathClass: "messages", authentication: "bearer", model: "claude-bearer-model",
+      unknownDigest: sensitiveDigest('"new-snapshot"'),
     })
     await waitForSecretSafeSession(
       claudeSession!,
@@ -2206,10 +2658,10 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     )
 
     expect(await safeFileFingerprint(codexConfigPath)).toEqual(codexBaseline.config)
-    expect(readTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
+    expect(readStableTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
     expect(codexSession!.get()).toMatchObject({
       currentProviderId: codexProvider.id,
-      servingProviderId: null,
+      servingProviderId: codexProvider.id,
       activatedSnapshot: { id: codexBaseline.snapshotId },
       takeover: { endpoint: codexBaseline.endpoint },
     })
@@ -2223,7 +2675,8 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
       "codex-baseline-serving",
     )
     expect(await safeFileFingerprint(codexConfigPath)).toEqual(codexBaseline.config)
-    expect(readTargetDatabaseFingerprint(databasePath, "codex")).not.toBe(codexBaseline.database)
+    expect(readStableTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
+    expect(stableTargetViewFingerprint(codexSession!.get())).toBe(codexBaseline.view)
     expect(codexSession!.get()).toMatchObject({
       currentProviderId: codexProvider.id,
       servingProviderId: codexProvider.id,
@@ -2249,6 +2702,8 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     expect(afterCloseClaude.status).toBe(200)
     expect(afterCloseCodex.status).toBe(201)
     expect(firstService.child.exitCode).toBeNull()
+    expect(await safeFileFingerprint(codexConfigPath)).toEqual(codexBaseline.config)
+    expect(readStableTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
 
     await stopService(firstService, firstShutdown)
     await expect(claudePost(claudeManaged.endpoint, claudeManaged.credential, "/v1/messages", { messages: [] })).rejects.toBeDefined()
@@ -2261,6 +2716,9 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
       activatedSnapshot: { id: codexBaseline.snapshotId },
       takeover: { endpoint: codexBaseline.endpoint },
     })
+    expect(stableTargetViewFingerprint(codexSession!.get())).toBe(codexBaseline.view)
+    expect(readStableTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
+    expect(await safeFileFingerprint(codexConfigPath)).toEqual(codexBaseline.config)
     expect(claudeSession!.get()).toMatchObject({
       currentProviderId: bearerProvider.id,
       activatedSnapshot: { id: bearerApplied.activatedSnapshot!.id, model: "claude-bearer-model" },
@@ -2268,13 +2726,18 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     })
     expect(extractManagedConfig(await readFile(codexConfigPath, "utf8"), "gpt-codex-baseline")).toEqual(codexConfig)
     const restartedSettingsBytes = await readFile(claudeSettingsPath, "utf8")
-    expect(extractClaudeManagedSettings(restartedSettingsBytes, "claude-bearer-model").credential).toBe(claudeManaged.credential)
+    expect(extractClaudeManagedSettings(restartedSettingsBytes, "claude-bearer-model", [
+      ...allStaticSecrets,
+      codexConfig.credential,
+    ]).credential).toBe(claudeManaged.credential)
     auditClaudeSettingsSecrets(restartedSettingsBytes, claudeManaged.credential, [
       ...allStaticSecrets,
       codexConfig.credential,
     ])
     expect((await claudePost(claudeManaged.endpoint, claudeManaged.credential, "/v1/messages", { messages: [] })).status).toBe(200)
     expect((await chunkedPost(codexConfig.endpoint, codexConfig.credential)).status).toBe(201)
+    expect(stableTargetViewFingerprint(codexSession!.get())).toBe(codexBaseline.view)
+    expect(readStableTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
 
     const database = new Database(databasePath, { readonly: true })
     try {
@@ -2317,6 +2780,17 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     } finally {
       database.close()
     }
+    auditSqliteSecretLocations(databasePath, {
+      providerSecrets: [
+        { target: "claude", name: "Claude API Key", secret: apiKeySecret },
+        { target: "claude", name: "Claude Bearer", secret: bearerSecret },
+        { target: "codex", name: "Codex Baseline", secret: providerSecret },
+      ],
+      routingSecrets: [
+        { target: "claude", secret: claudeManaged.credential },
+        { target: "codex", secret: codexConfig.credential },
+      ],
+    })
 
     await writeFile(secondShutdown, "shutdown\n", { mode: 0o600 })
     const finalResult = await Promise.race([secondService.output.completed, Bun.sleep(deadlineMs).then(() => undefined)])
@@ -2348,29 +2822,63 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     await assertSessionDrained(codexSession!, "codex")
     await assertSessionDrained(claudeSession!, "claude")
 
-    await upstream.quiesce()
-    assertAuditHealthy()
-    const completeSecrets = [
-      ...allStaticSecrets,
-      claudeManaged.credential,
-      codexConfig.credential,
-    ]
-    scanRawRpcFramesNoSecrets(rpcStreams, completeSecrets)
-    scanNoSecrets([decodedFrames, views, selectedFrames, nativeFrames], completeSecrets, "claude-zero-secret-observations")
-    scanProcessOutputNoSecrets(services.map(({ output }) => output.streams).flat(), completeSecrets)
-    expect(await controlledTreeFingerprint(trapHome)).toBe(trapFingerprint)
     expect((await stat(databasePath)).mode & 0o777).toBe(0o600)
     expect((await stat(muxviaHome)).mode & 0o777).toBe(0o700)
   } finally {
+    let cleanupFailed = false
     upstream.releaseDelayed()
-    rendererAudit?.stop()
-    if (setup && !setup.renderer.isDestroyed) setup.renderer.destroy()
+    if (rendererAudit) {
+      try {
+        rendererAudit.stop()
+        nativeFrames.push(...rendererAudit.frames())
+      } catch { cleanupFailed = true }
+    }
+    if (setup && !setup.renderer.isDestroyed) {
+      try { setup.renderer.destroy() } catch { cleanupFailed = true }
+    }
     await closeSessions().catch(() => {})
     await writeFile(firstShutdown, "shutdown\n").catch(() => {})
     await writeFile(secondShutdown, "shutdown\n").catch(() => {})
     for (const { child } of services) if (child.exitCode === null) child.kill("SIGKILL")
     await Promise.all(services.map(({ output }) => output.completed.catch(() => undefined)))
-    await upstream.stop()
+    try { await upstream.stop() } catch { cleanupFailed = true }
+    if (!codexRoutingCredential) {
+      try {
+        const raw = await readFile(codexConfigPath, "utf8")
+        scanNoSecrets([raw], allStaticSecrets, "claude-final-codex-config-raw")
+        codexRoutingCredential = raw.match(/X-Muxvia-Routing-Credential"\s*=\s*"([a-f0-9]{64})"/)?.[1]
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+      }
+    }
+    if (!claudeRoutingCredential) {
+      try {
+        const raw = await readFile(claudeSettingsPath, "utf8")
+        scanNoSecrets([raw], [
+          ...allStaticSecrets,
+          ...(codexRoutingCredential ? [codexRoutingCredential] : []),
+        ], "claude-final-settings-raw")
+        const parsed = JSON.parse(raw) as { env?: { ANTHROPIC_AUTH_TOKEN?: unknown } }
+        if (typeof parsed.env?.ANTHROPIC_AUTH_TOKEN === "string") {
+          claudeRoutingCredential = parsed.env.ANTHROPIC_AUTH_TOKEN
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+      }
+    }
+    const completeSecrets = [
+      ...allStaticSecrets,
+      ...(claudeRoutingCredential ? [claudeRoutingCredential] : []),
+      ...(codexRoutingCredential ? [codexRoutingCredential] : []),
+    ]
+    assertAuditHealthy()
+    if (rpcStreams.some((stream) => stream.length > 0)) scanRawRpcFramesNoSecrets(rpcStreams, completeSecrets)
+    scanNoSecrets([decodedFrames, views, selectedFrames, nativeFrames], completeSecrets, "claude-zero-secret-observations")
+    scanProcessOutputNoSecrets(services.map(({ output }) => output.streams).flat(), completeSecrets)
+    if (await controlledTreeFingerprint(trapHome) !== trapFingerprint) {
+      throw new Error("claude-environment-trap-mutated")
+    }
+    if (cleanupFailed) throw new Error("claude-security-finalizer-cleanup-failed")
   }
 }, 60_000)
 

@@ -1,11 +1,14 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
 use muxvia_routing::{
+    claude::CommandClaudeProbe,
+    codex::CodexConfigCodec,
     codex::CommandCodexProbe,
     control::protocol::{
         ActionStatus, CredentialPresence, ProviderCompleteness, ProviderReferenceView,
-        ProviderRequirement, ProviderRoutingRequirement,
+        ProviderRequirement, ProviderRoutingRequirement, Target,
     },
+    control::server::ControlServer,
     home::MuxviaHome,
     model::ReqwestUpstream,
     service::activate::ActivationService,
@@ -327,16 +330,10 @@ async fn schema_v6_migrates_real_v5_claude_states_without_rewriting_persisted_ar
                 .unwrap(),
             "6"
         );
-        let route: (
-            i64,
-            String,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            i64,
-        ) = database
+        let route: (i64, String, Option<i64>, bool, Option<String>, i64) = database
             .query_row(
-                "SELECT management_revision, takeover_state, route_port, routing_credential,
+                "SELECT management_revision, takeover_state, route_port,
+                        routing_credential IS 'route-secret',
                         activated_snapshot_id, managed_config_version
                  FROM target_route_state WHERE target = 'claude'",
                 [],
@@ -355,30 +352,24 @@ async fn schema_v6_migrates_real_v5_claude_states_without_rewriting_persisted_ar
         assert_eq!(route.5, 1);
         if active {
             assert_eq!(
-                (
-                    route.0,
-                    route.1.clone(),
-                    route.2,
-                    route.3.clone(),
-                    route.4.clone()
-                ),
+                (route.0, route.1.clone(), route.2, route.3, route.4.clone()),
                 (
                     7,
                     "active".to_owned(),
                     Some(43124),
-                    Some("route-secret".to_owned()),
+                    true,
                     Some(snapshot_id.to_owned())
                 )
             );
-            assert_eq!(
+            assert!(
                 database
                     .query_row(
-                        "SELECT bearer_token FROM credentials WHERE id = ?1",
+                        "SELECT bearer_token = 'provider-secret' FROM credentials WHERE id = ?1",
                         [provider_id],
-                        |row| row.get::<_, String>(0),
+                        |row| row.get::<_, bool>(0),
                     )
                     .unwrap(),
-                "provider-secret"
+                "v5 migration changed the Provider credential"
             );
             assert_eq!(
                 database
@@ -391,40 +382,283 @@ async fn schema_v6_migrates_real_v5_claude_states_without_rewriting_persisted_ar
                     .unwrap(),
                 "Claude|https://provider.test|claude-test|anthropic-messages|anthropic-bearer"
             );
-            assert_eq!(
+            assert!(
                 database
                     .query_row(
-                        "SELECT provider_bearer_token FROM activated_snapshots WHERE id = ?1",
+                        "SELECT provider_bearer_token = 'provider-secret'
+                         FROM activated_snapshots WHERE id = ?1",
                         [snapshot_id],
-                        |row| row.get::<_, String>(0),
+                        |row| row.get::<_, bool>(0),
                     )
                     .unwrap(),
-                "provider-secret"
+                "v5 migration changed the Activated Snapshot credential"
             );
-            assert_eq!(
+            assert!(
                 database
                     .query_row(
-                        "SELECT outcome_json FROM action_receipts WHERE action_id = ?1",
-                        [action_id],
-                        |row| row.get::<_, String>(0),
+                        "SELECT outcome_json = ?1 FROM action_receipts WHERE action_id = ?2",
+                        params![receipt, action_id],
+                        |row| row.get::<_, bool>(0),
                     )
                     .unwrap(),
-                receipt
+                "v5 migration rewrote the action receipt"
             );
-            assert_eq!(
+            assert!(
                 database
                     .query_row(
-                        "SELECT payload_json FROM activation_recovery WHERE id = ?1",
-                        [recovery_id],
-                        |row| row.get::<_, String>(0),
+                        "SELECT payload_json = ?1 FROM activation_recovery WHERE id = ?2",
+                        params![payload, recovery_id],
+                        |row| row.get::<_, bool>(0),
                     )
                     .unwrap(),
-                payload
+                "v5 migration rewrote the Recovery Intent payload"
             );
         } else {
-            assert_eq!(route, (0, "inactive".to_owned(), None, None, None, 1));
+            assert_eq!(route, (0, "inactive".to_owned(), None, false, None, 1));
         }
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn schema_v6_real_v5_claude_takeover_bootstraps_legacy_and_isolates_invalid_restart() {
+    let root = PathBuf::from("/tmp").join(format!("mv-{}", Uuid::new_v4()));
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let fixture = StoreFixture {
+        root,
+        home: MuxviaHome::from_user_home(&user_home),
+    };
+    fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
+    let codex_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let codex_port = codex_listener.local_addr().unwrap().port();
+    drop(codex_listener);
+    let claude_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let claude_port = claude_listener.local_addr().unwrap().port();
+    drop(claude_listener);
+    let codex_route_credential = "c".repeat(64);
+    let claude_route_credential = "d".repeat(64);
+
+    let codex_codec = CodexConfigCodec::for_user_home(fixture.home.user_home()).unwrap();
+    let codex_before = codex_codec.inspect().unwrap();
+    let codex_desired = codex_codec.desired_takeover(
+        "gpt-v5",
+        &format!("http://127.0.0.1:{codex_port}/v1"),
+        &codex_route_credential,
+    );
+    codex_codec
+        .atomic_apply(&codex_before, &codex_desired)
+        .unwrap();
+    let claude_path = fixture.home.user_home().join(".claude/settings.json");
+    fs::create_dir_all(claude_path.parent().unwrap()).unwrap();
+    fs::write(
+        &claude_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:{claude_port}"),
+                "ANTHROPIC_AUTH_TOKEN": claude_route_credential,
+                "ANTHROPIC_MODEL": "claude-v5",
+                "ANTHROPIC_API_KEY": "legacy-bootstrap-api-key-sentinel"
+            },
+            "operator": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    connection.execute_batch(&v5_schema()).unwrap();
+    for (target, provider_id, snapshot_id, model, protocol, authentication, secret) in [
+        (
+            "codex",
+            "00000000-0000-4000-8000-000000000301",
+            "00000000-0000-4000-8000-000000000302",
+            "gpt-v5",
+            "openai-responses",
+            "openai-bearer",
+            "codex-provider-secret-sentinel",
+        ),
+        (
+            "claude",
+            "00000000-0000-4000-8000-000000000303",
+            "00000000-0000-4000-8000-000000000304",
+            "claude-v5",
+            "anthropic-messages",
+            "anthropic-bearer",
+            "claude-provider-secret-sentinel",
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO credentials (id, target, bearer_token) VALUES (?1, ?2, ?3)",
+                params![provider_id, target, secret],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO providers
+                 (id, target, position, provider_revision, name, base_url, model, protocol,
+                  authentication, credential_id, routing_requirement)
+                 VALUES (?1, ?2, 0, 1, 'Provider', 'https://provider.test', ?3, ?4,
+                         ?5, ?1, 'direct-compatible')",
+                params![provider_id, target, model, protocol, authentication],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO activated_snapshots
+                 (id, target, provider_id, base_url, model, protocol, authentication,
+                  provider_bearer_token, epoch)
+                 VALUES (?1, ?2, ?3, 'https://provider.test', ?4, ?5, ?6, ?7,
+                         '00000000-0000-4000-8000-000000000305')",
+                params![
+                    snapshot_id,
+                    target,
+                    provider_id,
+                    model,
+                    protocol,
+                    authentication,
+                    secret
+                ],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "UPDATE target_route_state SET management_revision = 1, view_sequence = 1,
+               current_provider_id = '00000000-0000-4000-8000-000000000301',
+               takeover_state = 'active', route_port = ?1, routing_credential = ?2,
+               activated_snapshot_id = '00000000-0000-4000-8000-000000000302',
+               managed_config_path = ?3 WHERE target = 'codex'",
+            params![
+                codex_port,
+                codex_route_credential,
+                codex_codec.config_path().to_string_lossy()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE target_route_state SET management_revision = 1, view_sequence = 1,
+               current_provider_id = '00000000-0000-4000-8000-000000000303',
+               takeover_state = 'active', route_port = ?1, routing_credential = ?2,
+               activated_snapshot_id = '00000000-0000-4000-8000-000000000304',
+               managed_config_path = ?3 WHERE target = 'claude'",
+            params![
+                claude_port,
+                claude_route_credential,
+                claude_path.to_string_lossy()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let first_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+    let first = Arc::new(
+        ActivationService::new(
+            Arc::clone(&first_store),
+            fixture.home.clone(),
+            Arc::new(CommandCodexProbe),
+            "/not-used/codex".into(),
+            Arc::new(ReqwestUpstream::new().unwrap()),
+        )
+        .with_claude_runtime(Arc::new(CommandClaudeProbe), "/not-used/claude".into()),
+    );
+    let first_control = ControlServer::bind_with_activation(
+        &fixture.home,
+        Arc::clone(&first_store),
+        "test",
+        Arc::clone(&first),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first.model_endpoint().await.unwrap().port(),
+        codex_port,
+        "migrated v5 Codex Takeover did not resume"
+    );
+    assert_eq!(
+        first
+            .model_endpoint_for(Target::Claude)
+            .await
+            .unwrap()
+            .port(),
+        claude_port,
+        "migrated v5 Claude Takeover did not resume under legacy ownership"
+    );
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&claude_path).unwrap()).unwrap()
+            ["env"]["ANTHROPIC_API_KEY"]
+            .as_str()
+            == Some("legacy-bootstrap-api-key-sentinel"),
+        "legacy bootstrap changed the unrelated Claude API key"
+    );
+    first_control.shutdown().await.unwrap();
+    first.shutdown_models().await.unwrap();
+    drop(first);
+    drop(first_store);
+
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(|connection| {
+            connection.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+            connection.execute(
+                "UPDATE target_route_state SET managed_config_version = -1
+                 WHERE target = 'claude'",
+                [],
+            )?;
+            Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+    drop(database);
+
+    let second_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+    let second = Arc::new(
+        ActivationService::new(
+            Arc::clone(&second_store),
+            fixture.home.clone(),
+            Arc::new(CommandCodexProbe),
+            "/not-used/codex".into(),
+            Arc::new(ReqwestUpstream::new().unwrap()),
+        )
+        .with_claude_runtime(Arc::new(CommandClaudeProbe), "/not-used/claude".into()),
+    );
+    let second_control = ControlServer::bind_with_activation(
+        &fixture.home,
+        Arc::clone(&second_store),
+        "test-2",
+        Arc::clone(&second),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        second.model_endpoint().await.unwrap().port(),
+        codex_port,
+        "clean Codex peer did not resume beside invalid Claude ownership"
+    );
+    assert!(second.model_endpoint_for(Target::Claude).await.is_none());
+    assert_eq!(
+        second_store
+            .target_view_for(Target::Claude)
+            .await
+            .unwrap()
+            .recovery
+            .state,
+        "recovery-required"
+    );
+    let unbound = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, claude_port))
+        .await
+        .unwrap();
+    drop(unbound);
+    second_control.shutdown().await.unwrap();
+    second.shutdown_models().await.unwrap();
 }
 
 impl Drop for StoreFixture {

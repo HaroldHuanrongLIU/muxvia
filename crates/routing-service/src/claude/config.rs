@@ -34,7 +34,7 @@ const PROVIDER_SELECTORS: [ClaudeBlockingSelector; 5] = [
 type ClaudePreRenameHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClaudeConfigOwnership {
+pub(crate) enum ClaudeConfigOwnership {
     LegacyThree,
     FourField,
 }
@@ -268,7 +268,7 @@ impl ClaudeConfigCodec {
         self.inspect_with_ownership(ClaudeConfigOwnership::FourField)
     }
 
-    pub fn inspect_with_ownership(
+    pub(crate) fn inspect_with_ownership(
         &self,
         ownership: ClaudeConfigOwnership,
     ) -> Result<ClaudeConfigSnapshot, ClaudeProblem> {
@@ -289,7 +289,7 @@ impl ClaudeConfigCodec {
         )
     }
 
-    pub fn desired_takeover_with_ownership(
+    pub(crate) fn desired_takeover_with_ownership(
         &self,
         model: &str,
         base_url: &str,

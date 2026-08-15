@@ -52,7 +52,7 @@ pub struct StateStore {
 
 type ActivationPreparationRow = (
     u64,
-    u32,
+    i64,
     String,
     String,
     Option<u16>,
@@ -242,7 +242,7 @@ impl StateStore {
                                 row.get::<_, Option<u16>>(0)?,
                                 row.get::<_, Option<String>>(1)?,
                                 row.get::<_, Option<String>>(2)?,
-                                row.get::<_, u32>(3)?,
+                                row.get::<_, i64>(3)?,
                             ))
                         },
                     );
@@ -262,7 +262,10 @@ impl StateStore {
                                 if valid_managed_config_version(target, managed_config_version) {
                                     Ok(Some(CommittedTakeover {
                                         route_port,
-                                        managed_config_version,
+                                        managed_config_version: u32::try_from(
+                                            managed_config_version,
+                                        )
+                                        .expect("validated managed configuration version"),
                                     }))
                                 } else {
                                     Err(StateError::InvalidActivatedSnapshot)
@@ -448,7 +451,8 @@ impl StateStore {
                     )));
                 }
                 Ok(Ok(ActivationPreparation {
-                    managed_config_version,
+                    managed_config_version: u32::try_from(managed_config_version)
+                        .expect("validated managed configuration version"),
                     provider_id,
                     base_url,
                     model,
@@ -1294,7 +1298,7 @@ impl StateStore {
     }
 }
 
-fn valid_managed_config_version(target: Target, version: u32) -> bool {
+fn valid_managed_config_version(target: Target, version: i64) -> bool {
     matches!(
         (target, version),
         (Target::Codex, 1) | (Target::Claude, 1 | 2)
@@ -1303,7 +1307,7 @@ fn valid_managed_config_version(target: Target, version: u32) -> bool {
 
 fn valid_current_managed_config_version(
     target: Target,
-    version: u32,
+    version: i64,
     has_snapshot: bool,
     has_route_runtime: bool,
 ) -> bool {

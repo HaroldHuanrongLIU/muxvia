@@ -166,7 +166,12 @@ async fn managed_config_version_prepare_exposes_valid_target_ownership_version()
 
 #[tokio::test]
 async fn managed_config_version_invalid_pairs_persist_only_target_recovery_required() {
-    for (target, invalid_version) in [(Target::Claude, 99), (Target::Codex, 2)] {
+    for (target, invalid_version) in [
+        (Target::Claude, 99_i64),
+        (Target::Codex, 2_i64),
+        (Target::Claude, -1_i64),
+        (Target::Claude, i64::from(u32::MAX) + 1),
+    ] {
         let fixture = StoreFixture::new().await;
         let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
             .await
@@ -184,11 +189,14 @@ async fn managed_config_version_invalid_pairs_persist_only_target_recovery_requi
             .unwrap();
         drop(database);
 
-        let result = fixture
+        let prepared = fixture
             .store
             .prepare_activation_for(target, Uuid::new_v4(), 0)
-            .await
-            .unwrap();
+            .await;
+        let result = match prepared {
+            Ok(result) => result,
+            Err(_) => panic!("invalid ownership version escaped as a generic State failure"),
+        };
         let failure = match result {
             Ok(_) => panic!("invalid ownership version unexpectedly prepared"),
             Err(failure) => failure,

@@ -14,13 +14,14 @@ use axum::{
 };
 use futures_util::stream;
 use muxvia_routing::{
-    claude::{ClaudeCapability, ClaudeProbe, ClaudeProblem},
+    claude::{ClaudeCapability, ClaudeProbe, ClaudeProblem, CommandClaudeProbe},
     codex::{CodexCapability, CodexProbe, CodexProblem, CommandCodexProbe},
     control::{
         framing::{read_frame, write_frame},
         protocol::{
-            ActionOutcome, ActionStatus, ActivationMode, ClaudeHostManagedState,
-            ClaudePreflightContext, ClaudeSelectorState, ControlProblem, Target, TargetView,
+            ActionOutcome, ActionStatus, ActivationMode, ClaudeBlockingSelector,
+            ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState, ControlProblem,
+            Target, TargetView,
         },
         server::{ControlServer, ControlServerError},
     },
@@ -76,6 +77,14 @@ impl ClaudeProbe for GoodClaudeProbe {
         Ok(ClaudeCapability::Tested {
             version: "test".into(),
         })
+    }
+}
+
+struct BadClaudeProbe;
+
+impl ClaudeProbe for BadClaudeProbe {
+    fn probe(&self, _: &Path) -> Result<ClaudeCapability, ClaudeProblem> {
+        CommandClaudeProbe.probe(Path::new("relative-claude"))
     }
 }
 
@@ -144,6 +153,23 @@ impl ActivationObserver for Steps {
     }
 }
 
+struct ReplaceClaudeSettingsAtSnapshot {
+    path: std::path::PathBuf,
+    replacement: Vec<u8>,
+    calls: AtomicUsize,
+}
+
+impl ActivationObserver for ReplaceClaudeSettingsAtSnapshot {
+    fn reached(&self, step: ActivationStep) {
+        if step != ActivationStep::Snapshot || self.calls.fetch_add(1, Ordering::SeqCst) != 0 {
+            return;
+        }
+        let staged = self.path.with_extension("identity-race");
+        fs::write(&staged, &self.replacement).unwrap();
+        fs::rename(staged, &self.path).unwrap();
+    }
+}
+
 struct Fixture {
     _temp: TempDir,
     home: MuxviaHome,
@@ -181,8 +207,7 @@ impl Drop for ActivationCommitAbort {
 #[derive(PartialEq, Eq)]
 struct MutationFingerprint {
     sqlite: Vec<u8>,
-    config: Option<Vec<u8>>,
-    auth: Option<Vec<u8>>,
+    files: Vec<Option<Vec<u8>>>,
 }
 
 impl fmt::Debug for MutationFingerprint {
@@ -191,7 +216,7 @@ impl fmt::Debug for MutationFingerprint {
     }
 }
 
-fn redacted_match<T: PartialEq>(actual: &T, expected: &T) -> Result<(), &'static str> {
+fn redacted_match<T: PartialEq + ?Sized>(actual: &T, expected: &T) -> Result<(), &'static str> {
     if actual == expected {
         Ok(())
     } else {
@@ -883,6 +908,13 @@ impl Fixture {
     }
 
     async fn mutation_fingerprint(&self) -> MutationFingerprint {
+        self.mutation_fingerprint_with_files(&[]).await
+    }
+
+    async fn mutation_fingerprint_with_files(
+        &self,
+        additional_files: &[std::path::PathBuf],
+    ) -> MutationFingerprint {
         let database = tokio_rusqlite::Connection::open(self.home.database_path())
             .await
             .unwrap();
@@ -925,10 +957,15 @@ impl Fixture {
             })
             .await
             .unwrap();
+        let mut paths = vec![
+            self.home.user_home().join(".codex/config.toml"),
+            self.home.user_home().join(".codex/auth.json"),
+            self.home.user_home().join(".claude/settings.json"),
+        ];
+        paths.extend_from_slice(additional_files);
         MutationFingerprint {
             sqlite,
-            config: fs::read(self.home.user_home().join(".codex/config.toml")).ok(),
-            auth: fs::read(self.home.user_home().join(".codex/auth.json")).ok(),
+            files: paths.into_iter().map(|path| fs::read(path).ok()).collect(),
         }
     }
 
@@ -2342,6 +2379,485 @@ async fn inconsistent_claude_context_never_projects_provider_mode_without_a_sele
 }
 
 #[tokio::test]
+async fn claude_direct_rejects_unusable_operator_cwd_before_mutation() {
+    for invalid_cwd in ["empty", "relative", "missing", "not-directory"] {
+        let fixture = Fixture::new().await;
+        let settings_path = fixture.home.user_home().join(".claude/settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            br#"{"permissions":{"allow":["Read"]},"theme":"operator-value"}"#,
+        )
+        .unwrap();
+        let cwd = match invalid_cwd {
+            "empty" => String::new(),
+            "relative" => "relative-project".to_owned(),
+            "missing" => fixture
+                .home
+                .user_home()
+                .join("missing-project")
+                .to_string_lossy()
+                .into_owned(),
+            "not-directory" => {
+                let path = fixture.home.user_home().join("project-file");
+                fs::write(&path, b"not a directory").unwrap();
+                path.to_string_lossy().into_owned()
+            }
+            _ => unreachable!(),
+        };
+        let (provider_id, revision) = fixture
+            .save_claude("Claude", "claude-cwd", "provider-secret")
+            .await;
+        let before = fixture.mutation_fingerprint().await;
+        let codex_before = fixture.store.target_view().await.unwrap();
+        let mut updates = fixture.store.subscribe_target_views();
+        let probe = Arc::new(GoodClaudeProbe(AtomicUsize::new(0)));
+        let service = fixture.dual_service(ActivationHooks::default(), probe.clone());
+        let mut context = claude_context(&fixture.home);
+        context.cwd = cwd;
+        let action_id = Uuid::new_v4();
+
+        let failure = service
+            .apply_raw_for_with_context(
+                Target::Claude,
+                action_id,
+                revision,
+                direct_action(provider_id),
+                Some(&context),
+            )
+            .await
+            .expect_failure_redacted();
+
+        assert!(
+            public_surface_is_secret_free(&failure, &["provider-secret", "operator-value"]).is_ok(),
+            "invalid cwd failure exposed a credential or settings value"
+        );
+        assert_eq!(failure.problem.code, "preflight-context-required");
+        assert!(failure.problem.source.is_none());
+        assert!(failure.problem.selector.is_none());
+        assert_eq!(
+            fixture.mutation_fingerprint().await,
+            before,
+            "invalid cwd changed protected state"
+        );
+        assert_eq!(fixture.store.target_view().await.unwrap(), codex_before);
+        assert!(fixture.store.receipt(action_id).await.unwrap().is_none());
+        assert_eq!(probe.0.load(Ordering::SeqCst), 0);
+        assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+        assert!(updates.try_recv().is_err());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_direct_accepts_existing_absolute_and_canonical_symlink_cwd() {
+    for symlinked in [false, true] {
+        let fixture = Fixture::new().await;
+        let project = fixture.home.user_home().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let cwd = if symlinked {
+            let link = fixture.home.user_home().join("project-link");
+            std::os::unix::fs::symlink(&project, &link).unwrap();
+            link
+        } else {
+            project
+        };
+        let (provider_id, revision) = fixture
+            .save_claude("Claude", "claude-cwd", "provider-secret")
+            .await;
+        let service = fixture.dual_service(
+            ActivationHooks::default(),
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+        );
+        let mut context = claude_context(&fixture.home);
+        context.cwd = cwd.to_string_lossy().into_owned();
+
+        let applied = service
+            .apply_raw_for_with_context(
+                Target::Claude,
+                Uuid::new_v4(),
+                revision,
+                direct_action(provider_id),
+                Some(&context),
+            )
+            .await
+            .expect_applied_redacted();
+
+        assert!(
+            public_surface_is_secret_free(&applied, &["provider-secret"]).is_ok(),
+            "valid cwd activation exposed a credential"
+        );
+        assert_eq!(applied.view.mode, "direct");
+        assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn claude_direct_provider_and_context_failures_are_pre_mutation() {
+    for case in [
+        "routing-required",
+        "incomplete",
+        "bedrock",
+        "vertex",
+        "foundry",
+        "mantle",
+        "anthropic-aws",
+        "host-managed",
+        "inconsistent-context",
+        "nondefault-home",
+        "incompatible-probe",
+        "stale-revision",
+    ] {
+        let fixture = Fixture::new().await;
+        fixture
+            .save("Codex Peer", "gpt-peer", "codex-provider-secret")
+            .await;
+        let (provider_id, revision) = fixture
+            .save_claude("Claude", "claude-direct", "provider-secret")
+            .await;
+        let mut context = claude_context(&fixture.home);
+        let selector = match case {
+            "bedrock" => Some(ClaudeBlockingSelector::Bedrock),
+            "vertex" => Some(ClaudeBlockingSelector::Vertex),
+            "foundry" => Some(ClaudeBlockingSelector::Foundry),
+            "mantle" => Some(ClaudeBlockingSelector::Mantle),
+            "anthropic-aws" => Some(ClaudeBlockingSelector::AnthropicAws),
+            "host-managed" => Some(ClaudeBlockingSelector::HostManaged),
+            _ => None,
+        };
+        if let Some(selector) = selector {
+            context.blocking_selector = Some(selector);
+            if selector == ClaudeBlockingSelector::HostManaged {
+                context.host_managed_state = ClaudeHostManagedState::Managed;
+            } else {
+                context.selector_state = ClaudeSelectorState::Enabled;
+            }
+        }
+        match case {
+            "routing-required" => {
+                fixture
+                    .set_provider_routing_requirement(provider_id, "takeover-required")
+                    .await;
+            }
+            "incomplete" => fixture.remove_provider_credential(provider_id).await,
+            "inconsistent-context" => {
+                context.selector_state = ClaudeSelectorState::Enabled;
+            }
+            "nondefault-home" => {
+                let other = fixture.home.user_home().join("other-claude-home");
+                fs::create_dir_all(&other).unwrap();
+                context.claude_config_dir = Some(other.to_string_lossy().into_owned());
+            }
+            _ => {}
+        }
+        let service = if case == "incompatible-probe" {
+            fixture
+                .service(ActivationHooks::default())
+                .with_claude_runtime(Arc::new(BadClaudeProbe), "/usr/bin/claude".into())
+        } else {
+            fixture.dual_service(
+                ActivationHooks::default(),
+                Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+            )
+        };
+        let expected_revision = if case == "stale-revision" {
+            revision - 1
+        } else {
+            revision
+        };
+        let expected_code = match case {
+            "routing-required" => "takeover-required",
+            "incomplete" => "incomplete-provider",
+            "bedrock" | "vertex" | "foundry" | "mantle" | "anthropic-aws" | "host-managed" => {
+                "provider-mode-active"
+            }
+            "inconsistent-context" => "preflight-context-required",
+            "nondefault-home" => "unsupported-configuration-home",
+            "incompatible-probe" => "incompatible-target-cli",
+            "stale-revision" => "stale-revision",
+            _ => unreachable!(),
+        };
+
+        assert_claude_direct_pre_mutation_failure(
+            &fixture,
+            &service,
+            provider_id,
+            expected_revision,
+            &context,
+            (expected_code, selector),
+            &[],
+        )
+        .await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claude_direct_observable_configuration_failures_are_pre_mutation() {
+    for case in [
+        "shared-shadow",
+        "symlinked-shared-shadow",
+        "local-shadow",
+        "invalid-json",
+        "settings-symlink",
+        "active-takeover",
+    ] {
+        let fixture = Fixture::new().await;
+        fixture
+            .save("Codex Peer", "gpt-peer", "codex-provider-secret")
+            .await;
+        let settings_path = fixture.home.user_home().join(".claude/settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        if case != "settings-symlink" {
+            fs::write(
+                &settings_path,
+                br#"{"permissions":{"allow":["Read"]},"theme":"operator-value"}"#,
+            )
+            .unwrap();
+        }
+        let project = fixture.home.user_home().join("project");
+        fs::create_dir_all(project.join(".claude")).unwrap();
+        let mut context = claude_context(&fixture.home);
+        context.cwd = project.to_string_lossy().into_owned();
+        let mut additional_files = Vec::new();
+        match case {
+            "shared-shadow" | "symlinked-shared-shadow" | "local-shadow" => {
+                let name = if case == "local-shadow" {
+                    "settings.local.json"
+                } else {
+                    "settings.json"
+                };
+                let shadow = project.join(".claude").join(name);
+                fs::write(&shadow, br#"{"env":{"ANTHROPIC_MODEL":"operator-value"}}"#).unwrap();
+                additional_files.push(shadow);
+                if case == "symlinked-shared-shadow" {
+                    let link = fixture.home.user_home().join("project-link");
+                    std::os::unix::fs::symlink(&project, &link).unwrap();
+                    context.cwd = link.to_string_lossy().into_owned();
+                }
+            }
+            "invalid-json" => fs::write(&settings_path, b"{invalid-json").unwrap(),
+            "settings-symlink" => {
+                let outside = fixture.home.user_home().join("outside-settings.json");
+                fs::write(
+                    &outside,
+                    br#"{"env":{"ANTHROPIC_AUTH_TOKEN":"operator-token"}}"#,
+                )
+                .unwrap();
+                std::os::unix::fs::symlink(&outside, &settings_path).unwrap();
+                additional_files.push(outside);
+            }
+            "active-takeover" => {}
+            _ => unreachable!(),
+        }
+        let (provider_id, revision) = fixture
+            .save_claude("Claude", "claude-direct", "provider-secret")
+            .await;
+        let service = fixture.dual_service(
+            ActivationHooks::default(),
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+        );
+        let expected_revision = if case == "active-takeover" {
+            service
+                .apply_raw_for_with_context(
+                    Target::Claude,
+                    Uuid::new_v4(),
+                    revision,
+                    takeover_action(provider_id),
+                    Some(&context),
+                )
+                .await
+                .expect_applied_redacted()
+                .view
+                .management_revision
+        } else {
+            revision
+        };
+        let expected_code = match case {
+            "shared-shadow" | "symlinked-shared-shadow" | "local-shadow" => {
+                "shadowing-configuration"
+            }
+            "invalid-json" => "invalid-configuration",
+            "settings-symlink" => "configuration-write-failed",
+            "active-takeover" => "takeover-active",
+            _ => unreachable!(),
+        };
+
+        let failure = assert_claude_direct_pre_mutation_failure(
+            &fixture,
+            &service,
+            provider_id,
+            expected_revision,
+            &context,
+            (expected_code, None),
+            &additional_files,
+        )
+        .await;
+        if matches!(case, "shared-shadow" | "symlinked-shared-shadow") {
+            assert_eq!(
+                failure.problem.source.as_deref(),
+                Some("shared-project-settings")
+            );
+        } else if case == "local-shadow" {
+            assert_eq!(
+                failure.problem.source.as_deref(),
+                Some("local-project-settings")
+            );
+        } else {
+            assert!(failure.problem.source.is_none());
+        }
+        if case == "settings-symlink" {
+            assert!(
+                fs::symlink_metadata(&settings_path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        service.shutdown_models().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn claude_direct_settings_identity_race_fails_before_intent_and_preserves_operator_state() {
+    let fixture = Fixture::new().await;
+    fixture
+        .save("Codex Peer", "gpt-peer", "codex-provider-secret")
+        .await;
+    let settings_path = fixture.home.user_home().join(".claude/settings.json");
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    fs::write(
+        &settings_path,
+        br#"{"permissions":{"allow":["Read"]},"theme":"before"}"#,
+    )
+    .unwrap();
+    let replacement = br#"{"permissions":{"allow":["Bash"]},"theme":"operator-value"}"#.to_vec();
+    let (provider_id, revision) = fixture
+        .save_claude("Claude", "claude-direct", "provider-secret")
+        .await;
+    let observer = Arc::new(ReplaceClaudeSettingsAtSnapshot {
+        path: settings_path.clone(),
+        replacement: replacement.clone(),
+        calls: AtomicUsize::new(0),
+    });
+    let service = fixture.dual_service(
+        ActivationHooks::observed(observer),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let before = fixture.mutation_fingerprint().await;
+    let codex_before = fixture.store.target_view().await.unwrap();
+    let mut updates = fixture.store.subscribe_target_views();
+    let action_id = Uuid::new_v4();
+
+    let failure = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            action_id,
+            revision,
+            direct_action(provider_id),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .expect_failure_redacted();
+
+    assert!(
+        public_surface_is_secret_free(
+            &failure,
+            &["provider-secret", "codex-provider-secret", "operator-value"]
+        )
+        .is_ok(),
+        "identity-race failure exposed a credential or settings value"
+    );
+    assert_eq!(failure.problem.code, "configuration-write-failed");
+    let after = fixture.mutation_fingerprint().await;
+    assert!(
+        redacted_match(&after.sqlite, &before.sqlite).is_ok(),
+        "identity-race failure changed database state"
+    );
+    assert!(
+        redacted_match(&after.files[..2], &before.files[..2]).is_ok(),
+        "identity-race failure changed Codex files"
+    );
+    assert!(
+        redacted_match(&fs::read(&settings_path).unwrap(), &replacement).is_ok(),
+        "identity-race failure overwrote the operator replacement"
+    );
+    let codex_after = fixture.store.target_view().await.unwrap();
+    assert!(
+        public_surface_is_secret_free(&codex_before, &["codex-provider-secret"]).is_ok()
+            && public_surface_is_secret_free(&codex_after, &["codex-provider-secret"]).is_ok(),
+        "identity-race failure exposed the Codex peer"
+    );
+    assert!(redacted_match(&codex_after, &codex_before).is_ok());
+    assert!(fixture.store.receipt(action_id).await.unwrap().is_none());
+    assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+    assert!(updates.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn claude_direct_committed_drift_state_blocks_without_further_mutation() {
+    let fixture = Fixture::new().await;
+    fixture
+        .save("Codex Peer", "gpt-peer", "codex-provider-secret")
+        .await;
+    let (first_provider, first_revision) = fixture
+        .save_claude("Claude One", "claude-one", "provider-secret")
+        .await;
+    let service = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            first_revision,
+            direct_action(first_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .expect_applied_redacted();
+    let (second_provider, second_revision) = fixture
+        .save_claude("Claude Two", "claude-two", "provider-secret")
+        .await;
+    let settings_path = fixture.home.user_home().join(".claude/settings.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    document["env"]["ANTHROPIC_MODEL"] = serde_json::json!("operator-value");
+    fs::write(
+        &settings_path,
+        serde_json::to_vec_pretty(&document).unwrap(),
+    )
+    .unwrap();
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
+            connection.execute(
+                "INSERT INTO target_problems (target, code, message)
+                 VALUES ('claude', 'configuration-drift',
+                         'Managed configuration differs from committed state')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    assert_claude_direct_pre_mutation_failure(
+        &fixture,
+        &service,
+        second_provider,
+        second_revision,
+        &claude_context(&fixture.home),
+        ("configuration-drift", None),
+        &[],
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn claude_provisional_and_post_intent_faults_release_runtime_and_restore_exact_settings() {
     for (failpoint, expects_intent) in [
         (ActivationFailpoint::BindListener, false),
@@ -3027,6 +3543,77 @@ async fn assert_direct_pre_mutation_failure(
         expected_code,
     )
     .await;
+}
+
+async fn assert_claude_direct_pre_mutation_failure(
+    fixture: &Fixture,
+    service: &ActivationService,
+    provider_id: Uuid,
+    revision: u64,
+    context: &ClaudePreflightContext,
+    expected_problem: (
+        &str,
+        Option<muxvia_routing::control::protocol::ClaudeBlockingSelector>,
+    ),
+    additional_files: &[std::path::PathBuf],
+) -> ActionFailure {
+    let action_id = Uuid::new_v4();
+    let before = fixture
+        .mutation_fingerprint_with_files(additional_files)
+        .await;
+    let endpoint_before = service.model_endpoint_for(Target::Claude).await;
+    let codex_before = fixture.store.target_view().await.unwrap();
+    let mut updates = fixture.store.subscribe_target_views();
+    let failure = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            action_id,
+            revision,
+            direct_action(provider_id),
+            Some(context),
+        )
+        .await
+        .expect_failure_redacted();
+
+    assert!(
+        public_surface_is_secret_free(
+            &failure,
+            &[
+                "provider-secret",
+                "codex-provider-secret",
+                "operator-token",
+                "operator-value"
+            ]
+        )
+        .is_ok(),
+        "Claude fail-closed outcome exposed a credential or settings value"
+    );
+    assert_eq!(failure.problem.code, expected_problem.0);
+    assert_eq!(failure.problem.selector, expected_problem.1);
+    assert_eq!(
+        fixture
+            .mutation_fingerprint_with_files(additional_files)
+            .await,
+        before,
+        "Claude fail-closed activation changed protected state"
+    );
+    let codex_after = fixture.store.target_view().await.unwrap();
+    assert!(
+        public_surface_is_secret_free(&codex_before, &["codex-provider-secret"]).is_ok()
+            && public_surface_is_secret_free(&codex_after, &["codex-provider-secret"]).is_ok(),
+        "Claude fail-closed activation exposed the Codex peer"
+    );
+    assert!(
+        redacted_match(&codex_after, &codex_before).is_ok(),
+        "Claude fail-closed activation changed the Codex peer"
+    );
+    assert_eq!(
+        service.model_endpoint_for(Target::Claude).await,
+        endpoint_before
+    );
+    assert!(fixture.store.receipt(action_id).await.unwrap().is_none());
+    assert!(updates.try_recv().is_err());
+    failure
 }
 
 async fn assert_activation_pre_mutation_failure(

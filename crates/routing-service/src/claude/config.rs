@@ -516,7 +516,7 @@ impl ClaudeConfigCodec {
         expected_takeover: Option<&DesiredClaudeState>,
         ownership: ClaudeConfigOwnership,
     ) -> Result<(ClaudePreflightReport, ClaudeConfigSnapshot), ClaudeProblem> {
-        self.validate_context(context)?;
+        let cwd = self.validate_context(context)?;
         let (snapshot, document) = self.read_snapshot(ownership)?;
         validate_provider_modes(&document, self.settings_path(), "user-settings")?;
         if expected_takeover.is_some_and(|expected| snapshot.owned != expected.owned) {
@@ -526,12 +526,18 @@ impl ClaudeConfigCodec {
             ));
         }
         let mut shadow_paths = self.managed_settings_paths.clone();
-        let cwd = PathBuf::from(&context.cwd);
         shadow_paths.push(cwd.join(".claude/settings.json"));
         shadow_paths.push(cwd.join(".claude/settings.local.json"));
+        let canonical_settings_path = std::fs::canonicalize(&self.configured_home)
+            .unwrap_or_else(|_| self.configured_home.clone())
+            .join("settings.json");
         let mut seen = BTreeSet::new();
         for path in shadow_paths {
-            if path == self.settings_path() || !seen.insert(path.clone()) || !path.exists() {
+            if path == self.settings_path() || path == canonical_settings_path {
+                continue;
+            }
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            if !seen.insert(path.clone()) || !path.exists() {
                 continue;
             }
             let source = fs_read_json(&path)?;
@@ -563,12 +569,21 @@ impl ClaudeConfigCodec {
         ))
     }
 
-    fn validate_context(&self, context: &ClaudePreflightContext) -> Result<(), ClaudeProblem> {
+    fn validate_context(&self, context: &ClaudePreflightContext) -> Result<PathBuf, ClaudeProblem> {
         if !context.has_valid_blocking_selector() {
             return Err(ClaudeProblem::new(
                 "preflight-context-required",
                 Some(self.settings_path()),
             ));
+        }
+        let cwd = PathBuf::from(&context.cwd);
+        if !cwd.is_absolute() {
+            return Err(ClaudeProblem::new("preflight-context-required", None));
+        }
+        let cwd = std::fs::canonicalize(cwd)
+            .map_err(|_| ClaudeProblem::new("preflight-context-required", None))?;
+        if !cwd.is_dir() {
+            return Err(ClaudeProblem::new("preflight-context-required", None));
         }
         if let Some(observed) = &context.claude_config_dir {
             let observed = PathBuf::from(observed);
@@ -600,7 +615,7 @@ impl ClaudeConfigCodec {
                     .with_selector(selector),
             );
         }
-        Ok(())
+        Ok(cwd)
     }
 
     pub async fn reconcile_pending(&self, store: &StateStore) -> Result<(), ClaudeProblem> {
@@ -670,12 +685,17 @@ impl ClaudeConfigCodec {
         ))
     }
 
-    fn matches_before(&self, before: &ClaudeConfigSnapshot) -> bool {
+    pub(crate) fn matches_before(&self, before: &ClaudeConfigSnapshot) -> bool {
         self.inspect_with_ownership(before.ownership_version)
             .is_ok_and(|current| {
                 current.owned == before.owned
                     && current.unrelated_fingerprint == before.unrelated_fingerprint
             })
+    }
+
+    pub(crate) fn matches_pre_intent_snapshot(&self, before: &ClaudeConfigSnapshot) -> bool {
+        self.inspect_with_ownership(before.ownership_version)
+            .is_ok_and(|current| current == *before)
     }
 
     fn write_owned(

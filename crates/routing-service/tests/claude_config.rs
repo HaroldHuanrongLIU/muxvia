@@ -424,7 +424,8 @@ fn managed_shared_and_local_owned_shadows_block_with_source_but_unrelated_values
         fs::write(&path, include_str!("fixtures/claude/shadow.json")).unwrap();
         let error = codec.preflight(&context(&project)).unwrap_err();
         assert_eq!(error.code(), "shadowing-configuration");
-        assert_eq!(error.path(), Some(path.as_path()));
+        let canonical_path = fs::canonicalize(&path).unwrap();
+        assert_eq!(error.path(), Some(canonical_path.as_path()));
         fs::write(&path, r#"{"env":{"UNRELATED":"keep"},"permissions":{}}"#).unwrap();
         codec.preflight(&context(&project)).unwrap();
     }

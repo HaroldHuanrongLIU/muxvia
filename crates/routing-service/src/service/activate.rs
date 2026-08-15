@@ -155,6 +155,13 @@ impl ActivationConfiguration {
                 .map_err(|_| ()),
         }
     }
+
+    fn pre_intent_configuration_is_current(&self) -> bool {
+        match self {
+            Self::Codex { .. } => true,
+            Self::Claude { codec, before, .. } => codec.matches_pre_intent_snapshot(before),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -734,6 +741,12 @@ impl ActivationService {
         if self.hooks.reached(ActivationStep::Snapshot).is_err() {
             self.shutdown_candidate(candidate).await;
             return Err(self.target_failure(target, "internal-failure").await);
+        }
+        if !configuration.pre_intent_configuration_is_current() {
+            self.shutdown_candidate(candidate).await;
+            return Err(self
+                .target_failure(target, "configuration-write-failed")
+                .await);
         }
         let recovery_id = Uuid::new_v4();
         let intent =

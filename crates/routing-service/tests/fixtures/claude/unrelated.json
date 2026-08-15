@@ -1,0 +1,10 @@
+{
+  "permissions": {"allow": ["Read", "Bash(git status)"]},
+  "hooks": {"Notification": [{"matcher": "idle_prompt", "hooks": []}]},
+  "env": {
+    "OPERATOR_FLAG": "keep",
+    "ANTHROPIC_BASE_URL": "https://prior.example",
+    "ANTHROPIC_AUTH_TOKEN": "prior-token"
+  },
+  "model": "operator-top-level-model"
+}

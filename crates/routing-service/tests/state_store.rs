@@ -277,7 +277,7 @@ fn recovery_constructor_rejects_a_target_payload_mismatch() {
         Uuid::new_v4(),
         Uuid::new_v4(),
         PathBuf::from("/tmp/claude"),
-        RecoveryPayload::Claude {
+        RecoveryPayload::ClaudeLegacy {
             payload: serde_json::json!({ "opaque": true }),
         },
         0,
@@ -763,7 +763,7 @@ async fn target_scoped_receipts_and_recovery_action_ids_do_not_cross_targets() {
         Uuid::new_v4(),
         action_id,
         PathBuf::from("/tmp/claude-settings"),
-        RecoveryPayload::Claude {
+        RecoveryPayload::ClaudeLegacy {
             payload: serde_json::json!({ "owned": "claude" }),
         },
         0,

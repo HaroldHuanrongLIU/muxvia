@@ -1,24 +1,15 @@
-use std::{
-    cell::Cell,
-    fmt,
-    fs::{self, File},
-    io::{self, Read, Write},
-    os::fd::AsFd,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{fmt, path::Path};
 
-use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 use serde::{Deserialize, Serialize};
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use super::CodexProblem;
-use crate::state::{RecoveryIntent, RecoveryState, StateStore};
+use crate::{
+    config::managed_file::{ExchangeHook, ManagedFile, ManagedFileError, PreRenameHook},
+    state::{RecoveryIntent, RecoveryState, StateStore},
+};
 
-type PreRenameHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
-type ExchangeHook = Arc<dyn Fn(&Path, &Path) -> io::Result<bool> + Send + Sync>;
+pub use crate::config::managed_file::FileIdentity;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OwnedCodexState {
@@ -86,17 +77,6 @@ impl fmt::Debug for DesiredCodexState {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FileIdentity {
-    exists: bool,
-    device: Option<u64>,
-    inode: Option<u64>,
-    modified_seconds: Option<u64>,
-    modified_nanoseconds: Option<u32>,
-    length: Option<u64>,
-    mode: Option<u32>,
-}
-
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigSnapshot {
     identity: FileIdentity,
@@ -145,9 +125,7 @@ impl ConfigSnapshot {
 }
 
 pub struct CodexConfigCodec {
-    config_path: PathBuf,
-    pre_rename_hook: Option<PreRenameHook>,
-    exchange_hook: Option<ExchangeHook>,
+    file: ManagedFile,
 }
 
 impl CodexConfigCodec {
@@ -174,30 +152,23 @@ impl CodexConfigCodec {
         hook: Option<PreRenameHook>,
         exchange_hook: Option<ExchangeHook>,
     ) -> Result<Self, CodexProblem> {
-        let configured_home = user_home.join(".codex");
-        let config_home = match fs::symlink_metadata(&configured_home) {
-            Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(&configured_home)
-                .map_err(|_| {
-                    CodexProblem::new("configuration-write-failed", Some(&configured_home))
-                })?,
-            Ok(_) => configured_home,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => configured_home,
-            Err(_) => {
-                return Err(CodexProblem::new(
-                    "configuration-write-failed",
-                    Some(&configured_home),
-                ));
+        let file = match (hook, exchange_hook) {
+            (Some(hook), None) => {
+                ManagedFile::with_pre_rename_hook(user_home, ".codex", "config.toml", hook)
             }
+            (None, Some(hook)) => {
+                ManagedFile::with_exchange_hook(user_home, ".codex", "config.toml", hook)
+            }
+            (None, None) => ManagedFile::in_configuration_home(user_home, ".codex", "config.toml"),
+            (Some(_), Some(_)) => unreachable!("Codex test hooks are mutually exclusive"),
         };
         Ok(Self {
-            config_path: config_home.join("config.toml"),
-            pre_rename_hook: hook,
-            exchange_hook,
+            file: file.map_err(|error| map_file_error(error, None))?,
         })
     }
 
     pub fn config_path(&self) -> &Path {
-        &self.config_path
+        self.file.path()
     }
 
     pub fn inspect(&self) -> Result<ConfigSnapshot, CodexProblem> {
@@ -219,7 +190,7 @@ impl CodexConfigCodec {
                 {
                     return Err(CodexProblem::new(
                         "configuration-collision",
-                        Some(&self.config_path),
+                        Some(self.config_path()),
                     ));
                 }
                 Ok(ManagedCodexState::Unmanaged { snapshot })
@@ -228,7 +199,7 @@ impl CodexConfigCodec {
                 if !owned_semantically_matches(&snapshot.owned, &expected.owned) {
                     return Err(CodexProblem::new(
                         "configuration-collision",
-                        Some(&self.config_path),
+                        Some(self.config_path()),
                     ));
                 }
                 Ok(match mode {
@@ -253,9 +224,9 @@ impl CodexConfigCodec {
         &self,
         expected: &DesiredCodexState,
     ) -> Result<ManagedCodexState, CodexProblem> {
-        let mode = expected
-            .mode
-            .ok_or_else(|| CodexProblem::new("configuration-collision", Some(&self.config_path)))?;
+        let mode = expected.mode.ok_or_else(|| {
+            CodexProblem::new("configuration-collision", Some(self.config_path()))
+        })?;
         self.inspect_state(Some((mode, expected)))
     }
 
@@ -325,10 +296,10 @@ impl CodexConfigCodec {
         if !owned_semantically_matches(&current.owned, &expected_current.owned) {
             return Err(CodexProblem::new(
                 "recovery-required",
-                Some(&self.config_path),
+                Some(self.config_path()),
             ));
         }
-        let remove_file = !before.identity.exists
+        let remove_file = !before.identity.exists()
             && current
                 .unrelated
                 .as_object()
@@ -338,7 +309,7 @@ impl CodexConfigCodec {
         if restored.owned != before.owned || restored.unrelated != current.unrelated {
             return Err(CodexProblem::new(
                 "recovery-required",
-                Some(&self.config_path),
+                Some(self.config_path()),
             ));
         }
         Ok(())
@@ -358,7 +329,7 @@ impl CodexConfigCodec {
         } else {
             Err(CodexProblem::new(
                 "recovery-required",
-                Some(&self.config_path),
+                Some(self.config_path()),
             ))
         }
     }
@@ -374,7 +345,7 @@ impl CodexConfigCodec {
         {
             return Err(CodexProblem::new(
                 "configuration-write-failed",
-                Some(&self.config_path),
+                Some(self.config_path()),
             ));
         }
         Ok(())
@@ -384,7 +355,7 @@ impl CodexConfigCodec {
         for intent in store
             .pending_recovery_intents()
             .await
-            .map_err(|_| CodexProblem::new("recovery-required", Some(&self.config_path)))?
+            .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())))?
         {
             if intent.target() != crate::control::protocol::Target::Codex {
                 continue;
@@ -399,14 +370,14 @@ impl CodexConfigCodec {
         store: &StateStore,
         intent: &RecoveryIntent,
     ) -> Result<(), CodexProblem> {
-        if intent.config_path() != self.config_path {
+        if intent.config_path() != self.config_path() {
             store
                 .set_recovery_state(intent.id(), RecoveryState::RecoveryRequired)
                 .await
-                .map_err(|_| CodexProblem::new("recovery-required", Some(&self.config_path)))?;
+                .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())))?;
             return Err(CodexProblem::new(
                 "recovery-required",
-                Some(&self.config_path),
+                Some(self.config_path()),
             ));
         }
         let current = match self.read_snapshot() {
@@ -415,7 +386,7 @@ impl CodexConfigCodec {
                 self.mark_recovery_required(store, intent).await?;
                 return Err(CodexProblem::new(
                     "recovery-required",
-                    Some(&self.config_path),
+                    Some(self.config_path()),
                 ));
             }
         };
@@ -424,7 +395,7 @@ impl CodexConfigCodec {
             return store
                 .set_recovery_state(intent.id(), RecoveryState::RolledBack)
                 .await
-                .map_err(|_| CodexProblem::new("recovery-required", Some(&self.config_path)));
+                .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())));
         }
         if owned_semantically_matches(&current.owned, &intent.desired().owned)
             && current.unrelated == intent.before().unrelated
@@ -434,12 +405,12 @@ impl CodexConfigCodec {
             return store
                 .set_recovery_state(intent.id(), RecoveryState::RolledBack)
                 .await
-                .map_err(|_| CodexProblem::new("recovery-required", Some(&self.config_path)));
+                .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())));
         }
         self.mark_recovery_required(store, intent).await?;
         Err(CodexProblem::new(
             "recovery-required",
-            Some(&self.config_path),
+            Some(self.config_path()),
         ))
     }
 
@@ -451,7 +422,7 @@ impl CodexConfigCodec {
         store
             .set_recovery_state(intent.id(), RecoveryState::RecoveryRequired)
             .await
-            .map_err(|_| CodexProblem::new("recovery-required", Some(&self.config_path)))
+            .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())))
     }
 
     fn matches_before(&self, before: &ConfigSnapshot) -> bool {
@@ -474,228 +445,37 @@ impl CodexConfigCodec {
         if current != *expected {
             return Err(CodexProblem::new(
                 "configuration-write-failed",
-                Some(&self.config_path),
+                Some(self.config_path()),
             ));
         }
         apply_owned(&mut document, owned, preserve_decor).map_err(|_| {
-            CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+            CodexProblem::new("configuration-write-failed", Some(self.config_path()))
         })?;
-        let parent = self.config_path.parent().ok_or_else(|| {
-            CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-        })?;
-        create_private_parent(parent).map_err(|_| {
-            CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-        })?;
-        let directory = rustix::fs::openat(
-            rustix::fs::CWD,
-            parent,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|_| CodexProblem::new("configuration-write-failed", Some(&self.config_path)))?;
-        let directory_identity = directory_identity(&directory).map_err(|_| {
-            CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-        })?;
-        if !path_matches_directory(parent, directory_identity) {
-            return Err(CodexProblem::new(
-                "configuration-write-failed",
-                Some(&self.config_path),
-            ));
-        }
-        let target_name = self.config_path.file_name().ok_or_else(|| {
-            CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-        })?;
-        if file_identity_at(&directory, target_name)? != expected.identity {
-            return Err(CodexProblem::new(
-                "configuration-write-failed",
-                Some(&self.config_path),
-            ));
-        }
-        let temporary_name = format!(".muxvia-{}.tmp", uuid::Uuid::new_v4());
-        let temporary_fd = rustix::fs::openat(
-            &directory,
-            temporary_name.as_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(expected.identity.mode.unwrap_or(0o600) as _),
-        )
-        .map_err(|_| CodexProblem::new("configuration-write-failed", Some(&self.config_path)))?;
-        let mut temporary = File::from(temporary_fd);
-        rustix::fs::fchmod(
-            &temporary,
-            Mode::from_raw_mode(expected.identity.mode.unwrap_or(0o600) as _),
-        )
-        .map_err(|_| CodexProblem::new("configuration-write-failed", Some(&self.config_path)))?;
-        let retain_temporary = Cell::new(false);
-        let result = (|| -> Result<(), CodexProblem> {
-            temporary
-                .write_all(document.to_string().as_bytes())
-                .and_then(|_| temporary.flush())
-                .and_then(|_| temporary.sync_all())
-                .map_err(|_| {
-                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-                })?;
-            if let Some(hook) = &self.pre_rename_hook {
-                hook(&parent.join(&temporary_name)).map_err(|_| {
-                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-                })?;
-            }
-            if !path_matches_directory(parent, directory_identity)
-                || file_identity_at(&directory, target_name)? != expected.identity
-            {
-                return Err(CodexProblem::new(
-                    "configuration-write-failed",
-                    Some(&self.config_path),
-                ));
-            }
-            if expected.identity.exists {
-                rustix::fs::renameat_with(
-                    &directory,
-                    temporary_name.as_str(),
-                    &directory,
-                    target_name,
-                    RenameFlags::EXCHANGE,
-                )
-                .map_err(|_| {
-                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-                })?;
-                retain_temporary.set(true);
-                let inject_rollback_failure = self
-                    .exchange_hook
-                    .as_ref()
-                    .map(|hook| hook(&parent.join(&temporary_name), &self.config_path))
-                    .transpose()
-                    .map_err(|_| {
-                        retain_temporary.set(true);
-                        CodexProblem::new("recovery-required", Some(&self.config_path))
-                    })?
-                    .unwrap_or(false);
-                let displaced_matches = file_identity_at(&directory, temporary_name.as_str())
-                    .is_ok_and(|identity| identity == expected.identity);
-                if !displaced_matches {
-                    let rolled_back = !inject_rollback_failure
-                        && rustix::fs::renameat_with(
-                            &directory,
-                            temporary_name.as_str(),
-                            &directory,
-                            target_name,
-                            RenameFlags::EXCHANGE,
-                        )
-                        .is_ok();
-                    if !rolled_back {
-                        return Err(CodexProblem::new(
-                            "recovery-required",
-                            Some(&self.config_path),
-                        ));
-                    }
-                    retain_temporary.set(false);
-                    return Err(CodexProblem::new(
-                        "configuration-write-failed",
-                        Some(&self.config_path),
-                    ));
-                }
-                retain_temporary.set(false);
-                if remove_file {
-                    rustix::fs::unlinkat(&directory, target_name, AtFlags::empty()).map_err(
-                        |_| {
-                            CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-                        },
-                    )?;
-                }
-            } else {
-                rustix::fs::renameat_with(
-                    &directory,
-                    temporary_name.as_str(),
-                    &directory,
-                    target_name,
-                    RenameFlags::NOREPLACE,
-                )
-                .map_err(|_| {
-                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-                })?;
-            }
-            rustix::fs::fsync(&directory).map_err(|_| {
-                CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-            })
-        })();
-        if !retain_temporary.get() {
-            let _ = rustix::fs::unlinkat(&directory, temporary_name.as_str(), AtFlags::empty());
-        }
-        result
+        self.file
+            .replace(
+                &expected.identity,
+                document.to_string().as_bytes(),
+                remove_file,
+            )
+            .map_err(|error| map_file_error(error, Some(self.config_path())))
     }
 
     fn read_snapshot(&self) -> Result<(ConfigSnapshot, DocumentMut), CodexProblem> {
-        let parent = self.config_path.parent().ok_or_else(|| {
-            CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+        let contents = self
+            .file
+            .read()
+            .map_err(|error| map_file_error(error, Some(self.config_path())))?;
+        let source = String::from_utf8(contents.bytes).map_err(|_| {
+            CodexProblem::new("configuration-write-failed", Some(self.config_path()))
         })?;
-        let directory = match rustix::fs::openat(
-            rustix::fs::CWD,
-            parent,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(directory) => Some(directory),
-            Err(error) if error == rustix::io::Errno::NOENT => None,
-            Err(_) => {
-                return Err(CodexProblem::new(
-                    "configuration-write-failed",
-                    Some(&self.config_path),
-                ));
-            }
-        };
-        let (identity, source) = if let Some(directory) = directory {
-            let parent_identity = directory_identity(&directory).map_err(|_| {
-                CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-            })?;
-            if !path_matches_directory(parent, parent_identity) {
-                return Err(CodexProblem::new(
-                    "configuration-write-failed",
-                    Some(&self.config_path),
-                ));
-            }
-            let target_name = self.config_path.file_name().ok_or_else(|| {
-                CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-            })?;
-            let identity = file_identity_at(&directory, target_name)?;
-            let source = if identity.exists {
-                let file = rustix::fs::openat(
-                    &directory,
-                    target_name,
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(|_| {
-                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-                })?;
-                let mut file = File::from(file);
-                let mut source = String::new();
-                file.read_to_string(&mut source).map_err(|_| {
-                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-                })?;
-                if file_identity_from_stat(rustix::fs::fstat(&file).map_err(|_| {
-                    CodexProblem::new("configuration-write-failed", Some(&self.config_path))
-                })?) != identity
-                {
-                    return Err(CodexProblem::new(
-                        "configuration-write-failed",
-                        Some(&self.config_path),
-                    ));
-                }
-                source
-            } else {
-                String::new()
-            };
-            (identity, source)
-        } else {
-            (missing_file_identity(), String::new())
-        };
         let document = source.parse::<DocumentMut>().map_err(|_| {
-            CodexProblem::new("configuration-write-failed", Some(&self.config_path))
+            CodexProblem::new("configuration-write-failed", Some(self.config_path()))
         })?;
         let owned = capture_owned(&document)?;
         let unrelated = unrelated_projection(&document)?;
         Ok((
             ConfigSnapshot {
-                identity,
+                identity: contents.identity,
                 owned,
                 unrelated,
             },
@@ -704,86 +484,12 @@ impl CodexConfigCodec {
     }
 }
 
-fn missing_file_identity() -> FileIdentity {
-    FileIdentity {
-        exists: false,
-        device: None,
-        inode: None,
-        modified_seconds: None,
-        modified_nanoseconds: None,
-        length: None,
-        mode: None,
-    }
-}
-
-fn directory_identity(directory: &impl AsFd) -> io::Result<(u64, u64)> {
-    let stat = rustix::fs::fstat(directory).map_err(io::Error::from)?;
-    Ok((stat_device(&stat), stat.st_ino))
-}
-
-fn path_matches_directory(parent: &Path, expected: (u64, u64)) -> bool {
-    #[cfg(unix)]
-    {
-        fs::symlink_metadata(parent).is_ok_and(|metadata| {
-            !metadata.file_type().is_symlink()
-                && metadata.is_dir()
-                && (metadata.dev(), metadata.ino()) == expected
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = expected;
-        parent.is_dir()
-    }
-}
-
-fn file_identity_at(
-    directory: &impl AsFd,
-    name: impl rustix::path::Arg,
-) -> Result<FileIdentity, CodexProblem> {
-    let stat = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => stat,
-        Err(error) if error == rustix::io::Errno::NOENT => {
-            return Ok(missing_file_identity());
-        }
-        Err(_) => return Err(CodexProblem::new("configuration-write-failed", None)),
+fn map_file_error(error: ManagedFileError, path: Option<&Path>) -> CodexProblem {
+    let code = match error {
+        ManagedFileError::WriteFailed => "configuration-write-failed",
+        ManagedFileError::RecoveryRequired => "recovery-required",
     };
-    if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file() {
-        return Err(CodexProblem::new("configuration-write-failed", None));
-    }
-    Ok(file_identity_from_stat(stat))
-}
-
-fn file_identity_from_stat(stat: rustix::fs::Stat) -> FileIdentity {
-    FileIdentity {
-        exists: true,
-        device: Some(stat_device(&stat)),
-        inode: Some(stat.st_ino),
-        modified_seconds: u64::try_from(stat.st_mtime).ok(),
-        modified_nanoseconds: u32::try_from(stat.st_mtime_nsec).ok(),
-        length: u64::try_from(stat.st_size).ok(),
-        mode: Some(permission_bits(stat.st_mode)),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn permission_bits(mode: rustix::fs::RawMode) -> u32 {
-    u32::from(mode) & 0o777
-}
-
-#[cfg(target_os = "linux")]
-fn permission_bits(mode: rustix::fs::RawMode) -> u32 {
-    mode & 0o777
-}
-
-#[cfg(target_os = "macos")]
-fn stat_device(stat: &rustix::fs::Stat) -> u64 {
-    stat.st_dev as u64
-}
-
-#[cfg(target_os = "linux")]
-fn stat_device(stat: &rustix::fs::Stat) -> u64 {
-    stat.st_dev
+    CodexProblem::new(code, path)
 }
 
 fn capture_owned(document: &DocumentMut) -> Result<OwnedCodexState, CodexProblem> {
@@ -1020,29 +726,11 @@ fn restore_decor(item: Option<&mut Item>, decor: Option<OwnedDecor>) {
     }
 }
 
-fn create_private_parent(parent: &Path) -> io::Result<()> {
-    let existed = parent.exists();
-    fs::create_dir_all(parent)?;
-    #[cfg(unix)]
-    if !existed {
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{CodexConfigCodec, ManagedCodexMode, ManagedCodexState, permission_bits};
-    use rustix::fs::Mode;
+    use super::{CodexConfigCodec, ManagedCodexMode, ManagedCodexState};
     use std::fs;
     use tempfile::TempDir;
-
-    #[test]
-    fn permission_bits_project_to_portable_u32() {
-        let raw_mode = (Mode::RUSR | Mode::WUSR | Mode::RGRP).as_raw_mode();
-
-        assert_eq!(permission_bits(raw_mode), 0o640);
-    }
 
     #[test]
     fn managed_state_is_typed_only_by_the_callers_committed_expectation() {

@@ -4,8 +4,11 @@ use serde::{Deserialize, Serialize, de::Error as _};
 use tokio_rusqlite::rusqlite::params;
 use uuid::Uuid;
 
-use crate::codex::{ConfigSnapshot, DesiredCodexState};
 use crate::control::protocol::Target;
+use crate::{
+    claude::{ClaudeConfigSnapshot, DesiredClaudeState},
+    codex::{ConfigSnapshot, DesiredCodexState},
+};
 
 use super::{StateError, StateStore};
 
@@ -56,16 +59,53 @@ pub struct RecoveryIntent {
     created_revision: u64,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(tag = "target", rename_all = "lowercase")]
+#[derive(Clone)]
 pub enum RecoveryPayload {
     Codex {
         before: Box<ConfigSnapshot>,
         desired: Box<DesiredCodexState>,
     },
     Claude {
+        before: Box<ClaudeConfigSnapshot>,
+        desired: Box<DesiredClaudeState>,
+    },
+    ClaudeLegacy {
         payload: serde_json::Value,
     },
+}
+
+impl Serialize for RecoveryPayload {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let value = match self {
+            Self::Codex { before, desired } => serde_json::json!({
+                "target": "codex",
+                "before": before,
+                "desired": desired,
+            }),
+            Self::Claude { before, desired } => serde_json::json!({
+                "target": "claude",
+                "before": before,
+                "desired": desired,
+            }),
+            Self::ClaudeLegacy { payload } => serde_json::json!({
+                "target": "claude",
+                "payload": payload,
+            }),
+        };
+        value.serialize(serializer)
+    }
+}
+
+impl fmt::Debug for RecoveryPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Codex { .. } => formatter.write_str("RecoveryPayload::Codex(<redacted>)"),
+            Self::Claude { .. } => formatter.write_str("RecoveryPayload::Claude(<redacted>)"),
+            Self::ClaudeLegacy { .. } => {
+                formatter.write_str("RecoveryPayload::ClaudeLegacy(<redacted>)")
+            }
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for RecoveryPayload {
@@ -99,11 +139,31 @@ impl<'de> Deserialize<'de> for RecoveryPayload {
                     .map_err(D::Error::custom)?,
                 ),
             }),
-            "claude" => Ok(Self::Claude {
-                payload: object
+            "claude" => {
+                let claude = object
                     .remove("payload")
-                    .unwrap_or_else(|| serde_json::Value::Object(object.clone())),
-            }),
+                    .unwrap_or_else(|| serde_json::Value::Object(object.clone()));
+                let claude_object = claude
+                    .as_object()
+                    .ok_or_else(|| D::Error::custom("invalid Claude recovery payload"))?;
+                let typed = claude_object
+                    .get("before")
+                    .cloned()
+                    .zip(claude_object.get("desired").cloned())
+                    .and_then(|(before, desired)| {
+                        Some((
+                            serde_json::from_value(before).ok()?,
+                            serde_json::from_value(desired).ok()?,
+                        ))
+                    });
+                match typed {
+                    Some((before, desired)) => Ok(Self::Claude {
+                        before: Box::new(before),
+                        desired: Box::new(desired),
+                    }),
+                    None => Ok(Self::ClaudeLegacy { payload: claude }),
+                }
+            }
             _ => Err(D::Error::custom("invalid recovery target")),
         }
     }
@@ -113,7 +173,7 @@ impl RecoveryPayload {
     pub fn target(&self) -> Target {
         match self {
             Self::Codex { .. } => Target::Codex,
-            Self::Claude { .. } => Target::Claude,
+            Self::Claude { .. } | Self::ClaudeLegacy { .. } => Target::Claude,
         }
     }
 }
@@ -177,6 +237,28 @@ impl RecoveryIntent {
         })
     }
 
+    pub fn pending_claude(
+        id: Uuid,
+        action_id: Uuid,
+        config_path: PathBuf,
+        before: ClaudeConfigSnapshot,
+        desired: DesiredClaudeState,
+        created_revision: u64,
+    ) -> Self {
+        Self::pending_for_target(
+            Target::Claude,
+            id,
+            action_id,
+            config_path,
+            RecoveryPayload::Claude {
+                before: Box::new(before),
+                desired: Box::new(desired),
+            },
+            created_revision,
+        )
+        .expect("Claude payload has the Claude target")
+    }
+
     pub fn id(&self) -> Uuid {
         self.id
     }
@@ -192,7 +274,7 @@ impl RecoveryIntent {
     pub fn before(&self) -> &ConfigSnapshot {
         match &self.payload {
             RecoveryPayload::Codex { before, .. } => before,
-            RecoveryPayload::Claude { .. } => {
+            RecoveryPayload::Claude { .. } | RecoveryPayload::ClaudeLegacy { .. } => {
                 unreachable!("Claude recovery is reconciled by its adapter")
             }
         }
@@ -201,9 +283,23 @@ impl RecoveryIntent {
     pub fn desired(&self) -> &DesiredCodexState {
         match &self.payload {
             RecoveryPayload::Codex { desired, .. } => desired,
-            RecoveryPayload::Claude { .. } => {
+            RecoveryPayload::Claude { .. } | RecoveryPayload::ClaudeLegacy { .. } => {
                 unreachable!("Claude recovery is reconciled by its adapter")
             }
+        }
+    }
+
+    pub fn claude_before(&self) -> Option<&ClaudeConfigSnapshot> {
+        match &self.payload {
+            RecoveryPayload::Claude { before, .. } => Some(before),
+            _ => None,
+        }
+    }
+
+    pub fn claude_desired(&self) -> Option<&DesiredClaudeState> {
+        match &self.payload {
+            RecoveryPayload::Claude { desired, .. } => Some(desired),
+            _ => None,
         }
     }
 
@@ -221,7 +317,10 @@ impl StateStore {
                     RecoveryPayload::Codex { before, .. } => {
                         serde_json::to_string(before.identity())?
                     }
-                    RecoveryPayload::Claude { .. } => "null".to_owned(),
+                    RecoveryPayload::Claude { before, .. } => {
+                        serde_json::to_string(before.identity())?
+                    }
+                    RecoveryPayload::ClaudeLegacy { .. } => "null".to_owned(),
                 };
                 let payload_json = serde_json::to_string(&intent.payload)?;
                 connection.execute(
@@ -355,19 +454,28 @@ impl StateStore {
     }
 
     pub async fn managed_write_status(&self) -> Result<ManagedWriteStatus, StateError> {
+        self.managed_write_status_for(Target::Codex).await
+    }
+
+    pub async fn managed_write_status_for(
+        &self,
+        target: Target,
+    ) -> Result<ManagedWriteStatus, StateError> {
         self.connection
-            .call(|connection| -> Result<ManagedWriteStatus, StateError> {
-                let state: String = connection.query_row(
-                    "SELECT recovery_state FROM target_route_state WHERE target = 'codex'",
-                    [],
-                    |row| row.get(0),
-                )?;
-                match state.as_str() {
-                    "clean" => Ok(ManagedWriteStatus::Allowed),
-                    "recovery-required" => Ok(ManagedWriteStatus::RecoveryRequired),
-                    _ => Err(StateError::InvalidRecoveryState),
-                }
-            })
+            .call(
+                move |connection| -> Result<ManagedWriteStatus, StateError> {
+                    let state: String = connection.query_row(
+                        "SELECT recovery_state FROM target_route_state WHERE target = ?1",
+                        [target.as_str()],
+                        |row| row.get(0),
+                    )?;
+                    match state.as_str() {
+                        "clean" => Ok(ManagedWriteStatus::Allowed),
+                        "recovery-required" => Ok(ManagedWriteStatus::RecoveryRequired),
+                        _ => Err(StateError::InvalidRecoveryState),
+                    }
+                },
+            )
             .await
             .map_err(super::store::map_state_call_error)
     }

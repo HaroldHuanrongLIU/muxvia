@@ -1,0 +1,8 @@
+{
+  "object": {"nested": [1, true, null, {"name": "keep"}]},
+  "array": ["keep", 7, false],
+  "number": 42,
+  "boolean": true,
+  "nullValue": null,
+  "string": "keep"
+}

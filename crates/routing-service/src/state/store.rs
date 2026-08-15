@@ -650,9 +650,13 @@ impl StateStore {
             }
         }
 
-        if target == Target::Codex && self.ensure_managed_writes_allowed().await.is_err() {
+        if !matches!(
+            self.managed_write_status_for(target).await,
+            Ok(super::recovery::ManagedWriteStatus::Allowed)
+        ) {
             return Err(self
-                .failure(
+                .failure_for(
+                    target,
                     "recovery-required",
                     "Managed writes are blocked until recovery is resolved",
                 )

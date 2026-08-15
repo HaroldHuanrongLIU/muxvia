@@ -4,9 +4,11 @@ use std::{fs, path::Path};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use muxvia_routing::{
+    claude::ClaudeConfigCodec,
     codex::CodexConfigCodec,
+    control::protocol::Target,
     home::MuxviaHome,
-    state::{RecoveryIntent, RecoveryState, StateStore},
+    state::{RecoveryIntent, RecoveryPayload, RecoveryState, StateStore},
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -320,17 +322,19 @@ async fn recovery_required_startup_opens_read_only_control_without_resuming_comm
             )?;
             transaction.execute(
                 "INSERT INTO providers
-                 (id, target, position, provider_revision, name, base_url, model, protocol,
+                 (id, target, position, provider_revision, name, base_url, model, protocol, authentication,
                   routing_requirement, credential_id, provenance_kind, provenance_key,
                   generated_owner_id)
                  VALUES (?1, 'codex', 0, 1, 'Active', 'https://upstream.example/v1', 'gpt-active',
-                         'openai-responses', 'direct-compatible', ?1, NULL, NULL, NULL)",
+                         'openai-responses', 'openai-bearer', 'direct-compatible', ?1, NULL, NULL, NULL)",
                 [provider_id.to_string()],
             )?;
             transaction.execute(
                 "INSERT INTO activated_snapshots
-                 (id, target, provider_id, base_url, model, provider_bearer_token, epoch)
-                 VALUES (?1, 'codex', ?2, 'https://upstream.example/v1', 'gpt-active', 'secret', ?3)",
+                 (id, target, provider_id, base_url, model, protocol, authentication,
+                  provider_bearer_token, epoch)
+                 VALUES (?1, 'codex', ?2, 'https://upstream.example/v1', 'gpt-active',
+                         'openai-responses', 'openai-bearer', 'secret', ?3)",
                 (snapshot_id.to_string(), provider_id.to_string(), Uuid::new_v4().to_string()),
             )?;
             transaction.execute(
@@ -394,6 +398,16 @@ async fn recovery_required_startup_opens_read_only_control_without_resuming_comm
     .await
     .unwrap();
     read_frame(&mut stream).await.unwrap();
+    write_frame(
+        &mut stream,
+        &serde_json::json!({
+            "type":"request", "requestId":"open",
+            "operation":{"kind":"open-target","target":"codex"}
+        }),
+    )
+    .await
+    .unwrap();
+    read_frame(&mut stream).await.unwrap();
     for (request_id, action) in [
         (
             "save",
@@ -444,6 +458,16 @@ async fn recovery_required_startup_opens_read_only_control_without_resuming_comm
         &mut second_stream,
         &serde_json::json!({
             "type":"hello", "rpc":{"major":1,"minor":0}, "release":"test-2"
+        }),
+    )
+    .await
+    .unwrap();
+    read_frame(&mut second_stream).await.unwrap();
+    write_frame(
+        &mut second_stream,
+        &serde_json::json!({
+            "type":"request", "requestId":"open-2",
+            "operation":{"kind":"open-target","target":"codex"}
         }),
     )
     .await
@@ -730,4 +754,149 @@ async fn recovery_intent_debug_projects_only_public_identity_and_state() {
     assert!(debug.contains("Pending"));
     assert!(!debug.contains("recovery-route-secret"));
     assert!(!debug.contains("approval_policy"));
+}
+
+#[tokio::test]
+async fn claude_pending_desired_state_is_restored_and_marked_rolled_back() {
+    let root = TempDir::new().unwrap();
+    let codec = ClaudeConfigCodec::for_user_home(root.path()).unwrap();
+    fs::create_dir_all(codec.settings_path().parent().unwrap()).unwrap();
+    fs::write(
+        codec.settings_path(),
+        r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"operator-prior"},"permissions":{"allow":["Read"]}}"#,
+    )
+    .unwrap();
+    let store = StateStore::open(&MuxviaHome::from_user_home(root.path()))
+        .await
+        .unwrap();
+    let before = codec.inspect().unwrap();
+    let desired = codec.desired_takeover(
+        "claude-test",
+        "http://127.0.0.1:43124",
+        "claude-routing-secret",
+    );
+    let intent = RecoveryIntent::pending_claude(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        codec.settings_path().to_owned(),
+        before,
+        desired,
+        0,
+    );
+    store.insert_recovery_intent(&intent).await.unwrap();
+    codec
+        .atomic_apply(
+            intent.claude_before().unwrap(),
+            intent.claude_desired().unwrap(),
+        )
+        .unwrap();
+
+    codec.reconcile_pending(&store).await.unwrap();
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(codec.settings_path()).unwrap()
+        )
+        .unwrap(),
+        serde_json::json!({
+            "env": {"ANTHROPIC_AUTH_TOKEN": "operator-prior"},
+            "permissions": {"allow": ["Read"]}
+        })
+    );
+    assert_eq!(
+        store
+            .recovery_intent(intent.id())
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        RecoveryState::RolledBack
+    );
+}
+
+#[tokio::test]
+async fn claude_pending_third_state_marks_only_claude_recovery_required() {
+    let root = TempDir::new().unwrap();
+    let codec = ClaudeConfigCodec::for_user_home(root.path()).unwrap();
+    fs::create_dir_all(codec.settings_path().parent().unwrap()).unwrap();
+    fs::write(codec.settings_path(), "{}").unwrap();
+    let store = StateStore::open(&MuxviaHome::from_user_home(root.path()))
+        .await
+        .unwrap();
+    let intent = RecoveryIntent::pending_claude(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        codec.settings_path().to_owned(),
+        codec.inspect().unwrap(),
+        codec.desired_takeover("claude-test", "http://127.0.0.1:43124", "routing-secret"),
+        0,
+    );
+    store.insert_recovery_intent(&intent).await.unwrap();
+    fs::write(
+        codec.settings_path(),
+        r#"{"env":{"ANTHROPIC_MODEL":"operator-third-state"}}"#,
+    )
+    .unwrap();
+
+    let error = codec.reconcile_pending(&store).await.unwrap_err();
+
+    assert_eq!(error.code(), "recovery-required");
+    assert_eq!(
+        store
+            .target_view_for(Target::Claude)
+            .await
+            .unwrap()
+            .recovery
+            .state,
+        "recovery-required"
+    );
+    assert_eq!(store.target_view().await.unwrap().recovery.state, "clean");
+    let blocked = store
+        .apply_provider_action_for(
+            Target::Claude,
+            Uuid::new_v4(),
+            0,
+            serde_json::json!({"credential": "must-not-store"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(blocked.problem.code, "recovery-required");
+    assert_eq!(blocked.authoritative_view.target, Target::Claude);
+    assert!(!format!("{intent:?}\n{error:?}\n{error}").contains("routing-secret"));
+    assert!(!format!("{blocked:?}\n{blocked}").contains("must-not-store"));
+}
+
+#[test]
+fn claude_recovery_payload_is_typed_tagged_and_accepts_legacy_schema_v4_shape() {
+    let root = TempDir::new().unwrap();
+    let codec = ClaudeConfigCodec::for_user_home(root.path()).unwrap();
+    let before = codec.inspect().unwrap();
+    let desired = codec.desired_takeover("claude-test", "http://127.0.0.1:43124", "routing-secret");
+    let payload = RecoveryPayload::Claude {
+        before: Box::new(before.clone()),
+        desired: Box::new(desired.clone()),
+    };
+    let encoded = serde_json::to_value(&payload).unwrap();
+    assert_eq!(encoded["target"], "claude");
+    assert!(encoded.get("before").is_some());
+    assert!(encoded.get("desired").is_some());
+    assert!(!format!("{payload:?}").contains("routing-secret"));
+
+    let legacy = serde_json::json!({
+        "target": "claude",
+        "before": serde_json::to_value(before).unwrap(),
+        "desired": serde_json::to_value(desired).unwrap()
+    });
+    let decoded: RecoveryPayload = serde_json::from_value(legacy).unwrap();
+    match decoded {
+        RecoveryPayload::Claude { before, desired } => {
+            assert_eq!(*before, codec.inspect().unwrap());
+            assert_eq!(
+                *desired,
+                codec.desired_takeover("claude-test", "http://127.0.0.1:43124", "routing-secret")
+            );
+        }
+        RecoveryPayload::ClaudeLegacy { .. } => panic!("typed Claude payload decoded as legacy"),
+        RecoveryPayload::Codex { .. } => panic!("legacy Claude payload decoded as Codex"),
+    }
 }

@@ -1,0 +1,569 @@
+use std::{
+    collections::BTreeSet,
+    fmt, io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+use super::ClaudeProblem;
+use crate::{
+    config::managed_file::{FileIdentity, ManagedFile, ManagedFileError, PreRenameHook},
+    control::protocol::{
+        ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState, Target,
+    },
+    state::{RecoveryIntent, RecoveryState, StateStore},
+};
+
+const OWNED_KEYS: [&str; 3] = [
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_MODEL",
+];
+
+const PROVIDER_SELECTORS: [&str; 5] = [
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+];
+
+type ClaudePreRenameHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct OwnedClaudeState {
+    base_url: Option<Value>,
+    auth_token: Option<Value>,
+    model: Option<Value>,
+}
+
+impl fmt::Debug for OwnedClaudeState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnedClaudeState")
+            .field("base_url_present", &self.base_url.is_some())
+            .field("auth_token_present", &self.auth_token.is_some())
+            .field("model_present", &self.model.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct DesiredClaudeState {
+    owned: OwnedClaudeState,
+}
+
+impl fmt::Debug for DesiredClaudeState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DesiredClaudeState(<redacted>)")
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClaudeConfigSnapshot {
+    identity: FileIdentity,
+    owned: OwnedClaudeState,
+    unrelated: Value,
+}
+
+impl fmt::Debug for ClaudeConfigSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaudeConfigSnapshot")
+            .field("identity", &self.identity)
+            .field("owned", &self.owned)
+            .field("unrelated", &"<semantic-tree>")
+            .finish()
+    }
+}
+
+impl ClaudeConfigSnapshot {
+    pub(crate) fn identity(&self) -> &FileIdentity {
+        &self.identity
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaudeRuntimeShadow {
+    SettingsFlag,
+    ModelFlag,
+    InteractiveModel,
+    ResumedSession,
+    ExternalEnvironment,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaudePreflightReport {
+    pub restart_required: bool,
+    pub unobservable_shadows: [ClaudeRuntimeShadow; 5],
+}
+
+pub struct ClaudeConfigCodec {
+    file: ManagedFile,
+    configured_home: PathBuf,
+    managed_settings_paths: Vec<PathBuf>,
+}
+
+impl ClaudeConfigCodec {
+    pub fn for_user_home(user_home: &Path) -> Result<Self, ClaudeProblem> {
+        let managed_settings_paths = default_managed_settings_paths(user_home);
+        Self::build(user_home, managed_settings_paths, None)
+    }
+
+    pub fn for_user_home_with_pre_rename_hook(
+        user_home: &Path,
+        hook: ClaudePreRenameHook,
+    ) -> Result<Self, ClaudeProblem> {
+        Self::build(user_home, Vec::new(), Some(hook))
+    }
+
+    pub fn for_user_home_with_managed_settings(
+        user_home: &Path,
+        managed_settings_paths: Vec<PathBuf>,
+    ) -> Result<Self, ClaudeProblem> {
+        Self::build(user_home, managed_settings_paths, None)
+    }
+
+    fn build(
+        user_home: &Path,
+        managed_settings_paths: Vec<PathBuf>,
+        hook: Option<PreRenameHook>,
+    ) -> Result<Self, ClaudeProblem> {
+        if !user_home.is_absolute() || !user_home.is_dir() {
+            return Err(ClaudeProblem::new(
+                "unsupported-configuration-home",
+                Some(user_home),
+            ));
+        }
+        let configured_home = user_home.join(".claude");
+        let file = match hook {
+            Some(hook) => {
+                ManagedFile::with_pre_rename_hook(user_home, ".claude", "settings.json", hook)
+            }
+            None => ManagedFile::in_configuration_home(user_home, ".claude", "settings.json"),
+        }
+        .map_err(|error| map_file_error(error, Some(&configured_home)))?;
+        Ok(Self {
+            file,
+            configured_home,
+            managed_settings_paths,
+        })
+    }
+
+    pub fn settings_path(&self) -> &Path {
+        self.file.path()
+    }
+
+    pub fn inspect(&self) -> Result<ClaudeConfigSnapshot, ClaudeProblem> {
+        self.read_snapshot().map(|(snapshot, _)| snapshot)
+    }
+
+    pub fn desired_takeover(
+        &self,
+        model: &str,
+        base_url: &str,
+        routing_credential: &str,
+    ) -> DesiredClaudeState {
+        DesiredClaudeState {
+            owned: OwnedClaudeState {
+                base_url: Some(Value::String(base_url.to_owned())),
+                auth_token: Some(Value::String(routing_credential.to_owned())),
+                model: Some(Value::String(model.to_owned())),
+            },
+        }
+    }
+
+    pub fn atomic_apply(
+        &self,
+        before: &ClaudeConfigSnapshot,
+        desired: &DesiredClaudeState,
+    ) -> Result<(), ClaudeProblem> {
+        self.write_owned(before, &desired.owned, false)?;
+        self.verify(before, desired)
+    }
+
+    pub fn verify(
+        &self,
+        before: &ClaudeConfigSnapshot,
+        desired: &DesiredClaudeState,
+    ) -> Result<(), ClaudeProblem> {
+        let current = self.inspect()?;
+        if current.owned != desired.owned || current.unrelated != before.unrelated {
+            return Err(ClaudeProblem::new(
+                "configuration-write-failed",
+                Some(self.settings_path()),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn restore(
+        &self,
+        before: &ClaudeConfigSnapshot,
+        expected_current: &DesiredClaudeState,
+    ) -> Result<(), ClaudeProblem> {
+        let current = self.inspect()?;
+        if current.owned != expected_current.owned {
+            return Err(ClaudeProblem::new(
+                "recovery-required",
+                Some(self.settings_path()),
+            ));
+        }
+        let remove_file = !before.identity.exists()
+            && current
+                .unrelated
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty);
+        self.write_owned(&current, &before.owned, remove_file)?;
+        let restored = self.inspect()?;
+        if restored.owned != before.owned || restored.unrelated != current.unrelated {
+            return Err(ClaudeProblem::new(
+                "recovery-required",
+                Some(self.settings_path()),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn restore_or_confirm_before(
+        &self,
+        before: &ClaudeConfigSnapshot,
+        expected_current: &DesiredClaudeState,
+    ) -> Result<(), ClaudeProblem> {
+        if self.matches_before(before) {
+            return Ok(());
+        }
+        self.restore(before, expected_current)?;
+        if self.matches_before(before) {
+            Ok(())
+        } else {
+            Err(ClaudeProblem::new(
+                "recovery-required",
+                Some(self.settings_path()),
+            ))
+        }
+    }
+
+    pub fn preflight(
+        &self,
+        context: &ClaudePreflightContext,
+    ) -> Result<ClaudePreflightReport, ClaudeProblem> {
+        self.validate_context(context)?;
+        let (_, document) = self.read_snapshot()?;
+        validate_provider_modes(&document, self.settings_path())?;
+        let mut shadow_paths = self.managed_settings_paths.clone();
+        let cwd = PathBuf::from(&context.cwd);
+        shadow_paths.push(cwd.join(".claude/settings.json"));
+        shadow_paths.push(cwd.join(".claude/settings.local.json"));
+        let mut seen = BTreeSet::new();
+        for path in shadow_paths {
+            if !seen.insert(path.clone()) || !path.exists() {
+                continue;
+            }
+            let source = fs_read_json(&path)?;
+            if has_owned_shadow(&source) {
+                return Err(ClaudeProblem::new("shadowing-configuration", Some(&path)));
+            }
+            validate_provider_modes(&source, &path)?;
+        }
+        Ok(ClaudePreflightReport {
+            restart_required: true,
+            unobservable_shadows: [
+                ClaudeRuntimeShadow::SettingsFlag,
+                ClaudeRuntimeShadow::ModelFlag,
+                ClaudeRuntimeShadow::InteractiveModel,
+                ClaudeRuntimeShadow::ResumedSession,
+                ClaudeRuntimeShadow::ExternalEnvironment,
+            ],
+        })
+    }
+
+    fn validate_context(&self, context: &ClaudePreflightContext) -> Result<(), ClaudeProblem> {
+        if let Some(observed) = &context.claude_config_dir {
+            let observed = PathBuf::from(observed);
+            let resolved = std::fs::canonicalize(&observed).unwrap_or(observed);
+            let supported = self
+                .settings_path()
+                .parent()
+                .is_some_and(|parent| resolved == parent || resolved == self.configured_home);
+            if !supported {
+                return Err(ClaudeProblem::new(
+                    "unsupported-configuration-home",
+                    Some(&resolved),
+                ));
+            }
+        }
+        if matches!(
+            context.selector_state,
+            ClaudeSelectorState::Enabled | ClaudeSelectorState::UnknownNonempty
+        ) || matches!(
+            context.host_managed_state,
+            ClaudeHostManagedState::Managed | ClaudeHostManagedState::Unknown
+        ) {
+            return Err(ClaudeProblem::new(
+                "provider-mode-active",
+                Some(self.settings_path()),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn reconcile_pending(&self, store: &StateStore) -> Result<(), ClaudeProblem> {
+        for intent in store
+            .pending_recovery_intents()
+            .await
+            .map_err(|_| ClaudeProblem::new("recovery-required", Some(self.settings_path())))?
+        {
+            if intent.target() != Target::Claude {
+                continue;
+            }
+            self.reconcile_one(store, &intent).await?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_one(
+        &self,
+        store: &StateStore,
+        intent: &RecoveryIntent,
+    ) -> Result<(), ClaudeProblem> {
+        let before = intent
+            .claude_before()
+            .ok_or_else(|| ClaudeProblem::new("recovery-required", Some(self.settings_path())))?;
+        let desired = intent
+            .claude_desired()
+            .ok_or_else(|| ClaudeProblem::new("recovery-required", Some(self.settings_path())))?;
+        if intent.config_path() != self.settings_path() {
+            return self.mark_recovery_required(store, intent).await;
+        }
+        let current = match self.inspect() {
+            Ok(current) => current,
+            Err(_) => return self.mark_recovery_required(store, intent).await,
+        };
+        if current.owned == before.owned && current.unrelated == before.unrelated {
+            return store
+                .set_recovery_state(intent.id(), RecoveryState::RolledBack)
+                .await
+                .map_err(|_| ClaudeProblem::new("recovery-required", Some(self.settings_path())));
+        }
+        if current.owned == desired.owned
+            && current.unrelated == before.unrelated
+            && self.restore(before, desired).is_ok()
+            && self.matches_before(before)
+        {
+            return store
+                .set_recovery_state(intent.id(), RecoveryState::RolledBack)
+                .await
+                .map_err(|_| ClaudeProblem::new("recovery-required", Some(self.settings_path())));
+        }
+        self.mark_recovery_required(store, intent).await
+    }
+
+    async fn mark_recovery_required(
+        &self,
+        store: &StateStore,
+        intent: &RecoveryIntent,
+    ) -> Result<(), ClaudeProblem> {
+        let _ = store
+            .set_recovery_state(intent.id(), RecoveryState::RecoveryRequired)
+            .await;
+        Err(ClaudeProblem::new(
+            "recovery-required",
+            Some(self.settings_path()),
+        ))
+    }
+
+    fn matches_before(&self, before: &ClaudeConfigSnapshot) -> bool {
+        self.inspect().is_ok_and(|current| {
+            current.owned == before.owned && current.unrelated == before.unrelated
+        })
+    }
+
+    fn write_owned(
+        &self,
+        expected: &ClaudeConfigSnapshot,
+        owned: &OwnedClaudeState,
+        remove_file: bool,
+    ) -> Result<(), ClaudeProblem> {
+        let (current, mut document) = self.read_snapshot()?;
+        if current != *expected {
+            return Err(ClaudeProblem::new(
+                "configuration-write-failed",
+                Some(self.settings_path()),
+            ));
+        }
+        apply_owned(&mut document, owned);
+        let bytes = serde_json::to_vec_pretty(&document).map_err(|_| {
+            ClaudeProblem::new("configuration-write-failed", Some(self.settings_path()))
+        })?;
+        self.file
+            .replace(&expected.identity, &bytes, remove_file)
+            .map_err(|error| map_file_error(error, Some(self.settings_path())))
+    }
+
+    fn read_snapshot(&self) -> Result<(ClaudeConfigSnapshot, Value), ClaudeProblem> {
+        let contents = self
+            .file
+            .read()
+            .map_err(|error| map_file_error(error, Some(self.settings_path())))?;
+        let document = if contents.identity.exists() {
+            serde_json::from_slice::<Value>(&contents.bytes).map_err(|_| {
+                ClaudeProblem::new("invalid-configuration", Some(self.settings_path()))
+            })?
+        } else {
+            Value::Object(Map::new())
+        };
+        if !document.is_object() {
+            return Err(ClaudeProblem::new(
+                "invalid-configuration",
+                Some(self.settings_path()),
+            ));
+        }
+        if document.get("env").is_some_and(|value| !value.is_object()) {
+            return Err(ClaudeProblem::new(
+                "configuration-collision",
+                Some(self.settings_path()),
+            ));
+        }
+        let owned = capture_owned(&document);
+        let unrelated = unrelated_projection(&document);
+        Ok((
+            ClaudeConfigSnapshot {
+                identity: contents.identity,
+                owned,
+                unrelated,
+            },
+            document,
+        ))
+    }
+}
+
+fn capture_owned(document: &Value) -> OwnedClaudeState {
+    let env = document.get("env").and_then(Value::as_object);
+    OwnedClaudeState {
+        base_url: env.and_then(|env| env.get(OWNED_KEYS[0])).cloned(),
+        auth_token: env.and_then(|env| env.get(OWNED_KEYS[1])).cloned(),
+        model: env.and_then(|env| env.get(OWNED_KEYS[2])).cloned(),
+    }
+}
+
+fn unrelated_projection(document: &Value) -> Value {
+    let mut unrelated = document.clone();
+    let object = unrelated
+        .as_object_mut()
+        .expect("validated Claude settings object");
+    if let Some(env) = object.get_mut("env").and_then(Value::as_object_mut) {
+        for key in OWNED_KEYS {
+            env.remove(key);
+        }
+        if env.is_empty() {
+            object.remove("env");
+        }
+    }
+    unrelated
+}
+
+fn apply_owned(document: &mut Value, owned: &OwnedClaudeState) {
+    let object = document
+        .as_object_mut()
+        .expect("validated Claude settings object");
+    let needs_env = owned.base_url.is_some() || owned.auth_token.is_some() || owned.model.is_some();
+    if needs_env {
+        object
+            .entry("env")
+            .or_insert_with(|| Value::Object(Map::new()));
+    }
+    if let Some(env) = object.get_mut("env").and_then(Value::as_object_mut) {
+        for (key, value) in [
+            (OWNED_KEYS[0], &owned.base_url),
+            (OWNED_KEYS[1], &owned.auth_token),
+            (OWNED_KEYS[2], &owned.model),
+        ] {
+            match value {
+                Some(value) => {
+                    env.insert(key.to_owned(), value.clone());
+                }
+                None => {
+                    env.remove(key);
+                }
+            }
+        }
+        if env.is_empty() {
+            object.remove("env");
+        }
+    }
+}
+
+fn validate_provider_modes(document: &Value, path: &Path) -> Result<(), ClaudeProblem> {
+    let Some(env) = document.get("env").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    for key in PROVIDER_SELECTORS
+        .into_iter()
+        .chain(["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"])
+    {
+        if env.get(key).is_some_and(selector_blocks) {
+            return Err(ClaudeProblem::new("provider-mode-active", Some(path)));
+        }
+    }
+    Ok(())
+}
+
+fn selector_blocks(value: &Value) -> bool {
+    match value {
+        Value::Bool(false) => false,
+        Value::Number(number) if number.as_i64() == Some(0) => false,
+        Value::String(value)
+            if value.is_empty() || value.eq_ignore_ascii_case("false") || value == "0" =>
+        {
+            false
+        }
+        Value::Null => false,
+        _ => true,
+    }
+}
+
+fn has_owned_shadow(document: &Value) -> bool {
+    document
+        .get("env")
+        .and_then(Value::as_object)
+        .is_some_and(|env| OWNED_KEYS.into_iter().any(|key| env.contains_key(key)))
+}
+
+fn fs_read_json(path: &Path) -> Result<Value, ClaudeProblem> {
+    let bytes =
+        std::fs::read(path).map_err(|_| ClaudeProblem::new("invalid-configuration", Some(path)))?;
+    let document = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|_| ClaudeProblem::new("invalid-configuration", Some(path)))?;
+    if !document.is_object() || document.get("env").is_some_and(|value| !value.is_object()) {
+        return Err(ClaudeProblem::new("invalid-configuration", Some(path)));
+    }
+    Ok(document)
+}
+
+fn default_managed_settings_paths(user_home: &Path) -> Vec<PathBuf> {
+    if std::env::var_os("HOME").as_deref() != Some(user_home.as_os_str()) {
+        return Vec::new();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        vec![PathBuf::from(
+            "/Library/Application Support/ClaudeCode/managed-settings.json",
+        )]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        vec![PathBuf::from("/etc/claude-code/managed-settings.json")]
+    }
+}
+
+fn map_file_error(error: ManagedFileError, path: Option<&Path>) -> ClaudeProblem {
+    let code = match error {
+        ManagedFileError::WriteFailed => "configuration-write-failed",
+        ManagedFileError::RecoveryRequired => "recovery-required",
+    };
+    ClaudeProblem::new(code, path)
+}

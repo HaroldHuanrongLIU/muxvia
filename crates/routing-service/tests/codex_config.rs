@@ -684,7 +684,11 @@ fn installed_target_identity_mismatch_rolls_back_to_displaced_original() {
 
     assert_eq!(error.code(), "configuration-write-failed");
     assert_eq!(fs::read(codec.config_path()).unwrap(), original);
-    assert!(!format!("{error:?}\n{error}").contains("route-secret"));
+    let error_is_redacted = !format!("{error:?}\n{error}").contains("route-secret");
+    assert!(
+        error_is_redacted,
+        "Codex configuration error rendered credential bytes"
+    );
 }
 
 #[test]

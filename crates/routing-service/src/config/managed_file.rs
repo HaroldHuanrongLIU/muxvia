@@ -16,6 +16,16 @@ pub(crate) type PreRenameHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Syn
 pub(crate) type ExchangeHook = Arc<dyn Fn(&Path, &Path) -> io::Result<bool> + Send + Sync>;
 type DirectorySyncHook = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 type RollbackHook = Arc<dyn Fn() -> bool + Send + Sync>;
+type CleanupHook = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
+#[derive(Default)]
+struct ManagedFileHooks {
+    pre_rename: Option<PreRenameHook>,
+    exchange: Option<ExchangeHook>,
+    directory_sync: Option<DirectorySyncHook>,
+    rollback: Option<RollbackHook>,
+    cleanup: Option<CleanupHook>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileIdentity {
@@ -56,6 +66,7 @@ pub(crate) struct ManagedFile {
     exchange_hook: Option<ExchangeHook>,
     directory_sync_hook: Option<DirectorySyncHook>,
     rollback_hook: Option<RollbackHook>,
+    cleanup_hook: Option<CleanupHook>,
 }
 
 impl ManagedFile {
@@ -64,7 +75,12 @@ impl ManagedFile {
         directory_name: &str,
         file_name: &str,
     ) -> Result<Self, ManagedFileError> {
-        Self::build(user_home, directory_name, file_name, None, None, None, None)
+        Self::build(
+            user_home,
+            directory_name,
+            file_name,
+            ManagedFileHooks::default(),
+        )
     }
 
     pub(crate) fn with_pre_rename_hook(
@@ -77,10 +93,10 @@ impl ManagedFile {
             user_home,
             directory_name,
             file_name,
-            Some(hook),
-            None,
-            None,
-            None,
+            ManagedFileHooks {
+                pre_rename: Some(hook),
+                ..ManagedFileHooks::default()
+            },
         )
     }
 
@@ -94,10 +110,10 @@ impl ManagedFile {
             user_home,
             directory_name,
             file_name,
-            None,
-            Some(hook),
-            None,
-            None,
+            ManagedFileHooks {
+                exchange: Some(hook),
+                ..ManagedFileHooks::default()
+            },
         )
     }
 
@@ -113,10 +129,39 @@ impl ManagedFile {
             user_home,
             directory_name,
             file_name,
-            None,
-            None,
-            Some(directory_sync_hook),
-            Some(Arc::new(move || fail_rollback)),
+            ManagedFileHooks {
+                directory_sync: Some(directory_sync_hook),
+                rollback: Some(Arc::new(move || fail_rollback)),
+                ..ManagedFileHooks::default()
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn with_cleanup_fault_hooks(
+        user_home: &Path,
+        directory_name: &str,
+        file_name: &str,
+        directory_sync_hook: DirectorySyncHook,
+        fail_rollback: bool,
+        fail_cleanup: bool,
+    ) -> Result<Self, ManagedFileError> {
+        Self::build(
+            user_home,
+            directory_name,
+            file_name,
+            ManagedFileHooks {
+                directory_sync: Some(directory_sync_hook),
+                rollback: Some(Arc::new(move || fail_rollback)),
+                cleanup: Some(Arc::new(move || {
+                    if fail_cleanup {
+                        Err(io::Error::other("injected cleanup unlink failure"))
+                    } else {
+                        Ok(())
+                    }
+                })),
+                ..ManagedFileHooks::default()
+            },
         )
     }
 
@@ -124,10 +169,7 @@ impl ManagedFile {
         user_home: &Path,
         directory_name: &str,
         file_name: &str,
-        pre_rename_hook: Option<PreRenameHook>,
-        exchange_hook: Option<ExchangeHook>,
-        directory_sync_hook: Option<DirectorySyncHook>,
-        rollback_hook: Option<RollbackHook>,
+        hooks: ManagedFileHooks,
     ) -> Result<Self, ManagedFileError> {
         let configured_home = user_home.join(directory_name);
         let config_home = match fs::symlink_metadata(&configured_home) {
@@ -141,10 +183,11 @@ impl ManagedFile {
         };
         Ok(Self {
             path: config_home.join(file_name),
-            pre_rename_hook,
-            exchange_hook,
-            directory_sync_hook,
-            rollback_hook,
+            pre_rename_hook: hooks.pre_rename,
+            exchange_hook: hooks.exchange,
+            directory_sync_hook: hooks.directory_sync,
+            rollback_hook: hooks.rollback,
+            cleanup_hook: hooks.cleanup,
         })
     }
 
@@ -388,9 +431,10 @@ impl ManagedFile {
             }
             Ok(())
         })();
-        if !retain_temporary.get() {
-            let _ = rustix::fs::unlinkat(&directory, temporary_name.as_str(), AtFlags::empty());
+        if retain_temporary.get() {
+            return result;
         }
+        self.cleanup_temporary(&directory, temporary_name.as_str())?;
         result
     }
 
@@ -399,6 +443,46 @@ impl ManagedFile {
             hook().map_err(|_| ManagedFileError::WriteFailed)?;
         }
         rustix::fs::fsync(directory).map_err(|_| ManagedFileError::WriteFailed)
+    }
+
+    fn cleanup_temporary(
+        &self,
+        directory: &impl AsFd,
+        temporary_name: &str,
+    ) -> Result<(), ManagedFileError> {
+        if let Some(hook) = &self.cleanup_hook {
+            hook().map_err(|_| ManagedFileError::RecoveryRequired)?;
+        }
+        match rustix::fs::unlinkat(directory, temporary_name, AtFlags::empty()) {
+            Ok(()) => {
+                if file_identity_at(directory, temporary_name)
+                    .map_err(|_| ManagedFileError::RecoveryRequired)?
+                    .exists()
+                {
+                    return Err(ManagedFileError::RecoveryRequired);
+                }
+                self.sync_directory(directory)
+                    .map_err(|_| ManagedFileError::RecoveryRequired)?;
+                if file_identity_at(directory, temporary_name)
+                    .map_err(|_| ManagedFileError::RecoveryRequired)?
+                    .exists()
+                {
+                    return Err(ManagedFileError::RecoveryRequired);
+                }
+                Ok(())
+            }
+            Err(error) if error == rustix::io::Errno::NOENT => {
+                if file_identity_at(directory, temporary_name)
+                    .map_err(|_| ManagedFileError::RecoveryRequired)?
+                    .exists()
+                {
+                    Err(ManagedFileError::RecoveryRequired)
+                } else {
+                    Ok(())
+                }
+            }
+            Err(_) => Err(ManagedFileError::RecoveryRequired),
+        }
     }
 }
 
@@ -511,6 +595,21 @@ mod tests {
         (hook, calls)
     }
 
+    fn sync_failing_on(failures: &[usize]) -> (DirectorySyncHook, Arc<AtomicUsize>) {
+        let failures = failures.to_vec();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_hook = Arc::clone(&calls);
+        let hook = Arc::new(move || {
+            let call = calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            if failures.contains(&call) {
+                Err(io::Error::other("injected directory sync failure"))
+            } else {
+                Ok(())
+            }
+        });
+        (hook, calls)
+    }
+
     fn temporary_artifacts(managed: &ManagedFile) -> Vec<PathBuf> {
         fs::read_dir(managed.path().parent().unwrap())
             .unwrap()
@@ -547,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_target_directory_sync_failure_rolls_back_and_cleans_artifact() {
+    fn existing_target_directory_sync_failure_rolls_back_and_durably_cleans_credential_artifact() {
         let home = tempfile::TempDir::new().unwrap();
         let plain = ManagedFile::in_configuration_home(home.path(), ".target", "settings").unwrap();
         fs::create_dir_all(plain.path().parent().unwrap()).unwrap();
@@ -559,13 +658,21 @@ mod tests {
                 .unwrap();
 
         let error = managed
-            .replace(&before, b"muxvia-desired", false)
+            .replace(&before, b"routing-secret-sentinel", false)
             .unwrap_err();
 
         assert_eq!(error, ManagedFileError::WriteFailed);
         assert_eq!(fs::read(managed.path()).unwrap(), b"operator-original");
-        assert!(temporary_artifacts(&managed).is_empty());
-        assert!(calls.load(Ordering::SeqCst) >= 2);
+        assert!(
+            temporary_artifacts(&managed).is_empty(),
+            "credential-bearing rollback artifact remained after clean rollback"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let error_is_redacted = !format!("{error:?}").contains("routing-secret-sentinel");
+        assert!(
+            error_is_redacted,
+            "managed-file rollback error rendered credential bytes"
+        );
     }
 
     #[test]
@@ -629,12 +736,18 @@ mod tests {
 
         assert_eq!(error, ManagedFileError::RecoveryRequired);
         assert!(!managed.path().exists());
+        let secret_artifact_retained = temporary_artifacts(&managed)
+            .iter()
+            .any(|path| fs::read(path).is_ok_and(|bytes| bytes == b"routing-secret-sentinel"));
         assert!(
-            temporary_artifacts(&managed)
-                .iter()
-                .any(|path| fs::read(path).is_ok_and(|bytes| bytes == b"routing-secret-sentinel"))
+            secret_artifact_retained,
+            "managed-file recovery artifact was not retained"
         );
-        assert!(!format!("{error:?}").contains("routing-secret-sentinel"));
+        let error_is_redacted = !format!("{error:?}").contains("routing-secret-sentinel");
+        assert!(
+            error_is_redacted,
+            "managed-file error rendered credential bytes"
+        );
     }
 
     #[test]
@@ -660,5 +773,165 @@ mod tests {
                 .iter()
                 .any(|path| fs::read(path).is_ok_and(|bytes| bytes == b"operator-original"))
         );
+    }
+
+    #[test]
+    fn successful_exchange_cleanup_unlink_failure_requires_recovery_and_retains_artifact() {
+        let home = tempfile::TempDir::new().unwrap();
+        let plain = ManagedFile::in_configuration_home(home.path(), ".target", "settings").unwrap();
+        fs::create_dir_all(plain.path().parent().unwrap()).unwrap();
+        fs::write(plain.path(), b"operator-original").unwrap();
+        let before = plain.read().unwrap().identity;
+        let (sync_hook, _) = sync_failing_on(&[]);
+        let managed = ManagedFile::with_cleanup_fault_hooks(
+            home.path(),
+            ".target",
+            "settings",
+            sync_hook,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let error = managed
+            .replace(&before, b"muxvia-desired", false)
+            .unwrap_err();
+
+        assert_eq!(error, ManagedFileError::RecoveryRequired);
+        assert_eq!(fs::read(managed.path()).unwrap(), b"muxvia-desired");
+        assert!(
+            temporary_artifacts(&managed)
+                .iter()
+                .any(|path| fs::read(path).is_ok_and(|bytes| bytes == b"operator-original")),
+            "displaced original was not retained after cleanup unlink failure"
+        );
+    }
+
+    #[test]
+    fn successful_exchange_cleanup_sync_failure_requires_recovery_after_unlink() {
+        let home = tempfile::TempDir::new().unwrap();
+        let plain = ManagedFile::in_configuration_home(home.path(), ".target", "settings").unwrap();
+        fs::create_dir_all(plain.path().parent().unwrap()).unwrap();
+        fs::write(plain.path(), b"operator-original").unwrap();
+        let before = plain.read().unwrap().identity;
+        let (sync_hook, calls) = sync_failing_on(&[1]);
+        let managed = ManagedFile::with_cleanup_fault_hooks(
+            home.path(),
+            ".target",
+            "settings",
+            sync_hook,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let error = managed
+            .replace(&before, b"muxvia-desired", false)
+            .unwrap_err();
+
+        assert_eq!(error, ManagedFileError::RecoveryRequired);
+        assert!(
+            temporary_artifacts(&managed).is_empty(),
+            "temporary artifact remained after successful cleanup unlink"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn rollback_cleanup_unlink_failure_requires_recovery_and_retains_written_artifact() {
+        let home = tempfile::TempDir::new().unwrap();
+        let plain = ManagedFile::in_configuration_home(home.path(), ".target", "settings").unwrap();
+        fs::create_dir_all(plain.path().parent().unwrap()).unwrap();
+        fs::write(plain.path(), b"operator-original").unwrap();
+        let before = plain.read().unwrap().identity;
+        let (sync_hook, _) = sync_failing_on(&[0]);
+        let managed = ManagedFile::with_cleanup_fault_hooks(
+            home.path(),
+            ".target",
+            "settings",
+            sync_hook,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let error = managed
+            .replace(&before, b"muxvia-desired", false)
+            .unwrap_err();
+
+        assert_eq!(error, ManagedFileError::RecoveryRequired);
+        assert_eq!(fs::read(managed.path()).unwrap(), b"operator-original");
+        assert!(
+            temporary_artifacts(&managed)
+                .iter()
+                .any(|path| fs::read(path).is_ok_and(|bytes| bytes == b"muxvia-desired")),
+            "written rollback artifact was not retained after cleanup unlink failure"
+        );
+    }
+
+    #[test]
+    fn rollback_cleanup_sync_failure_requires_recovery_after_unlink() {
+        let home = tempfile::TempDir::new().unwrap();
+        let plain = ManagedFile::in_configuration_home(home.path(), ".target", "settings").unwrap();
+        fs::create_dir_all(plain.path().parent().unwrap()).unwrap();
+        fs::write(plain.path(), b"operator-original").unwrap();
+        let before = plain.read().unwrap().identity;
+        let (sync_hook, calls) = sync_failing_on(&[0, 2]);
+        let managed = ManagedFile::with_cleanup_fault_hooks(
+            home.path(),
+            ".target",
+            "settings",
+            sync_hook,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let error = managed
+            .replace(&before, b"muxvia-desired", false)
+            .unwrap_err();
+
+        assert_eq!(error, ManagedFileError::RecoveryRequired);
+        assert_eq!(fs::read(managed.path()).unwrap(), b"operator-original");
+        assert!(
+            temporary_artifacts(&managed).is_empty(),
+            "temporary artifact remained after successful rollback cleanup unlink"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn successful_exchange_durably_removes_credential_bearing_temporary_artifact() {
+        let home = tempfile::TempDir::new().unwrap();
+        let plain = ManagedFile::in_configuration_home(home.path(), ".target", "settings").unwrap();
+        fs::create_dir_all(plain.path().parent().unwrap()).unwrap();
+        fs::write(plain.path(), b"operator-original").unwrap();
+        let before = plain.read().unwrap().identity;
+        let (sync_hook, calls) = sync_failing_on(&[]);
+        let managed = ManagedFile::with_cleanup_fault_hooks(
+            home.path(),
+            ".target",
+            "settings",
+            sync_hook,
+            false,
+            false,
+        )
+        .unwrap();
+
+        managed
+            .replace(&before, b"routing-secret-sentinel", false)
+            .unwrap();
+
+        let target_matches =
+            fs::read(managed.path()).is_ok_and(|bytes| bytes == b"routing-secret-sentinel");
+        assert!(
+            target_matches,
+            "managed target did not contain desired bytes"
+        );
+        assert!(
+            temporary_artifacts(&managed).is_empty(),
+            "credential-bearing temporary artifact remained after successful exchange"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

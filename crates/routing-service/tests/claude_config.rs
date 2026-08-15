@@ -237,8 +237,16 @@ fn substituted_temporary_path_is_never_installed() {
     assert_eq!(error.code(), "configuration-write-failed");
     assert_eq!(fs::read_to_string(codec.settings_path()).unwrap(), "{}");
     let diagnostic = format!("{error:?}\n{error}");
-    assert!(!diagnostic.contains("routing-secret"));
-    assert!(!diagnostic.contains("attacker-substitute"));
+    let credential_is_redacted = !diagnostic.contains("routing-secret");
+    let substitute_is_redacted = !diagnostic.contains("attacker-substitute");
+    assert!(
+        credential_is_redacted,
+        "Claude configuration error rendered credential bytes"
+    );
+    assert!(
+        substitute_is_redacted,
+        "Claude configuration error rendered substitute bytes"
+    );
 }
 
 #[test]

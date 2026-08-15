@@ -98,7 +98,7 @@ export function ProviderForm(props: ProviderFormProps) {
     focus: () => {
       setFocus(0)
       const input = inputs[0]
-      if (input && !input.isDestroyed) input.focus()
+      if (input && !input.isDestroyed && input.parent) input.focus()
     },
   }
   props.ref?.(formRef)

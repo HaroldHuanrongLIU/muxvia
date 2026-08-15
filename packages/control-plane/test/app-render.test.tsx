@@ -319,6 +319,84 @@ test("a dirty Provider draft remains owned by Codex while Claude is visited", as
   }
 })
 
+test("a hidden dirty Codex draft gates exit from Home exactly once", async () => {
+  const codex = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={codex} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  const destroy = setup.renderer.destroy.bind(setup.renderer)
+  let destroyCalls = 0
+  setup.renderer.destroy = () => {
+    destroyCalls++
+    destroy()
+  }
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await enterProvider(setup)
+    expectSecretFree(setup, codex)
+    setup.mockInput.pressKey("p", { ctrl: true })
+    await setup.waitForFrame((frame) => frame.includes("Search commands"))
+    await setup.mockInput.typeText("Return home")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
+    const homeFocus = setup.renderer.currentFocusedRenderable
+
+    setup.mockInput.pressCtrlC()
+    setup.mockInput.pressCtrlC()
+    const confirmation = await setup.waitForFrame((frame) => frame.includes("Discard Provider draft?"))
+    expect(confirmation.match(/Discard Provider draft\?/g)).toHaveLength(1)
+    expect(setup.renderer.isDestroyed).toBeFalse()
+    expect(destroyCalls).toBe(0)
+    expectSecretFree(setup, codex)
+
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => setup.renderer.isDestroyed)
+    expect(destroyCalls).toBe(1)
+    expect(codex.actions).toEqual([])
+  } finally {
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("a hidden peer dirty draft gates exit and cancel restores the current target focus", async () => {
+  const codex = new MemoryTargetSession(view())
+  const claude = new MemoryTargetSession(view({ target: "claude" }))
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await enterProvider(setup)
+    expectSecretFree(setup, codex)
+    setup.mockInput.pressKey("p", { ctrl: true })
+    await setup.waitForFrame((frame) => frame.includes("Search commands"))
+    await setup.mockInput.typeText("Return home")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
+    setup.mockInput.pressKey("2")
+    await setup.waitForFrame((frame) => frame.includes("Claude · Control Plane"))
+    const claudeFocus = setup.renderer.currentFocusedRenderable
+
+    setup.mockInput.pressCtrlC()
+    await setup.waitForFrame((frame) => frame.includes("Discard Provider draft?"))
+    setup.mockInput.pressKey("n")
+    await flushUi(setup)
+    const claudeFrame = await setup.waitForFrame((frame) => frame.includes("Claude · Control Plane") && !frame.includes("Discard Provider draft?"))
+    expect(claudeFrame).not.toContain("Fixture Provider")
+    expect(setup.renderer.currentFocusedRenderable).toBe(claudeFocus)
+    expect(claudeFocus?.isDestroyed).toBeFalse()
+
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
+    setup.mockInput.pressKey("1")
+    const restored = await setup.waitForFrame((frame) => frame.includes("Fixture Provider"))
+    expect(restored).toContain("https://fixture.example/v1")
+    expect((restored.match(/•/g) ?? []).length).toBe(0)
+    expect(codex.actions).toEqual([])
+    expect(claude.actions).toEqual([])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
 test("renders a localized unavailable Claude target without operating the Codex session", async () => {
   const session = new MemoryTargetSession(view())
   const setup = await testRender(() => <App session={session} locale="zh-CN" />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })

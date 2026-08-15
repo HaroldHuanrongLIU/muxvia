@@ -1,7 +1,7 @@
 /** @jsxImportSource @opentui/solid */
 import { RGBA, type Renderable } from "@opentui/core"
 import { useRenderer, useTerminalDimensions } from "@opentui/solid"
-import { createContext, createMemo, createSignal, onCleanup, Show, useContext, type JSX } from "solid-js"
+import { createContext, createMemo, createSignal, For, onCleanup, useContext, type JSX } from "solid-js"
 
 import { useCommandLayer } from "../commands/keymap"
 import { theme } from "../theme"
@@ -47,7 +47,7 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
   const dimensions = useTerminalDimensions()
   const [stack, setStack] = createSignal<OverlayEntry[]>([])
   const closed = new WeakSet<OverlayEntry>()
-  let priorFocus: Renderable | null = null
+  const returnFocus = new WeakMap<OverlayEntry, Renderable | null>()
   let restoreGeneration = 0
   let closeScheduled = false
   let tearingDown = false
@@ -58,20 +58,19 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
     closed.add(entry)
     entry.onClose?.()
   }
-  const captureFocus = () => {
+  const captureFocus = (entry: OverlayEntry, current = stack()) => {
     restoreGeneration++
-    if (stack().length > 0) return
-    if (priorFocus) return
-    priorFocus = renderer.currentFocusedRenderable
-    priorFocus?.blur()
+    const candidate = renderer.currentFocusedRenderable
+      ?? (current.length > 0 ? returnFocus.get(current.at(-1)!) : null)
+      ?? null
+    returnFocus.set(entry, candidate)
+    renderer.currentFocusedRenderable?.blur()
   }
-  const scheduleRestore = () => {
+  const scheduleRestore = (candidate: Renderable | null | undefined) => {
     if (tearingDown) return
     const generation = ++restoreGeneration
     queueMicrotask(() => {
-      if (generation !== restoreGeneration || tearingDown || stack().length > 0 || renderer.isDestroyed) return
-      const candidate = priorFocus
-      priorFocus = null
+      if (generation !== restoreGeneration || tearingDown || renderer.isDestroyed) return
       if (candidate && !candidate.isDestroyed && reachesRoot(candidate, renderer.root)) candidate.focus()
     })
   }
@@ -80,14 +79,19 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
     get depth() { return stack().length },
     push(entry) {
       if (tearingDown) return
-      captureFocus()
+      captureFocus(entry)
       setStack((current) => [...current, entry])
     },
     replace(entry) {
       if (tearingDown) return
-      captureFocus()
       const current = stack()
       const replaced = current.at(-1)
+      if (replaced) {
+        returnFocus.set(entry, returnFocus.get(replaced) ?? null)
+        restoreGeneration++
+      } else {
+        captureFocus(entry, current)
+      }
       setStack(replaced ? [...current.slice(0, -1), entry] : [entry])
       if (replaced) closeEntry(replaced)
     },
@@ -97,10 +101,11 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
       const index = current.findIndex((entry) => entry.token === token)
       if (index < 0) return
       const entry = current[index]!
+      const wasTop = index === current.length - 1
       const next = [...current.slice(0, index), ...current.slice(index + 1)]
       setStack(next)
       closeEntry(entry)
-      if (next.length === 0) scheduleRestore()
+      if (wasTop) scheduleRestore(returnFocus.get(entry))
     },
     closeTop() {
       if (tearingDown) return
@@ -110,15 +115,16 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
       const next = current.slice(0, -1)
       setStack(next)
       closeEntry(top)
-      if (next.length === 0) scheduleRestore()
+      scheduleRestore(returnFocus.get(top))
     },
     clear() {
       if (tearingDown) return
       const current = stack()
       if (current.length === 0) return
+      const candidate = returnFocus.get(current[0]!)
       setStack([])
       for (const entry of current) closeEntry(entry)
-      scheduleRestore()
+      scheduleRestore(candidate)
     },
   }
   const requestCloseTop = () => {
@@ -146,7 +152,6 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
     const current = stack()
     setStack([])
     for (const entry of current) closeEntry(entry)
-    priorFocus = null
   })
 
   const panelWidth = () => Math.max(1, Math.min(60, dimensions().width - 2))
@@ -155,8 +160,9 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
 
   return <OverlayContext.Provider value={controller}>
     {props.children}
-    <Show when={top()} keyed>{(entry: OverlayEntry) => (
+    <For each={stack()}>{(entry: OverlayEntry) => (
       <box
+        visible={top() === entry}
         position="absolute"
         top={0}
         left={0}
@@ -175,7 +181,7 @@ export function OverlayProvider(props: { children: JSX.Element }): JSX.Element {
           {entry.render()}
         </box>
       </box>
-    )}</Show>
+    )}</For>
   </OverlayContext.Provider>
 }
 

@@ -728,12 +728,14 @@ test("Claude owns edit reorder duplicate and delete actions without touching Cod
     await setup.mockInput.typeText("/providers")
     setup.mockInput.pressEnter()
     await setup.waitForFrame((frame) => frame.includes("Claude First Updated"))
+    const pickerFocus = setup.renderer.currentFocusedRenderable
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("d")
     await setup.waitForFrame((frame) => frame.includes("Delete Provider?"))
     setup.mockInput.pressEscape()
     await setup.waitForFrame((frame) => frame.includes("Claude First Updated") && !frame.includes("Delete Provider?"))
-    expect(setup.renderer.currentFocusedRenderable?.isDestroyed).toBeFalse()
+    expect(setup.renderer.currentFocusedRenderable).toBe(pickerFocus)
+    expect(pickerFocus?.isDestroyed).toBeFalse()
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("d")
     await setup.waitForFrame((frame) => frame.includes("Delete Provider?"))
@@ -1135,7 +1137,8 @@ test("a Takeover-required Provider offers only Takeover or cancel with scoped si
     expect(session.actions).toEqual([])
     expect(setup.captureCharFrame()).toContain("Providers")
     const restoredFocus = setup.renderer.currentFocusedRenderable as InputRenderable
-    expect(pickerFocus.isDestroyed).toBeTrue()
+    expect(restoredFocus).toBe(pickerFocus)
+    expect(pickerFocus.isDestroyed).toBeFalse()
     expect(restoredFocus.isDestroyed).toBeFalse()
     expect(restoredFocus.placeholder).toBe("Navigate Providers")
 
@@ -1212,7 +1215,8 @@ test("authoritative takeover-required preserves the pending picker and restores 
     expect(restored).toContain("Providers")
     expect(restored).not.toContain("Commands")
     const restoredFocus = setup.renderer.currentFocusedRenderable as InputRenderable
-    expect(pickerFocus.isDestroyed).toBeTrue()
+    expect(restoredFocus).toBe(pickerFocus)
+    expect(pickerFocus.isDestroyed).toBeFalse()
     expect(restoredFocus.isDestroyed).toBeFalse()
     expect(restoredFocus.placeholder).toBe("Navigate Providers")
     expect(session.actions).toHaveLength(1)

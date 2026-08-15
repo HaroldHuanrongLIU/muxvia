@@ -156,6 +156,12 @@ function Shell(props: {
   const [activitiesByTarget, setActivitiesByTarget] = createSignal<Record<Target, ActivityEntry[]>>({ codex: [], claude: [] })
   const [sidebarOpenByTarget, setSidebarOpenByTarget] = createSignal<Record<Target, boolean>>({ codex: true, claude: true })
   const providerFormRefs: Partial<Record<Target, ProviderFormRef>> = {}
+  const providerFormRefCallbacks = Object.fromEntries(
+    (["codex", "claude"] as const).map((target) => [target, (value: ProviderFormRef | undefined) => {
+      if (value) providerFormRefs[target] = value
+      else delete providerFormRefs[target]
+    }]),
+  ) as Record<Target, (value: ProviderFormRef | undefined) => void>
   let nextActivityId = 1
   const lastViewSequence: Partial<Record<Target, number>> = Object.fromEntries(
     Object.entries(initialViews).map(([target, initial]) => [target, initial!.viewSequence]),
@@ -218,10 +224,7 @@ function Shell(props: {
       [target]: typeof next === "function" ? next(current[target]) : next,
     }))
   }
-  const providerFormRef = () => {
-    const target = activeTarget()
-    return target ? providerFormRefs[target] : undefined
-  }
+  const hasDirtyEditor = () => Object.values(editors()).some((current) => current?.dirty)
   const bumpEditorGeneration = (target = activeTarget()) => target === undefined ? -1 : ++editorGenerations[target]
   const appendActivity = (activity: ActivityDraft, target = activeTarget()) => {
     if (!target) return
@@ -290,8 +293,9 @@ function Shell(props: {
     })
   }
   const cancelExit = () => {
+    const mountedDirtyForm = editor()?.dirty ? providerFormRefs[activeTarget()!] : undefined
     overlay.closeTop()
-    queueMicrotask(() => providerFormRef()?.focus())
+    if (mountedDirtyForm) queueMicrotask(() => mountedDirtyForm.focus())
   }
   const confirmExit = () => {
     if (exiting) return
@@ -306,14 +310,14 @@ function Shell(props: {
   }
   const requestExit = () => {
     if (exitScheduled || exiting) return
-    if (!providerFormRef()?.isDirty()) {
+    if (!hasDirtyEditor()) {
       destroyRenderer()
       return
     }
     exitScheduled = true
     queueMicrotask(() => {
       exitScheduled = false
-      if (disposed || exiting || renderer.isDestroyed || !providerFormRef()?.isDirty()) return
+      if (disposed || exiting || renderer.isDestroyed || !hasDirtyEditor()) return
       overlay.replace({
         id: "exit-confirmation",
         render: () => <ExitConfirmation t={props.t} onConfirm={confirmExit} onCancel={cancelExit} />,
@@ -825,10 +829,7 @@ function Shell(props: {
                     target={activeTarget()!}
                     discoverModels={(source, signal) => session()!.discoverModels(source, signal)}
                     t={props.t}
-                    ref={(value) => {
-                      const target = activeTarget()
-                      if (target && value) providerFormRefs[target] = value
-                    }}
+                    ref={providerFormRefCallbacks[activeTarget()!]}
                     pending={saving()}
                     initialDirty={editor()?.dirty}
                     onDirtyChange={(dirty) => setEditor((current) => current ? { ...current, dirty } : current)}
@@ -848,7 +849,7 @@ function Shell(props: {
               <TargetSidebar view={view()!} t={props.t} width={sidebarWidth()} />
             </Show>
           </box>
-          <Show when={!editor() && overlay.depth === 0}>
+          <Show when={!editor()}>
             <ActionPrompt
               scope={activeTarget()!}
               placeholder={props.t("prompt.target")}

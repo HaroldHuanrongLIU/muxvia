@@ -1,14 +1,105 @@
 export type SecretSurfaceKind = "frame" | "action" | "activity" | "view" | "diagnostic"
 
-function serializeSurface(value: unknown): string {
-  try {
-    const serialized = JSON.stringify(value, (_key, current) => current instanceof Error
-      ? { name: current.name, message: current.message, cause: current.cause }
-      : current)
-    return serialized === undefined ? String(value) : serialized
-  } catch {
-    throw new Error("secret-surface-serialization-failed")
+interface SecretScan {
+  matched: boolean[]
+  seen: WeakSet<object>
+  secrets: readonly string[]
+}
+
+function scanText(value: string, scan: SecretScan): void {
+  for (let index = 0; index < scan.secrets.length; index += 1) {
+    const secret = scan.secrets[index]!
+    if (secret.length > 0 && value.includes(secret)) {
+      scan.matched[index] = true
+    }
   }
+}
+
+function scanSurface(value: unknown, scan: SecretScan): void {
+  if (typeof value === "string") {
+    scanText(value, scan)
+    return
+  }
+  if (typeof value === "bigint" || typeof value === "number" || typeof value === "boolean") {
+    scanText(String(value), scan)
+    return
+  }
+  if (typeof value === "symbol") {
+    scanText(value.description ?? "", scan)
+    return
+  }
+  if ((typeof value !== "object" || value === null) && typeof value !== "function") {
+    return
+  }
+
+  const object = value as object
+  if (scan.seen.has(object)) {
+    return
+  }
+  scan.seen.add(object)
+
+  try {
+    if (object instanceof Error) {
+      scanSurface(object.name, scan)
+      scanSurface(object.message, scan)
+      scanSurface(object.stack, scan)
+      scanSurface((object as Error & { cause?: unknown }).cause, scan)
+      if (object instanceof AggregateError) {
+        scanSurface(object.errors, scan)
+      }
+    }
+  } catch {
+    throw new Error("secret-surface-uninspectable")
+  }
+
+  let keys: PropertyKey[]
+  try {
+    keys = Reflect.ownKeys(object)
+  } catch {
+    throw new Error("secret-surface-uninspectable")
+  }
+
+  for (const key of keys) {
+    scanText(typeof key === "symbol" ? key.description ?? "" : String(key), scan)
+    let descriptor: PropertyDescriptor | undefined
+    try {
+      descriptor = Reflect.getOwnPropertyDescriptor(object, key)
+    } catch {
+      throw new Error("secret-surface-uninspectable")
+    }
+    if (descriptor === undefined) {
+      continue
+    }
+    if (!("value" in descriptor)) {
+      throw new Error("secret-surface-uninspectable")
+    }
+    scanSurface(descriptor.value, scan)
+  }
+
+  try {
+    if (object instanceof Map) {
+      for (const [key, entry] of object) {
+        scanSurface(key, scan)
+        scanSurface(entry, scan)
+      }
+    } else if (object instanceof Set) {
+      for (const entry of object) {
+        scanSurface(entry, scan)
+      }
+    }
+  } catch {
+    throw new Error("secret-surface-uninspectable")
+  }
+}
+
+function scanSecrets(value: unknown, secrets: readonly string[]): boolean[] {
+  const scan = {
+    matched: secrets.map(() => false),
+    seen: new WeakSet<object>(),
+    secrets,
+  }
+  scanSurface(value, scan)
+  return scan.matched
 }
 
 export function auditSecretFreeSurface(
@@ -18,13 +109,11 @@ export function auditSecretFreeSurface(
   label: string,
 ): void {
   const diagnostic = `secret-scan-failed:${label}-${kind}`
-  let surface: string
   try {
-    surface = serializeSurface(value)
+    if (scanSecrets(value, secrets).some(Boolean)) {
+      throw new Error(diagnostic)
+    }
   } catch {
-    throw new Error(`secret-surface-serialization-failed:${label}-${kind}`)
-  }
-  if (secrets.some((secret) => secret.length > 0 && surface.includes(secret))) {
     throw new Error(diagnostic)
   }
 }
@@ -119,13 +208,13 @@ export function assertControlledSecretSource(
   secrets: readonly string[],
   label: string,
 ): void {
-  let surface: string
+  let matched: boolean[]
   try {
-    surface = serializeSurface(value)
+    matched = scanSecrets(value, secrets)
   } catch {
     throw new Error(`controlled-secret-source-invalid:${label}`)
   }
-  if (!secrets.every((secret) => secret.length > 0 && surface.includes(secret))) {
+  if (!secrets.every((secret, index) => secret.length > 0 && matched[index])) {
     throw new Error(`controlled-secret-source-missing:${label}`)
   }
 }

@@ -166,3 +166,80 @@ test("Claude Direct audits fail before a secret-bearing opposite branch can prod
   expect(frameDiagnostic).toBe("secret-scan-failed:opposite-branch-frame")
   expect(frameDiagnostic.includes(secret)).toBeFalse()
 })
+
+test.each(["stack", "credential", "settings", "cause", "aggregate"] as const)(
+  "Claude Direct audits scan complete Error %s diagnostics without echoing secrets",
+  (source) => {
+    const secret = `controlled-error-${source}-secret`
+    let error: Error
+    if (source === "stack") {
+      error = new Error("safe stack error")
+      error.stack = `Error: safe stack error\n    at credential:${secret}`
+    } else if (source === "credential") {
+      error = new Error("safe custom error")
+      Object.assign(error, { credential: secret })
+    } else if (source === "settings") {
+      error = new Error("safe custom error")
+      Object.defineProperty(error, "settings", {
+        configurable: true,
+        value: secret,
+      })
+    } else if (source === "cause") {
+      error = new Error("safe cause error")
+      Object.assign(error, { cause: new Error(secret) })
+    } else {
+      error = new AggregateError([new Error(secret)], "safe aggregate error")
+    }
+
+    let diagnostic = ""
+    try {
+      auditSecretFreeDiagnostic(error, [secret], `complete-error-${source}`)
+    } catch (caught) {
+      diagnostic = caught instanceof Error ? caught.message : String(caught)
+    }
+    expect(diagnostic).toBe(`secret-scan-failed:complete-error-${source}-diagnostic`)
+    expect(diagnostic.includes(secret)).toBeFalse()
+  },
+)
+
+test("Claude Direct audits handle Symbol, BigInt, and cyclic Error surfaces safely", () => {
+  const cleanError = new Error("safe cyclic error") as Error & {
+    bigint?: bigint
+    cycle?: unknown
+    nested?: unknown
+    symbol?: symbol
+  }
+  cleanError.bigint = 42n
+  cleanError.symbol = Symbol("safe-symbol")
+  cleanError.cycle = cleanError
+
+  expect(() => auditSecretFreeDiagnostic(
+    cleanError,
+    ["controlled-cycle-secret"],
+    "cycle-safe",
+  )).not.toThrow()
+
+  const cases = [
+    ["symbol", "controlled-symbol-secret", () => {
+      cleanError.symbol = Symbol("controlled-symbol-secret")
+    }],
+    ["bigint", "424242424242", () => {
+      cleanError.bigint = 424242424242n
+    }],
+    ["cycle", "controlled-cycle-secret", () => {
+      cleanError.nested = { cycle: cleanError, settings: "controlled-cycle-secret" }
+    }],
+  ] as const
+
+  for (const [source, secret, contaminate] of cases) {
+    contaminate()
+    let diagnostic = ""
+    try {
+      auditSecretFreeDiagnostic(cleanError, [secret], `cycle-safe-${source}`)
+    } catch (caught) {
+      diagnostic = caught instanceof Error ? caught.message : String(caught)
+    }
+    expect(diagnostic).toBe(`secret-scan-failed:cycle-safe-${source}-diagnostic`)
+    expect(diagnostic.includes(secret)).toBeFalse()
+  }
+})

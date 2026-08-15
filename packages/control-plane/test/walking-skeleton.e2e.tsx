@@ -1942,6 +1942,29 @@ test("real processes prove the complete Target Provider workflow without leaking
       expect(await readOnlyStateFingerprint(databasePath, configPath)).toEqual(before)
       readOnlyInspections.push(label)
     }
+    const waitForInboundResult = async (
+      start: number,
+      resultKind: "model-discovery" | "reachability" | "action",
+      label: string,
+    ) => {
+      try {
+        await waitFor(() => decodedInboundFrames.slice(start).some((frame) => {
+          if (typeof frame !== "object" || frame === null) return false
+          const candidate = frame as {
+            type?: unknown
+            requestId?: unknown
+            result?: { kind?: unknown }
+          }
+          if (resultKind === "action") {
+            return candidate.type === "response" && candidate.result?.kind === "action-outcome"
+              || candidate.type === "error" && typeof candidate.requestId === "string"
+          }
+          return candidate.type === "response" && candidate.result?.kind === resultKind
+        }), `inbound ${label}`)
+      } catch {
+        throw new Error(`inbound-result-wait-failed:${label}`)
+      }
+    }
     const leader = (key: string) => {
       setup!.mockInput.pressKey("x", { ctrl: true })
       setup!.mockInput.pressKey(key)
@@ -2019,10 +2042,12 @@ test("real processes prove the complete Target Provider workflow without leaking
     // Reopening now performs automatic discovery with the newly saved endpoint and Credential Reference.
     await openProviderPicker()
     const savedInspectionBefore = await readOnlyStateFingerprint(databasePath, configPath)
+    const automaticInboundStart = decodedInboundFrames.length
     requestAudit.expectNext("expected-provider")
     setup.mockInput.pressEnter()
     await upstream.waitForCallCount(1)
     expect(requestAudit.projection(0)).toEqual(expectedModelRequestProjection)
+    await waitForInboundResult(automaticInboundStart, "model-discovery", "automatic-model-discovery")
     const automaticModelsFrame = await setup.waitForFrame((frame) => frame.includes("2 models available"))
     selectedRenderedFrames.push(automaticModelsFrame)
     await assertReadOnlyInspection("complete automatic discovery", savedInspectionBefore)
@@ -2034,9 +2059,7 @@ test("real processes prove the complete Target Provider workflow without leaking
     leader("f")
     await upstream.waitForCallCount(2)
     expect(requestAudit.projection(1)).toEqual(expectedModelRequestProjection)
-    await setup.waitFor(() => decodedInboundFrames.slice(explicitInboundStart).some((frame) =>
-      JSON.stringify(frame).includes('"kind":"model-discovery"')
-    ))
+    await waitForInboundResult(explicitInboundStart, "model-discovery", "explicit-model-discovery")
     const explicitModelsFrame = await setup.waitForFrame((frame) => frame.includes("2 models available"))
     selectedRenderedFrames.push(explicitModelsFrame)
     await assertReadOnlyInspection("explicit discovery", explicitInspectionBefore)
@@ -2181,10 +2204,12 @@ test("real processes prove the complete Target Provider workflow without leaking
       await setup.renderOnce()
     }
     const activeEditorInspectionBefore = await readOnlyStateFingerprint(databasePath, configPath)
+    const activeAutomaticInboundStart = decodedInboundFrames.length
     requestAudit.expectNext("expected-provider")
     setup.mockInput.pressEnter()
     await upstream.waitForCallCount(3)
     expect(requestAudit.projection(2)).toEqual(expectedModelRequestProjection)
+    await waitForInboundResult(activeAutomaticInboundStart, "model-discovery", "active-model-discovery")
     await setup.waitForFrame((frame) => frame.includes("2 models available"))
     await assertReadOnlyInspection("active declaration automatic discovery", activeEditorInspectionBefore)
     setup.mockInput.pressTab()
@@ -2225,10 +2250,12 @@ test("real processes prove the complete Target Provider workflow without leaking
     // 8. Reachability is an unauthenticated, headers-only 401 observation with no state change.
     await openProviderPicker()
     const reachabilityBefore = await readOnlyStateFingerprint(databasePath, configPath)
+    const reachabilityInboundStart = decodedInboundFrames.length
     requestAudit.expectNext("absent")
     leader("t")
     await upstream.waitForCallCount(5)
     expect(requestAudit.projection(4)).toEqual(expectedReachabilityRequestProjection)
+    await waitForInboundResult(reachabilityInboundStart, "reachability", "reachability")
     const reachabilityFrame = await setup.waitForFrame((frame) =>
       frame.includes("Reachable") && frame.includes("HTTP 401")
     )
@@ -2236,15 +2263,13 @@ test("real processes prove the complete Target Provider workflow without leaking
     await assertReadOnlyInspection("reachability", reachabilityBefore)
 
     // 9. Active deletion is rejected; deleting the inactive shared duplicate preserves its credential.
-    const activeDeleteFrameStart = decodedInboundFrames.length
     const activeDeleteRenderStart = rendererAudit.frames().length
     leader("d")
     const activeDeleteConfirmation = await setup.waitForFrame((frame) => frame.includes("Delete Provider?"))
     selectedRenderedFrames.push(activeDeleteConfirmation)
+    const activeDeleteInboundStart = decodedInboundFrames.length
     setup.mockInput.pressKey("y")
-    await setup.waitFor(() => decodedInboundFrames.slice(activeDeleteFrameStart).some((frame) =>
-      JSON.stringify(frame).includes("provider-referenced")
-    ))
+    await waitForInboundResult(activeDeleteInboundStart, "action", "active-provider-delete")
     await setup.renderOnce()
     const activeDeleteRejected = captureFrame(setup, selectedRenderedFrames)
     const activeDeleteRenderedFrames = rendererAudit.frames().slice(activeDeleteRenderStart)

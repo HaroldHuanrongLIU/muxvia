@@ -113,6 +113,8 @@ pub struct RoutingSnapshot {
     base_url: String,
     model: String,
     provider_credential: SecretString,
+    protocol: ProviderProtocol,
+    authentication: ProviderAuthentication,
     epoch: Uuid,
 }
 
@@ -135,6 +137,14 @@ impl RoutingSnapshot {
 
     pub fn provider_credential(&self) -> &SecretString {
         &self.provider_credential
+    }
+
+    pub fn protocol(&self) -> ProviderProtocol {
+        self.protocol
+    }
+
+    pub fn authentication(&self) -> ProviderAuthentication {
+        self.authentication
     }
 
     pub fn epoch(&self) -> Uuid {
@@ -497,11 +507,18 @@ impl StateStore {
     }
 
     pub async fn routing_credential(&self) -> Result<Option<SecretString>, StateError> {
+        self.routing_credential_for(Target::Codex).await
+    }
+
+    pub async fn routing_credential_for(
+        &self,
+        target: Target,
+    ) -> Result<Option<SecretString>, StateError> {
         self.connection
-            .call(|connection| {
+            .call(move |connection| {
                 let credential = connection.query_row(
-                    "SELECT routing_credential FROM target_route_state WHERE target = 'codex'",
-                    [],
+                    "SELECT routing_credential FROM target_route_state WHERE target = ?1",
+                    [target.as_str()],
                     |row| row.get::<_, Option<String>>(0),
                 )?;
                 Ok(credential.map(SecretString::from))
@@ -511,15 +528,22 @@ impl StateStore {
     }
 
     pub async fn activated_snapshot(&self) -> Result<Option<RoutingSnapshot>, StateError> {
+        self.activated_snapshot_for(Target::Codex).await
+    }
+
+    pub async fn activated_snapshot_for(
+        &self,
+        target: Target,
+    ) -> Result<Option<RoutingSnapshot>, StateError> {
         self.connection
-            .call(|connection| {
+            .call(move |connection| {
                 let row = connection.query_row(
                     "SELECT s.id, s.provider_id, s.base_url, s.model,
-                            s.provider_bearer_token, s.epoch
+                            s.provider_bearer_token, s.epoch, s.protocol, s.authentication
                      FROM target_route_state r
                      JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
-                     WHERE r.target = 'codex'",
-                    [],
+                     WHERE r.target = ?1 AND s.target = ?1",
+                    [target.as_str()],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
@@ -528,23 +552,47 @@ impl StateStore {
                             row.get::<_, String>(3)?,
                             row.get::<_, String>(4)?,
                             row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
                         ))
                     },
                 );
                 match row {
-                    Ok((id, provider_id, base_url, model, credential, epoch)) => {
+                    Ok((
+                        id,
+                        provider_id,
+                        base_url,
+                        model,
+                        credential,
+                        epoch,
+                        protocol,
+                        authentication,
+                    )) => {
                         let id = Uuid::parse_str(&id)
                             .map_err(|_| StateError::InvalidActivatedSnapshot)?;
                         let provider_id = Uuid::parse_str(&provider_id)
                             .map_err(|_| StateError::InvalidActivatedSnapshot)?;
                         let epoch = Uuid::parse_str(&epoch)
                             .map_err(|_| StateError::InvalidActivatedSnapshot)?;
+                        let protocol = match protocol.as_str() {
+                            "openai-responses" => ProviderProtocol::OpenaiResponses,
+                            "anthropic-messages" => ProviderProtocol::AnthropicMessages,
+                            _ => return Err(StateError::InvalidActivatedSnapshot),
+                        };
+                        let authentication = match authentication.as_str() {
+                            "openai-bearer" => ProviderAuthentication::OpenaiBearer,
+                            "anthropic-api-key" => ProviderAuthentication::AnthropicApiKey,
+                            "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
+                            _ => return Err(StateError::InvalidActivatedSnapshot),
+                        };
                         Ok(Some(RoutingSnapshot {
                             id,
                             provider_id,
                             base_url,
                             model,
                             provider_credential: SecretString::from(credential),
+                            protocol,
+                            authentication,
                             epoch,
                         }))
                     }
@@ -557,6 +605,14 @@ impl StateStore {
     }
 
     pub async fn record_serving(&self, snapshot_id: Uuid) -> Result<TargetView, StateError> {
+        self.record_serving_for(Target::Codex, snapshot_id).await
+    }
+
+    pub async fn record_serving_for(
+        &self,
+        target: Target,
+        snapshot_id: Uuid,
+    ) -> Result<TargetView, StateError> {
         let service_epoch = self.service_epoch.clone();
         let view = self
             .connection
@@ -566,8 +622,9 @@ impl StateStore {
                 )?;
                 let provider_id = transaction
                     .query_row(
-                        "SELECT provider_id FROM activated_snapshots WHERE id = ?1",
-                        [snapshot_id.to_string()],
+                        "SELECT provider_id FROM activated_snapshots
+                         WHERE id = ?1 AND target = ?2",
+                        [snapshot_id.to_string(), target.as_str().to_owned()],
                         |row| row.get::<_, String>(0),
                     )
                     .map_err(|error| match error {
@@ -580,10 +637,10 @@ impl StateStore {
                     "UPDATE target_route_state
                      SET serving_provider_id = ?1,
                          view_sequence = view_sequence + 1
-                     WHERE target = 'codex'",
-                    [provider_id],
+                     WHERE target = ?2",
+                    [provider_id, target.as_str().to_owned()],
                 )?;
-                let view = project_target_view(&transaction, &service_epoch)?;
+                let view = project_target_view_for(&transaction, &service_epoch, target)?;
                 transaction.commit()?;
                 Ok(view)
             })

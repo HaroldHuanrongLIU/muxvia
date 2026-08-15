@@ -1,0 +1,31 @@
+{
+  "fixtures": [
+    {
+      "file": "messages-tools-thinking.json",
+      "oracleType": "official-anthropic-contract-adapted",
+      "source": "https://docs.anthropic.com/en/api/messages",
+      "retrievalDate": "2026-08-15",
+      "behavior": "Messages JSON preserves ordered system blocks, messages, tools, tool_choice, thinking, metadata, context/output configuration, and compatible unknown fields while Muxvia replaces only the top-level model; the same bytes are exercised through identity and gzip request encodings.",
+      "sha256": "4e08e922dd3b80bed553575ce0e830bbb22ee0c296e564fdfe15803d75c95b13",
+      "muxviaCompatibilityDeviation": "Muxvia requires a target-specific local Routing Credential and replaces top-level model from the request-pinned Activated Snapshot."
+    },
+    {
+      "file": "messages-count-tokens.json",
+      "oracleType": "official-anthropic-contract-adapted",
+      "source": "https://docs.anthropic.com/en/api/messages-count-tokens",
+      "retrievalDate": "2026-08-15",
+      "behavior": "Token-counting uses the native /v1/messages/count_tokens path and preserves system, messages, tools, and compatible unknown fields while replacing only top-level model.",
+      "sha256": "bf5882dd435454e73823e96d070eb9a0e1daafc29f71cc4e34683ee7ea681d72",
+      "muxviaCompatibilityDeviation": "Muxvia authenticates local ingress and pins model from the Claude Activated Snapshot."
+    },
+    {
+      "file": "messages-stream.sse",
+      "oracleType": "official-anthropic-stream-shape-adapted",
+      "source": "https://docs.anthropic.com/en/api/messages-streaming",
+      "retrievalDate": "2026-08-15",
+      "behavior": "Anthropic SSE event bytes retain original order and framing across message_start, content block, delta, and message_stop events; response compression tests wrap these bytes without changing them.",
+      "sha256": "29d45efe53492dab2b5512cf62172410373890ef54e519fc56ea27ce045ea130",
+      "muxviaCompatibilityDeviation": "None beyond authenticated loopback ingress and target-scoped Serving observation after a 2xx upstream response head."
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "model": "client-selected-model",
+  "system": [{ "type": "text", "text": "Count this context." }],
+  "messages": [
+    { "role": "user", "content": [{ "type": "text", "text": "hello" }] }
+  ],
+  "tools": [
+    {
+      "name": "lookup",
+      "input_schema": { "type": "object", "properties": {} }
+    }
+  ],
+  "compatible_future_field": { "count": true }
+}

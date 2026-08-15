@@ -38,6 +38,10 @@ impl ReqwestUpstream {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|_| UpstreamError)?;
@@ -72,4 +76,20 @@ impl UpstreamTransport for ReqwestUpstream {
 pub fn responses_url(base_url: &str) -> Result<Url, UpstreamError> {
     let normalized = base_url.trim_end_matches('/');
     Url::parse(&format!("{normalized}/responses")).map_err(|_| UpstreamError)
+}
+
+pub fn messages_url(
+    base_url: &str,
+    count_tokens: bool,
+    query: Option<&str>,
+) -> Result<Url, UpstreamError> {
+    let normalized = base_url.trim_end_matches('/');
+    let suffix = if count_tokens {
+        "/messages/count_tokens"
+    } else {
+        "/messages"
+    };
+    let mut url = Url::parse(&format!("{normalized}{suffix}")).map_err(|_| UpstreamError)?;
+    url.set_query(query);
+    Ok(url)
 }

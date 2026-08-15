@@ -1,4 +1,4 @@
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, header};
 use secrecy::{ExposeSecret, SecretString};
 use subtle::{Choice, ConstantTimeEq};
 
@@ -20,6 +20,28 @@ pub fn routing_credential_matches(headers: &HeaderMap, expected: &SecretString) 
         (candidate.is_some()
             && !duplicate
             && bytes.len() == ROUTING_CREDENTIAL_LEN
+            && padded_candidate.is_ascii()
+            && expected_bytes.len() == ROUTING_CREDENTIAL_LEN
+            && padded_expected.is_ascii()) as u8,
+    );
+    bool::from(padded_candidate.ct_eq(&padded_expected) & shape_is_valid)
+}
+
+pub fn bearer_routing_credential_matches(headers: &HeaderMap, expected: &SecretString) -> bool {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let candidate = values.next();
+    let duplicate = values.next().is_some();
+    let bytes = candidate.map_or(&[][..], |value| value.as_bytes());
+    let token = bytes.strip_prefix(b"Bearer ").unwrap_or(&[]);
+
+    let padded_candidate = normalize_credential(token, |_| {});
+    let expected_bytes = expected.expose_secret().as_bytes();
+    let padded_expected = normalize_credential(expected_bytes, |_| {});
+
+    let shape_is_valid = Choice::from(
+        (candidate.is_some()
+            && !duplicate
+            && token.len() == ROUTING_CREDENTIAL_LEN
             && padded_candidate.is_ascii()
             && expected_bytes.len() == ROUTING_CREDENTIAL_LEN
             && padded_expected.is_ascii()) as u8,

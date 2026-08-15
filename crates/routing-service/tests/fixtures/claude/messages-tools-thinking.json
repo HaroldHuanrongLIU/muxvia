@@ -1,0 +1,35 @@
+{
+  "model": "client-selected-model",
+  "max_tokens": 2048,
+  "system": [
+    { "type": "text", "text": "Preserve the first system block." },
+    { "type": "text", "text": "Preserve the second system block." }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Use the weather tool." },
+        { "type": "tool_result", "tool_use_id": "toolu_fixture", "content": "sunny" }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "weather",
+      "description": "Read weather",
+      "input_schema": {
+        "type": "object",
+        "properties": { "city": { "type": "string" } },
+        "required": ["city"]
+      }
+    }
+  ],
+  "tool_choice": { "type": "auto" },
+  "thinking": { "type": "enabled", "budget_tokens": 1024 },
+  "metadata": { "user_id": "fixture-operator" },
+  "context_management": { "edits": [] },
+  "output_config": { "effort": "high" },
+  "compatible_future_field": { "nested": [true, 7, "kept"] },
+  "stream": true
+}

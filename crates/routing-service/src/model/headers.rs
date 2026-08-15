@@ -4,6 +4,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
 use secrecy::{ExposeSecret, SecretString};
 
 use super::auth::ROUTING_CREDENTIAL_HEADER;
+use crate::control::protocol::ProviderAuthentication;
 
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -37,6 +38,38 @@ pub fn forward_request_headers(
         HeaderValue::from_str(&format!("Bearer {}", provider_credential.expose_secret()))
             .map_err(|_| HeaderPolicyError)?;
     forwarded.insert(header::AUTHORIZATION, authorization);
+    Ok(forwarded)
+}
+
+pub fn forward_claude_request_headers(
+    incoming: &HeaderMap,
+    authentication: ProviderAuthentication,
+    provider_credential: &SecretString,
+) -> Result<HeaderMap, HeaderPolicyError> {
+    let mut blocked = blocked_names(incoming);
+    blocked.extend([
+        header::HOST,
+        header::CONTENT_LENGTH,
+        header::CONTENT_ENCODING,
+        header::AUTHORIZATION,
+        HeaderName::from_static("x-api-key"),
+        HeaderName::from_static(ROUTING_CREDENTIAL_HEADER),
+    ]);
+    let mut forwarded = copy_except(incoming, &blocked);
+    let value = HeaderValue::from_str(provider_credential.expose_secret())
+        .map_err(|_| HeaderPolicyError)?;
+    match authentication {
+        ProviderAuthentication::AnthropicApiKey => {
+            forwarded.insert(HeaderName::from_static("x-api-key"), value);
+        }
+        ProviderAuthentication::AnthropicBearer => {
+            let authorization =
+                HeaderValue::from_str(&format!("Bearer {}", provider_credential.expose_secret()))
+                    .map_err(|_| HeaderPolicyError)?;
+            forwarded.insert(header::AUTHORIZATION, authorization);
+        }
+        ProviderAuthentication::OpenaiBearer => return Err(HeaderPolicyError),
+    }
     Ok(forwarded)
 }
 

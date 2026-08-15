@@ -17,8 +17,10 @@ use axum::{
 use reqwest::Body as ReqwestBody;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
+use crate::control::protocol::Target;
 use crate::state::StateStore;
 
+use super::messages::route_messages;
 use super::{
     auth::routing_credential_matches,
     headers::{forward_request_headers, forward_response_headers},
@@ -94,14 +96,16 @@ impl ModelServerStatus {
     }
 }
 
-struct RouteState {
-    store: Arc<StateStore>,
-    upstream: Arc<dyn UpstreamTransport>,
+pub(crate) struct RouteState {
+    pub(crate) target: Target,
+    pub(crate) store: Arc<StateStore>,
+    pub(crate) upstream: Arc<dyn UpstreamTransport>,
 }
 
 impl Clone for RouteState {
     fn clone(&self) -> Self {
         Self {
+            target: self.target,
             store: Arc::clone(&self.store),
             upstream: Arc::clone(&self.upstream),
         }
@@ -114,10 +118,28 @@ impl ModelServer {
         store: Arc<StateStore>,
         upstream: Arc<dyn UpstreamTransport>,
     ) -> Result<ModelServerHandle, ModelServerError> {
+        Self::bind_reserved_for(reserved, Target::Codex, store, upstream).await
+    }
+
+    pub async fn bind_reserved_for(
+        reserved: ReservedListener,
+        target: Target,
+        store: Arc<StateStore>,
+        upstream: Arc<dyn UpstreamTransport>,
+    ) -> Result<ModelServerHandle, ModelServerError> {
         let endpoint = reserved.endpoint;
-        let router = Router::new()
-            .route("/v1/responses", post(route_responses))
-            .with_state(RouteState { store, upstream });
+        let state = RouteState {
+            target,
+            store,
+            upstream,
+        };
+        let router = match target {
+            Target::Codex => Router::new().route("/v1/responses", post(route_responses)),
+            Target::Claude => Router::new()
+                .route("/v1/messages", post(route_messages))
+                .route("/v1/messages/count_tokens", post(route_messages)),
+        }
+        .with_state(state);
         let (shutdown, shutdown_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let status = Arc::new(AtomicU8::new(ModelServerStatus::Starting.encode()));

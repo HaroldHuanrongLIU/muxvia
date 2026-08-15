@@ -239,6 +239,21 @@ impl ClaudeConfigCodec {
         Ok(())
     }
 
+    pub(crate) fn inspect_takeover(
+        &self,
+        desired: &DesiredClaudeState,
+    ) -> Result<ClaudeConfigSnapshot, ClaudeProblem> {
+        let current = self.inspect()?;
+        if current.owned == desired.owned {
+            Ok(current)
+        } else {
+            Err(ClaudeProblem::new(
+                "configuration-collision",
+                Some(self.settings_path()),
+            ))
+        }
+    }
+
     pub fn restore(
         &self,
         before: &ClaudeConfigSnapshot,
@@ -293,16 +308,31 @@ impl ClaudeConfigCodec {
         &self,
         context: &ClaudePreflightContext,
     ) -> Result<ClaudePreflightReport, ClaudeProblem> {
+        self.preflight_snapshot(context, None)
+            .map(|(report, _)| report)
+    }
+
+    pub(crate) fn preflight_snapshot(
+        &self,
+        context: &ClaudePreflightContext,
+        expected_takeover: Option<&DesiredClaudeState>,
+    ) -> Result<(ClaudePreflightReport, ClaudeConfigSnapshot), ClaudeProblem> {
         self.validate_context(context)?;
-        let (_, document) = self.read_snapshot()?;
+        let (snapshot, document) = self.read_snapshot()?;
         validate_provider_modes(&document, self.settings_path())?;
+        if expected_takeover.is_some_and(|expected| snapshot.owned != expected.owned) {
+            return Err(ClaudeProblem::new(
+                "configuration-collision",
+                Some(self.settings_path()),
+            ));
+        }
         let mut shadow_paths = self.managed_settings_paths.clone();
         let cwd = PathBuf::from(&context.cwd);
         shadow_paths.push(cwd.join(".claude/settings.json"));
         shadow_paths.push(cwd.join(".claude/settings.local.json"));
         let mut seen = BTreeSet::new();
         for path in shadow_paths {
-            if !seen.insert(path.clone()) || !path.exists() {
+            if path == self.settings_path() || !seen.insert(path.clone()) || !path.exists() {
                 continue;
             }
             let source = fs_read_json(&path)?;
@@ -311,16 +341,19 @@ impl ClaudeConfigCodec {
             }
             validate_provider_modes(&source, &path)?;
         }
-        Ok(ClaudePreflightReport {
-            restart_required: true,
-            unobservable_shadows: [
-                ClaudeRuntimeShadow::SettingsFlag,
-                ClaudeRuntimeShadow::ModelFlag,
-                ClaudeRuntimeShadow::InteractiveModel,
-                ClaudeRuntimeShadow::ResumedSession,
-                ClaudeRuntimeShadow::ExternalEnvironment,
-            ],
-        })
+        Ok((
+            ClaudePreflightReport {
+                restart_required: true,
+                unobservable_shadows: [
+                    ClaudeRuntimeShadow::SettingsFlag,
+                    ClaudeRuntimeShadow::ModelFlag,
+                    ClaudeRuntimeShadow::InteractiveModel,
+                    ClaudeRuntimeShadow::ResumedSession,
+                    ClaudeRuntimeShadow::ExternalEnvironment,
+                ],
+            },
+            snapshot,
+        ))
     }
 
     fn validate_context(&self, context: &ClaudePreflightContext) -> Result<(), ClaudeProblem> {

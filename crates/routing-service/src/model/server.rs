@@ -62,6 +62,8 @@ pub struct ModelServer;
 
 pub struct ModelServerHandle {
     endpoint: SocketAddr,
+    activate: Option<oneshot::Sender<()>>,
+    running: Option<oneshot::Receiver<()>>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), io::Error>>>,
     status: Arc<AtomicU8>,
@@ -127,6 +129,17 @@ impl ModelServer {
         store: Arc<StateStore>,
         upstream: Arc<dyn UpstreamTransport>,
     ) -> Result<ModelServerHandle, ModelServerError> {
+        let mut handle = Self::bind_reserved_staged_for(reserved, target, store, upstream).await?;
+        handle.activate().await?;
+        Ok(handle)
+    }
+
+    pub async fn bind_reserved_staged_for(
+        reserved: ReservedListener,
+        target: Target,
+        store: Arc<StateStore>,
+        upstream: Arc<dyn UpstreamTransport>,
+    ) -> Result<ModelServerHandle, ModelServerError> {
         let endpoint = reserved.endpoint;
         let state = RouteState {
             target,
@@ -140,15 +153,27 @@ impl ModelServer {
                 .route("/v1/messages/count_tokens", post(route_messages)),
         }
         .with_state(state);
+        let (activate, activate_rx) = oneshot::channel();
+        let (running_tx, running_rx) = oneshot::channel();
         let (shutdown, shutdown_rx) = oneshot::channel();
-        let (ready_tx, ready_rx) = oneshot::channel();
+        let (staged_tx, staged_rx) = oneshot::channel();
         let status = Arc::new(AtomicU8::new(ModelServerStatus::Starting.encode()));
         let task_status = Arc::clone(&status);
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let task_shutdown_requested = Arc::clone(&shutdown_requested);
         let task = tokio::spawn(async move {
+            let mut shutdown_rx = shutdown_rx;
+            let _ = staged_tx.send(());
+            let activated = tokio::select! {
+                activated = activate_rx => activated.is_ok(),
+                _ = &mut shutdown_rx => false,
+            };
+            if !activated {
+                task_status.store(ModelServerStatus::Stopped.encode(), Ordering::Release);
+                return Ok(());
+            }
             task_status.store(ModelServerStatus::Running.encode(), Ordering::Release);
-            let _ = ready_tx.send(());
+            let _ = running_tx.send(());
             let result = axum::serve(reserved.listener, router)
                 .with_graceful_shutdown(async {
                     let _ = shutdown_rx.await;
@@ -163,18 +188,20 @@ impl ModelServer {
             task_status.store(final_status.encode(), Ordering::Release);
             result
         });
-        if ready_rx.await.is_err() {
+        if staged_rx.await.is_err() {
             status.store(ModelServerStatus::Failed.encode(), Ordering::Release);
             return Err(ModelServerError::Task);
         }
         let handle = ModelServerHandle {
             endpoint,
+            activate: Some(activate),
+            running: Some(running_rx),
             shutdown: Some(shutdown),
             task: Some(task),
             status,
             shutdown_requested,
         };
-        if !handle.is_running() {
+        if handle.task.as_ref().is_none_or(JoinHandle::is_finished) {
             return Err(ModelServerError::Task);
         }
         Ok(handle)
@@ -201,11 +228,32 @@ impl ModelServerHandle {
         self.status() == ModelServerStatus::Running
     }
 
+    pub fn is_staged(&self) -> bool {
+        self.status() == ModelServerStatus::Starting
+            && self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
+    pub async fn activate(&mut self) -> Result<(), ModelServerError> {
+        if let Some(activate) = self.activate.take() {
+            activate.send(()).map_err(|_| ModelServerError::Task)?;
+        }
+        if let Some(running) = self.running.take() {
+            running.await.map_err(|_| ModelServerError::Task)?;
+        }
+        if self.is_running() {
+            Ok(())
+        } else {
+            Err(ModelServerError::Task)
+        }
+    }
+
     #[doc(hidden)]
     pub fn abort(&mut self) {
         self.status
             .store(ModelServerStatus::Failed.encode(), Ordering::Release);
         self.shutdown.take();
+        self.activate.take();
+        self.running.take();
         if let Some(task) = &self.task {
             task.abort();
         }
@@ -213,6 +261,8 @@ impl ModelServerHandle {
 
     pub async fn shutdown(mut self) -> Result<(), ModelServerError> {
         self.shutdown_requested.store(true, Ordering::Release);
+        self.activate.take();
+        self.running.take();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -235,6 +285,8 @@ impl Drop for ModelServerHandle {
         self.shutdown_requested.store(true, Ordering::Release);
         self.status
             .store(ModelServerStatus::Stopped.encode(), Ordering::Release);
+        self.activate.take();
+        self.running.take();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }

@@ -9,9 +9,8 @@ use crate::{
         ProviderRoutingRequirement, Target, TargetAction, TargetView,
     },
     domain::{
-        activation::ActivatedSnapshot,
-        provider::has_valid_provider_declaration,
-        view::{empty_target_view, project_target_view, project_target_view_for},
+        activation::ActivatedSnapshot, provider::has_valid_provider_declaration,
+        view::project_target_view_for,
     },
     home::MuxviaHome,
 };
@@ -217,14 +216,21 @@ impl StateStore {
     }
 
     pub async fn committed_takeover(&self) -> Result<Option<CommittedTakeover>, StateError> {
+        self.committed_takeover_for(Target::Codex).await
+    }
+
+    pub async fn committed_takeover_for(
+        &self,
+        target: Target,
+    ) -> Result<Option<CommittedTakeover>, StateError> {
         self.connection
             .call(
-                |connection| -> Result<Option<CommittedTakeover>, StateError> {
+                move |connection| -> Result<Option<CommittedTakeover>, StateError> {
                     let row = connection.query_row(
                         "SELECT route_port, routing_credential, activated_snapshot_id
                      FROM target_route_state
-                     WHERE target = 'codex' AND takeover_state = 'active'",
-                        [],
+                     WHERE target = ?1 AND takeover_state = 'active'",
+                        [target.as_str()],
                         |row| {
                             Ok((
                                 row.get::<_, Option<u16>>(0)?,
@@ -263,6 +269,16 @@ impl StateStore {
         provider_id: Uuid,
         expected_revision: u64,
     ) -> Result<Result<ActivationPreparation, ActionFailure>, StateError> {
+        self.prepare_activation_for(Target::Codex, provider_id, expected_revision)
+            .await
+    }
+
+    pub async fn prepare_activation_for(
+        &self,
+        target: Target,
+        provider_id: Uuid,
+        expected_revision: u64,
+    ) -> Result<Result<ActivationPreparation, ActionFailure>, StateError> {
         let service_epoch = self.service_epoch.clone();
         self.connection
             .call(move |connection| -> Result<Result<ActivationPreparation, ActionFailure>, StateError> {
@@ -274,9 +290,10 @@ impl StateStore {
                                 r.route_port, r.routing_credential, r.activated_snapshot_id,
                                 s.id, s.base_url, s.model, s.provider_bearer_token
                          FROM target_route_state r
-                         LEFT JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
-                         WHERE r.target = 'codex'",
-                        [],
+                         LEFT JOIN activated_snapshots s
+                           ON s.id = r.activated_snapshot_id AND s.target = r.target
+                         WHERE r.target = ?1",
+                        [target.as_str()],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
                             row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?,
                             row.get(9)?)),
@@ -284,12 +301,24 @@ impl StateStore {
                 let failure = |code: &str, message: &str| -> ActionFailure {
                     ActionFailure {
                         problem: ControlProblem { code: code.to_owned(), message: message.to_owned() },
-                        authoritative_view: project_target_view(connection, &service_epoch)
-                            .unwrap_or_else(|_| empty_target_view(&service_epoch)),
+                        authoritative_view: project_target_view_for(connection, &service_epoch, target)
+                            .unwrap_or_else(|_| crate::domain::view::empty_target_view_for(&service_epoch, target)),
                     }
                 };
                 if recovery_state == "recovery-required" {
                     return Ok(Err(failure("recovery-required", "Managed writes are blocked until recovery is resolved")));
+                }
+                let drifted: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM target_problems
+                     WHERE target = ?1 AND code = 'configuration-drift')",
+                    [target.as_str()],
+                    |row| row.get(0),
+                )?;
+                if drifted {
+                    return Ok(Err(failure(
+                        "configuration-drift",
+                        "Managed configuration drift must be reconciled",
+                    )));
                 }
                 if revision != expected_revision {
                     return Ok(Err(failure("stale-revision", "Target state changed; refresh and retry")));
@@ -339,8 +368,8 @@ impl StateStore {
                 let provider = connection.query_row(
                     "SELECT p.base_url, p.model, c.bearer_token, p.protocol, p.authentication, p.routing_requirement
                      FROM providers p LEFT JOIN credentials c ON c.id = p.credential_id
-                     WHERE p.id = ?1 AND p.target = 'codex'",
-                    [provider_id.to_string()],
+                     WHERE p.id = ?1 AND p.target = ?2",
+                    params![provider_id.to_string(), target.as_str()],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?, row.get::<_, String>(5)?)),
@@ -372,7 +401,7 @@ impl StateStore {
                     "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
                     _ => return Err(StateError::InvalidActivatedSnapshot),
                 };
-                if !has_valid_provider_declaration(Target::Codex, protocol, authentication) {
+                if !has_valid_provider_declaration(target, protocol, authentication) {
                     return Ok(Err(failure(
                         "incomplete-provider",
                         "Provider is missing or incomplete",
@@ -406,6 +435,36 @@ impl StateStore {
         config_path: String,
         capability_problem: Option<ControlProblem>,
     ) -> Result<ActivationCommit, StateError> {
+        self.commit_activation_for(
+            Target::Codex,
+            action_id,
+            expected_revision,
+            snapshot,
+            runtime,
+            recovery_id,
+            config_path,
+            capability_problem,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_activation_for(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        expected_revision: u64,
+        snapshot: ActivatedSnapshot,
+        runtime: ActivationRuntime,
+        recovery_id: Uuid,
+        config_path: String,
+        capability_problem: Option<ControlProblem>,
+    ) -> Result<ActivationCommit, StateError> {
+        if snapshot.target != target
+            || !has_valid_provider_declaration(target, snapshot.protocol, snapshot.authentication)
+        {
+            return Err(StateError::InvalidActivatedSnapshot);
+        }
         let service_epoch = self.service_epoch.clone();
         let (takeover_state, route_port, routing_credential) = match runtime {
             ActivationRuntime::Direct => ("inactive", None, None),
@@ -424,8 +483,8 @@ impl StateStore {
                 tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
             )?;
             let recorded = transaction.query_row(
-                "SELECT outcome_json FROM action_receipts WHERE target = 'codex' AND action_id = ?1",
-                [action_id.to_string()],
+                "SELECT outcome_json FROM action_receipts WHERE target = ?1 AND action_id = ?2",
+                params![target.as_str(), action_id.to_string()],
                 |row| row.get::<_, String>(0),
             );
             match recorded {
@@ -438,28 +497,28 @@ impl StateStore {
                 Err(error) => return Err(StateError::Sqlite(error)),
             }
             let (revision, recovery_state): (u64, String) = transaction.query_row(
-                "SELECT management_revision, recovery_state FROM target_route_state WHERE target = 'codex'",
-                [],
+                "SELECT management_revision, recovery_state FROM target_route_state WHERE target = ?1",
+                [target.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             if recovery_state == "recovery-required" {
-                return Ok(ActivationCommit::RecoveryRequired(project_target_view(&transaction, &service_epoch)?));
+                return Ok(ActivationCommit::RecoveryRequired(project_target_view_for(&transaction, &service_epoch, target)?));
             }
             if revision != expected_revision {
-                return Ok(ActivationCommit::Stale(project_target_view(&transaction, &service_epoch)?));
+                return Ok(ActivationCommit::Stale(project_target_view_for(&transaction, &service_epoch, target)?));
             }
             transaction.execute(
                 "INSERT INTO activated_snapshots
                  (id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch)
-                 VALUES (?1, 'codex', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![snapshot.id.to_string(), snapshot.provider_id.to_string(), snapshot.base_url,
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![snapshot.id.to_string(), target.as_str(), snapshot.provider_id.to_string(), snapshot.base_url,
                     snapshot.model, snapshot.protocol.to_string(), snapshot.authentication.to_string(),
                     provider_credential, snapshot.epoch.to_string()],
             )?;
             let changed = transaction.execute(
                 "UPDATE activation_recovery SET state = 'committed'
-                 WHERE id = ?1 AND state = 'pending'",
-                [recovery_id.to_string()],
+                 WHERE id = ?1 AND target = ?2 AND action_id = ?3 AND state = 'pending'",
+                params![recovery_id.to_string(), target.as_str(), action_id.to_string()],
             )?;
             if changed != 1 {
                 return Err(StateError::MissingRecoveryIntent);
@@ -473,29 +532,29 @@ impl StateStore {
                     takeover_state = ?2, route_port = ?3,
                     routing_credential = ?4, activated_snapshot_id = ?5,
                     managed_config_path = ?6, recovery_state = 'clean'
-                 WHERE target = 'codex'",
+                 WHERE target = ?7",
                 params![snapshot.provider_id.to_string(), takeover_state, route_port,
-                    routing_credential, snapshot.id.to_string(), config_path],
+                    routing_credential, snapshot.id.to_string(), config_path, target.as_str()],
             )?;
             transaction.execute(
                 "DELETE FROM target_problems
-                 WHERE target = 'codex' AND code = 'untested-target-cli'",
-                [],
+                 WHERE target = ?1 AND code = 'untested-target-cli'",
+                [target.as_str()],
             )?;
             if let Some(problem) = capability_problem {
                 transaction.execute(
                     "INSERT INTO target_problems (target, code, message)
-                     VALUES ('codex', ?1, ?2)",
-                    params![problem.code, problem.message],
+                     VALUES (?1, ?2, ?3)",
+                    params![target.as_str(), problem.code, problem.message],
                 )?;
             }
-            let view = project_target_view(&transaction, &service_epoch)?;
+            let view = project_target_view_for(&transaction, &service_epoch, target)?;
             let outcome = ActionOutcome { status: ActionStatus::Applied, view };
             let json = serde_json::to_string(&outcome)?;
             transaction.execute(
                 "INSERT INTO action_receipts (target, action_id, action_kind, committed_revision, outcome_json)
-                 VALUES ('codex', ?1, 'activate-provider', ?2, ?3)",
-                params![action_id.to_string(), outcome.view.management_revision, json],
+                 VALUES (?1, ?2, 'activate-provider', ?3, ?4)",
+                params![target.as_str(), action_id.to_string(), outcome.view.management_revision, json],
             )?;
             transaction.commit()?;
             Ok(ActivationCommit::Applied(outcome))
@@ -504,6 +563,50 @@ impl StateStore {
 
     pub(crate) fn publish_target_view(&self, view: TargetView) {
         let _ = self.target_views.send(view);
+    }
+
+    pub async fn mark_configuration_drift_for(&self, target: Target) -> Result<(), StateError> {
+        self.connection
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                let inserted = transaction.execute(
+                    "INSERT OR IGNORE INTO target_problems (target, code, message)
+                     VALUES (?1, 'configuration-drift',
+                       'Managed configuration drift must be reconciled')",
+                    [target.as_str()],
+                )?;
+                if inserted == 1 {
+                    transaction.execute(
+                        "UPDATE target_route_state
+                         SET view_sequence = view_sequence + 1 WHERE target = ?1",
+                        [target.as_str()],
+                    )?;
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    pub async fn service_lifecycle_required(&self) -> Result<bool, StateError> {
+        self.connection
+            .call(|connection| {
+                connection.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM target_route_state
+                       WHERE takeover_state = 'active' OR recovery_state = 'recovery-required'
+                       UNION ALL
+                       SELECT 1 FROM activation_recovery WHERE state = 'pending'
+                       UNION ALL
+                       SELECT 1 FROM target_problems WHERE code = 'configuration-drift'
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .map_err(map_call_error)
     }
 
     pub async fn routing_credential(&self) -> Result<Option<SecretString>, StateError> {
@@ -707,17 +810,26 @@ impl StateStore {
             }
         }
 
-        if !matches!(
-            self.managed_write_status_for(target).await,
-            Ok(super::recovery::ManagedWriteStatus::Allowed)
-        ) {
-            return Err(self
-                .failure_for(
-                    target,
-                    "recovery-required",
-                    "Managed writes are blocked until recovery is resolved",
-                )
-                .await);
+        match self.managed_write_status_for(target).await {
+            Ok(super::recovery::ManagedWriteStatus::Allowed) => {}
+            Ok(super::recovery::ManagedWriteStatus::ConfigurationDrift) => {
+                return Err(self
+                    .failure_for(
+                        target,
+                        "configuration-drift",
+                        "Managed configuration drift must be reconciled",
+                    )
+                    .await);
+            }
+            Ok(super::recovery::ManagedWriteStatus::RecoveryRequired) | Err(_) => {
+                return Err(self
+                    .failure_for(
+                        target,
+                        "recovery-required",
+                        "Managed writes are blocked until recovery is resolved",
+                    )
+                    .await);
+            }
         }
 
         let (action, action_kind) = match serde_json::from_value(raw_action) {
@@ -964,10 +1076,6 @@ impl StateStore {
         };
         self.apply_provider_action(action_id, expected_revision, raw_action)
             .await
-    }
-
-    pub(crate) async fn failure(&self, code: &str, message: &str) -> ActionFailure {
-        self.failure_for(Target::Codex, code, message).await
     }
 
     pub(crate) async fn failure_for(

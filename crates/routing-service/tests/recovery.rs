@@ -814,6 +814,60 @@ async fn claude_pending_desired_state_is_restored_and_marked_rolled_back() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn control_server_reconciles_claude_pending_before_accepting_sessions() {
+    use muxvia_routing::control::server::ControlServer;
+    use std::sync::Arc;
+
+    let root = TempDir::new().unwrap();
+    let codec = ClaudeConfigCodec::for_user_home(root.path()).unwrap();
+    fs::create_dir_all(codec.settings_path().parent().unwrap()).unwrap();
+    fs::write(
+        codec.settings_path(),
+        r#"{"permissions":{"allow":["Read"]}}"#,
+    )
+    .unwrap();
+    let home = MuxviaHome::from_user_home(root.path());
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    let intent = RecoveryIntent::pending_claude(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        codec.settings_path().to_owned(),
+        codec.inspect().unwrap(),
+        codec.desired_takeover("claude-test", "http://127.0.0.1:43124", "routing-secret"),
+        0,
+    );
+    store.insert_recovery_intent(&intent).await.unwrap();
+    codec
+        .atomic_apply(
+            intent.claude_before().unwrap(),
+            intent.claude_desired().unwrap(),
+        )
+        .unwrap();
+
+    let handle = ControlServer::bind(&home, Arc::clone(&store), "test")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .recovery_intent(intent.id())
+            .await
+            .unwrap()
+            .unwrap()
+            .state(),
+        RecoveryState::RolledBack
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(codec.settings_path()).unwrap())
+            .unwrap(),
+        serde_json::json!({"permissions":{"allow":["Read"]}})
+    );
+    assert_eq!(store.target_view().await.unwrap().recovery.state, "clean");
+    handle.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn claude_pending_third_state_marks_only_claude_recovery_required() {
     let root = TempDir::new().unwrap();

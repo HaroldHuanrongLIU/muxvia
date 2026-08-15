@@ -14,10 +14,14 @@ use axum::{
 };
 use futures_util::stream;
 use muxvia_routing::{
+    claude::{ClaudeCapability, ClaudeProbe, ClaudeProblem},
     codex::{CodexCapability, CodexProbe, CodexProblem, CommandCodexProbe},
     control::{
         framing::{read_frame, write_frame},
-        protocol::{ActionStatus, ActivationMode},
+        protocol::{
+            ActionStatus, ActivationMode, ClaudeHostManagedState, ClaudePreflightContext,
+            ClaudeSelectorState, Target,
+        },
         server::ControlServer,
     },
     home::MuxviaHome,
@@ -29,6 +33,7 @@ use muxvia_routing::{
     state::StateStore,
 };
 use tempfile::TempDir;
+use tokio::sync::Notify;
 use tokio_rusqlite::rusqlite::OptionalExtension;
 use toml_edit::DocumentMut;
 use uuid::Uuid;
@@ -63,6 +68,17 @@ impl CodexProbe for BadProbe {
     }
 }
 
+struct GoodClaudeProbe(AtomicUsize);
+
+impl ClaudeProbe for GoodClaudeProbe {
+    fn probe(&self, _: &Path) -> Result<ClaudeCapability, ClaudeProblem> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(ClaudeCapability::Tested {
+            version: "test".into(),
+        })
+    }
+}
+
 struct NoopUpstream;
 
 #[async_trait]
@@ -77,6 +93,40 @@ struct SuccessfulUpstream;
 #[async_trait]
 impl UpstreamTransport for SuccessfulUpstream {
     async fn send(&self, _: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
+        Ok(UpstreamResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Box::pin(stream::once(async { Ok(Bytes::from_static(b"ok")) })),
+        })
+    }
+}
+
+#[derive(Default)]
+struct PinningUpstream {
+    calls: AtomicUsize,
+    models: Mutex<Vec<String>>,
+    first_started: Notify,
+    release_first: Notify,
+}
+
+#[async_trait]
+impl UpstreamTransport for PinningUpstream {
+    async fn send(&self, request: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
+        let body: serde_json::Value = serde_json::from_slice(
+            request
+                .body
+                .as_bytes()
+                .expect("Messages activation route rebuilds a buffered identity body"),
+        )
+        .unwrap();
+        self.models
+            .lock()
+            .unwrap()
+            .push(body["model"].as_str().unwrap().to_owned());
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first_started.notify_one();
+            self.release_first.notified().await;
+        }
         Ok(UpstreamResponse {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
@@ -157,6 +207,42 @@ impl Fixture {
             Arc::new(NoopUpstream),
         )
         .with_hooks(hooks)
+    }
+
+    fn dual_service(
+        &self,
+        hooks: ActivationHooks,
+        claude_probe: Arc<GoodClaudeProbe>,
+    ) -> ActivationService {
+        self.service(hooks)
+            .with_claude_runtime(claude_probe, "/usr/bin/claude".into())
+    }
+
+    async fn save_claude(&self, name: &str, model: &str, secret: &str) -> (Uuid, u64) {
+        let result = self
+            .store
+            .apply_provider_action_for(
+                Target::Claude,
+                Uuid::new_v4(),
+                self.store
+                    .target_view_for(Target::Claude)
+                    .await
+                    .unwrap()
+                    .management_revision,
+                serde_json::json!({
+                    "kind": "create-provider", "name": name,
+                    "baseUrl": "https://api.anthropic.test", "model": model,
+                    "credential": { "kind": "replace", "value": secret },
+                    "authentication": "anthropic-api-key",
+                    "presetKey": null,
+                }),
+            )
+            .await
+            .unwrap();
+        (
+            result.view.providers.last().unwrap().id,
+            result.view.management_revision,
+        )
     }
 
     async fn mutate_provider(&self, provider_id: Uuid, base_url: &str, model: &str) {
@@ -393,6 +479,442 @@ fn takeover_action(provider_id: Uuid) -> serde_json::Value {
         "providerId": provider_id,
         "mode": "takeover",
     })
+}
+
+fn claude_context(home: &MuxviaHome) -> ClaudePreflightContext {
+    ClaudePreflightContext {
+        claude_config_dir: None,
+        selector_state: ClaudeSelectorState::Unset,
+        host_managed_state: ClaudeHostManagedState::Unmanaged,
+        cwd: home.user_home().to_string_lossy().into_owned(),
+    }
+}
+
+#[tokio::test]
+async fn claude_takeover_commits_one_target_native_snapshot_and_leaves_codex_unchanged() {
+    let fixture = Fixture::new().await;
+    let codex_before = fixture.store.target_view().await.unwrap();
+    let codex_file_before = fs::read(fixture.home.user_home().join(".codex/config.toml")).ok();
+    let (provider_id, revision) = fixture
+        .save_claude("Claude", "claude-sonnet-test", "provider-secret")
+        .await;
+    let probe = Arc::new(GoodClaudeProbe(AtomicUsize::new(0)));
+    let service = fixture.dual_service(ActivationHooks::default(), probe.clone());
+    let mut updates = fixture.store.subscribe_target_views();
+
+    let outcome = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            revision,
+            takeover_action(provider_id),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ActionStatus::Applied);
+    assert_eq!(outcome.view.target, Target::Claude);
+    assert_eq!(outcome.view.mode, "takeover");
+    assert_eq!(
+        outcome.view.current_provider_id,
+        Some(provider_id.to_string())
+    );
+    assert_eq!(
+        outcome.view.activated_snapshot.as_ref().unwrap().model,
+        "claude-sonnet-test"
+    );
+    assert_eq!(
+        outcome
+            .view
+            .activated_snapshot
+            .as_ref()
+            .unwrap()
+            .protocol
+            .to_string(),
+        "anthropic-messages"
+    );
+    assert_eq!(probe.0.load(Ordering::SeqCst), 1);
+    assert!(service.model_endpoint_for(Target::Claude).await.is_some());
+    assert!(service.model_endpoint().await.is_none());
+    assert_eq!(updates.recv().await.unwrap(), outcome.view);
+    assert!(updates.try_recv().is_err());
+    assert_eq!(fixture.store.target_view().await.unwrap(), codex_before);
+    assert_eq!(
+        fs::read(fixture.home.user_home().join(".codex/config.toml")).ok(),
+        codex_file_before
+    );
+}
+
+#[tokio::test]
+async fn claude_direct_is_receipt_first_but_rejected_before_probe_file_or_runtime_work() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture
+        .save_claude("Claude", "claude-sonnet-test", "provider-secret")
+        .await;
+    let probe = Arc::new(GoodClaudeProbe(AtomicUsize::new(0)));
+    let service = fixture.dual_service(ActivationHooks::default(), probe.clone());
+    let before = fixture.mutation_fingerprint().await;
+    let settings = fixture.home.user_home().join(".claude/settings.json");
+
+    let failure = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            revision,
+            direct_action(provider_id),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.problem.code, "unsupported-activation-mode");
+    assert_eq!(probe.0.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.mutation_fingerprint().await, before);
+    assert!(!settings.exists());
+    assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+}
+
+#[tokio::test]
+async fn claude_provisional_and_post_intent_faults_release_runtime_and_restore_exact_settings() {
+    for (failpoint, expects_intent) in [
+        (ActivationFailpoint::BindListener, false),
+        (ActivationFailpoint::PersistRoutingCredential, false),
+        (ActivationFailpoint::Snapshot, false),
+        (ActivationFailpoint::RecoveryIntent, true),
+        (ActivationFailpoint::AtomicConfigWrite, true),
+        (ActivationFailpoint::ConfigVerify, true),
+        (ActivationFailpoint::FinalCommit, true),
+    ] {
+        let fixture = Fixture::new().await;
+        let settings_home = fixture.home.user_home().join(".claude");
+        fs::create_dir_all(&settings_home).unwrap();
+        let settings_path = settings_home.join("settings.json");
+        let before = br#"{"permissions":{"allow":["Read"]}}"#;
+        let before_value: serde_json::Value = serde_json::from_slice(before).unwrap();
+        fs::write(&settings_path, before).unwrap();
+        let (provider_id, revision) = fixture
+            .save_claude("Claude", "claude-sonnet-test", "provider-secret")
+            .await;
+        let codex_before = fixture.store.target_view().await.unwrap();
+        let service = fixture.dual_service(
+            ActivationHooks::failing(failpoint),
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+        );
+        let action_id = Uuid::new_v4();
+
+        let failure = service
+            .apply_raw_for_with_context(
+                Target::Claude,
+                action_id,
+                revision,
+                takeover_action(provider_id),
+                Some(&claude_context(&fixture.home)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            failure.problem.code.as_str(),
+            "configuration-write-failed" | "internal-failure"
+        ));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&settings_path).unwrap())
+                .unwrap(),
+            before_value,
+            "{failpoint:?}"
+        );
+        assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+        assert!(
+            fixture
+                .store
+                .routing_credential_for(Target::Claude)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .activated_snapshot_for(Target::Claude)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let intent = fixture
+            .store
+            .recovery_intent_for(Target::Claude, action_id)
+            .await
+            .unwrap();
+        assert_eq!(intent.is_some(), expects_intent, "{failpoint:?}");
+        if let Some(intent) = intent {
+            assert_eq!(
+                intent.state(),
+                muxvia_routing::state::RecoveryState::RolledBack
+            );
+        }
+        assert_eq!(fixture.store.target_view().await.unwrap(), codex_before);
+    }
+}
+
+#[tokio::test]
+async fn claude_unverifiable_restore_marks_only_claude_recovery_required() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture
+        .save_claude("Claude", "claude-test", "provider-secret")
+        .await;
+    let service = fixture.dual_service(
+        ActivationHooks::failing(ActivationFailpoint::RestoreVerify),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+
+    let failure = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            revision,
+            takeover_action(provider_id),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.problem.code, "recovery-required");
+    assert_eq!(
+        fixture
+            .store
+            .target_view_for(Target::Claude)
+            .await
+            .unwrap()
+            .recovery
+            .state,
+        "recovery-required"
+    );
+    assert_eq!(
+        fixture.store.target_view().await.unwrap().recovery.state,
+        "clean"
+    );
+    assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+}
+
+#[tokio::test]
+async fn claude_publication_failure_keeps_the_commit_and_replay_is_side_effect_free() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture
+        .save_claude("Claude", "claude-sonnet-test", "provider-secret")
+        .await;
+    let service = fixture.dual_service(
+        ActivationHooks::failing(ActivationFailpoint::PublishView),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let mut updates = fixture.store.subscribe_target_views();
+    let action_id = Uuid::new_v4();
+
+    let applied = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            action_id,
+            revision,
+            takeover_action(provider_id),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(applied.status, ActionStatus::Applied);
+    assert!(updates.try_recv().is_err());
+    assert_eq!(
+        fixture.store.target_view_for(Target::Claude).await.unwrap(),
+        applied.view
+    );
+    assert!(service.model_endpoint_for(Target::Claude).await.is_some());
+    let replay = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            action_id,
+            0,
+            serde_json::json!({"malformed": true}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status, ActionStatus::Replayed);
+    assert_eq!(replay.view, applied.view);
+    assert!(updates.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn claude_hot_switch_reuses_runtime_and_pins_in_flight_then_next_request_snapshots() {
+    let fixture = Fixture::new().await;
+    let upstream = Arc::new(PinningUpstream::default());
+    let service = ActivationService::new(
+        Arc::clone(&fixture.store),
+        fixture.home.clone(),
+        fixture.probe.clone(),
+        "/usr/bin/codex".into(),
+        upstream.clone(),
+    )
+    .with_claude_runtime(
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+        "/usr/bin/claude".into(),
+    );
+    let (first_id, revision) = fixture
+        .save_claude("First", "claude-first", "first-provider-secret")
+        .await;
+    let first = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            revision,
+            takeover_action(first_id),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    let endpoint = first.view.takeover.endpoint.clone().unwrap();
+    let credential = fixture
+        .store
+        .routing_credential_for(Target::Claude)
+        .await
+        .unwrap()
+        .unwrap();
+    let credential_value = secrecy::ExposeSecret::expose_secret(&credential).to_owned();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let old_request = {
+        let client = client.clone();
+        let endpoint = endpoint.clone();
+        let credential = credential_value.clone();
+        tokio::spawn(async move {
+            client
+                .post(format!("{endpoint}/v1/messages"))
+                .bearer_auth(credential)
+                .header("content-type", "application/json")
+                .body(r#"{"model":"client-old","messages":[]}"#)
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+    upstream.first_started.notified().await;
+
+    let (second_id, second_revision) = fixture
+        .save_claude("Second", "claude-second", "second-provider-secret")
+        .await;
+    let second = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            second_revision,
+            takeover_action(second_id),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second.view.takeover.endpoint.as_deref(),
+        Some(endpoint.as_str())
+    );
+    let credential_was_reused = secrecy::ExposeSecret::expose_secret(
+        &fixture
+            .store
+            .routing_credential_for(Target::Claude)
+            .await
+            .unwrap()
+            .unwrap(),
+    ) == credential_value;
+    assert!(
+        credential_was_reused,
+        "Claude hot switch changed its stable Routing Credential"
+    );
+    let new_response = client
+        .post(format!("{endpoint}/v1/messages"))
+        .bearer_auth(&credential_value)
+        .header("content-type", "application/json")
+        .body(r#"{"model":"client-new","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(new_response.status(), StatusCode::OK);
+    upstream.release_first.notify_one();
+    assert_eq!(old_request.await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        upstream.models.lock().unwrap().as_slice(),
+        ["claude-first", "claude-second"]
+    );
+    assert_eq!(fixture.count("activated_snapshots").await, 2);
+}
+
+#[tokio::test]
+async fn claude_listener_credential_and_snapshot_remain_provisional_until_database_commit() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture
+        .save_claude("Claude", "claude-test", "provider-secret")
+        .await;
+    let pause = Arc::new(ActivationPause::default());
+    let service = Arc::new(fixture.dual_service(
+        ActivationHooks::pausing_final_commit(pause.clone()),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    ));
+    let context = claude_context(&fixture.home);
+    let activation = {
+        let service = Arc::clone(&service);
+        tokio::spawn(async move {
+            service
+                .apply_raw_for_with_context(
+                    Target::Claude,
+                    Uuid::new_v4(),
+                    revision,
+                    takeover_action(provider_id),
+                    Some(&context),
+                )
+                .await
+        })
+    };
+    pause.wait_until_reached().await;
+
+    assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+    assert!(
+        fixture
+            .store
+            .routing_credential_for(Target::Claude)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .store
+            .activated_snapshot_for(Target::Claude)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let settings: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.home.user_home().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    let endpoint = settings["env"]["ANTHROPIC_BASE_URL"].as_str().unwrap();
+    let credential = settings["env"]["ANTHROPIC_AUTH_TOKEN"].as_str().unwrap();
+    let attempted = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{endpoint}/v1/messages"))
+        .bearer_auth(credential)
+        .header("content-type", "application/json")
+        .body(r#"{"messages":[]}"#)
+        .send();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), attempted)
+            .await
+            .is_err(),
+        "a provisional Claude listener served before the database commit"
+    );
+
+    pause.release();
+    let applied = activation.await.unwrap().unwrap();
+    assert_eq!(applied.status, ActionStatus::Applied);
+    assert!(service.model_endpoint_for(Target::Claude).await.is_some());
 }
 
 async fn assert_direct_pre_mutation_failure(
@@ -1729,6 +2251,288 @@ async fn occupied_committed_port_blocks_production_bootstrap_before_control_sock
     );
     assert!(!fixture.home.root().join("run/control.sock").exists());
     drop(occupied);
+}
+
+#[tokio::test]
+async fn occupied_claude_port_closes_dual_bootstrap_before_control_socket_and_drains_codex() {
+    let fixture = Fixture::new().await;
+    let (codex_provider, codex_revision) = fixture.save("Codex", "gpt-test", "secret").await;
+    let (claude_provider, claude_revision) =
+        fixture.save_claude("Claude", "claude-test", "secret").await;
+    let first = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let codex = first
+        .activate(command(codex_provider, codex_revision, Uuid::new_v4()))
+        .await
+        .unwrap();
+    let claude = first
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            claude_revision,
+            takeover_action(claude_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    let codex_endpoint: std::net::SocketAddr = codex
+        .view
+        .takeover
+        .endpoint
+        .unwrap()
+        .trim_start_matches("http://")
+        .parse()
+        .unwrap();
+    let claude_endpoint: std::net::SocketAddr = claude
+        .view
+        .takeover
+        .endpoint
+        .unwrap()
+        .trim_start_matches("http://")
+        .parse()
+        .unwrap();
+    first.shutdown_models().await.unwrap();
+    let occupied = tokio::net::TcpListener::bind(claude_endpoint)
+        .await
+        .unwrap();
+    let second_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+    let second = Arc::new(
+        ActivationService::new(
+            Arc::clone(&second_store),
+            fixture.home.clone(),
+            fixture.probe.clone(),
+            "/usr/bin/codex".into(),
+            Arc::new(NoopUpstream),
+        )
+        .with_claude_runtime(
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+            "/usr/bin/claude".into(),
+        ),
+    );
+
+    assert!(
+        ControlServer::bind_with_activation(&fixture.home, second_store, "test", second)
+            .await
+            .is_err()
+    );
+    assert!(!fixture.home.root().join("run/control.sock").exists());
+    let rebound_codex = tokio::net::TcpListener::bind(codex_endpoint).await.unwrap();
+    drop(rebound_codex);
+    drop(occupied);
+}
+
+#[tokio::test]
+async fn startup_marks_only_claude_configuration_drift_and_resumes_clean_codex() {
+    let fixture = Fixture::new().await;
+    let (codex_provider, codex_revision) = fixture
+        .save("Codex", "gpt-test", "codex-provider-secret")
+        .await;
+    let (claude_provider, claude_revision) = fixture
+        .save_claude("Claude", "claude-test", "claude-provider-secret")
+        .await;
+    let first = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let codex_applied = first
+        .activate(command(codex_provider, codex_revision, Uuid::new_v4()))
+        .await
+        .unwrap();
+    let claude_applied = first
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            claude_revision,
+            takeover_action(claude_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    let codex_endpoint: std::net::SocketAddr = codex_applied
+        .view
+        .takeover
+        .endpoint
+        .unwrap()
+        .trim_start_matches("http://")
+        .parse()
+        .unwrap();
+    let claude_endpoint: std::net::SocketAddr = claude_applied
+        .view
+        .takeover
+        .endpoint
+        .unwrap()
+        .trim_start_matches("http://")
+        .parse()
+        .unwrap();
+    assert_ne!(codex_endpoint, claude_endpoint);
+    let routing_credentials_are_distinct = secrecy::ExposeSecret::expose_secret(
+        &fixture.store.routing_credential().await.unwrap().unwrap(),
+    ) != secrecy::ExposeSecret::expose_secret(
+        &fixture
+            .store
+            .routing_credential_for(Target::Claude)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert!(
+        routing_credentials_are_distinct,
+        "Codex and Claude Routing Credentials were not isolated"
+    );
+    first.shutdown_models().await.unwrap();
+
+    let settings_path = fixture.home.user_home().join(".claude/settings.json");
+    let mut drifted: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    drifted["env"]["ANTHROPIC_MODEL"] = serde_json::json!("operator-drift");
+    fs::write(&settings_path, serde_json::to_vec_pretty(&drifted).unwrap()).unwrap();
+    let drifted_before = fs::read(&settings_path).unwrap();
+
+    let second_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+    let second = Arc::new(
+        ActivationService::new(
+            Arc::clone(&second_store),
+            fixture.home.clone(),
+            fixture.probe.clone(),
+            "/usr/bin/codex".into(),
+            Arc::new(NoopUpstream),
+        )
+        .with_claude_runtime(
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+            "/usr/bin/claude".into(),
+        ),
+    );
+    let handle = ControlServer::bind_with_activation(
+        &fixture.home,
+        Arc::clone(&second_store),
+        "test",
+        Arc::clone(&second),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(second.model_endpoint().await, Some(codex_endpoint));
+    assert!(second.model_endpoint_for(Target::Claude).await.is_none());
+    assert_eq!(
+        second_store
+            .target_view_for(Target::Claude)
+            .await
+            .unwrap()
+            .managed_configuration
+            .state,
+        "configuration-drift"
+    );
+    assert_eq!(fs::read(&settings_path).unwrap(), drifted_before);
+    let unbound = tokio::net::TcpListener::bind(claude_endpoint)
+        .await
+        .unwrap();
+    drop(unbound);
+    handle.shutdown().await.unwrap();
+    second.shutdown_models().await.unwrap();
+}
+
+#[tokio::test]
+async fn startup_keeps_claude_recovery_control_only_while_resuming_clean_codex() {
+    let fixture = Fixture::new().await;
+    let (codex_provider, codex_revision) = fixture
+        .save("Codex", "gpt-test", "codex-provider-secret")
+        .await;
+    let (claude_provider, claude_revision) = fixture
+        .save_claude("Claude", "claude-test", "claude-provider-secret")
+        .await;
+    let first = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let codex = first
+        .activate(command(codex_provider, codex_revision, Uuid::new_v4()))
+        .await
+        .unwrap();
+    let claude_action = Uuid::new_v4();
+    let claude = first
+        .apply_raw_for_with_context(
+            Target::Claude,
+            claude_action,
+            claude_revision,
+            takeover_action(claude_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    let codex_endpoint: std::net::SocketAddr = codex
+        .view
+        .takeover
+        .endpoint
+        .unwrap()
+        .trim_start_matches("http://")
+        .parse()
+        .unwrap();
+    let claude_endpoint: std::net::SocketAddr = claude
+        .view
+        .takeover
+        .endpoint
+        .unwrap()
+        .trim_start_matches("http://")
+        .parse()
+        .unwrap();
+    first.shutdown_models().await.unwrap();
+    let claude_intent = fixture
+        .store
+        .recovery_intent_for(Target::Claude, claude_action)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .set_recovery_state(
+            claude_intent.id(),
+            muxvia_routing::state::RecoveryState::RecoveryRequired,
+        )
+        .await
+        .unwrap();
+
+    let second_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+    let second = Arc::new(
+        ActivationService::new(
+            Arc::clone(&second_store),
+            fixture.home.clone(),
+            fixture.probe.clone(),
+            "/usr/bin/codex".into(),
+            Arc::new(NoopUpstream),
+        )
+        .with_claude_runtime(
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+            "/usr/bin/claude".into(),
+        ),
+    );
+    let handle = ControlServer::bind_with_activation(
+        &fixture.home,
+        Arc::clone(&second_store),
+        "test",
+        Arc::clone(&second),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(second.model_endpoint().await, Some(codex_endpoint));
+    assert!(second.model_endpoint_for(Target::Claude).await.is_none());
+    assert_eq!(
+        second_store
+            .target_view_for(Target::Claude)
+            .await
+            .unwrap()
+            .recovery
+            .state,
+        "recovery-required"
+    );
+    let unbound = tokio::net::TcpListener::bind(claude_endpoint)
+        .await
+        .unwrap();
+    drop(unbound);
+    handle.shutdown().await.unwrap();
+    second.shutdown_models().await.unwrap();
 }
 
 #[tokio::test]

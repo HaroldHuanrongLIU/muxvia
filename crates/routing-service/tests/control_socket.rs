@@ -8,12 +8,17 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use muxvia_routing::{
+    claude::{ClaudeCapability, ClaudeProbe, ClaudeProblem},
+    codex::{CodexCapability, CodexProbe, CodexProblem},
     control::{
         framing::{FrameError, read_frame, write_frame},
         server::{ControlServer, peer_uid_matches},
     },
     home::MuxviaHome,
+    model::{UpstreamError, UpstreamRequest, UpstreamResponse, UpstreamTransport},
+    service::activate::ActivationService,
     state::StateStore,
 };
 use serde_json::{Value, json};
@@ -24,6 +29,35 @@ use tokio::{
     task::JoinHandle,
 };
 use uuid::Uuid;
+
+struct ControlCodexProbe;
+
+impl CodexProbe for ControlCodexProbe {
+    fn probe(&self, _: &Path) -> Result<CodexCapability, CodexProblem> {
+        Ok(CodexCapability::Tested {
+            version: "test".into(),
+        })
+    }
+}
+
+struct ControlClaudeProbe;
+
+impl ClaudeProbe for ControlClaudeProbe {
+    fn probe(&self, _: &Path) -> Result<ClaudeCapability, ClaudeProblem> {
+        Ok(ClaudeCapability::Tested {
+            version: "test".into(),
+        })
+    }
+}
+
+struct ControlNoopUpstream;
+
+#[async_trait]
+impl UpstreamTransport for ControlNoopUpstream {
+    async fn send(&self, _: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
+        Err(UpstreamError)
+    }
+}
 
 struct ControlFixture {
     root: PathBuf,
@@ -289,6 +323,88 @@ async fn request(stream: &mut UnixStream, request_id: &str, operation: Value) ->
     .await
     .unwrap();
     read_frame(stream).await.unwrap()
+}
+
+#[tokio::test]
+async fn claude_open_context_is_used_by_takeover_and_publishes_only_the_claude_session() {
+    let root = short_temp_root("mx-claude-act");
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    let activation = Arc::new(
+        ActivationService::new(
+            Arc::clone(&store),
+            home.clone(),
+            Arc::new(ControlCodexProbe),
+            "/usr/bin/codex".into(),
+            Arc::new(ControlNoopUpstream),
+        )
+        .with_claude_runtime(Arc::new(ControlClaudeProbe), "/usr/bin/claude".into()),
+    );
+    let handle =
+        ControlServer::bind_with_activation(&home, Arc::clone(&store), "routing-test", activation)
+            .await
+            .unwrap();
+    let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut stream).await;
+    let opened = request(
+        &mut stream,
+        "open",
+        json!({
+            "kind": "open-target", "target": "claude",
+            "claudeContext": {
+                "claudeConfigDir": null,
+                "selectorState": "unset",
+                "hostManagedState": "unmanaged",
+                "cwd": user_home
+            }
+        }),
+    )
+    .await;
+    assert_eq!(opened["result"]["view"]["target"], "claude");
+    let saved = request(
+        &mut stream,
+        "save",
+        json!({
+            "kind": "act", "target": "claude", "actionId": Uuid::new_v4(),
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-provider", "name": "Claude",
+                "baseUrl": "https://api.anthropic.test", "model": "claude-test",
+                "credential": {"kind": "replace", "value": "provider-secret"},
+                "authentication": "anthropic-api-key", "presetKey": null
+            }
+        }),
+    )
+    .await;
+    let provider_id = saved["result"]["outcome"]["view"]["providers"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        read_frame(&mut stream).await.unwrap()["view"]["target"],
+        "claude"
+    );
+
+    let applied = request(
+        &mut stream,
+        "activate",
+        json!({
+            "kind": "act", "target": "claude", "actionId": Uuid::new_v4(),
+            "expectedRevision": 1,
+            "action": {"kind": "activate-provider", "providerId": provider_id, "mode": "takeover"}
+        }),
+    )
+    .await;
+
+    assert_eq!(applied["result"]["outcome"]["status"], "applied");
+    let push = read_frame(&mut stream).await.unwrap();
+    assert_eq!(push["view"], applied["result"]["outcome"]["view"]);
+    assert_eq!(store.target_view().await.unwrap().management_revision, 0);
+    assert!(!format!("{opened}{saved}{applied}{push}").contains("provider-secret"));
+    handle.shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]

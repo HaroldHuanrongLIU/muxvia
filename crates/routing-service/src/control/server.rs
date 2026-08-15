@@ -18,6 +18,7 @@ use tokio::{
 };
 
 use crate::{
+    claude::ClaudeConfigCodec,
     codex::{CodexConfigCodec, CommandCodexProbe},
     control::{
         framing::{FrameError, read_frame, write_frame},
@@ -161,19 +162,30 @@ impl ControlServer {
         );
         let codec = CodexConfigCodec::for_user_home(home.user_home())
             .map_err(|_| ControlServerError::State)?;
-        let reconciliation = codec.reconcile_pending(&store).await;
-        match store
-            .managed_write_status()
-            .await
-            .map_err(|_| ControlServerError::State)?
-        {
-            ManagedWriteStatus::Allowed if reconciliation.is_ok() => activation
-                .bootstrap_committed_takeover()
+        let claude_codec = ClaudeConfigCodec::for_user_home(home.user_home())
+            .map_err(|_| ControlServerError::State)?;
+        let reconciliations = [
+            (Target::Codex, codec.reconcile_pending(&store).await.is_ok()),
+            (
+                Target::Claude,
+                claude_codec.reconcile_pending(&store).await.is_ok(),
+            ),
+        ];
+        for (target, reconciled) in reconciliations {
+            match store
+                .managed_write_status_for(target)
                 .await
-                .map_err(|_| ControlServerError::State)?,
-            ManagedWriteStatus::RecoveryRequired => {}
-            ManagedWriteStatus::Allowed => return Err(ControlServerError::State),
+                .map_err(|_| ControlServerError::State)?
+            {
+                ManagedWriteStatus::Allowed if reconciled => {}
+                ManagedWriteStatus::RecoveryRequired | ManagedWriteStatus::ConfigurationDrift => {}
+                ManagedWriteStatus::Allowed => return Err(ControlServerError::State),
+            }
         }
+        activation
+            .bootstrap_committed_takeovers()
+            .await
+            .map_err(|_| ControlServerError::State)?;
 
         let run_dir = home.root().join("run");
         fs::create_dir_all(&run_dir)?;
@@ -418,6 +430,7 @@ async fn serve_session(
     let (responses, response_rx) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
     let mut writer_task = tokio::spawn(write_responses(writer, response_rx));
     let mut opened_target = None;
+    let mut opened_claude_context = None;
     let mut update_rx = store.subscribe_target_views();
     let mut inspections = JoinSet::<InspectionCompletion>::new();
     let mut inspection_requests = std::collections::HashMap::<String, InspectionRequest>::new();
@@ -514,7 +527,7 @@ async fn serve_session(
                 }
 
                 match operation {
-                    ControlOperation::OpenTarget { target, .. } => {
+                    ControlOperation::OpenTarget { target, claude_context } => {
                         let Ok(view) = store.target_view_for(target).await else {
                             if !enqueue_response(&responses, problem_frame(Some(request_id), "state-store-error", "State store unavailable", None)) {
                                 break 'session;
@@ -522,6 +535,11 @@ async fn serve_session(
                             continue;
                         };
                         opened_target = Some(target);
+                        opened_claude_context = if target == Target::Claude {
+                            claude_context
+                        } else {
+                            None
+                        };
                         let response = ServerFrame::Response {
                             request_id,
                             result: ControlResult::TargetView { view },
@@ -531,7 +549,16 @@ async fn serve_session(
                     ControlOperation::Act { target, action_id, expected_revision, action } => {
                         lifecycle.pending_actions.fetch_add(1, Ordering::AcqRel);
                         let _action = ActionGuard(Arc::clone(&lifecycle));
-                        match activation.apply_raw_for(target, action_id, expected_revision, action).await {
+                        match activation
+                            .apply_raw_for_with_context(
+                                target,
+                                action_id,
+                                expected_revision,
+                                action,
+                                opened_claude_context.as_ref(),
+                            )
+                            .await
+                        {
                             Ok(outcome) => {
                                 let response = ServerFrame::Response {
                                     request_id,
@@ -740,7 +767,7 @@ async fn should_exit_idle(store: &StateStore, lifecycle: &ServerLifecycle) -> bo
     lifecycle.accepted.load(Ordering::Acquire)
         && lifecycle.active_sessions.load(Ordering::Acquire) == 0
         && lifecycle.pending_actions.load(Ordering::Acquire) == 0
-        && matches!(store.committed_takeover().await, Ok(None))
+        && matches!(store.service_lifecycle_required().await, Ok(false))
 }
 
 fn find_codex_executable() -> PathBuf {

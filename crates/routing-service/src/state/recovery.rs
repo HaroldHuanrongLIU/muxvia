@@ -25,6 +25,7 @@ pub enum RecoveryState {
 pub enum ManagedWriteStatus {
     Allowed,
     RecoveryRequired,
+    ConfigurationDrift,
 }
 
 impl RecoveryState {
@@ -447,6 +448,9 @@ impl StateStore {
     pub async fn ensure_managed_writes_allowed(&self) -> Result<(), crate::codex::CodexProblem> {
         match self.managed_write_status().await {
             Ok(ManagedWriteStatus::Allowed) => Ok(()),
+            Ok(ManagedWriteStatus::ConfigurationDrift) => {
+                Err(crate::codex::CodexProblem::new("configuration-drift", None))
+            }
             Ok(ManagedWriteStatus::RecoveryRequired) | Err(_) => {
                 Err(crate::codex::CodexProblem::new("recovery-required", None))
             }
@@ -464,12 +468,16 @@ impl StateStore {
         self.connection
             .call(
                 move |connection| -> Result<ManagedWriteStatus, StateError> {
-                    let state: String = connection.query_row(
-                        "SELECT recovery_state FROM target_route_state WHERE target = ?1",
+                    let (state, drifted): (String, bool) = connection.query_row(
+                        "SELECT r.recovery_state,
+                                EXISTS(SELECT 1 FROM target_problems p
+                                  WHERE p.target = r.target AND p.code = 'configuration-drift')
+                         FROM target_route_state r WHERE r.target = ?1",
                         [target.as_str()],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )?;
                     match state.as_str() {
+                        "clean" if drifted => Ok(ManagedWriteStatus::ConfigurationDrift),
                         "clean" => Ok(ManagedWriteStatus::Allowed),
                         "recovery-required" => Ok(ManagedWriteStatus::RecoveryRequired),
                         _ => Err(StateError::InvalidRecoveryState),

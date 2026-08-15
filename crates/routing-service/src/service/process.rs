@@ -11,6 +11,7 @@ use fs2::FileExt;
 use tokio::time::MissedTickBehavior;
 
 use crate::{
+    claude::CommandClaudeProbe,
     codex::{CodexProbe, CommandCodexProbe},
     control::server::{ControlServer, ControlServerError},
     home::MuxviaHome,
@@ -45,6 +46,7 @@ pub struct ProcessOptions {
     pub home: PathBuf,
     pub test_shutdown_file: Option<PathBuf>,
     pub codex_executable: PathBuf,
+    pub claude_executable: PathBuf,
     pub release: String,
 }
 
@@ -95,6 +97,7 @@ pub async fn run(options: ProcessOptions) -> Result<(), ProcessError> {
             options.codex_executable,
             upstream,
         )
+        .with_claude_runtime(Arc::new(CommandClaudeProbe), options.claude_executable)
         .with_configuration_home_override(std::env::var_os("CODEX_HOME").map(PathBuf::from)),
     );
     let mut control = ControlServer::bind_process(
@@ -118,7 +121,7 @@ pub async fn run(options: ProcessOptions) -> Result<(), ProcessError> {
     }
     control.shutdown().await?;
     activation
-        .shutdown_model()
+        .shutdown_models()
         .await
         .map_err(|_| ProcessError::State)?;
     Ok(())

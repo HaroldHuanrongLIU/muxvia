@@ -21,13 +21,6 @@ type RouteProjectionRow = (
     Option<String>,
 );
 
-pub(crate) fn project_target_view(
-    connection: &Connection,
-    service_epoch: &str,
-) -> Result<TargetView> {
-    project_target_view_for(connection, service_epoch, Target::Codex)
-}
-
 pub(crate) fn project_target_view_for(
     connection: &Connection,
     service_epoch: &str,
@@ -216,6 +209,9 @@ pub(crate) fn project_target_view_for(
             })
         })?
         .collect::<Result<Vec<_>>>()?;
+    let configuration_drift = problems
+        .iter()
+        .any(|problem| problem.code == "configuration-drift");
 
     Ok(TargetView {
         target,
@@ -240,6 +236,8 @@ pub(crate) fn project_target_view_for(
         managed_configuration: ManagedConfigurationView {
             state: if recovery_state == "recovery-required" {
                 recovery_state.clone()
+            } else if configuration_drift {
+                "configuration-drift".to_owned()
             } else if mode != "unmanaged" {
                 "applied".to_owned()
             } else {
@@ -265,10 +263,6 @@ fn conversion_error(
         tokio_rusqlite::rusqlite::types::Type::Text,
         Box::new(error),
     )
-}
-
-pub(crate) fn empty_target_view(service_epoch: &str) -> TargetView {
-    empty_target_view_for(service_epoch, Target::Codex)
 }
 
 pub(crate) fn empty_target_view_for(service_epoch: &str, target: Target) -> TargetView {

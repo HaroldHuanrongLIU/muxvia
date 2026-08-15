@@ -10,7 +10,15 @@ use std::{
 };
 
 use fs2::FileExt;
-use muxvia_routing::control::framing::{read_frame, write_frame};
+use muxvia_routing::{
+    claude::ClaudeConfigCodec,
+    control::{
+        framing::{read_frame, write_frame},
+        protocol::Target,
+    },
+    home::MuxviaHome,
+    state::{RecoveryIntent, RecoveryState, StateStore},
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
@@ -89,6 +97,19 @@ fn command(home: &Path, shutdown_file: &Path) -> Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
+}
+
+fn fake_cli(root: &Path, name: &str, version: &str) -> PathBuf {
+    let path = root.join(name);
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '{version}' ;;\n  --help) printf '%s\\n' 'Usage: {name}' ;;\n  *) exit 64 ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
 }
 
 async fn wait_for_socket(socket: &Path) {
@@ -259,6 +280,68 @@ async fn inactive_service_exits_after_its_last_accepted_session() {
 }
 
 #[tokio::test]
+async fn unresolved_claude_recovery_or_drift_keeps_control_only_process_alive() {
+    for state in ["recovery-required", "configuration-drift"] {
+        let root = TempDir::new().unwrap();
+        let user_home = root.path().join("home");
+        let home_path = user_home.join(".muxvia");
+        let shutdown_file = root.path().join(format!("shutdown-{state}"));
+        fs::create_dir_all(&user_home).unwrap();
+        let home = MuxviaHome::from_user_home(&user_home);
+        let store = StateStore::open(&home).await.unwrap();
+        if state == "recovery-required" {
+            let codec = ClaudeConfigCodec::for_user_home(&user_home).unwrap();
+            let intent = RecoveryIntent::pending_claude(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                codec.settings_path().to_owned(),
+                codec.inspect().unwrap(),
+                codec.desired_takeover("claude-test", "http://127.0.0.1:43124", "routing-secret"),
+                0,
+            );
+            store.insert_recovery_intent(&intent).await.unwrap();
+            store
+                .set_recovery_state(intent.id(), RecoveryState::RecoveryRequired)
+                .await
+                .unwrap();
+        } else {
+            store
+                .mark_configuration_drift_for(Target::Claude)
+                .await
+                .unwrap();
+        }
+        drop(store);
+
+        let mut child = command(&home_path, &shutdown_file).spawn().unwrap();
+        let socket = home_path.join("run/control.sock");
+        wait_for_socket(&socket).await;
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        hello(&mut stream).await;
+        request(
+            &mut stream,
+            "open",
+            json!({"kind":"open-target","target":"claude"}),
+        )
+        .await;
+        drop(stream);
+        assert!(
+            timeout(Duration::from_millis(200), child.wait())
+                .await
+                .is_err(),
+            "unresolved {state} did not retain control-only service lifetime"
+        );
+        fs::write(&shutdown_file, b"shutdown\n").unwrap();
+        assert!(
+            timeout(PROCESS_TIMEOUT, child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+#[tokio::test]
 async fn disconnected_pending_action_commits_before_inactive_exit() {
     let mut fixture = ProcessFixture::start().await;
     let mut stream = fixture.connect().await;
@@ -338,12 +421,153 @@ async fn explicit_test_shutdown_drains_sessions_and_removes_its_socket() {
 }
 
 #[tokio::test]
+async fn either_takeover_keeps_the_process_alive_and_shutdown_drains_both_routes_and_sessions() {
+    let root = TempDir::new().unwrap();
+    let user_home = root.path().join("home");
+    let home = user_home.join(".muxvia");
+    let shutdown_file = root.path().join("shutdown");
+    fs::create_dir_all(&user_home).unwrap();
+    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.106.0");
+    let claude = fake_cli(root.path(), "fake-claude", "2.1.37 (Claude Code)");
+    let mut child = command(&home, &shutdown_file)
+        .arg("--test-codex-executable")
+        .arg(codex)
+        .arg("--test-claude-executable")
+        .arg(claude)
+        .spawn()
+        .unwrap();
+    let socket = home.join("run/control.sock");
+    wait_for_socket(&socket).await;
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+    hello(&mut stream).await;
+    request(
+        &mut stream,
+        "open-claude",
+        json!({
+            "kind": "open-target", "target": "claude",
+            "claudeContext": {
+                "claudeConfigDir": null, "selectorState": "unset",
+                "hostManagedState": "unmanaged", "cwd": user_home
+            }
+        }),
+    )
+    .await;
+    let saved = request(
+        &mut stream,
+        "save-claude",
+        json!({
+            "kind": "act", "target": "claude", "actionId": Uuid::new_v4(),
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-provider", "name": "Claude",
+                "baseUrl": "https://api.anthropic.test", "model": "claude-test",
+                "credential": {"kind": "replace", "value": "provider-secret"},
+                "authentication": "anthropic-api-key", "presetKey": null
+            }
+        }),
+    )
+    .await;
+    read_frame(&mut stream).await.unwrap();
+    let provider_id = saved["result"]["outcome"]["view"]["providers"][0]["id"].clone();
+    let applied = request(
+        &mut stream,
+        "activate-claude",
+        json!({
+            "kind": "act", "target": "claude", "actionId": Uuid::new_v4(),
+            "expectedRevision": 1,
+            "action": {"kind": "activate-provider", "providerId": provider_id, "mode": "takeover"}
+        }),
+    )
+    .await;
+    read_frame(&mut stream).await.unwrap();
+    let endpoint: std::net::SocketAddr =
+        applied["result"]["outcome"]["view"]["takeover"]["endpoint"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("http://")
+            .parse()
+            .unwrap();
+    drop(stream);
+
+    let mut codex_stream = UnixStream::connect(&socket).await.unwrap();
+    hello(&mut codex_stream).await;
+    request(
+        &mut codex_stream,
+        "open-codex",
+        json!({"kind": "open-target", "target": "codex"}),
+    )
+    .await;
+    let codex_saved = request(
+        &mut codex_stream,
+        "save-codex",
+        json!({
+            "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-provider", "name": "Codex",
+                "baseUrl": "https://api.openai.test/v1", "model": "gpt-test",
+                "credential": {"kind": "replace", "value": "codex-provider-secret"},
+                "presetKey": null
+            }
+        }),
+    )
+    .await;
+    read_frame(&mut codex_stream).await.unwrap();
+    let codex_provider = codex_saved["result"]["outcome"]["view"]["providers"][0]["id"].clone();
+    let codex_applied = request(
+        &mut codex_stream,
+        "activate-codex",
+        json!({
+            "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
+            "expectedRevision": 1,
+            "action": {"kind": "activate-provider", "providerId": codex_provider, "mode": "takeover"}
+        }),
+    )
+    .await;
+    read_frame(&mut codex_stream).await.unwrap();
+    let codex_endpoint: std::net::SocketAddr =
+        codex_applied["result"]["outcome"]["view"]["takeover"]["endpoint"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("http://")
+            .parse()
+            .unwrap();
+    assert_ne!(endpoint, codex_endpoint);
+
+    assert!(
+        timeout(Duration::from_millis(200), child.wait())
+            .await
+            .is_err(),
+        "a committed Claude Takeover did not retain the Routing Service"
+    );
+    assert!(tokio::net::TcpStream::connect(endpoint).await.is_ok());
+    assert!(tokio::net::TcpStream::connect(codex_endpoint).await.is_ok());
+    fs::write(&shutdown_file, b"shutdown\n").unwrap();
+    assert!(
+        timeout(PROCESS_TIMEOUT, child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(!socket.exists());
+    assert!(read_frame(&mut codex_stream).await.is_err());
+    assert!(tokio::net::TcpStream::connect(endpoint).await.is_err());
+    assert!(
+        tokio::net::TcpStream::connect(codex_endpoint)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn test_only_options_are_hidden_and_reject_normal_invocation() {
     let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/muxvia-routing");
     let help = Command::new(&binary).arg("--help").output().await.unwrap();
     let help = String::from_utf8(help.stdout).unwrap();
     assert!(!help.contains("test-shutdown"));
     assert!(!help.contains("test-codex"));
+    assert!(!help.contains("test-claude"));
 
     let root = TempDir::new().unwrap();
     let output = Command::new(binary)

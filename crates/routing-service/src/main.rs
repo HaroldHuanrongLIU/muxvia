@@ -12,13 +12,19 @@ struct Args {
     test_shutdown_file: Option<PathBuf>,
     #[arg(long, hide = true)]
     test_codex_executable: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    test_claude_executable: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args = Args::parse();
     let integration = env::var("MUXVIA_INTEGRATION_TEST").as_deref() == Ok("1");
-    if !integration && (args.test_shutdown_file.is_some() || args.test_codex_executable.is_some()) {
+    if !integration
+        && (args.test_shutdown_file.is_some()
+            || args.test_codex_executable.is_some()
+            || args.test_claude_executable.is_some())
+    {
         eprintln!("test-only Routing Service options require integration invocation");
         std::process::exit(64);
     }
@@ -40,10 +46,15 @@ async fn main() {
         .test_codex_executable
         .or_else(find_codex_executable)
         .unwrap_or_else(|| PathBuf::from("/usr/bin/codex"));
+    let claude_executable = args
+        .test_claude_executable
+        .or_else(find_claude_executable)
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/claude"));
     let options = ProcessOptions {
         home,
         test_shutdown_file: args.test_shutdown_file,
         codex_executable,
+        claude_executable,
         release: env!("CARGO_PKG_VERSION").to_owned(),
     };
     if let Err(error) = run(options).await {
@@ -57,6 +68,16 @@ fn find_codex_executable() -> Option<PathBuf> {
         .and_then(|path| {
             env::split_paths(&path)
                 .map(|directory| directory.join("codex"))
+                .find(|candidate| candidate.is_file())
+        })
+        .and_then(|path| fs::canonicalize(path).ok())
+}
+
+fn find_claude_executable() -> Option<PathBuf> {
+    env::var_os("PATH")
+        .and_then(|path| {
+            env::split_paths(&path)
+                .map(|directory| directory.join("claude"))
                 .find(|candidate| candidate.is_file())
         })
         .and_then(|path| fs::canonicalize(path).ok())

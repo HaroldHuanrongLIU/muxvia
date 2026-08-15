@@ -7,7 +7,7 @@ const rpcSchema = z.object({
   minor: z.literal(0),
 })
 
-const targetSchema = z.literal("codex")
+const targetSchema = z.enum(["codex", "claude"])
 
 const controlProblemSchema = z.object({
   code: z.string(),
@@ -21,7 +21,8 @@ const providerViewSchema = z.object({
   name: z.string(),
   baseUrl: z.string(),
   model: z.string(),
-  protocol: z.literal("openai-responses"),
+  protocol: z.enum(["openai-responses", "anthropic-messages"]),
+  authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]),
   routingRequirement: z.enum(["direct-compatible", "takeover-required"]),
   credential: z.enum(["present", "missing"]),
   completeness: z.enum(["complete", "incomplete"]),
@@ -34,17 +35,29 @@ const providerViewSchema = z.object({
   activeReferences: z.array(z.enum(["current", "activated-snapshot"])),
 })
 
-const providerPresetSchema = z.object({
-  key: z.literal("openai-api-responses"),
-  baseUrl: z.literal("https://api.openai.com/v1"),
-  model: z.literal(""),
-  protocol: z.literal("openai-responses"),
-})
+const providerPresetSchema = z.discriminatedUnion("key", [
+  z.object({
+    key: z.literal("openai-api-responses"),
+    baseUrl: z.literal("https://api.openai.com/v1"),
+    model: z.literal(""),
+    protocol: z.literal("openai-responses"),
+    authentication: z.literal("openai-bearer"),
+  }),
+  z.object({
+    key: z.literal("anthropic-api-messages"),
+    baseUrl: z.literal("https://api.anthropic.com/v1"),
+    model: z.literal(""),
+    protocol: z.literal("anthropic-messages"),
+    authentication: z.literal("anthropic-api-key"),
+  }),
+])
 
 const activatedSnapshotSchema = z.object({
   id: z.string().uuid(),
   providerId: z.string().uuid(),
   model: z.string(),
+  protocol: z.enum(["openai-responses", "anthropic-messages"]),
+  authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]),
   epoch: z.string().uuid(),
 })
 
@@ -61,6 +74,7 @@ const targetViewSchema = z.object({
     state: z.string(),
     endpoint: z.string().nullable(),
   }),
+  routeHealth: z.object({ state: z.literal("unobserved") }),
   providers: z.array(providerViewSchema),
   providerPresets: z.array(providerPresetSchema),
   currentProviderId: z.string().nullable(),
@@ -120,7 +134,7 @@ const targetActionSchema = z.discriminatedUnion("kind", [
     baseUrl: z.string(),
     model: z.string(),
     credential: credentialEditSchema,
-    presetKey: z.literal("openai-api-responses").nullable().optional(),
+    presetKey: z.enum(["openai-api-responses", "anthropic-api-messages"]).nullable().optional(),
   }),
   z.object({
     kind: z.literal("update-provider"),

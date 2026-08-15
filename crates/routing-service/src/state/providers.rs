@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 use crate::{
     control::protocol::{
-        CredentialEdit, DuplicateCredential, ProviderPresetView, ProviderProtocol,
+        CredentialEdit, DuplicateCredential, ProviderAuthentication, ProviderPresetView,
+        ProviderProtocol,
     },
     domain::provider::normalize_provider_base_url,
 };
@@ -74,6 +75,7 @@ pub(crate) fn provider_presets() -> Vec<ProviderPresetView> {
         base_url: OPENAI_API_RESPONSES_BASE_URL.to_owned(),
         model: String::new(),
         protocol: ProviderProtocol::OpenaiResponses,
+        authentication: ProviderAuthentication::OpenaiBearer,
     }]
 }
 
@@ -327,9 +329,9 @@ fn create_provider(
         .execute(
             "INSERT INTO providers
              (id, target, position, provider_revision, name, base_url, model, protocol,
-              routing_requirement, credential_id, provenance_kind, provenance_key,
+              authentication, routing_requirement, credential_id, provenance_kind, provenance_key,
               generated_owner_id)
-             VALUES (?1, 'codex', ?2, 1, ?3, ?4, ?5, 'openai-responses',
+             VALUES (?1, 'codex', ?2, 1, ?3, ?4, ?5, 'openai-responses', 'openai-bearer',
                      'direct-compatible', ?6, ?7, ?8, NULL)",
             params![
                 Uuid::new_v4().to_string(),
@@ -410,9 +412,9 @@ fn duplicate_provider(
         .execute(
             "INSERT INTO providers
              (id, target, position, provider_revision, name, base_url, model, protocol,
-              routing_requirement, credential_id, provenance_kind, provenance_key,
+              authentication, routing_requirement, credential_id, provenance_kind, provenance_key,
               generated_owner_id)
-             VALUES (?1, 'codex', ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)",
+             VALUES (?1, 'codex', ?2, 1, ?3, ?4, ?5, ?6, 'openai-bearer', ?7, ?8, ?9, ?10, NULL)",
             params![
                 Uuid::new_v4().to_string(),
                 position,

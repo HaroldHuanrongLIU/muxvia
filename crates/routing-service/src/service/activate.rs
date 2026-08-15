@@ -388,6 +388,8 @@ impl ActivationService {
             provider_id: preparation.provider_id,
             base_url: preparation.base_url,
             model: preparation.model.clone(),
+            protocol: preparation.protocol,
+            authentication: preparation.authentication,
             provider_credential: preparation.provider_credential,
             epoch: self.store.service_epoch(),
         };

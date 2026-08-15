@@ -290,9 +290,9 @@ async fn routing_requirement_schema(home: &MuxviaHome) -> (i64, i64, Option<Stri
         .unwrap()
 }
 
-async fn assert_schema_v3_routing_requirement(home: &MuxviaHome) {
+async fn assert_schema_v4_routing_requirement(home: &MuxviaHome) {
     let (column_id, not_null, default_value, table_sql) = routing_requirement_schema(home).await;
-    assert_eq!(column_id, 12);
+    assert_eq!(column_id, 13);
     assert_eq!(not_null, 1);
     assert_eq!(default_value.as_deref(), Some("'direct-compatible'"));
     assert!(table_sql.contains("'direct-compatible', 'takeover-required'"));
@@ -415,7 +415,7 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
     drop(connection);
 
     let store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
-    assert_schema_v3_routing_requirement(&fixture.home).await;
+    assert_schema_v4_routing_requirement(&fixture.home).await;
     let view = store.target_view().await.unwrap();
 
     assert_eq!(
@@ -447,7 +447,7 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "3");
+    assert_eq!(schema_version, "4");
     assert_eq!(
         view.providers[0].id,
         Uuid::parse_str(existing_provider_id).unwrap()
@@ -547,7 +547,7 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
 }
 
 #[tokio::test]
-async fn v2_database_migrates_routing_requirement_and_historical_receipts() {
+async fn schema_v4_migrates_v2_routing_requirement_and_historical_receipts() {
     let fixture = StoreFixture::new();
     fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
     let provider_id = Uuid::parse_str("00000000-0000-4000-8000-000000000101").unwrap();
@@ -664,7 +664,7 @@ async fn v2_database_migrates_routing_requirement_and_historical_receipts() {
     drop(connection);
 
     let store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
-    assert_schema_v3_routing_requirement(&fixture.home).await;
+    assert_schema_v4_routing_requirement(&fixture.home).await;
     let schema_version = tokio_rusqlite::Connection::open(fixture.home.database_path())
         .await
         .unwrap()
@@ -677,7 +677,7 @@ async fn v2_database_migrates_routing_requirement_and_historical_receipts() {
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "3");
+    assert_eq!(schema_version, "4");
     assert_eq!(
         store.target_view().await.unwrap().providers[0].routing_requirement,
         ProviderRoutingRequirement::DirectCompatible
@@ -739,7 +739,7 @@ async fn v2_database_migrates_routing_requirement_and_historical_receipts() {
 async fn create_name_only_persists_an_incomplete_provider_with_all_missing_requirements() {
     let fixture = StoreFixture::new();
     let store = fixture.open().await;
-    assert_schema_v3_routing_requirement(&fixture.home).await;
+    assert_schema_v4_routing_requirement(&fixture.home).await;
 
     let outcome = store
         .apply_provider_action(
@@ -1110,8 +1110,8 @@ async fn declaration_edits_do_not_mutate_active_snapshot_bytes() {
         .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
             connection.execute(
                 "INSERT INTO activated_snapshots
-                 (id, target, provider_id, base_url, model, provider_bearer_token, epoch)
-                 VALUES (?1, 'codex', ?2, 'https://one.example/v1', 'one', 'snapshot-secret', ?3)",
+                 (id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch)
+                 VALUES (?1, 'codex', ?2, 'https://one.example/v1', 'one', 'openai-responses', 'openai-bearer', 'snapshot-secret', ?3)",
                 params![
                     snapshot_id.to_string(),
                     provider.id.to_string(),

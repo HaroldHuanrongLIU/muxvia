@@ -497,6 +497,82 @@ async fn concurrent_duplicate_action_ids_apply_once_and_replay_once() {
     assert_eq!(store.target_view().await.unwrap().providers.len(), 1);
 }
 
+#[tokio::test]
+async fn target_scoped_receipts_and_recovery_action_ids_do_not_cross_targets() {
+    let fixture = StoreFixture::new().await;
+    let action_id = fixed_uuid(71);
+    let codex = fixture.store.target_view().await.unwrap();
+    let mut claude = codex.clone();
+    claude.target = Target::Claude;
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+            for (target, outcome) in [("codex", codex), ("claude", claude)] {
+                connection.execute(
+                    "INSERT INTO action_receipts
+                     (target, action_id, action_kind, committed_revision, outcome_json)
+                     VALUES (?1, ?2, 'create-provider', 0, ?3)",
+                    tokio_rusqlite::rusqlite::params![
+                        target,
+                        action_id.to_string(),
+                        serde_json::to_string(&muxvia_routing::control::protocol::ActionOutcome {
+                            status: ActionStatus::Applied,
+                            view: outcome,
+                        })
+                        .unwrap(),
+                    ],
+                )?;
+            }
+            connection.execute(
+                "INSERT INTO activation_recovery
+                 (id, target, action_id, config_path, file_identity_json, payload_json, state, created_revision)
+                 VALUES (?1, 'claude', ?2, '/tmp/settings', '{}', ?3, 'pending', 0)",
+                tokio_rusqlite::rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    action_id.to_string(),
+                    r#"{"target":"claude","before":{},"desired":{}}"#,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .store
+            .receipt_for(Target::Codex, action_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .view
+            .target,
+        Target::Codex
+    );
+    assert_eq!(
+        fixture
+            .store
+            .receipt_for(Target::Claude, action_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .view
+            .target,
+        Target::Claude
+    );
+    let targets = fixture
+        .store
+        .pending_recovery_intents()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|intent| intent.target())
+        .collect::<Vec<_>>();
+    assert!(targets.contains(&Target::Claude));
+}
+
 #[test]
 fn typed_and_raw_action_debug_output_redacts_credentials() {
     let secret = "debug-secret-must-not-escape";

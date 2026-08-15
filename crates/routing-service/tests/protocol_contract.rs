@@ -5,10 +5,12 @@ use muxvia_routing::{
         framing::{FrameError, read_frame, write_frame},
         protocol::{
             ActivationMode, ClientFrame, ControlResult, CredentialEdit, DiscoverySource,
-            DraftCredentialSource, DuplicateCredential, ProviderCompleteness, ProviderProtocol,
-            ProviderRequirement, ProviderRoutingRequirement, ServerFrame, TargetAction, TargetView,
+            DraftCredentialSource, DuplicateCredential, ProviderAuthentication,
+            ProviderCompleteness, ProviderProtocol, ProviderRequirement,
+            ProviderRoutingRequirement, ServerFrame, Target, TargetAction, TargetView,
         },
     },
+    domain::provider::has_valid_provider_declaration,
     service::provider_inspector::{DiscoveredModel, ModelDiscoveryResult, ReachabilityResult},
 };
 use serde_json::Value;
@@ -239,6 +241,7 @@ fn provider_declaration_contract_round_trips_the_secret_free_projection_and_acti
         "baseUrl": "https://provider.example/v1",
         "model": "model-a",
         "protocol": "openai-responses",
+        "authentication": "openai-bearer",
         "routingRequirement": "direct-compatible",
         "credential": "present",
         "completeness": "complete",
@@ -254,12 +257,14 @@ fn provider_declaration_contract_round_trips_the_secret_free_projection_and_acti
         "service": { "epoch": "00000000-0000-4000-8000-000000000001", "state": "running" },
         "mode": "unmanaged",
         "takeover": { "state": "inactive", "endpoint": null },
+        "routeHealth": { "state": "unobserved" },
         "providers": [provider.clone()],
         "providerPresets": [{
             "key": "openai-api-responses",
             "baseUrl": "https://api.openai.com/v1",
             "model": "",
-            "protocol": "openai-responses"
+            "protocol": "openai-responses",
+            "authentication": "openai-bearer"
         }],
         "currentProviderId": null,
         "servingProviderId": null,
@@ -300,6 +305,102 @@ fn provider_declaration_contract_round_trips_the_secret_free_projection_and_acti
             "presetKey": "openai-api-responses"
         })
     );
+}
+
+#[test]
+fn claude_declarations_use_the_exact_messages_authentication_and_neutral_health_literals() {
+    let claude = serde_json::json!({
+        "target": "claude",
+        "managementRevision": 0,
+        "viewSequence": 0,
+        "service": { "epoch": "00000000-0000-4000-8000-000000000001", "state": "running" },
+        "mode": "unmanaged",
+        "takeover": { "state": "inactive", "endpoint": null },
+        "routeHealth": { "state": "unobserved" },
+        "providers": [{
+            "id": "00000000-0000-4000-8000-000000000101",
+            "position": 0,
+            "providerRevision": 1,
+            "name": "Anthropic API",
+            "baseUrl": "https://api.anthropic.com/v1",
+            "model": "claude-test",
+            "protocol": "anthropic-messages",
+            "authentication": "anthropic-api-key",
+            "routingRequirement": "takeover-required",
+            "credential": "present",
+            "completeness": "complete",
+            "missingFields": [],
+            "provenance": null,
+            "generated": false,
+            "activeReferences": []
+        }],
+        "providerPresets": [{
+            "key": "anthropic-api-messages",
+            "baseUrl": "https://api.anthropic.com/v1",
+            "model": "",
+            "protocol": "anthropic-messages",
+            "authentication": "anthropic-api-key"
+        }],
+        "currentProviderId": null,
+        "servingProviderId": null,
+        "managedConfiguration": { "state": "unmanaged", "path": null, "restartRequired": false },
+        "recovery": { "intentId": null, "state": "clean" },
+        "activatedSnapshot": null,
+        "problems": [],
+        "futureField": "ignored"
+    });
+    let parsed: TargetView = serde_json::from_value(claude.clone()).unwrap();
+    let serialized = serde_json::to_value(parsed).unwrap();
+    assert_eq!(serialized["target"], "claude");
+    assert_eq!(serialized["providers"][0]["protocol"], "anthropic-messages");
+    assert_eq!(
+        serialized["providers"][0]["authentication"],
+        "anthropic-api-key"
+    );
+    assert_eq!(
+        serialized["routeHealth"],
+        serde_json::json!({ "state": "unobserved" })
+    );
+    assert!(serialized.get("futureField").is_none());
+
+    for authentication in [
+        ProviderAuthentication::AnthropicApiKey,
+        ProviderAuthentication::AnthropicBearer,
+    ] {
+        assert!(
+            serde_json::from_value::<ProviderAuthentication>(
+                serde_json::to_value(authentication).unwrap()
+            )
+            .is_ok()
+        );
+    }
+
+    assert!(has_valid_provider_declaration(
+        Target::Codex,
+        ProviderProtocol::OpenaiResponses,
+        ProviderAuthentication::OpenaiBearer,
+    ));
+    for invalid in [
+        (
+            Target::Codex,
+            ProviderProtocol::AnthropicMessages,
+            ProviderAuthentication::AnthropicApiKey,
+        ),
+        (
+            Target::Claude,
+            ProviderProtocol::OpenaiResponses,
+            ProviderAuthentication::OpenaiBearer,
+        ),
+        (
+            Target::Claude,
+            ProviderProtocol::AnthropicMessages,
+            ProviderAuthentication::OpenaiBearer,
+        ),
+    ] {
+        assert!(!has_valid_provider_declaration(
+            invalid.0, invalid.1, invalid.2
+        ));
+    }
 }
 
 #[test]
@@ -425,6 +526,8 @@ fn target_projections_do_not_serialize_secrets() {
         "id": "00000000-0000-4000-8000-000000000002",
         "providerId": "00000000-0000-4000-8000-000000000003",
         "model": "gpt-test",
+        "protocol": "openai-responses",
+        "authentication": "openai-bearer",
         "epoch": "00000000-0000-4000-8000-000000000004",
         "providerCredential": "provider-secret-must-not-escape",
         "routingCredential": "routing-secret-must-not-escape",
@@ -450,6 +553,8 @@ fn target_projections_do_not_serialize_secrets() {
             "id": "00000000-0000-4000-8000-000000000002",
             "providerId": "00000000-0000-4000-8000-000000000003",
             "model": "gpt-test",
+            "protocol": "openai-responses",
+            "authentication": "openai-bearer",
             "epoch": "00000000-0000-4000-8000-000000000004"
         })
     );

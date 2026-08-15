@@ -32,6 +32,7 @@ function provider(overrides: Partial<TargetView["providers"][number]>): TargetVi
     baseUrl: "https://first.example/v1",
     model: "first-model",
     protocol: "openai-responses",
+    authentication: "openai-bearer",
     routingRequirement: "direct-compatible",
     credential: "present",
     completeness: "complete",
@@ -51,6 +52,7 @@ function view(overrides: Partial<TargetView> = {}): TargetView {
     service: { epoch: "00000000-0000-4000-8000-000000000001", state: "running" },
     mode: "unmanaged",
     takeover: { state: "inactive", endpoint: null },
+    routeHealth: { state: "unobserved" },
     providers: [],
     providerPresets: [],
     currentProviderId: null,
@@ -158,6 +160,8 @@ test("/providers renders provenance kinds and generated state with secret-free s
       id: "00000000-0000-4000-8000-000000000002",
       providerId: first.id,
       model: first.model,
+      protocol: "openai-responses",
+      authentication: "openai-bearer",
       epoch: "00000000-0000-4000-8000-000000000003",
     },
   }))
@@ -531,6 +535,7 @@ test("Preset source selection copies an ordinary draft without discovery and sav
       baseUrl: "https://api.openai.com/v1",
       model: "",
       protocol: "openai-responses",
+      authentication: "openai-bearer",
     }],
   }))
   const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
@@ -804,6 +809,8 @@ test("Provider Direct Activation disables picker actions while pending then clos
       id: "00000000-0000-4000-8000-000000000021",
       providerId: selected.id,
       model: selected.model,
+      protocol: "openai-responses",
+      authentication: "openai-bearer",
       epoch: "00000000-0000-4000-8000-000000000022",
     },
   })

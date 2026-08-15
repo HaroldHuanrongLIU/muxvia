@@ -2,9 +2,30 @@ use std::net::IpAddr;
 
 use url::{Host, Url};
 
+use crate::control::protocol::{ProviderAuthentication, ProviderProtocol, Target};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("invalid-provider")]
 pub struct InvalidProvider;
+
+pub fn has_valid_provider_declaration(
+    target: Target,
+    protocol: ProviderProtocol,
+    authentication: ProviderAuthentication,
+) -> bool {
+    matches!(
+        (target, protocol, authentication),
+        (
+            Target::Codex,
+            ProviderProtocol::OpenaiResponses,
+            ProviderAuthentication::OpenaiBearer
+        ) | (
+            Target::Claude,
+            ProviderProtocol::AnthropicMessages,
+            ProviderAuthentication::AnthropicApiKey | ProviderAuthentication::AnthropicBearer
+        )
+    )
+}
 
 pub fn normalize_provider_base_url(input: &str) -> Result<String, InvalidProvider> {
     let mut url = Url::parse(input).map_err(|_| InvalidProvider)?;

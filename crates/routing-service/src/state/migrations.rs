@@ -6,14 +6,15 @@ use tokio_rusqlite::rusqlite::{
 
 use crate::control::protocol::{
     ActionOutcome, ActionStatus, ActivatedSnapshotView, ControlProblem, CredentialPresence,
-    ManagedConfigurationView, ProviderCompleteness, ProviderPresetView, ProviderProtocol,
-    ProviderProvenanceView, ProviderReferenceView, ProviderRequirement, ProviderRoutingRequirement,
-    ProviderView, RecoveryView, ServiceView, TakeoverView, Target, TargetView,
+    ManagedConfigurationView, ProviderAuthentication, ProviderCompleteness, ProviderPresetView,
+    ProviderProtocol, ProviderProvenanceView, ProviderReferenceView, ProviderRequirement,
+    ProviderRoutingRequirement, ProviderView, RecoveryView, RouteHealthView, ServiceView,
+    TakeoverView, Target, TargetView,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -41,12 +42,193 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
         Some(1) => {
             migrate_v1(connection)?;
             migrate_v2(connection)?;
+            migrate_v3(connection)?;
         }
-        Some(2) => migrate_v2(connection)?,
+        Some(2) => {
+            migrate_v2(connection)?;
+            migrate_v3(connection)?;
+        }
+        Some(3) => migrate_v3(connection)?,
         Some(_) => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v3(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE credentials_v4 (
+           id TEXT PRIMARY KEY,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           bearer_token TEXT NOT NULL
+         );
+         CREATE TABLE providers_v4 (
+           id TEXT PRIMARY KEY,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           position INTEGER NOT NULL CHECK (position >= 0),
+           provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
+           name TEXT NOT NULL,
+           base_url TEXT NOT NULL,
+           model TEXT NOT NULL,
+           protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
+           authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
+           credential_id TEXT REFERENCES credentials_v4(id) ON DELETE SET NULL,
+           provenance_kind TEXT,
+           provenance_key TEXT,
+           generated_owner_id TEXT,
+           routing_requirement TEXT NOT NULL DEFAULT 'direct-compatible'
+             CHECK (routing_requirement IN ('direct-compatible', 'takeover-required')),
+           CHECK ((target = 'codex' AND protocol = 'openai-responses' AND authentication = 'openai-bearer')
+             OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer')))
+         );
+         CREATE TABLE target_route_state_v4 (
+           target TEXT PRIMARY KEY CHECK (target IN ('codex', 'claude')),
+           management_revision INTEGER NOT NULL, view_sequence INTEGER NOT NULL,
+           current_provider_id TEXT, serving_provider_id TEXT, takeover_state TEXT NOT NULL,
+           route_port INTEGER, routing_credential TEXT, activated_snapshot_id TEXT,
+           managed_config_path TEXT, recovery_state TEXT NOT NULL
+         );
+         CREATE TABLE target_problems_v4 (
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           code TEXT NOT NULL, message TEXT NOT NULL, PRIMARY KEY (target, code)
+         );
+         CREATE TABLE activated_snapshots_v4 (
+           id TEXT PRIMARY KEY,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           provider_id TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL,
+           protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
+           authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
+           provider_bearer_token TEXT NOT NULL, epoch TEXT NOT NULL,
+           CHECK ((target = 'codex' AND protocol = 'openai-responses' AND authentication = 'openai-bearer')
+             OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer')))
+         );
+         CREATE TABLE action_receipts_v4 (
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           action_id TEXT NOT NULL, action_kind TEXT NOT NULL, committed_revision INTEGER NOT NULL,
+           outcome_json TEXT NOT NULL, PRIMARY KEY (target, action_id)
+         );
+         CREATE TABLE activation_recovery_v4 (
+           id TEXT PRIMARY KEY,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           action_id TEXT NOT NULL, config_path TEXT NOT NULL, file_identity_json TEXT NOT NULL,
+           payload_json TEXT NOT NULL,
+           state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'rolled-back', 'recovery-required')),
+           created_revision INTEGER NOT NULL, UNIQUE (target, action_id)
+         );
+         INSERT INTO credentials_v4 SELECT id, target, bearer_token FROM credentials;
+         INSERT INTO providers_v4
+           (id, target, position, provider_revision, name, base_url, model, protocol, authentication,
+            credential_id, provenance_kind, provenance_key, generated_owner_id, routing_requirement)
+           SELECT id, target, position, provider_revision, name, base_url, model, protocol, 'openai-bearer',
+                  credential_id, provenance_kind, provenance_key, generated_owner_id, routing_requirement
+           FROM providers;
+         INSERT INTO target_route_state_v4 SELECT * FROM target_route_state;
+         INSERT INTO target_problems_v4 SELECT * FROM target_problems;
+         INSERT INTO activated_snapshots_v4
+           (id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch)
+           SELECT id, target, provider_id, base_url, model, 'openai-responses', 'openai-bearer', provider_bearer_token, epoch
+           FROM activated_snapshots;
+         INSERT INTO target_route_state_v4
+           (target, management_revision, view_sequence, takeover_state, recovery_state)
+           VALUES ('claude', 0, 0, 'inactive', 'clean');",
+    )?;
+
+    let receipts = {
+        let mut statement = transaction.prepare(
+            "SELECT action_id, action_kind, committed_revision, outcome_json FROM action_receipts",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>>>()?
+    };
+    for (action_id, action_kind, committed_revision, outcome_json) in receipts {
+        let legacy: LegacyV3ActionOutcome =
+            serde_json::from_str(&outcome_json).map_err(json_conversion_error)?;
+        let outcome_json =
+            serde_json::to_string(&legacy.into_v4()).map_err(json_conversion_error)?;
+        transaction.execute(
+            "INSERT INTO action_receipts_v4 (target, action_id, action_kind, committed_revision, outcome_json)
+             VALUES ('codex', ?1, ?2, ?3, ?4)",
+            params![action_id, action_kind, committed_revision, outcome_json],
+        )?;
+    }
+    let recovery = {
+        let mut statement = transaction.prepare(
+            "SELECT id, action_id, config_path, file_identity_json, before_owned_json, desired_owned_json, state, created_revision
+             FROM activation_recovery",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, u64>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>>>()?
+    };
+    for (
+        id,
+        action_id,
+        config_path,
+        file_identity_json,
+        before,
+        desired,
+        state,
+        created_revision,
+    ) in recovery
+    {
+        let before = serde_json::from_str(&before).map_err(json_conversion_error)?;
+        let desired = serde_json::from_str(&desired).map_err(json_conversion_error)?;
+        let payload_json = serde_json::to_string(&LegacyRecoveryPayload {
+            target: Target::Codex,
+            before,
+            desired,
+        })
+        .map_err(json_conversion_error)?;
+        transaction.execute(
+            "INSERT INTO activation_recovery_v4
+             (id, target, action_id, config_path, file_identity_json, payload_json, state, created_revision)
+             VALUES (?1, 'codex', ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, action_id, config_path, file_identity_json, payload_json, state, created_revision],
+        )?;
+    }
+    transaction.execute_batch(
+        "DROP TABLE activation_recovery;
+         DROP TABLE action_receipts;
+         DROP TABLE activated_snapshots;
+         DROP TABLE target_problems;
+         DROP TABLE target_route_state;
+         DROP TABLE providers;
+         DROP TABLE credentials;
+         ALTER TABLE credentials_v4 RENAME TO credentials;
+         ALTER TABLE providers_v4 RENAME TO providers;
+         ALTER TABLE target_route_state_v4 RENAME TO target_route_state;
+         ALTER TABLE target_problems_v4 RENAME TO target_problems;
+         ALTER TABLE activated_snapshots_v4 RENAME TO activated_snapshots;
+         ALTER TABLE action_receipts_v4 RENAME TO action_receipts;
+         ALTER TABLE activation_recovery_v4 RENAME TO activation_recovery;
+         UPDATE metadata SET value = '4' WHERE key = 'schema-version';",
+    )?;
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.commit()
 }
 
 fn migrate_v1(connection: &mut Connection) -> Result<()> {
@@ -229,7 +411,15 @@ impl LegacyActionOutcome {
                 mode: self.view.mode,
                 takeover: self.view.takeover,
                 providers,
-                provider_presets: super::providers::provider_presets(),
+                provider_presets: super::providers::provider_presets()
+                    .into_iter()
+                    .map(|preset| LegacyV3ProviderPresetView {
+                        key: preset.key,
+                        base_url: preset.base_url,
+                        model: preset.model,
+                        protocol: preset.protocol,
+                    })
+                    .collect(),
                 current_provider_id,
                 serving_provider_id: self.view.serving_provider_id,
                 managed_configuration: self.view.managed_configuration,
@@ -258,18 +448,35 @@ impl LegacyV2ActionOutcome {
                 service: self.view.service,
                 mode: self.view.mode,
                 takeover: self.view.takeover,
+                route_health: RouteHealthView {
+                    state: "unobserved".to_owned(),
+                },
                 providers: self
                     .view
                     .providers
                     .into_iter()
                     .map(LegacyV2ProviderView::into_v3)
                     .collect(),
-                provider_presets: self.view.provider_presets,
+                provider_presets: self
+                    .view
+                    .provider_presets
+                    .into_iter()
+                    .map(|preset| ProviderPresetView {
+                        key: preset.key,
+                        base_url: preset.base_url,
+                        model: preset.model,
+                        protocol: preset.protocol,
+                        authentication: ProviderAuthentication::OpenaiBearer,
+                    })
+                    .collect(),
                 current_provider_id: self.view.current_provider_id,
                 serving_provider_id: self.view.serving_provider_id,
                 managed_configuration: self.view.managed_configuration,
                 recovery: self.view.recovery,
-                activated_snapshot: self.view.activated_snapshot,
+                activated_snapshot: self
+                    .view
+                    .activated_snapshot
+                    .map(LegacySnapshotView::into_v4),
                 problems: self.view.problems,
             },
         }
@@ -290,7 +497,7 @@ struct LegacyTargetView {
     serving_provider_id: Option<String>,
     managed_configuration: ManagedConfigurationView,
     recovery: RecoveryView,
-    activated_snapshot: Option<ActivatedSnapshotView>,
+    activated_snapshot: Option<LegacySnapshotView>,
     problems: Vec<ControlProblem>,
 }
 
@@ -304,12 +511,12 @@ struct LegacyV2TargetView {
     mode: String,
     takeover: TakeoverView,
     providers: Vec<LegacyV2ProviderView>,
-    provider_presets: Vec<ProviderPresetView>,
+    provider_presets: Vec<LegacyV3ProviderPresetView>,
     current_provider_id: Option<String>,
     serving_provider_id: Option<String>,
     managed_configuration: ManagedConfigurationView,
     recovery: RecoveryView,
-    activated_snapshot: Option<ActivatedSnapshotView>,
+    activated_snapshot: Option<LegacySnapshotView>,
     problems: Vec<ControlProblem>,
 }
 
@@ -399,6 +606,7 @@ impl LegacyV2ProviderView {
             base_url: self.base_url,
             model: self.model,
             protocol: self.protocol,
+            authentication: ProviderAuthentication::OpenaiBearer,
             routing_requirement: ProviderRoutingRequirement::DirectCompatible,
             credential: self.credential,
             completeness: self.completeness,
@@ -408,6 +616,157 @@ impl LegacyV2ProviderView {
             active_references: self.active_references,
         }
     }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacySnapshotView {
+    id: uuid::Uuid,
+    provider_id: uuid::Uuid,
+    model: String,
+    epoch: uuid::Uuid,
+}
+
+impl LegacySnapshotView {
+    fn into_v4(self) -> ActivatedSnapshotView {
+        ActivatedSnapshotView {
+            id: self.id,
+            provider_id: self.provider_id,
+            model: self.model,
+            protocol: ProviderProtocol::OpenaiResponses,
+            authentication: ProviderAuthentication::OpenaiBearer,
+            epoch: self.epoch,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyV3ActionOutcome {
+    status: ActionStatus,
+    view: LegacyV3TargetView,
+}
+
+impl LegacyV3ActionOutcome {
+    fn into_v4(self) -> ActionOutcome {
+        ActionOutcome {
+            status: self.status,
+            view: TargetView {
+                target: self.view.target,
+                management_revision: self.view.management_revision,
+                view_sequence: self.view.view_sequence,
+                service: self.view.service,
+                mode: self.view.mode,
+                takeover: self.view.takeover,
+                route_health: RouteHealthView {
+                    state: "unobserved".to_owned(),
+                },
+                providers: self
+                    .view
+                    .providers
+                    .into_iter()
+                    .map(LegacyV3ProviderView::into_v4)
+                    .collect(),
+                provider_presets: self
+                    .view
+                    .provider_presets
+                    .into_iter()
+                    .map(|preset| ProviderPresetView {
+                        key: preset.key,
+                        base_url: preset.base_url,
+                        model: preset.model,
+                        protocol: preset.protocol,
+                        authentication: ProviderAuthentication::OpenaiBearer,
+                    })
+                    .collect(),
+                current_provider_id: self.view.current_provider_id,
+                serving_provider_id: self.view.serving_provider_id,
+                managed_configuration: self.view.managed_configuration,
+                recovery: self.view.recovery,
+                activated_snapshot: self
+                    .view
+                    .activated_snapshot
+                    .map(LegacySnapshotView::into_v4),
+                problems: self.view.problems,
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyV3TargetView {
+    target: Target,
+    management_revision: u64,
+    view_sequence: u64,
+    service: ServiceView,
+    mode: String,
+    takeover: TakeoverView,
+    providers: Vec<LegacyV3ProviderView>,
+    provider_presets: Vec<LegacyV3ProviderPresetView>,
+    current_provider_id: Option<String>,
+    serving_provider_id: Option<String>,
+    managed_configuration: ManagedConfigurationView,
+    recovery: RecoveryView,
+    activated_snapshot: Option<LegacySnapshotView>,
+    problems: Vec<ControlProblem>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyV3ProviderView {
+    id: uuid::Uuid,
+    position: u32,
+    provider_revision: u64,
+    name: String,
+    base_url: String,
+    model: String,
+    protocol: ProviderProtocol,
+    routing_requirement: ProviderRoutingRequirement,
+    credential: CredentialPresence,
+    completeness: ProviderCompleteness,
+    missing_fields: Vec<ProviderRequirement>,
+    provenance: Option<ProviderProvenanceView>,
+    generated: bool,
+    active_references: Vec<ProviderReferenceView>,
+}
+
+impl LegacyV3ProviderView {
+    fn into_v4(self) -> ProviderView {
+        ProviderView {
+            id: self.id,
+            position: self.position,
+            provider_revision: self.provider_revision,
+            name: self.name,
+            base_url: self.base_url,
+            model: self.model,
+            protocol: self.protocol,
+            authentication: ProviderAuthentication::OpenaiBearer,
+            routing_requirement: self.routing_requirement,
+            credential: self.credential,
+            completeness: self.completeness,
+            missing_fields: self.missing_fields,
+            provenance: self.provenance,
+            generated: self.generated,
+            active_references: self.active_references,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyV3ProviderPresetView {
+    key: String,
+    base_url: String,
+    model: String,
+    protocol: ProviderProtocol,
+}
+
+#[derive(Serialize)]
+struct LegacyRecoveryPayload {
+    target: Target,
+    before: serde_json::Value,
+    desired: serde_json::Value,
 }
 
 fn json_conversion_error(error: impl std::error::Error + Send + Sync + 'static) -> Error {

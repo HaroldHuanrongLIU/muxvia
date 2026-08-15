@@ -5,6 +5,7 @@ use tokio_rusqlite::rusqlite::params;
 use uuid::Uuid;
 
 use crate::codex::{ConfigSnapshot, DesiredCodexState};
+use crate::control::protocol::Target;
 
 use super::{StateError, StateStore};
 
@@ -47,12 +48,25 @@ impl RecoveryState {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RecoveryIntent {
     id: Uuid,
+    target: Target,
     action_id: Uuid,
     config_path: PathBuf,
-    before: ConfigSnapshot,
-    desired: DesiredCodexState,
+    payload: RecoveryPayload,
     state: RecoveryState,
     created_revision: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "lowercase")]
+enum RecoveryPayload {
+    Codex {
+        before: Box<ConfigSnapshot>,
+        desired: Box<DesiredCodexState>,
+    },
+    Claude {
+        before: serde_json::Value,
+        desired: serde_json::Value,
+    },
 }
 
 impl fmt::Debug for RecoveryIntent {
@@ -60,6 +74,7 @@ impl fmt::Debug for RecoveryIntent {
         formatter
             .debug_struct("RecoveryIntent")
             .field("id", &self.id)
+            .field("target", &self.target)
             .field("action_id", &self.action_id)
             .field("config_path", &self.config_path)
             .field("state", &self.state)
@@ -79,10 +94,13 @@ impl RecoveryIntent {
     ) -> Self {
         Self {
             id,
+            target: Target::Codex,
             action_id,
             config_path,
-            before,
-            desired,
+            payload: RecoveryPayload::Codex {
+                before: Box::new(before),
+                desired: Box::new(desired),
+            },
             state: RecoveryState::Pending,
             created_revision,
         }
@@ -92,16 +110,30 @@ impl RecoveryIntent {
         self.id
     }
 
+    pub fn target(&self) -> Target {
+        self.target
+    }
+
     pub fn config_path(&self) -> &std::path::Path {
         &self.config_path
     }
 
     pub fn before(&self) -> &ConfigSnapshot {
-        &self.before
+        match &self.payload {
+            RecoveryPayload::Codex { before, .. } => before,
+            RecoveryPayload::Claude { .. } => {
+                unreachable!("Claude recovery is reconciled by its adapter")
+            }
+        }
     }
 
     pub fn desired(&self) -> &DesiredCodexState {
-        &self.desired
+        match &self.payload {
+            RecoveryPayload::Codex { desired, .. } => desired,
+            RecoveryPayload::Claude { .. } => {
+                unreachable!("Claude recovery is reconciled by its adapter")
+            }
+        }
     }
 
     pub fn state(&self) -> RecoveryState {
@@ -114,37 +146,36 @@ impl StateStore {
         let intent = intent.clone();
         self.connection
             .call(move |connection| -> Result<(), StateError> {
-                let identity_json = serde_json::to_string(intent.before.identity())?;
-                let before_json = serde_json::to_string(&intent.before)?;
-                let desired_json = serde_json::to_string(&intent.desired)?;
+                let identity_json = serde_json::to_string(intent.before().identity())?;
+                let payload_json = serde_json::to_string(&intent.payload)?;
                 connection.execute(
                     "INSERT INTO activation_recovery
                      (id, target, action_id, config_path, file_identity_json,
-                      before_owned_json, desired_owned_json, state, created_revision)
-                     VALUES (?1, 'codex', ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                     ON CONFLICT(action_id) DO UPDATE SET
+                      payload_json, state, created_revision)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(target, action_id) DO UPDATE SET
                        id = excluded.id,
                        config_path = excluded.config_path,
                        file_identity_json = excluded.file_identity_json,
-                       before_owned_json = excluded.before_owned_json,
-                       desired_owned_json = excluded.desired_owned_json,
+                       payload_json = excluded.payload_json,
                        state = excluded.state,
                        created_revision = excluded.created_revision
-                     WHERE activation_recovery.state = 'rolled-back'",
+                     WHERE activation_recovery.target = excluded.target
+                       AND activation_recovery.state = 'rolled-back'",
                     params![
                         intent.id.to_string(),
+                        intent.target.as_str(),
                         intent.action_id.to_string(),
                         intent.config_path.to_string_lossy(),
                         identity_json,
-                        before_json,
-                        desired_json,
+                        payload_json,
                         intent.state.as_str(),
                         intent.created_revision,
                     ],
                 )?;
                 let stored_id: String = connection.query_row(
-                    "SELECT id FROM activation_recovery WHERE action_id = ?1",
-                    [intent.action_id.to_string()],
+                    "SELECT id FROM activation_recovery WHERE target = ?1 AND action_id = ?2",
+                    params![intent.target.as_str(), intent.action_id.to_string()],
                     |row| row.get(0),
                 )?;
                 if stored_id != intent.id.to_string() {
@@ -167,8 +198,7 @@ impl StateStore {
         self.connection
             .call(|connection| {
                 let mut statement = connection.prepare(
-                    "SELECT id, action_id, config_path, before_owned_json,
-                            desired_owned_json, state, created_revision
+                    "SELECT id, target, action_id, config_path, payload_json, state, created_revision
                      FROM activation_recovery WHERE state = 'pending' ORDER BY rowid",
                 )?;
                 let rows = statement.query_map([], parse_intent_row)?;
@@ -187,6 +217,11 @@ impl StateStore {
         self.connection
             .call(move |connection| -> Result<(), StateError> {
                 let transaction = connection.transaction()?;
+                let target: String = transaction.query_row(
+                    "SELECT target FROM activation_recovery WHERE id = ?1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )?;
                 let changed = transaction.execute(
                     "UPDATE activation_recovery SET state = ?1 WHERE id = ?2",
                     params![state.as_str(), id.to_string()],
@@ -200,8 +235,8 @@ impl StateStore {
                          SET recovery_state = 'recovery-required',
                              view_sequence = view_sequence + CASE
                                WHEN recovery_state = 'recovery-required' THEN 0 ELSE 1 END
-                         WHERE target = 'codex'",
-                        [],
+                         WHERE target = ?1",
+                        [target],
                     )?;
                 }
                 transaction.commit()?;
@@ -244,8 +279,7 @@ fn load_intent(
     id: &str,
 ) -> Result<Option<RecoveryIntent>, StateError> {
     let result = connection.query_row(
-        "SELECT id, action_id, config_path, before_owned_json,
-                desired_owned_json, state, created_revision
+        "SELECT id, target, action_id, config_path, payload_json, state, created_revision
          FROM activation_recovery WHERE id = ?1",
         [id],
         parse_intent_row,
@@ -261,16 +295,22 @@ fn parse_intent_row(
     row: &tokio_rusqlite::rusqlite::Row<'_>,
 ) -> tokio_rusqlite::rusqlite::Result<RecoveryIntent> {
     let id: String = row.get(0)?;
-    let action_id: String = row.get(1)?;
-    let before_json: String = row.get(3)?;
-    let desired_json: String = row.get(4)?;
+    let target: String = row.get(1)?;
+    let action_id: String = row.get(2)?;
+    let payload_json: String = row.get(4)?;
     let state: String = row.get(5)?;
+    let target = match target.as_str() {
+        "codex" => Target::Codex,
+        "claude" => Target::Claude,
+        _ => return Err(conversion_error(StateError::InvalidRecoveryState)),
+    };
+    let payload = serde_json::from_str(&payload_json).map_err(conversion_error)?;
     Ok(RecoveryIntent {
         id: Uuid::parse_str(&id).map_err(conversion_error)?,
+        target,
         action_id: Uuid::parse_str(&action_id).map_err(conversion_error)?,
-        config_path: PathBuf::from(row.get::<_, String>(2)?),
-        before: serde_json::from_str(&before_json).map_err(conversion_error)?,
-        desired: serde_json::from_str(&desired_json).map_err(conversion_error)?,
+        config_path: PathBuf::from(row.get::<_, String>(3)?),
+        payload,
         state: RecoveryState::parse(&state).map_err(conversion_error)?,
         created_revision: row.get(6)?,
     })

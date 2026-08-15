@@ -5,11 +5,12 @@ use uuid::Uuid;
 
 use crate::{
     control::protocol::{
-        ActionOutcome, ActionStatus, ControlProblem, ProviderRoutingRequirement, TargetAction,
-        TargetView,
+        ActionOutcome, ActionStatus, ControlProblem, ProviderAuthentication, ProviderProtocol,
+        ProviderRoutingRequirement, Target, TargetAction, TargetView,
     },
     domain::{
         activation::ActivatedSnapshot,
+        provider::has_valid_provider_declaration,
         view::{empty_target_view, project_target_view},
     },
     home::MuxviaHome,
@@ -65,6 +66,8 @@ pub struct ActivationPreparation {
     pub provider_id: Uuid,
     pub base_url: String,
     pub model: String,
+    pub protocol: ProviderProtocol,
+    pub authentication: ProviderAuthentication,
     pub provider_credential: SecretString,
     pub routing_requirement: ProviderRoutingRequirement,
     pub prior_snapshot: Option<CommittedActivationSnapshot>,
@@ -316,14 +319,15 @@ impl StateStore {
                     ))),
                 };
                 let provider = connection.query_row(
-                    "SELECT p.base_url, p.model, c.bearer_token, p.routing_requirement
+                    "SELECT p.base_url, p.model, c.bearer_token, p.protocol, p.authentication, p.routing_requirement
                      FROM providers p LEFT JOIN credentials c ON c.id = p.credential_id
                      WHERE p.id = ?1 AND p.target = 'codex'",
                     [provider_id.to_string()],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?)),
+                        row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?, row.get::<_, String>(5)?)),
                 );
-                let (base_url, model, credential, routing_requirement) = match provider {
+                let (base_url, model, credential, protocol, authentication, routing_requirement) = match provider {
                     Ok(values) => values,
                     Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => {
                         return Ok(Err(failure("incomplete-provider", "Provider is missing or incomplete")));
@@ -339,10 +343,29 @@ impl StateStore {
                     "takeover-required" => ProviderRoutingRequirement::TakeoverRequired,
                     _ => return Err(StateError::InvalidProviderRoutingRequirement),
                 };
+                let protocol = match protocol.as_str() {
+                    "openai-responses" => ProviderProtocol::OpenaiResponses,
+                    "anthropic-messages" => ProviderProtocol::AnthropicMessages,
+                    _ => return Err(StateError::InvalidActivatedSnapshot),
+                };
+                let authentication = match authentication.as_str() {
+                    "openai-bearer" => ProviderAuthentication::OpenaiBearer,
+                    "anthropic-api-key" => ProviderAuthentication::AnthropicApiKey,
+                    "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
+                    _ => return Err(StateError::InvalidActivatedSnapshot),
+                };
+                if !has_valid_provider_declaration(Target::Codex, protocol, authentication) {
+                    return Ok(Err(failure(
+                        "incomplete-provider",
+                        "Provider is missing or incomplete",
+                    )));
+                }
                 Ok(Ok(ActivationPreparation {
                     provider_id,
                     base_url,
                     model,
+                    protocol,
+                    authentication,
                     provider_credential: SecretString::from(credential),
                     routing_requirement,
                     prior_snapshot,
@@ -383,7 +406,7 @@ impl StateStore {
                 tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
             )?;
             let recorded = transaction.query_row(
-                "SELECT outcome_json FROM action_receipts WHERE action_id = ?1",
+                "SELECT outcome_json FROM action_receipts WHERE target = 'codex' AND action_id = ?1",
                 [action_id.to_string()],
                 |row| row.get::<_, String>(0),
             );
@@ -409,10 +432,11 @@ impl StateStore {
             }
             transaction.execute(
                 "INSERT INTO activated_snapshots
-                 (id, target, provider_id, base_url, model, provider_bearer_token, epoch)
-                 VALUES (?1, 'codex', ?2, ?3, ?4, ?5, ?6)",
+                 (id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch)
+                 VALUES (?1, 'codex', ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![snapshot.id.to_string(), snapshot.provider_id.to_string(), snapshot.base_url,
-                    snapshot.model, provider_credential, snapshot.epoch.to_string()],
+                    snapshot.model, snapshot.protocol.to_string(), snapshot.authentication.to_string(),
+                    provider_credential, snapshot.epoch.to_string()],
             )?;
             let changed = transaction.execute(
                 "UPDATE activation_recovery SET state = 'committed'
@@ -451,8 +475,8 @@ impl StateStore {
             let outcome = ActionOutcome { status: ActionStatus::Applied, view };
             let json = serde_json::to_string(&outcome)?;
             transaction.execute(
-                "INSERT INTO action_receipts (action_id, action_kind, committed_revision, outcome_json)
-                 VALUES (?1, 'activate-provider', ?2, ?3)",
+                "INSERT INTO action_receipts (target, action_id, action_kind, committed_revision, outcome_json)
+                 VALUES ('codex', ?1, 'activate-provider', ?2, ?3)",
                 params![action_id.to_string(), outcome.view.management_revision, json],
             )?;
             transaction.commit()?;
@@ -562,11 +586,19 @@ impl StateStore {
     }
 
     pub async fn receipt(&self, action_id: Uuid) -> Result<Option<ActionOutcome>, StateError> {
+        self.receipt_for(Target::Codex, action_id).await
+    }
+
+    pub async fn receipt_for(
+        &self,
+        target: Target,
+        action_id: Uuid,
+    ) -> Result<Option<ActionOutcome>, StateError> {
         self.connection
             .call(move |connection| {
                 let outcome = connection.query_row(
-                    "SELECT outcome_json FROM action_receipts WHERE action_id = ?1",
-                    [action_id.to_string()],
+                    "SELECT outcome_json FROM action_receipts WHERE target = ?1 AND action_id = ?2",
+                    params![target.as_str(), action_id.to_string()],
                     |row| row.get::<_, String>(0),
                 );
                 match outcome {
@@ -695,7 +727,7 @@ impl StateStore {
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
                 let recorded = transaction.query_row(
-                    "SELECT outcome_json FROM action_receipts WHERE action_id = ?1",
+                    "SELECT outcome_json FROM action_receipts WHERE target = 'codex' AND action_id = ?1",
                     [&action_id],
                     |row| row.get::<_, String>(0),
                 );
@@ -782,8 +814,8 @@ impl StateStore {
                 let outcome_json = serde_json::to_string(&outcome)?;
                 transaction.execute(
                     "INSERT INTO action_receipts
-                     (action_id, action_kind, committed_revision, outcome_json)
-                     VALUES (?1, ?2, ?3, ?4)",
+                     (target, action_id, action_kind, committed_revision, outcome_json)
+                     VALUES ('codex', ?1, ?2, ?3, ?4)",
                     params![
                         action_id,
                         action_kind,

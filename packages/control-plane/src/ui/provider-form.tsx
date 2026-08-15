@@ -15,7 +15,7 @@ export interface ProviderDraft {
   model: string
   providerId?: string
   providerRevision?: number
-  presetKey?: "openai-api-responses" | null
+  presetKey?: "openai-api-responses" | "anthropic-api-messages" | null
 }
 
 export type ProviderFormResult = Extract<TargetAction,

@@ -75,10 +75,20 @@ impl<'de> Deserialize<'de> for FrameLimit {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Target {
     Codex,
+    Claude,
+}
+
+impl Target {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -501,6 +511,7 @@ pub struct TargetView {
     pub service: ServiceView,
     pub mode: String,
     pub takeover: TakeoverView,
+    pub route_health: RouteHealthView,
     pub providers: Vec<ProviderView>,
     pub provider_presets: Vec<ProviderPresetView>,
     pub current_provider_id: Option<String>,
@@ -525,6 +536,12 @@ pub struct TakeoverView {
     pub endpoint: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteHealthView {
+    pub state: String,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderView {
@@ -535,6 +552,7 @@ pub struct ProviderView {
     pub base_url: String,
     pub model: String,
     pub protocol: ProviderProtocol,
+    pub authentication: ProviderAuthentication,
     pub routing_requirement: ProviderRoutingRequirement,
     pub credential: CredentialPresence,
     pub completeness: ProviderCompleteness,
@@ -544,10 +562,19 @@ pub struct ProviderView {
     pub active_references: Vec<ProviderReferenceView>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderProtocol {
     OpenaiResponses,
+    AnthropicMessages,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderAuthentication {
+    OpenaiBearer,
+    AnthropicApiKey,
+    AnthropicBearer,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -570,6 +597,17 @@ impl fmt::Display for ProviderProtocol {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::OpenaiResponses => "openai-responses",
+            Self::AnthropicMessages => "anthropic-messages",
+        })
+    }
+}
+
+impl fmt::Display for ProviderAuthentication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::OpenaiBearer => "openai-bearer",
+            Self::AnthropicApiKey => "anthropic-api-key",
+            Self::AnthropicBearer => "anthropic-bearer",
         })
     }
 }
@@ -629,6 +667,7 @@ pub struct ProviderPresetView {
     pub base_url: String,
     pub model: String,
     pub protocol: ProviderProtocol,
+    pub authentication: ProviderAuthentication,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -659,6 +698,8 @@ pub struct ActivatedSnapshotView {
     pub id: Uuid,
     pub provider_id: Uuid,
     pub model: String,
+    pub protocol: ProviderProtocol,
+    pub authentication: ProviderAuthentication,
     pub epoch: Uuid,
 }
 

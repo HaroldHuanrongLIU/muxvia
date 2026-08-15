@@ -45,6 +45,7 @@ function provider(
     baseUrl: "https://fixture.example/v1",
     model: "gpt-test",
     protocol: "openai-responses",
+    authentication: "openai-bearer",
     routingRequirement: "direct-compatible",
     credential: "present",
     completeness: "complete",
@@ -64,6 +65,7 @@ function view(overrides: Partial<TargetView> = {}): TargetView {
     service: { epoch: serviceEpoch, state: "running" },
     mode: "unmanaged",
     takeover: { state: "inactive", endpoint: null },
+    routeHealth: { state: "unobserved" },
     providers: [],
     currentProviderId: null,
     servingProviderId: null,
@@ -609,7 +611,7 @@ test("saves a masked Provider, applies its visible identity, and follows pushed 
       takeover: { state: "active", endpoint: "http://127.0.0.1:43123/v1" },
       currentProviderId: "provider-1",
       managedConfiguration: { state: "managed", path: "/tmp/home/.codex/config.toml", restartRequired: true },
-      activatedSnapshot: { id: snapshotId, providerId: "provider-1", model: "gpt-test", epoch: snapshotEpoch },
+      activatedSnapshot: { id: snapshotId, providerId: "provider-1", model: "gpt-test", protocol: "openai-responses", authentication: "openai-bearer", epoch: snapshotEpoch },
     })
     session.push(active)
     await setup.waitForFrame((frame) => frame.includes("Mode       Takeover") && frame.includes("Current Target Provider  Fixture Provider"))
@@ -654,6 +656,8 @@ test("Codex Direct Activation chooses Current or first and renders one restart-g
         id: snapshotId,
         providerId: testCase.expected.id,
         model: testCase.expected.model,
+        protocol: "openai-responses",
+        authentication: "openai-bearer",
         epoch: snapshotEpoch,
       },
     })

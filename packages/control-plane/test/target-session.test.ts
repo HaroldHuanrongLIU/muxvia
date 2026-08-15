@@ -24,6 +24,7 @@ function viewAtRevision(revision: number, sequence = revision): TargetView {
     service: { epoch: serviceEpoch, state: "running" },
     mode: "unmanaged",
     takeover: { state: "inactive", endpoint: null },
+    routeHealth: { state: "unobserved" },
     providers: revision === 0 ? [] : [{
       id: `provider-${revision}`,
       position: 0,
@@ -32,6 +33,7 @@ function viewAtRevision(revision: number, sequence = revision): TargetView {
       baseUrl: "https://provider.example/v1",
       model: `model-${revision}`,
       protocol: "openai-responses",
+      authentication: "openai-bearer",
       routingRequirement: "direct-compatible",
       credential: "present",
       completeness: "complete",

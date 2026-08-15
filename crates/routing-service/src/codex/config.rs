@@ -386,6 +386,9 @@ impl CodexConfigCodec {
             .await
             .map_err(|_| CodexProblem::new("recovery-required", Some(&self.config_path)))?
         {
+            if intent.target() != crate::control::protocol::Target::Codex {
+                continue;
+            }
             self.reconcile_one(store, &intent).await?;
         }
         Ok(())

@@ -17,6 +17,7 @@ const initialView: TargetView = {
   service: { epoch: "00000000-0000-4000-8000-000000000001", state: "running" },
   mode: "unmanaged",
   takeover: { state: "inactive", endpoint: null },
+  routeHealth: { state: "unobserved" },
   providers: [],
   providerPresets: [],
   currentProviderId: null,

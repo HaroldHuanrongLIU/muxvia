@@ -169,6 +169,7 @@ test("round-trips schema-v3 Provider declarations, Presets, and credential inten
     baseUrl: "https://provider.example/v1",
     model: "model-a",
     protocol: "openai-responses",
+    authentication: "openai-bearer",
     routingRequirement: "direct-compatible",
     credential: "present",
     completeness: "complete",
@@ -184,12 +185,14 @@ test("round-trips schema-v3 Provider declarations, Presets, and credential inten
     service: { epoch: "00000000-0000-4000-8000-000000000001", state: "running" },
     mode: "unmanaged",
     takeover: { state: "inactive", endpoint: null },
+    routeHealth: { state: "unobserved" },
     providers: [provider],
     providerPresets: [{
       key: "openai-api-responses",
       baseUrl: "https://api.openai.com/v1",
       model: "",
       protocol: "openai-responses",
+      authentication: "openai-bearer",
     }],
     currentProviderId: null,
     servingProviderId: null,
@@ -233,6 +236,56 @@ test("round-trips schema-v3 Provider declarations, Presets, and credential inten
     model: "copied-model",
     credential: { kind: "reuse-source" },
   })
+})
+
+test("round-trips Claude Messages declarations with explicit authentication and neutral Route Health", () => {
+  const view = {
+    target: "claude",
+    managementRevision: 0,
+    viewSequence: 0,
+    service: { epoch: "00000000-0000-4000-8000-000000000001", state: "running" },
+    mode: "unmanaged",
+    takeover: { state: "inactive", endpoint: null },
+    routeHealth: { state: "unobserved" },
+    providers: [{
+      id: "00000000-0000-4000-8000-000000000101",
+      position: 0,
+      providerRevision: 1,
+      name: "Anthropic API",
+      baseUrl: "https://api.anthropic.com/v1",
+      model: "claude-test",
+      protocol: "anthropic-messages",
+      authentication: "anthropic-api-key",
+      routingRequirement: "takeover-required",
+      credential: "present",
+      completeness: "complete",
+      missingFields: [],
+      provenance: null,
+      generated: false,
+      activeReferences: [],
+    }],
+    providerPresets: [{
+      key: "anthropic-api-messages",
+      baseUrl: "https://api.anthropic.com/v1",
+      model: "",
+      protocol: "anthropic-messages",
+      authentication: "anthropic-api-key",
+    }],
+    currentProviderId: null,
+    servingProviderId: null,
+    managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
+    recovery: { intentId: null, state: "clean" },
+    activatedSnapshot: null,
+    problems: [],
+    futureField: "ignored",
+  }
+
+  const parsed = parseTargetView(view)
+  expect(parsed.target).toBe("claude")
+  expect(parsed.providers[0]?.protocol).toBe("anthropic-messages")
+  expect(parsed.providers[0]?.authentication).toBe("anthropic-api-key")
+  expect(parsed.routeHealth).toEqual({ state: "unobserved" })
+  expect(JSON.parse(JSON.stringify(parsed))).not.toHaveProperty("futureField")
 })
 
 test.each(["direct", "takeover"] as const)("accepts activate-provider mode %s", (mode) => {
@@ -310,6 +363,8 @@ test("drops additive secret fields from typed Target View projections", async ()
     id: "00000000-0000-4000-8000-000000000002",
     providerId: "00000000-0000-4000-8000-000000000003",
     model: "gpt-test",
+    protocol: "openai-responses",
+    authentication: "openai-bearer",
     epoch: "00000000-0000-4000-8000-000000000004",
     providerCredential: "provider-secret-must-not-escape",
     routingCredential: "routing-secret-must-not-escape",
@@ -331,6 +386,8 @@ test("drops additive secret fields from typed Target View projections", async ()
     id: "00000000-0000-4000-8000-000000000002",
     providerId: "00000000-0000-4000-8000-000000000003",
     model: "gpt-test",
+    protocol: "openai-responses",
+    authentication: "openai-bearer",
     epoch: "00000000-0000-4000-8000-000000000004",
   })
 })

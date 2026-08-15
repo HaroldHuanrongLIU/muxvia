@@ -289,6 +289,46 @@ function auditClaudeSettingsSecrets(
   }
 }
 
+type ClaudeDirectSettingsExpectation = {
+  authentication: "anthropic-api-key" | "anthropic-bearer"
+  baseUrl: string
+  credential: string
+  model: string
+}
+
+function assertExactClaudeDirectSettings(
+  text: string,
+  expected: ClaudeDirectSettingsExpectation,
+  forbiddenSecrets: readonly string[],
+): void {
+  scanNoSecrets([text], forbiddenSecrets, "claude-direct-settings-raw")
+  let parsed: Record<string, unknown>
+  try {
+    parsed = JSON.parse(text) as Record<string, unknown>
+  } catch {
+    throw new Error("claude-direct-settings-json-invalid")
+  }
+  const credentialKey = expected.authentication === "anthropic-bearer"
+    ? "ANTHROPIC_AUTH_TOKEN"
+    : "ANTHROPIC_API_KEY"
+  const desired = {
+    env: {
+      ANTHROPIC_BASE_URL: expected.baseUrl,
+      ANTHROPIC_MODEL: expected.model,
+      OPERATOR_UNRELATED: "keep-me",
+      [credentialKey]: expected.credential,
+    },
+    operator: { hooks: ["keep"], theme: "dark" },
+  }
+  const occurrences = jsonSecretOccurrences(parsed, expected.credential)
+  if (
+    occurrences.length !== 1
+    || occurrences[0]!.path !== `env.${credentialKey}`
+    || !occurrences[0]!.exact
+    || canonicalJson(parsed) !== canonicalJson(desired)
+  ) throw new Error("claude-direct-settings-mismatch")
+}
+
 type ClaudeRequestProjection = {
   method: string
   pathClass: "models" | "messages" | "count-tokens" | "reachability" | "other"
@@ -648,6 +688,69 @@ async function waitForSecretSafeSession(
   } catch (error) {
     throw fixedSurfaceError(error, scanFailure, `target-view-wait-failed:${label}`)
   }
+}
+
+type ClaudeDirectFrameEvidence = {
+  type?: unknown
+  result?: { kind?: unknown; outcome?: { status?: unknown; view?: unknown } }
+  view?: unknown
+}
+
+function matchesClaudeDirectView(
+  value: unknown,
+  expected: { providerId: string; model: string; settingsPath: string },
+): boolean {
+  if (!value || typeof value !== "object") return false
+  const view = value as TargetView
+  return view.target === "claude"
+    && view.mode === "direct"
+    && view.takeover.state === "inactive"
+    && view.takeover.endpoint === null
+    && view.currentProviderId === expected.providerId
+    && view.servingProviderId === null
+    && view.managedConfiguration.state === "applied"
+    && view.managedConfiguration.path === expected.settingsPath
+    && view.managedConfiguration.restartRequired === true
+    && view.recovery.state === "committed"
+    && view.activatedSnapshot?.providerId === expected.providerId
+    && view.activatedSnapshot.model === expected.model
+    && view.activatedSnapshot.protocol === "anthropic-messages"
+}
+
+async function assertClaudeDirectResponseAndPush(
+  frames: readonly unknown[],
+  start: number,
+  expected: { providerId: string; model: string; settingsPath: string },
+  secrets: readonly string[],
+  label: string,
+): Promise<void> {
+  await waitFor(() => {
+    const candidates = frames.slice(start)
+    scanNoSecrets(candidates, secrets, `${label}-raw-frame`)
+    const hasResponse = candidates.some((candidate) => {
+      const frame = candidate as ClaudeDirectFrameEvidence
+      return frame.type === "response" && frame.result?.kind === "action-outcome"
+    })
+    const hasPush = candidates.some((candidate) => (candidate as ClaudeDirectFrameEvidence).type === "target-view")
+    return hasResponse && hasPush
+  }, `${label} response and push`)
+
+  const candidates = frames.slice(start)
+  scanNoSecrets(candidates, secrets, `${label}-raw-frame`)
+  const responses = candidates.filter((candidate) => {
+    const frame = candidate as ClaudeDirectFrameEvidence
+    return frame.type === "response" && frame.result?.kind === "action-outcome"
+  }) as ClaudeDirectFrameEvidence[]
+  const pushes = candidates.filter((candidate) => (
+    candidate as ClaudeDirectFrameEvidence
+  ).type === "target-view") as ClaudeDirectFrameEvidence[]
+  if (
+    responses.length !== 1
+    || pushes.length !== 1
+    || responses[0]!.result?.outcome?.status !== "applied"
+    || !matchesClaudeDirectView(responses[0]!.result?.outcome?.view, expected)
+    || !matchesClaudeDirectView(pushes[0]!.view, expected)
+  ) throw new Error(`claude-direct-response-push-mismatch:${label}`)
 }
 
 function scanRawRpcFramesNoSecrets(
@@ -1146,12 +1249,17 @@ type SqliteSecretPolicy = {
 function approvedRecoveryOccurrence(
   target: "codex" | "claude",
   occurrence: SecretOccurrence,
+  ownershipVersion?: number,
 ): boolean {
   if (target === "claude") {
-    return occurrence.exact && [
+    const approvedPaths = [
       "before.owned.auth_token",
       "desired.owned.auth_token",
-    ].includes(occurrence.path)
+    ]
+    if (ownershipVersion === 2) {
+      approvedPaths.push("before.owned.api_key", "desired.owned.api_key")
+    }
+    return occurrence.exact && approvedPaths.includes(occurrence.path)
   }
   if ([
     "before.owned.provider_http_headers.rendered",
@@ -1211,12 +1319,14 @@ function auditSqliteSecretLocations(path: string, policy: SqliteSecretPolicy): v
               table === "activation_recovery"
               && column === "payload_json"
               && row.target === target
-              && policy.routingSecrets.some((entry) => entry.target === target && entry.secret === secret)
             ) {
               const occurrences = jsonSecretOccurrences(recoveryPayload, secret)
+              const ownershipVersion = typeof (recoveryPayload as Record<string, unknown>)?.ownership_version === "number"
+                ? (recoveryPayload as Record<string, number>).ownership_version
+                : undefined
               if (
                 occurrences.length > 0
-                && occurrences.every((entry) => approvedRecoveryOccurrence(target, entry))
+                && occurrences.every((entry) => approvedRecoveryOccurrence(target, entry, ownershipVersion))
               ) continue
             }
             throw new Error("secret-scan-failed:claude-sqlite-secret-location")
@@ -1466,6 +1576,108 @@ test("action error diagnostics never retain a secret error or authoritative view
   expect(diagnostic === "secret-scan-failed:controlled-act-error").toBeTrue()
   expect(diagnostic.includes(providerSecret)).toBeFalse()
   expect(diagnostic.includes(controlledError.message)).toBeFalse()
+})
+
+test("Claude Direct audits reject secrets across every public diagnostic surface", async () => {
+  const secret = "controlled-claude-direct-public-surface-secret"
+  const surfaces = [
+    { label: "claude-direct-view", value: { target: "claude", additiveDiagnostic: secret } },
+    { label: "claude-direct-receipt", value: { actionKind: "activate-provider", outcomeJson: secret } },
+    { label: "claude-direct-activity", value: { kind: "success", message: secret } },
+    { label: "claude-direct-renderer-frame", value: `frame:${secret}` },
+  ]
+  for (const { label, value } of surfaces) {
+    let diagnostic = ""
+    try { scanNoSecrets([value], [secret], label) } catch (error) {
+      diagnostic = error instanceof Error ? error.message : String(error)
+    }
+    expect(diagnostic).toBe(`secret-scan-failed:${label}`)
+    expect(diagnostic.includes(secret)).toBeFalse()
+  }
+
+  let processDiagnostic = ""
+  try {
+    scanProcessOutputNoSecrets([[Buffer.from(`stdout:${secret}`)], []], [secret])
+  } catch (error) {
+    processDiagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(processDiagnostic).toBe("secret-scan-failed:process-output-stream-0")
+  expect(processDiagnostic.includes(secret)).toBeFalse()
+
+  const controlledError = new Error(`failed:${secret}`) as Error & { authoritativeView?: unknown }
+  controlledError.authoritativeView = { target: "claude", additiveDiagnostic: secret }
+  const controlledSession = {
+    act: async () => { throw controlledError },
+  } as unknown as TargetSession
+  let actionDiagnostic = ""
+  try {
+    await actSecretSafe(controlledSession, {
+      kind: "activate-provider",
+      providerId: "controlled-provider",
+      mode: "direct",
+    }, [secret], "claude-direct-controlled-action")
+  } catch (error) {
+    actionDiagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(actionDiagnostic).toBe("secret-scan-failed:claude-direct-controlled-action-error")
+  expect(actionDiagnostic.includes(secret)).toBeFalse()
+})
+
+test("Claude Direct settings audit detects dual credentials and unrelated semantic or mode mutation", () => {
+  const bearer = "controlled-claude-direct-bearer"
+  const apiKey = "controlled-claude-direct-api-key"
+  const expected: ClaudeDirectSettingsExpectation = {
+    authentication: "anthropic-bearer",
+    baseUrl: "https://direct-claude.invalid/v1",
+    credential: bearer,
+    model: "claude-direct",
+  }
+  const clean = JSON.stringify({
+    operator: { theme: "dark", hooks: ["keep"] },
+    env: {
+      OPERATOR_UNRELATED: "keep-me",
+      ANTHROPIC_BASE_URL: expected.baseUrl,
+      ANTHROPIC_MODEL: expected.model,
+      ANTHROPIC_AUTH_TOKEN: bearer,
+    },
+  })
+  expect(() => assertExactClaudeDirectSettings(clean, expected, [apiKey])).not.toThrow()
+
+  const mutations = [
+    JSON.stringify({
+      operator: { theme: "dark", hooks: ["keep"] },
+      env: {
+        OPERATOR_UNRELATED: "keep-me",
+        ANTHROPIC_BASE_URL: expected.baseUrl,
+        ANTHROPIC_MODEL: expected.model,
+        ANTHROPIC_AUTH_TOKEN: bearer,
+        ANTHROPIC_API_KEY: apiKey,
+      },
+    }),
+    clean.replace('"theme":"dark"', '"theme":"light"'),
+    clean.replace('"OPERATOR_UNRELATED":"keep-me"', '"OPERATOR_UNRELATED":"changed"'),
+  ]
+  const expectedDiagnostics = [
+    "secret-scan-failed:claude-direct-settings-raw",
+    "claude-direct-settings-mismatch",
+    "claude-direct-settings-mismatch",
+  ]
+  mutations.forEach((mutation, index) => {
+    let diagnostic = ""
+    try { assertExactClaudeDirectSettings(mutation, expected, [apiKey]) } catch (error) {
+      diagnostic = error instanceof Error ? error.message : String(error)
+    }
+    expect(diagnostic).toBe(expectedDiagnostics[index]!)
+    expect(diagnostic.includes(bearer)).toBeFalse()
+    expect(diagnostic.includes(apiKey)).toBeFalse()
+    expect(diagnostic.includes(mutation)).toBeFalse()
+  })
+
+  let modeDiagnostic = ""
+  try { assertExactFileMode(0o600, 0o640) } catch (error) {
+    modeDiagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(modeDiagnostic).toBe("direct-managed-configuration-mode-mismatch")
 })
 
 test("inbound action barrier rejects a wrong error with fixed diagnostics", async () => {
@@ -2014,6 +2226,45 @@ test("Claude SQLite recovery audit rejects a prefixed semantic token", async () 
   try {
     auditSqliteSecretLocations(path, { providerSecrets: [], routingSecrets: [{ target: "claude", secret }] })
   } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(diagnostic).toBe("secret-scan-failed:claude-sqlite-secret-location")
+  expect(diagnostic.includes(secret)).toBeFalse()
+})
+
+test("Claude SQLite recovery audit allows v2 API-key ownership but rejects the same legacy claim", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-recovery-version-audit-"))
+  roots.push(root)
+  const path = join(root, "mutation.db")
+  const secret = "controlled-versioned-recovery-api-key"
+  const database = new Database(path, { create: true })
+  database.exec("CREATE TABLE activation_recovery (target TEXT, payload_json TEXT)")
+  const payload = (ownershipVersion: number) => JSON.stringify({
+    target: "claude",
+    ownership_version: ownershipVersion,
+    before: {
+      ownership_version: ownershipVersion,
+      owned: { base_url: null, auth_token: null, model: null, api_key: secret },
+    },
+    desired: {
+      ownership_version: ownershipVersion,
+      mode: "direct",
+      owned: { base_url: "https://controlled.invalid", auth_token: null, model: "controlled", api_key: null },
+    },
+  })
+  database.query("INSERT INTO activation_recovery VALUES ('claude', ?)").run(payload(2))
+  database.close()
+  const policy = {
+    providerSecrets: [{ target: "claude" as const, name: "Prior API Key", secret }],
+    routingSecrets: [],
+  }
+  expect(() => auditSqliteSecretLocations(path, policy)).not.toThrow()
+
+  const mutation = new Database(path)
+  mutation.query("UPDATE activation_recovery SET payload_json = ?").run(payload(1))
+  mutation.close()
+  let diagnostic = ""
+  try { auditSqliteSecretLocations(path, policy) } catch (error) {
     diagnostic = error instanceof Error ? error.message : String(error)
   }
   expect(diagnostic).toBe("secret-scan-failed:claude-sqlite-secret-location")
@@ -2733,7 +2984,7 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     setup.mockInput.pressEnter()
     await setup.waitForFrame((frame) => frame.includes("Claude Bearer"))
     setup.mockInput.pressKey("down")
-    leader("a")
+    leader("o")
     const bearerApplied = await waitForSecretSafeSession(
       claudeSession!,
       (view) => view.currentProviderId === bearerProvider.id,
@@ -3484,6 +3735,623 @@ test("real processes prove Codex direct activation is control-only and survives 
     await upstream.stop()
   }
 })
+
+test("real processes prove Claude Direct authentication replacement and natural idle restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "m6-"))
+  roots.push(root)
+  const userHome = join(root, "home")
+  const muxviaHome = join(userHome, ".muxvia")
+  const codexHome = join(userHome, ".codex")
+  const claudeHome = join(userHome, ".claude")
+  const settingsPath = join(claudeHome, "settings.json")
+  const socketPath = join(muxviaHome, "run/control.sock")
+  const databasePath = join(muxviaHome, "state/muxvia.db")
+  const trapHome = join(root, "outside-home-traps")
+  const bearerSecret = "claude-direct-bearer-secret-must-not-escape"
+  const apiKeySecret = "claude-direct-api-key-secret-must-not-escape"
+  const priorBearer = "claude-direct-prior-bearer-must-not-escape"
+  const priorApiKey = "claude-direct-prior-api-key-must-not-escape"
+  const bearerBaseUrl = "https://claude-bearer-direct.invalid/v1"
+  const apiKeyBaseUrl = "https://claude-api-key-direct.invalid/v1"
+  const bearerModel = "claude-direct-bearer-model"
+  const apiKeyModel = "claude-direct-api-key-model"
+  const directSecrets = [bearerSecret, apiKeySecret, priorBearer, priorApiKey]
+  const sqliteSecretPolicy: SqliteSecretPolicy = {
+    providerSecrets: [
+      { target: "claude", name: "Claude Direct Bearer", secret: bearerSecret },
+      { target: "claude", name: "Claude Direct API Key", secret: apiKeySecret },
+      { target: "claude", name: "Prior Bearer", secret: priorBearer },
+      { target: "claude", name: "Prior API Key", secret: priorApiKey },
+    ],
+    routingSecrets: [],
+  }
+
+  await mkdir(codexHome, { recursive: true, mode: 0o700 })
+  await mkdir(claudeHome, { recursive: true, mode: 0o700 })
+  await mkdir(join(trapHome, ".muxvia/state"), { recursive: true, mode: 0o700 })
+  await mkdir(join(trapHome, ".codex"), { recursive: true, mode: 0o700 })
+  await mkdir(join(trapHome, ".claude"), { recursive: true, mode: 0o700 })
+  await writeFile(join(trapHome, ".muxvia/state/canary"), "muxvia-trap\n", { mode: 0o600 })
+  await writeFile(join(trapHome, ".codex/config.toml"), 'trap = "codex"\n', { mode: 0o600 })
+  await writeFile(join(trapHome, ".claude/settings.json"), '{"trap":"claude"}\n', { mode: 0o600 })
+  await writeFile(settingsPath, JSON.stringify({
+    operator: { theme: "dark", hooks: ["keep"] },
+    env: {
+      OPERATOR_UNRELATED: "keep-me",
+      ANTHROPIC_AUTH_TOKEN: priorBearer,
+      ANTHROPIC_API_KEY: priorApiKey,
+    },
+  }), { mode: 0o640 })
+  await chmod(settingsPath, 0o640)
+  await chmod(fakeCodex, 0o755)
+  await chmod(fakeClaude, 0o755)
+  const originalMode = (await stat(settingsPath)).mode & 0o777
+  const trapFingerprint = await controlledTreeFingerprint(trapHome)
+  assertExactFileMode(originalMode, 0o640)
+
+  const services: Array<{
+    child: ReturnType<typeof spawn>
+    output: ReturnType<typeof captureProcessOutput>
+  }> = []
+  const rpcStreams: Buffer[][] = []
+  const decodedFrames: unknown[] = []
+  const views: TargetView[] = []
+  const selectedFrames: string[] = []
+  const nativeFrames: string[] = []
+  const outboundAudits: ReturnType<typeof createOutboundOperationAudit>[] = []
+  const outboundOperationKinds: string[] = []
+  let codexClient: RpcClient | undefined
+  let claudeClient: RpcClient | undefined
+  let codexSession: TargetSession | undefined
+  let claudeSession: TargetSession | undefined
+  let unsubscribes: Array<() => void> = []
+  let setup: Awaited<ReturnType<typeof testRender>> | undefined
+  let rendererAudit: ReturnType<typeof createRendererAudit> | undefined
+  let activeSettings: ClaudeDirectSettingsExpectation | undefined
+
+  const collectView = (view: TargetView, label: string) => {
+    assertSecretSafeStructured(view, directSecrets, label)
+    views.push(view)
+  }
+  const startService = async (label: string) => {
+    const child = spawn(serviceBinary, [
+      "--home", muxviaHome,
+      "--test-codex-executable", fakeCodex,
+      "--test-claude-executable", fakeClaude,
+    ], {
+      cwd: root,
+      env: {
+        HOME: userHome,
+        PATH: `${dirname(fakeClaude)}:/usr/bin:/bin`,
+        MUXVIA_INTEGRATION_TEST: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    const record = { child, output: captureProcessOutput(child) }
+    services.push(record)
+    await waitFor(async () => {
+      if (child.exitCode !== null) {
+        scanProcessOutputNoSecrets(record.output.streams, directSecrets)
+        const output = Buffer.concat(record.output.streams.flat()).toString("utf8")
+        const category = output.includes("another Routing Service")
+          ? "lock-collision"
+          : output.includes("state is unavailable")
+            ? "state"
+            : output.includes("control transport failed")
+              ? "control"
+              : output.includes("I/O failed")
+                ? "io"
+                : output.includes("test-only Routing Service options")
+                  ? "integration-guard"
+                  : "unknown"
+        throw new Error(`claude-direct-service-exited-before-connect:${label}:${category}`)
+      }
+      try { return (await stat(socketPath)).isSocket() } catch { return false }
+    }, `Claude Direct ${label} control socket`)
+    return record
+  }
+  const connect = async (release: string) => {
+    const stream: Buffer[] = []
+    const decoder = new FrameDecoder()
+    rpcStreams.push(stream)
+    return await RpcClient.connect(socketPath, release, undefined, (path) => {
+      const socket = createConnection({ path })
+      const outboundAudit = createOutboundOperationAudit()
+      outboundAudits.push(outboundAudit)
+      const write = socket.write.bind(socket)
+      socket.write = ((chunk: Uint8Array, callback?: (error?: Error | null) => void) => {
+        const beforeCount = outboundAudit.operationKinds.length
+        outboundAudit.observe(chunk)
+        outboundOperationKinds.push(...outboundAudit.operationKinds.slice(beforeCount))
+        return write(chunk, callback)
+      }) as typeof socket.write
+      socket.on("data", (chunk) => {
+        const bytes = Buffer.from(chunk)
+        stream.push(bytes)
+        for (const frame of decoder.push(bytes)) {
+          assertSecretSafeStructured(frame, directSecrets, "claude-direct-decoded-frame")
+          decodedFrames.push(frame)
+        }
+      })
+      return socket
+    })
+  }
+  const openSessions = async (release: string) => {
+    codexClient = await connect(`${release}-codex`)
+    claudeClient = await connect(`${release}-claude`)
+    codexSession = await codexClient.openTarget("codex")
+    claudeSession = await claudeClient.openTarget("claude", {
+      claudeConfigDir: null,
+      selectorState: "unset",
+      hostManagedState: "unmanaged",
+      cwd: root,
+    })
+    collectView(codexSession.get() as TargetView, "claude-direct-codex-view")
+    collectView(claudeSession.get() as TargetView, "claude-direct-claude-view")
+    unsubscribes = [
+      codexSession.subscribe((view) => collectView(view as TargetView, "claude-direct-codex-push")),
+      claudeSession.subscribe((view) => collectView(view as TargetView, "claude-direct-claude-push")),
+    ]
+  }
+  const closeSessions = async () => {
+    unsubscribes.splice(0).forEach((unsubscribe) => unsubscribe())
+    const sessions = [codexSession, claudeSession]
+    const clients = [codexClient, claudeClient]
+    codexSession = undefined
+    claudeSession = undefined
+    codexClient = undefined
+    claudeClient = undefined
+    await Promise.all(sessions.map((session) => session?.close().catch(() => undefined)))
+    await Promise.all(clients.map((client) => client?.close().catch(() => undefined)))
+  }
+  const closeRenderer = async () => {
+    setup!.mockInput.pressCtrlC()
+    await waitFor(() => setup!.renderer.isDestroyed, "Claude Direct renderer destroy")
+    rendererAudit!.stop()
+    const frames = rendererAudit!.frames()
+    scanNoSecrets(frames, directSecrets, "claude-direct-native-renderer-frames")
+    nativeFrames.push(...frames)
+    setup = undefined
+    rendererAudit = undefined
+  }
+  const waitForCleanExit = async (
+    record: { child: ReturnType<typeof spawn>; output: ReturnType<typeof captureProcessOutput> },
+    label: string,
+  ) => {
+    const result = await Promise.race([
+      record.output.completed,
+      Bun.sleep(deadlineMs).then(() => undefined),
+    ])
+    if (!result) throw new Error(`claude-direct-natural-exit-timeout:${label}`)
+    if (result.code !== 0 || result.signal !== null || record.child.exitCode !== 0) {
+      throw new Error(`claude-direct-natural-exit-failed:${label}`)
+    }
+    await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" })
+  }
+  const leader = (key: string) => {
+    setup!.mockInput.pressKey("x", { ctrl: true })
+    setup!.mockInput.pressKey(key)
+  }
+
+  try {
+    const firstService = await startService("first")
+    await openSessions("claude-direct-first")
+    setup = await testRender(() => <App sessions={{ codex: codexSession!, claude: claudeSession! }} />, {
+      width: 100,
+      height: 28,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    rendererAudit = createRendererAudit(setup)
+    rendererAudit.start()
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await waitForSecretSafeFrame(
+      setup,
+      (frame) => frame.includes("Claude Code") && frame.includes("Run a target action"),
+      directSecrets,
+      "claude-direct-target",
+    )
+
+    await setup.mockInput.typeText("/provider")
+    setup.mockInput.pressEnter()
+    await waitForSecretSafeFrame(setup, (frame) => frame.includes("Anthropic API (Messages)"), directSecrets, "claude-direct-bearer-preset")
+    setup.mockInput.pressEnter()
+    await waitForSecretSafeFrame(setup, (frame) => frame.includes("Anthropic API key"), directSecrets, "claude-direct-bearer-editor")
+    await setup.mockInput.typeText("Claude Direct Bearer")
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(bearerBaseUrl)
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(bearerModel)
+    setup.mockInput.pressTab()
+    leader("h")
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(bearerSecret)
+    captureSecretSafeFrame(setup, selectedFrames, directSecrets, "claude-direct-bearer-entry")
+    setup.mockInput.pressEnter()
+    const bearerSaved = await waitForSecretSafeSession(
+      claudeSession!,
+      (view) => view.providers.length === 1,
+      directSecrets,
+      "claude-direct-bearer-save",
+    )
+    const bearerProvider = bearerSaved.providers[0]!
+    assertSecretSafeStructured(bearerProvider, directSecrets, "claude-direct-bearer-provider", (provider) => {
+      expect(provider).toMatchObject({
+        name: "Claude Direct Bearer",
+        baseUrl: bearerBaseUrl,
+        model: bearerModel,
+        protocol: "anthropic-messages",
+        authentication: "anthropic-bearer",
+        routingRequirement: "direct-compatible",
+        credential: "present",
+        completeness: "complete",
+      })
+    })
+    await waitFor(() => views.some((view) => view.target === "claude" && view.providers.length === 1), "Claude Direct bearer save push")
+
+    const bearerFrameStart = decodedFrames.length
+    await setup.mockInput.typeText("/direct")
+    setup.mockInput.pressEnter()
+    const bearerView = await waitForSecretSafeSession(
+      claudeSession!,
+      (view) => view.mode === "direct" && view.currentProviderId === bearerProvider.id,
+      directSecrets,
+      "claude-direct-bearer-activation",
+    )
+    const bearerAppliedFrame = await waitForSecretSafeFrame(
+      setup,
+      (frame) => frame.includes("Mode       Direct")
+        && frame.includes("Current Target Provider  Claude Direct Bearer")
+        && frame.includes("Direct Activation applied: Claude Direct Bearer")
+        && frame.includes("Restart Claude Code to use the managed configuration."),
+      directSecrets,
+      "claude-direct-bearer-applied",
+    )
+    selectedFrames.push(bearerAppliedFrame)
+    await assertClaudeDirectResponseAndPush(decodedFrames, bearerFrameStart, {
+      providerId: bearerProvider.id,
+      model: bearerModel,
+      settingsPath,
+    }, directSecrets, "claude-direct-bearer")
+    const bearerSettings: ClaudeDirectSettingsExpectation = {
+      authentication: "anthropic-bearer",
+      baseUrl: bearerBaseUrl,
+      credential: bearerSecret,
+      model: bearerModel,
+    }
+    assertExactClaudeDirectSettings(await readFile(settingsPath, "utf8"), bearerSettings, [
+      apiKeySecret,
+      priorBearer,
+      priorApiKey,
+    ])
+    activeSettings = bearerSettings
+    assertExactFileMode((await stat(settingsPath)).mode & 0o777, originalMode)
+    assertSecretSafeStructured(bearerView, directSecrets, "claude-direct-bearer-view", (view) => {
+      expect(view).toMatchObject({
+        target: "claude",
+        mode: "direct",
+        takeover: { state: "inactive", endpoint: null },
+        currentProviderId: bearerProvider.id,
+        servingProviderId: null,
+        managedConfiguration: { state: "applied", path: settingsPath, restartRequired: true },
+        recovery: { state: "committed" },
+        activatedSnapshot: {
+          providerId: bearerProvider.id,
+          model: bearerModel,
+          protocol: "anthropic-messages",
+          authentication: "anthropic-bearer",
+        },
+      })
+    })
+    if (!firstService.child.pid) throw new Error("claude-direct-first-service-pid-missing")
+    await assertNoTcpListeners(firstService.child.pid)
+
+    const bearerSettingsFingerprint = await safeFileFingerprint(settingsPath)
+    await setup.mockInput.typeText("/provider")
+    setup.mockInput.pressEnter()
+    await waitForSecretSafeFrame(setup, (frame) => frame.includes("Anthropic API (Messages)"), directSecrets, "claude-direct-api-preset")
+    setup.mockInput.pressEnter()
+    await waitForSecretSafeFrame(setup, (frame) => frame.includes("Anthropic API key"), directSecrets, "claude-direct-api-editor")
+    await setup.mockInput.typeText("Claude Direct API Key")
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(apiKeyBaseUrl)
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(apiKeyModel)
+    setup.mockInput.pressTab()
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(apiKeySecret)
+    captureSecretSafeFrame(setup, selectedFrames, directSecrets, "claude-direct-api-entry")
+    setup.mockInput.pressEnter()
+    const apiSaved = await waitForSecretSafeSession(
+      claudeSession!,
+      (view) => view.providers.length === 2,
+      directSecrets,
+      "claude-direct-api-save",
+    )
+    const apiKeyProvider = apiSaved.providers.find((provider) => provider.name === "Claude Direct API Key")!
+    assertSecretSafeStructured(apiKeyProvider, directSecrets, "claude-direct-api-provider", (provider) => {
+      expect(provider).toMatchObject({
+        baseUrl: apiKeyBaseUrl,
+        model: apiKeyModel,
+        protocol: "anthropic-messages",
+        authentication: "anthropic-api-key",
+        routingRequirement: "direct-compatible",
+        credential: "present",
+        completeness: "complete",
+      })
+    })
+    await waitFor(() => views.some((view) => view.target === "claude" && view.providers.length === 2), "Claude Direct API-key save push")
+    expect(await safeFileFingerprint(settingsPath)).toEqual(bearerSettingsFingerprint)
+    assertSecretSafeStructured(apiSaved.activatedSnapshot, directSecrets, "claude-direct-immutable-bearer-snapshot", (snapshot) => {
+      expect(snapshot).toMatchObject({
+        id: bearerView.activatedSnapshot!.id,
+        providerId: bearerProvider.id,
+        model: bearerModel,
+      })
+    })
+
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await waitForSecretSafeFrame(
+      setup,
+      (frame) => frame.includes("Providers") && frame.includes("Claude Direct API Key"),
+      directSecrets,
+      "claude-direct-api-picker",
+    )
+    setup.mockInput.pressKey("down")
+    const apiFrameStart = decodedFrames.length
+    leader("a")
+    const apiKeyView = await waitForSecretSafeSession(
+      claudeSession!,
+      (view) => view.mode === "direct" && view.currentProviderId === apiKeyProvider.id,
+      directSecrets,
+      "claude-direct-api-activation",
+    )
+    await setup.renderOnce()
+    const apiAppliedFrame = captureSecretSafeFrame(
+      setup,
+      selectedFrames,
+      directSecrets,
+      "claude-direct-api-applied",
+    )
+    const missingApiFrameEvidence = [
+      ["Mode       Direct", "mode"],
+      ["Current Target Provider  Claude Direct API Key", "current"],
+      ["Restart Claude Code to use the managed configuration.", "restart"],
+    ].find(([expected]) => !apiAppliedFrame.includes(expected!))
+    if (missingApiFrameEvidence) {
+      throw new Error(`claude-direct-api-frame-missing:${missingApiFrameEvidence[1]}`)
+    }
+    await assertClaudeDirectResponseAndPush(decodedFrames, apiFrameStart, {
+      providerId: apiKeyProvider.id,
+      model: apiKeyModel,
+      settingsPath,
+    }, directSecrets, "claude-direct-api-key")
+    const apiKeySettings: ClaudeDirectSettingsExpectation = {
+      authentication: "anthropic-api-key",
+      baseUrl: apiKeyBaseUrl,
+      credential: apiKeySecret,
+      model: apiKeyModel,
+    }
+    const finalSettingsBytes = await readFile(settingsPath, "utf8")
+    assertExactClaudeDirectSettings(finalSettingsBytes, apiKeySettings, [
+      bearerSecret,
+      priorBearer,
+      priorApiKey,
+    ])
+    activeSettings = apiKeySettings
+    assertExactFileMode((await stat(settingsPath)).mode & 0o777, originalMode)
+    assertSecretSafeStructured(apiKeyView, directSecrets, "claude-direct-api-view", (view) => {
+      expect(view).toMatchObject({
+        target: "claude",
+        mode: "direct",
+        takeover: { state: "inactive", endpoint: null },
+        currentProviderId: apiKeyProvider.id,
+        servingProviderId: null,
+        managedConfiguration: { state: "applied", path: settingsPath, restartRequired: true },
+        activatedSnapshot: {
+          providerId: apiKeyProvider.id,
+          model: apiKeyModel,
+          protocol: "anthropic-messages",
+          authentication: "anthropic-api-key",
+        },
+      })
+    })
+    expect(apiKeyView.activatedSnapshot!.id).not.toBe(bearerView.activatedSnapshot!.id)
+
+    auditSqliteSecretLocations(databasePath, sqliteSecretPolicy)
+    const firstEpochDatabase = new Database(databasePath, { readonly: true })
+    const firstEpochRoute = firstEpochDatabase.query(`SELECT current_provider_id AS currentProviderId,
+      serving_provider_id IS NULL AS servingAbsent, takeover_state AS takeoverState,
+      route_port IS NULL AS routePortAbsent, routing_credential IS NULL AS routingCredentialAbsent,
+      activated_snapshot_id AS snapshotId, managed_config_path AS managedConfigPath,
+      managed_config_version AS managedConfigVersion, recovery_state AS recoveryState
+      FROM target_route_state WHERE target = 'claude'`).get() as Record<string, unknown>
+    const firstEpochSnapshots = firstEpochDatabase.query(`SELECT provider_id AS providerId, model,
+      authentication, provider_bearer_token AS secret FROM activated_snapshots
+      WHERE target = 'claude' ORDER BY rowid`).all() as Array<Record<string, unknown> & { secret: string }>
+    firstEpochDatabase.close()
+    expect(firstEpochRoute).toEqual({
+      currentProviderId: apiKeyProvider.id,
+      servingAbsent: 1,
+      takeoverState: "inactive",
+      routePortAbsent: 1,
+      routingCredentialAbsent: 1,
+      snapshotId: apiKeyView.activatedSnapshot!.id,
+      managedConfigPath: settingsPath,
+      managedConfigVersion: 2,
+      recoveryState: "clean",
+    })
+    const firstEpochSnapshotProjection = firstEpochSnapshots.map(({ secret, ...snapshot }) => ({
+      ...snapshot,
+      secretDigest: sensitiveDigest(secret),
+    })) as Array<Record<string, unknown>>
+    expect(firstEpochSnapshotProjection).toEqual([
+      {
+        providerId: bearerProvider.id,
+        model: bearerModel,
+        authentication: "anthropic-bearer",
+        secretDigest: sensitiveDigest(bearerSecret),
+      },
+      {
+        providerId: apiKeyProvider.id,
+        model: apiKeyModel,
+        authentication: "anthropic-api-key",
+        secretDigest: sensitiveDigest(apiKeySecret),
+      },
+    ])
+    await assertNoTcpListeners(firstService.child.pid)
+    expect(await controlledTreeFingerprint(trapHome)).toBe(trapFingerprint)
+
+    const firstEpoch = apiKeyView.service.epoch
+    await closeRenderer()
+    await closeSessions()
+    await waitForCleanExit(firstService, "first")
+
+    const secondService = await startService("restart")
+    await openSessions("claude-direct-restart")
+    const restartedView = claudeSession!.get()
+    assertSecretSafeStructured(restartedView, directSecrets, "claude-direct-restarted-view", (view) => {
+      expect(view).toMatchObject({
+        target: "claude",
+        mode: "direct",
+        takeover: { state: "inactive", endpoint: null },
+        currentProviderId: apiKeyProvider.id,
+        servingProviderId: null,
+        managedConfiguration: { state: "applied", path: settingsPath, restartRequired: true },
+        activatedSnapshot: {
+          id: apiKeyView.activatedSnapshot!.id,
+          providerId: apiKeyProvider.id,
+          model: apiKeyModel,
+          protocol: "anthropic-messages",
+          authentication: "anthropic-api-key",
+        },
+      })
+    })
+    expect(restartedView.service.epoch).not.toBe(firstEpoch)
+    assertExactClaudeDirectSettings(await readFile(settingsPath, "utf8"), activeSettings, [
+      bearerSecret,
+      priorBearer,
+      priorApiKey,
+    ])
+    assertExactFileMode((await stat(settingsPath)).mode & 0o777, originalMode)
+    if (!secondService.child.pid) throw new Error("claude-direct-second-service-pid-missing")
+    await assertNoTcpListeners(secondService.child.pid)
+    expect(await controlledTreeFingerprint(trapHome)).toBe(trapFingerprint)
+
+    await closeSessions()
+    await waitForCleanExit(secondService, "restart")
+
+    auditSqliteSecretLocations(databasePath, sqliteSecretPolicy)
+    const finalDatabase = new Database(databasePath, { readonly: true })
+    const receipts = finalDatabase.query(`SELECT action_kind AS actionKind,
+      outcome_json AS outcomeJson FROM action_receipts
+      WHERE target = 'claude' ORDER BY committed_revision, action_id`).all()
+    const recoveryPayloads = finalDatabase.query(`SELECT payload_json AS payloadJson
+      FROM activation_recovery WHERE target = 'claude' ORDER BY created_revision`).all() as Array<{ payloadJson: string }>
+    const finalRoute = finalDatabase.query(`SELECT takeover_state AS takeoverState,
+      route_port IS NULL AS routePortAbsent, routing_credential IS NULL AS routingCredentialAbsent,
+      managed_config_version AS managedConfigVersion
+      FROM target_route_state WHERE target = 'claude'`).get()
+    finalDatabase.close()
+    scanNoSecrets(receipts, directSecrets, "claude-direct-action-receipts")
+    expect(receipts.filter((receipt) => (receipt as { actionKind: string }).actionKind === "activate-provider")).toHaveLength(2)
+    expect(finalRoute).toEqual({
+      takeoverState: "inactive",
+      routePortAbsent: 1,
+      routingCredentialAbsent: 1,
+      managedConfigVersion: 2,
+    })
+    expect(recoveryPayloads).toHaveLength(2)
+    for (const { payloadJson } of recoveryPayloads) {
+      const payload = JSON.parse(payloadJson) as {
+        ownership_version?: unknown
+        before?: { ownership_version?: unknown }
+        desired?: { ownership_version?: unknown; owned?: { auth_token?: unknown; api_key?: unknown } }
+      }
+      if (
+        payload.ownership_version !== 2
+        || payload.before?.ownership_version !== 2
+        || payload.desired?.ownership_version !== 2
+      ) throw new Error("claude-direct-recovery-ownership-version-mismatch")
+      const desiredCredentialCount = [
+        payload.desired.owned?.auth_token,
+        payload.desired.owned?.api_key,
+      ].filter((value) => typeof value === "string").length
+      if (desiredCredentialCount !== 1) throw new Error("claude-direct-recovery-dual-credential")
+    }
+    for (const audit of outboundAudits) audit.finish()
+    if (outboundOperationKinds.some((kind) => kind === "discover-models" || kind === "check-reachability")) {
+      throw new Error("claude-direct-unexpected-inspection-operation")
+    }
+    scanRawRpcFramesNoSecrets(rpcStreams, directSecrets)
+    scanNoSecrets(
+      [decodedFrames, views, receipts, selectedFrames, nativeFrames],
+      directSecrets,
+      "claude-direct-observed-surfaces",
+    )
+    scanProcessOutputNoSecrets(services.map(({ output }) => output.streams).flat(), directSecrets)
+    expect(await controlledTreeFingerprint(trapHome)).toBe(trapFingerprint)
+  } finally {
+    await runClaudeSecurityFinalizer([
+      { name: "native-recorder-drain", run: () => {
+        if (!rendererAudit) return
+        rendererAudit.stop()
+        nativeFrames.push(...rendererAudit.frames())
+      } },
+      { name: "renderer-destroy", run: () => {
+        if (setup && !setup.renderer.isDestroyed) setup.renderer.destroy()
+      } },
+      { name: "session-close", run: closeSessions },
+      { name: "process-kill", run: () => {
+        for (const { child } of services) if (child.exitCode === null) child.kill("SIGKILL")
+      } },
+      { name: "process-output-drain", run: async () => {
+        const results = await Promise.allSettled(services.map(({ output }) => Promise.race([
+          output.completed,
+          Bun.sleep(deadlineMs).then(() => { throw new Error("claude-direct-output-drain-timeout") }),
+        ])))
+        if (results.some((result) => result.status === "rejected")) {
+          throw new Error("claude-direct-output-drain-incomplete")
+        }
+      } },
+      { name: "raw-rpc", run: () => {
+        if (rpcStreams.some((stream) => stream.length > 0)) {
+          scanRawRpcFramesNoSecrets(rpcStreams, directSecrets)
+        }
+      } },
+      { name: "observed-surfaces", run: () => {
+        scanNoSecrets(
+          [decodedFrames, views, selectedFrames, nativeFrames],
+          directSecrets,
+          "claude-direct-final-observed-surfaces",
+        )
+      } },
+      { name: "process-output", run: () => {
+        scanProcessOutputNoSecrets(services.map(({ output }) => output.streams).flat(), directSecrets)
+      } },
+      { name: "sqlite-secret-locations", run: async () => {
+        try { await stat(databasePath) } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+          throw error
+        }
+        auditSqliteSecretLocations(databasePath, sqliteSecretPolicy)
+      } },
+      { name: "settings", run: async () => {
+        if (!activeSettings) return
+        const forbidden = directSecrets.filter((secret) => secret !== activeSettings!.credential)
+        assertExactClaudeDirectSettings(await readFile(settingsPath, "utf8"), activeSettings, forbidden)
+        assertExactFileMode((await stat(settingsPath)).mode & 0o777, originalMode)
+      } },
+      { name: "trap", run: async () => {
+        if (await controlledTreeFingerprint(trapHome) !== trapFingerprint) {
+          throw new Error("claude-direct-environment-trap-mutated")
+        }
+      } },
+    ])
+  }
+}, 60_000)
 
 test("real processes prove the complete Target Provider workflow without leaking secrets or mutating inspections", async () => {
   const root = await mkdtemp(join(tmpdir(), "muxvia-e2e-"))

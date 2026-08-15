@@ -76,7 +76,7 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, label: strin
 }
 
 type InboundResultExpectation =
-  | { resultKind: "model-discovery" | "reachability" | "action-outcome" }
+  | { resultKind: "model-discovery" | "reachability" }
   | { errorCode: string }
 type WaitForCondition = (
   predicate: () => boolean | Promise<boolean>,

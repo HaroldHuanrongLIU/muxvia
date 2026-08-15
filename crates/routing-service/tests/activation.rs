@@ -20,7 +20,7 @@ use muxvia_routing::{
         framing::{read_frame, write_frame},
         protocol::{
             ActionOutcome, ActionStatus, ActivationMode, ClaudeHostManagedState,
-            ClaudePreflightContext, ClaudeSelectorState, Target,
+            ClaudePreflightContext, ClaudeSelectorState, ControlProblem, Target, TargetView,
         },
         server::{ControlServer, ControlServerError},
     },
@@ -30,10 +30,10 @@ use muxvia_routing::{
         ActivateProviderCommand, ActivationFailpoint, ActivationHooks, ActivationObserver,
         ActivationPause, ActivationService, ActivationStep,
     },
-    state::StateStore,
+    state::{ActionFailure, StateStore},
 };
 use tempfile::TempDir;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, broadcast};
 use tokio_rusqlite::rusqlite::{Connection as SqliteConnection, OptionalExtension};
 use toml_edit::DocumentMut;
 use uuid::Uuid;
@@ -199,25 +199,263 @@ fn redacted_match<T: PartialEq>(actual: &T, expected: &T) -> Result<(), &'static
     }
 }
 
+const ACTIVATION_SECRET_SENTINELS: &[&str] = &[
+    "secret",
+    "api-provider-secret",
+    "bearer-provider-secret",
+    "claude-provider-secret",
+    "claude-secret",
+    "codex-provider-secret",
+    "codex-secret",
+    "controlled-secret-sentinel",
+    "direct-api-secret",
+    "direct-secret",
+    "edited-first-secret",
+    "edited-provider-secret",
+    "edited-second-secret",
+    "first-provider-secret",
+    "first-secret",
+    "legacy-upstream-secret",
+    "other-secret",
+    "prior-token",
+    "operator-token",
+    "prior-key",
+    "operator-key",
+    "legacy-api-key",
+    "provider-secret",
+    "provider-secret-must-not-appear-in-warning",
+    "provider-secret-must-not-escape",
+    "routing-secret",
+    "second-provider-secret",
+    "second-secret",
+    "secret-1",
+    "secret-2",
+    "secret-a",
+    "secret-b",
+    "secret-c",
+    "takeover-secret",
+    "upgraded-upstream-secret",
+    "upstream-secret",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+];
+
+fn encoded_surface_is_secret_free(encoded: &str, additional: &[&str]) -> Result<(), &'static str> {
+    for sentinel in ACTIVATION_SECRET_SENTINELS.iter().chain(additional) {
+        let debug_bytes = format!("{:?}", sentinel.as_bytes());
+        let numeric_bytes = serde_json::to_string(sentinel.as_bytes())
+            .map_err(|_| "secret signature did not encode")?;
+        if encoded.contains(sentinel)
+            || encoded.contains(&debug_bytes)
+            || encoded.contains(&numeric_bytes)
+        {
+            return Err("surface contained a credential or settings value");
+        }
+    }
+    Ok(())
+}
+
 fn public_surface_is_secret_free<T: fmt::Debug>(
     surface: &T,
     forbidden: &[&str],
 ) -> Result<(), &'static str> {
     let encoded = format!("{surface:?}");
-    if forbidden.iter().any(|secret| encoded.contains(secret)) {
-        Err("public surface contained a credential")
-    } else {
-        Ok(())
+    encoded_surface_is_secret_free(&encoded, forbidden)
+}
+
+fn action_outcome_is_secret_free(outcome: &ActionOutcome) -> Result<(), &'static str> {
+    public_surface_is_secret_free(outcome, &[])?;
+    let encoded = serde_json::to_string(outcome).map_err(|_| "action outcome did not encode")?;
+    encoded_surface_is_secret_free(&encoded, &[])
+}
+
+fn action_failure_is_secret_free(failure: &ActionFailure) -> Result<(), &'static str> {
+    public_surface_is_secret_free(failure, &[])?;
+    let encoded = serde_json::to_string(&serde_json::json!({
+        "problem": &failure.problem,
+        "authoritativeView": &failure.authoritative_view,
+    }))
+    .map_err(|_| "action failure did not encode")?;
+    encoded_surface_is_secret_free(&encoded, &[])
+}
+
+fn take_applied_redacted(
+    result: Result<ActionOutcome, ActionFailure>,
+) -> Result<ActionOutcome, &'static str> {
+    match result {
+        Ok(outcome) => {
+            action_outcome_is_secret_free(&outcome)?;
+            Ok(outcome)
+        }
+        Err(failure) => {
+            action_failure_is_secret_free(&failure)?;
+            Err("expected an applied activation outcome")
+        }
     }
 }
 
-#[test]
-fn redacted_test_diagnostics_do_not_echo_secret_values_on_mismatch() {
+fn take_failure_redacted(
+    result: Result<ActionOutcome, ActionFailure>,
+) -> Result<ActionFailure, &'static str> {
+    match result {
+        Ok(outcome) => {
+            action_outcome_is_secret_free(&outcome)?;
+            Err("expected an activation failure")
+        }
+        Err(failure) => {
+            action_failure_is_secret_free(&failure)?;
+            Ok(failure)
+        }
+    }
+}
+
+trait RedactedActivationResult {
+    fn expect_applied_redacted(self) -> ActionOutcome;
+    fn expect_failure_redacted(self) -> ActionFailure;
+}
+
+impl RedactedActivationResult for Result<ActionOutcome, ActionFailure> {
+    fn expect_applied_redacted(self) -> ActionOutcome {
+        match take_applied_redacted(self) {
+            Ok(outcome) => outcome,
+            Err(diagnostic) => panic!("{diagnostic}"),
+        }
+    }
+
+    fn expect_failure_redacted(self) -> ActionFailure {
+        match take_failure_redacted(self) {
+            Ok(failure) => failure,
+            Err(diagnostic) => panic!("{diagnostic}"),
+        }
+    }
+}
+
+fn validate_push_redacted(
+    actual: TargetView,
+    expected: &TargetView,
+) -> Result<TargetView, &'static str> {
+    public_surface_is_secret_free(&actual, &[])?;
+    public_surface_is_secret_free(expected, &[])?;
+    let actual_json = serde_json::to_string(&actual).map_err(|_| "push did not encode")?;
+    let expected_json = serde_json::to_string(expected).map_err(|_| "push did not encode")?;
+    encoded_surface_is_secret_free(&actual_json, &[])?;
+    encoded_surface_is_secret_free(&expected_json, &[])?;
+    if actual != *expected {
+        return Err("activation push did not match its response view");
+    }
+    Ok(actual)
+}
+
+async fn expect_push_redacted(
+    updates: &mut broadcast::Receiver<TargetView>,
+    expected: &TargetView,
+) -> TargetView {
+    let actual = match updates.recv().await {
+        Ok(view) => view,
+        Err(_) => panic!("activation push was unavailable"),
+    };
+    match validate_push_redacted(actual, expected) {
+        Ok(view) => view,
+        Err(diagnostic) => panic!("{diagnostic}"),
+    }
+}
+
+#[tokio::test]
+async fn redacted_test_diagnostics_do_not_echo_secret_values_on_mismatch() {
     let secret = "controlled-secret-sentinel";
     let actual = serde_json::json!({"credential": secret});
     let expected = serde_json::json!({"credential": "mutated"});
+    assert!(format!("{actual:?}").contains(secret));
     let diagnostic = redacted_match(&actual, &expected).unwrap_err();
     assert_eq!(diagnostic, "redacted values differed");
+    assert!(!diagnostic.contains(secret));
+
+    let fixture = Fixture::new().await;
+    let view = fixture.store.target_view().await.unwrap();
+    let unexpected_failure = ActionFailure {
+        problem: ControlProblem {
+            code: "controlled-opposite-branch".to_owned(),
+            message: secret.to_owned(),
+            source: None,
+            selector: None,
+        },
+        authoritative_view: view.clone(),
+    };
+    assert!(format!("{unexpected_failure:?}").contains(secret));
+    let diagnostic = match take_applied_redacted(Err(unexpected_failure)) {
+        Ok(_) => panic!("redacted opposite-branch helper accepted a failure"),
+        Err(diagnostic) => diagnostic,
+    };
+    assert_eq!(
+        diagnostic,
+        "surface contained a credential or settings value"
+    );
+    assert!(!diagnostic.contains(secret));
+
+    let mut unexpected_outcome_view = view.clone();
+    unexpected_outcome_view.problems.push(ControlProblem {
+        code: "controlled-opposite-success-branch".to_owned(),
+        message: secret.to_owned(),
+        source: None,
+        selector: None,
+    });
+    let unexpected_outcome = ActionOutcome {
+        status: ActionStatus::Applied,
+        view: unexpected_outcome_view,
+    };
+    assert!(format!("{unexpected_outcome:?}").contains(secret));
+    let diagnostic = match take_failure_redacted(Ok(unexpected_outcome)) {
+        Ok(_) => panic!("redacted opposite-branch helper accepted an outcome"),
+        Err(diagnostic) => diagnostic,
+    };
+    assert_eq!(
+        diagnostic,
+        "surface contained a credential or settings value"
+    );
+    assert!(!diagnostic.contains(secret));
+
+    for encoded_secret in [
+        format!("{:?}", secret.as_bytes()),
+        serde_json::to_string(secret.as_bytes()).unwrap(),
+    ] {
+        let numeric_failure = ActionFailure {
+            problem: ControlProblem {
+                code: "controlled-numeric-opposite-branch".to_owned(),
+                message: encoded_secret,
+                source: None,
+                selector: None,
+            },
+            authoritative_view: view.clone(),
+        };
+        let diagnostic = match take_applied_redacted(Err(numeric_failure)) {
+            Ok(_) => panic!("redacted opposite-branch helper accepted encoded secret bytes"),
+            Err(diagnostic) => diagnostic,
+        };
+        assert_eq!(
+            diagnostic,
+            "surface contained a credential or settings value"
+        );
+        assert!(!diagnostic.contains(secret));
+    }
+
+    let mut secret_bearing_push = view.clone();
+    secret_bearing_push.problems.push(ControlProblem {
+        code: "controlled-push-mismatch".to_owned(),
+        message: secret.to_owned(),
+        source: None,
+        selector: None,
+    });
+    assert!(format!("{secret_bearing_push:?}").contains(secret));
+    let diagnostic = match validate_push_redacted(secret_bearing_push, &view) {
+        Ok(_) => panic!("redacted push helper accepted a secret-bearing mismatch"),
+        Err(diagnostic) => diagnostic,
+    };
+    assert_eq!(
+        diagnostic,
+        "surface contained a credential or settings value"
+    );
     assert!(!diagnostic.contains(secret));
 }
 
@@ -248,7 +486,7 @@ impl Fixture {
                 }),
             )
             .await
-            .unwrap();
+            .expect_applied_redacted();
         assert!(
             public_surface_is_secret_free(&result, &[secret]).is_ok(),
             "provider save outcome exposed a credential"
@@ -310,7 +548,7 @@ impl Fixture {
                 }),
             )
             .await
-            .unwrap();
+            .expect_applied_redacted();
         assert!(
             public_surface_is_secret_free(&result, &[secret]).is_ok(),
             "Claude provider save outcome exposed a credential"
@@ -707,7 +945,7 @@ async fn claude_takeover_commits_one_target_native_snapshot_and_leaves_codex_unc
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
 
     assert_eq!(outcome.status, ActionStatus::Applied);
     assert_eq!(outcome.view.target, Target::Claude);
@@ -733,7 +971,7 @@ async fn claude_takeover_commits_one_target_native_snapshot_and_leaves_codex_unc
     assert_eq!(probe.0.load(Ordering::SeqCst), 1);
     assert!(service.model_endpoint_for(Target::Claude).await.is_some());
     assert!(service.model_endpoint().await.is_none());
-    assert_eq!(updates.recv().await.unwrap(), outcome.view);
+    expect_push_redacted(&mut updates, &outcome.view).await;
     assert!(updates.try_recv().is_err());
     assert_eq!(fixture.store.target_view().await.unwrap(), codex_before);
     assert_eq!(
@@ -789,7 +1027,7 @@ async fn claude_direct_commits_both_authentication_profiles_without_model_runtim
                 Some(&claude_context(&fixture.home)),
             )
             .await
-            .unwrap();
+            .expect_applied_redacted();
 
         assert!(
             public_surface_is_secret_free(
@@ -863,7 +1101,7 @@ async fn claude_direct_commits_both_authentication_profiles_without_model_runtim
         );
         assert!(!env.contains_key(inactive_key));
         assert_eq!(document["permissions"]["allow"][0], "Read");
-        assert_eq!(updates.recv().await.unwrap(), outcome.view);
+        expect_push_redacted(&mut updates, &outcome.view).await;
         assert!(updates.try_recv().is_err());
         let reached = steps.0.lock().unwrap().clone();
         assert!(!reached.contains(&ActivationStep::BindListener));
@@ -879,7 +1117,7 @@ async fn claude_direct_commits_both_authentication_profiles_without_model_runtim
                 None,
             )
             .await
-            .unwrap();
+            .expect_applied_redacted();
         assert!(
             public_surface_is_secret_free(
                 &replay,
@@ -935,7 +1173,7 @@ async fn claude_direct_switches_authentication_profiles_against_the_immutable_sn
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert!(
         public_surface_is_secret_free(&first, &["api-provider-secret", "bearer-provider-secret"])
             .is_ok(),
@@ -960,7 +1198,7 @@ async fn claude_direct_switches_authentication_profiles_against_the_immutable_sn
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert!(
         public_surface_is_secret_free(
             &second,
@@ -1001,7 +1239,7 @@ async fn claude_direct_switches_authentication_profiles_against_the_immutable_sn
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert!(
         public_surface_is_secret_free(
             &third,
@@ -1058,7 +1296,7 @@ async fn claude_corrupt_committed_expectation_fails_closed_as_recovery_required(
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     let (second_provider, second_revision) = fixture
         .save_claude_with_auth(
             "Second",
@@ -1095,7 +1333,7 @@ async fn claude_corrupt_committed_expectation_fails_closed_as_recovery_required(
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap_err();
+        .expect_failure_redacted();
 
     assert!(
         public_surface_is_secret_free(&failure, &["first-secret", "second-secret"]).is_ok(),
@@ -1144,7 +1382,7 @@ async fn claude_retried_rolled_back_action_rebinds_the_current_recovery_expectat
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap_err();
+        .expect_failure_redacted();
     assert!(
         public_surface_is_secret_free(&first_a, &["secret-a", "secret-b", "secret-c"]).is_ok(),
         "failed Claude activation exposed a credential"
@@ -1168,7 +1406,7 @@ async fn claude_retried_rolled_back_action_rebinds_the_current_recovery_expectat
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert!(
         public_surface_is_secret_free(&b, &["secret-a", "secret-b", "secret-c"]).is_ok(),
         "Claude activation outcome exposed a credential"
@@ -1182,7 +1420,7 @@ async fn claude_retried_rolled_back_action_rebinds_the_current_recovery_expectat
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert!(
         public_surface_is_secret_free(&retried_a, &["secret-a", "secret-b", "secret-c"]).is_ok(),
         "retried Claude outcome exposed a credential"
@@ -1202,7 +1440,7 @@ async fn claude_retried_rolled_back_action_rebinds_the_current_recovery_expectat
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert!(
         public_surface_is_secret_free(&c, &["secret-a", "secret-b", "secret-c"]).is_ok(),
         "Claude activation outcome exposed a credential"
@@ -1232,7 +1470,7 @@ async fn claude_legal_committed_payload_mismatch_persists_recovery_required_and_
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     let (provider_b, next_revision) = fixture
         .save_claude_with_auth("B", "claude-b", "secret-b", "anthropic-bearer")
         .await;
@@ -1274,7 +1512,7 @@ async fn claude_legal_committed_payload_mismatch_persists_recovery_required_and_
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap_err();
+        .expect_failure_redacted();
     assert!(
         public_surface_is_secret_free(&failure, &["secret-a", "secret-b"]).is_ok(),
         "recovery-required failure exposed a credential"
@@ -1307,7 +1545,7 @@ async fn claude_legal_committed_payload_mismatch_persists_recovery_required_and_
             serde_json::json!({"kind": "delete-provider", "providerId": provider_b}),
         )
         .await
-        .unwrap_err();
+        .expect_failure_redacted();
     assert!(
         public_surface_is_secret_free(&blocked, &["secret-a", "secret-b"]).is_ok(),
         "blocked managed write exposed a credential"
@@ -1340,7 +1578,7 @@ async fn claude_direct_final_revision_race_restores_auth_profile_and_same_action
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert!(
         public_surface_is_secret_free(&a, &["secret-a"]).is_ok(),
         "Claude Direct setup outcome exposed a credential"
@@ -1379,7 +1617,7 @@ async fn claude_direct_final_revision_race_restores_auth_profile_and_same_action
     let mut updates = fixture.store.subscribe_target_views();
     pause.release();
 
-    let failure = activation.await.unwrap().unwrap_err();
+    let failure = activation.await.unwrap().expect_failure_redacted();
     assert!(
         public_surface_is_secret_free(&failure, &["secret-a", "secret-b", "secret-c"]).is_ok(),
         "stale Claude activation exposed a credential"
@@ -1410,7 +1648,7 @@ async fn claude_direct_final_revision_race_restores_auth_profile_and_same_action
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert!(
         public_surface_is_secret_free(&retry, &["secret-a", "secret-b", "secret-c"]).is_ok(),
         "retried Claude outcome exposed a credential"
@@ -1453,7 +1691,7 @@ async fn claude_direct_to_takeover_uses_v2_and_takeover_to_direct_fails_before_i
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert!(
         public_surface_is_secret_free(&direct, &["direct-api-secret", "upstream-secret"]).is_ok(),
         "Claude Direct outcome exposed a credential"
@@ -1468,7 +1706,7 @@ async fn claude_direct_to_takeover_uses_v2_and_takeover_to_direct_fails_before_i
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert!(
         public_surface_is_secret_free(&takeover, &["direct-api-secret", "upstream-secret"]).is_ok(),
         "Claude Takeover outcome exposed a credential"
@@ -1498,7 +1736,7 @@ async fn claude_direct_to_takeover_uses_v2_and_takeover_to_direct_fails_before_i
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap_err();
+        .expect_failure_redacted();
     assert!(
         public_surface_is_secret_free(&failure, &["direct-api-secret", "upstream-secret"]).is_ok(),
         "takeover-active failure exposed a credential"
@@ -1550,7 +1788,7 @@ async fn claude_direct_post_intent_failpoints_restore_exact_state_without_runtim
                 Some(&claude_context(&fixture.home)),
             )
             .await
-            .unwrap_err();
+            .expect_failure_redacted();
 
         assert!(
             public_surface_is_secret_free(
@@ -1630,7 +1868,7 @@ async fn claude_real_sqlite_commit_failure_restores_first_and_direct_to_direct_c
                     Some(&claude_context(&fixture.home)),
                 )
                 .await
-                .unwrap();
+                .expect_applied_redacted();
             let (second_provider, second_revision) = fixture
                 .save_claude_with_auth(
                     "Second",
@@ -1661,7 +1899,7 @@ async fn claude_real_sqlite_commit_failure_restores_first_and_direct_to_direct_c
                 Some(&claude_context(&fixture.home)),
             )
             .await
-            .unwrap_err();
+            .expect_failure_redacted();
         drop(abort);
 
         assert!(
@@ -1736,7 +1974,7 @@ async fn claude_real_sqlite_commit_failure_cleans_direct_to_takeover_candidate()
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     let (takeover_provider, revision) = fixture
         .save_claude_with_auth(
             "Takeover",
@@ -1762,7 +2000,7 @@ async fn claude_real_sqlite_commit_failure_cleans_direct_to_takeover_candidate()
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap_err();
+        .expect_failure_redacted();
     drop(abort);
 
     assert!(
@@ -1840,7 +2078,7 @@ async fn claude_v1_takeover_sqlite_failure_restores_legacy_api_key_and_retry_upg
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert!(
         public_surface_is_secret_free(&first, &["legacy-upstream-secret", "legacy-api-key"])
             .is_ok(),
@@ -1909,7 +2147,7 @@ async fn claude_v1_takeover_sqlite_failure_restores_legacy_api_key_and_retry_upg
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap_err();
+        .expect_failure_redacted();
     drop(abort);
 
     assert!(
@@ -1959,7 +2197,7 @@ async fn claude_v1_takeover_sqlite_failure_restores_legacy_api_key_and_retry_upg
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert!(
         public_surface_is_secret_free(
             &upgraded,
@@ -2015,7 +2253,7 @@ async fn inconsistent_claude_context_never_projects_provider_mode_without_a_sele
             Some(&invalid),
         )
         .await
-        .unwrap_err();
+        .expect_failure_redacted();
 
     assert_eq!(failure.problem.code, "preflight-context-required");
     assert!(failure.problem.selector.is_none());
@@ -2060,7 +2298,7 @@ async fn claude_provisional_and_post_intent_faults_release_runtime_and_restore_e
                 Some(&claude_context(&fixture.home)),
             )
             .await
-            .unwrap_err();
+            .expect_failure_redacted();
 
         assert!(
             public_surface_is_secret_free(&failure, &["provider-secret"]).is_ok(),
@@ -2132,7 +2370,7 @@ async fn claude_unverifiable_restore_marks_only_claude_recovery_required() {
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap_err();
+        .expect_failure_redacted();
 
     assert_eq!(failure.problem.code, "recovery-required");
     assert_eq!(
@@ -2168,7 +2406,7 @@ async fn claude_unverifiable_hot_switch_drains_only_the_claude_runtime() {
     let codex_applied = first
         .activate(command(codex_provider, codex_revision, Uuid::new_v4()))
         .await
-        .unwrap();
+        .expect_applied_redacted();
     let claude_applied = first
         .apply_raw_for_with_context(
             Target::Claude,
@@ -2178,7 +2416,7 @@ async fn claude_unverifiable_hot_switch_drains_only_the_claude_runtime() {
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     let codex_endpoint: std::net::SocketAddr = codex_applied
         .view
         .takeover
@@ -2223,7 +2461,7 @@ async fn claude_unverifiable_hot_switch_drains_only_the_claude_runtime() {
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap_err();
+        .expect_failure_redacted();
 
     assert_eq!(failure.problem.code, "recovery-required");
     assert_eq!(
@@ -2264,7 +2502,7 @@ async fn claude_publication_failure_keeps_the_commit_and_replay_is_side_effect_f
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
 
     assert_eq!(applied.status, ActionStatus::Applied);
     assert!(updates.try_recv().is_err());
@@ -2282,7 +2520,7 @@ async fn claude_publication_failure_keeps_the_commit_and_replay_is_side_effect_f
             None,
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert_eq!(replay.status, ActionStatus::Replayed);
     assert_eq!(replay.view, applied.view);
     assert!(updates.try_recv().is_err());
@@ -2312,7 +2550,7 @@ async fn claude_post_commit_runtime_handoff_recovery_updates_applied_receipt_and
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
 
     assert_eq!(initial.status, ActionStatus::Applied);
     let current = fixture.store.target_view_for(Target::Claude).await.unwrap();
@@ -2331,7 +2569,7 @@ async fn claude_post_commit_runtime_handoff_recovery_updates_applied_receipt_and
             None,
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert_eq!(replay.status, ActionStatus::Replayed);
     assert_eq!(replay.view, current);
     let receipt = fixture
@@ -2375,7 +2613,7 @@ async fn claude_post_commit_runtime_handoff_recovery_updates_applied_receipt_and
     assert_eq!(settings["env"]["ANTHROPIC_MODEL"], "claude-handoff-test");
     assert!(service.model_endpoint_for(Target::Claude).await.is_none());
     assert!(tokio::net::TcpStream::connect(endpoint).await.is_err());
-    assert_eq!(updates.recv().await.unwrap(), current);
+    expect_push_redacted(&mut updates, &current).await;
     assert!(updates.try_recv().is_err());
     assert_eq!(fixture.store.target_view().await.unwrap(), codex_before);
 }
@@ -2407,7 +2645,7 @@ async fn claude_hot_switch_reuses_runtime_and_pins_in_flight_then_next_request_s
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     let endpoint = first.view.takeover.endpoint.clone().unwrap();
     let credential = fixture
         .store
@@ -2446,7 +2684,7 @@ async fn claude_hot_switch_reuses_runtime_and_pins_in_flight_then_next_request_s
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     assert_eq!(
         second.view.takeover.endpoint.as_deref(),
         Some(endpoint.as_str())
@@ -2549,7 +2787,7 @@ async fn claude_listener_credential_and_snapshot_remain_provisional_until_databa
     );
 
     pause.release();
-    let applied = activation.await.unwrap().unwrap();
+    let applied = activation.await.unwrap().expect_applied_redacted();
     assert_eq!(applied.status, ActionStatus::Applied);
     assert!(service.model_endpoint_for(Target::Claude).await.is_some());
 }
@@ -2576,7 +2814,7 @@ async fn claude_payload_ownership_mismatch_rolls_back_without_commit_or_publicat
                     Some(&claude_context(&fixture.home)),
                 )
                 .await
-                .unwrap();
+                .expect_applied_redacted();
             revision = applied.view.management_revision;
             snapshot_count = 1;
             setup.shutdown_models().await.unwrap();
@@ -2663,7 +2901,7 @@ async fn claude_payload_ownership_mismatch_rolls_back_without_commit_or_publicat
             .unwrap();
         pause.release();
 
-        let failure = activation.await.unwrap().unwrap_err();
+        let failure = activation.await.unwrap().expect_failure_redacted();
         assert!(
             public_surface_is_secret_free(&failure, &["provider-secret"]).is_ok(),
             "ownership mismatch failure exposed a credential"
@@ -4100,7 +4338,7 @@ async fn occupied_claude_port_fails_before_uds_and_drains_the_resumed_codex_peer
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     let codex_endpoint: std::net::SocketAddr = codex
         .view
         .takeover
@@ -4181,7 +4419,7 @@ async fn malformed_claude_committed_state_is_target_local_while_codex_and_uds_re
                 Some(&claude_context(&fixture.home)),
             )
             .await
-            .unwrap();
+            .expect_applied_redacted();
         let codex_endpoint: std::net::SocketAddr = codex
             .view
             .takeover
@@ -4256,7 +4494,7 @@ async fn unconstructible_claude_configuration_home_is_target_local_at_startup() 
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     let codex_endpoint: std::net::SocketAddr = codex
         .view
         .takeover
@@ -4340,7 +4578,7 @@ async fn startup_marks_only_claude_configuration_drift_and_resumes_clean_codex()
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     let codex_endpoint: std::net::SocketAddr = codex_applied
         .view
         .takeover
@@ -4454,7 +4692,7 @@ async fn startup_keeps_claude_recovery_control_only_while_resuming_clean_codex()
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap();
+        .expect_applied_redacted();
     let codex_endpoint: std::net::SocketAddr = codex
         .view
         .takeover

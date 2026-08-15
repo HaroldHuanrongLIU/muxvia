@@ -56,6 +56,16 @@ async function controlledTreeFingerprint(path: string): Promise<string> {
   }
 }
 
+async function assertControlledTreeUnchanged(
+  path: string,
+  expectedFingerprint: string,
+  diagnostic: string,
+): Promise<void> {
+  if (await controlledTreeFingerprint(path) !== expectedFingerprint) {
+    throw new Error(diagnostic)
+  }
+}
+
 async function safeFileFingerprint(path: string): Promise<{
   digest: string
   mode: number
@@ -296,6 +306,10 @@ type ClaudeDirectSettingsExpectation = {
   model: string
 }
 
+type ClaudeDirectSettingsAuditPhase =
+  | { kind: "unmanaged"; priorAuthToken: string; priorApiKey: string }
+  | { kind: "direct"; expected: ClaudeDirectSettingsExpectation }
+
 function assertExactClaudeDirectSettings(
   text: string,
   expected: ClaudeDirectSettingsExpectation,
@@ -327,6 +341,52 @@ function assertExactClaudeDirectSettings(
     || !occurrences[0]!.exact
     || canonicalJson(parsed) !== canonicalJson(desired)
   ) throw new Error("claude-direct-settings-mismatch")
+}
+
+async function auditClaudeDirectSettingsFile(
+  path: string,
+  phase: ClaudeDirectSettingsAuditPhase,
+  secrets: readonly string[],
+  expectedMode: number,
+): Promise<void> {
+  const bytes = await readFile(path)
+  const allowedSecrets = phase.kind === "unmanaged"
+    ? [phase.priorAuthToken, phase.priorApiKey]
+    : [phase.expected.credential]
+  const forbiddenSecrets = secrets.filter((secret) => !allowedSecrets.includes(secret))
+  assertBytesContainNoSecrets(bytes, forbiddenSecrets, "claude-direct-final-settings-bytes")
+  const text = bytes.toString("utf8")
+  scanNoSecrets([text], forbiddenSecrets, "claude-direct-final-settings-text")
+
+  if (phase.kind === "direct") {
+    assertExactClaudeDirectSettings(text, phase.expected, [])
+  } else {
+    let parsed: Record<string, unknown>
+    try { parsed = JSON.parse(text) as Record<string, unknown> } catch {
+      throw new Error("claude-direct-final-settings-json-invalid")
+    }
+    const expected = {
+      env: {
+        ANTHROPIC_API_KEY: phase.priorApiKey,
+        ANTHROPIC_AUTH_TOKEN: phase.priorAuthToken,
+        OPERATOR_UNRELATED: "keep-me",
+      },
+      operator: { hooks: ["keep"], theme: "dark" },
+    }
+    const locationsAreExact = [
+      [phase.priorAuthToken, "env.ANTHROPIC_AUTH_TOKEN"],
+      [phase.priorApiKey, "env.ANTHROPIC_API_KEY"],
+    ].every(([secret, expectedPath]) => {
+      const occurrences = jsonSecretOccurrences(parsed, secret!)
+      return occurrences.length === 1
+        && occurrences[0]!.path === expectedPath
+        && occurrences[0]!.exact
+    })
+    if (!locationsAreExact || canonicalJson(parsed) !== canonicalJson(expected)) {
+      throw new Error("claude-direct-final-settings-mismatch")
+    }
+  }
+  assertExactFileMode((await stat(path)).mode & 0o777, expectedMode)
 }
 
 type ClaudeRequestProjection = {
@@ -483,11 +543,14 @@ function fixedClaudeRequestAuditDiagnostic(error: unknown): string {
 function assertChildVisibleEnvironment(
   requested: Readonly<Record<"HOME" | "CODEX_HOME" | "CLAUDE_CONFIG_DIR", string>>,
   actual: Readonly<NodeJS.ProcessEnv>,
+  requestedCwd?: string,
+  actualCwd?: string,
 ): void {
   if (
     actual.HOME !== requested.HOME
     || actual.CODEX_HOME !== requested.CODEX_HOME
     || actual.CLAUDE_CONFIG_DIR !== requested.CLAUDE_CONFIG_DIR
+    || requestedCwd !== actualCwd
   ) throw new Error("claude-environment-traps-not-child-visible")
 }
 
@@ -1246,6 +1309,22 @@ type SqliteSecretPolicy = {
   routingSecrets: ReadonlyArray<{ target: "codex" | "claude"; secret: string }>
 }
 
+function claudeRecoveryOwnershipVersion(payload: unknown): number | undefined {
+  if (!payload || typeof payload !== "object") return undefined
+  const root = payload as Record<string, unknown>
+  if (root.target !== "claude" || !root.before || typeof root.before !== "object"
+    || !root.desired || typeof root.desired !== "object") return undefined
+  const before = root.before as Record<string, unknown>
+  const desired = root.desired as Record<string, unknown>
+  const versions = [
+    root.ownership_version ?? 1,
+    before.ownership_version ?? 1,
+    desired.ownership_version ?? 1,
+  ]
+  if (!versions.every((version) => version === 1 || version === 2)) return undefined
+  return versions.every((version) => version === versions[0]) ? versions[0] as number : undefined
+}
+
 function approvedRecoveryOccurrence(
   target: "codex" | "claude",
   occurrence: SecretOccurrence,
@@ -1296,9 +1375,15 @@ function auditSqliteSecretLocations(path: string, policy: SqliteSecretPolicy): v
       const rows = database.query(`SELECT * FROM ${quoted}`).all() as Array<Record<string, unknown>>
       for (const row of rows) {
         let recoveryPayload: unknown
+        let recoveryOwnershipVersion: number | undefined
+        let invalidClaudeRecoveryOwnership = false
         if (table === "activation_recovery") {
           try { recoveryPayload = JSON.parse(String(row.payload_json)) } catch {
             throw new Error("claude-sqlite-recovery-json-invalid")
+          }
+          if (row.target === "claude") {
+            recoveryOwnershipVersion = claudeRecoveryOwnershipVersion(recoveryPayload)
+            invalidClaudeRecoveryOwnership = recoveryOwnershipVersion === undefined
           }
         }
         for (const { target, secret } of secrets) {
@@ -1321,16 +1406,20 @@ function auditSqliteSecretLocations(path: string, policy: SqliteSecretPolicy): v
               && row.target === target
             ) {
               const occurrences = jsonSecretOccurrences(recoveryPayload, secret)
-              const ownershipVersion = typeof (recoveryPayload as Record<string, unknown>)?.ownership_version === "number"
-                ? (recoveryPayload as Record<string, number>).ownership_version
-                : undefined
               if (
                 occurrences.length > 0
-                && occurrences.every((entry) => approvedRecoveryOccurrence(target, entry, ownershipVersion))
+                && occurrences.every((entry) => approvedRecoveryOccurrence(
+                  target,
+                  entry,
+                  recoveryOwnershipVersion,
+                ))
               ) continue
             }
             throw new Error("secret-scan-failed:claude-sqlite-secret-location")
           }
+        }
+        if (invalidClaudeRecoveryOwnership) {
+          throw new Error("claude-sqlite-recovery-ownership-version-invalid")
         }
       }
     }
@@ -1678,6 +1767,72 @@ test("Claude Direct settings audit detects dual credentials and unrelated semant
     modeDiagnostic = error instanceof Error ? error.message : String(error)
   }
   expect(modeDiagnostic).toBe("direct-managed-configuration-mode-mismatch")
+})
+
+test("Claude Direct final settings audit survives an earlier failure at partial progress", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-direct-final-settings-"))
+  roots.push(root)
+  const settingsPath = join(root, "settings.json")
+  const bearer = "controlled-final-settings-bearer"
+  const apiKey = "controlled-final-settings-api-key"
+  const expected: ClaudeDirectSettingsExpectation = {
+    authentication: "anthropic-bearer",
+    baseUrl: "https://controlled-final-settings.invalid/v1",
+    credential: bearer,
+    model: "controlled-final-settings-model",
+  }
+  const clean = JSON.stringify({
+    operator: { theme: "dark", hooks: ["keep"] },
+    env: {
+      OPERATOR_UNRELATED: "keep-me",
+      ANTHROPIC_BASE_URL: expected.baseUrl,
+      ANTHROPIC_MODEL: expected.model,
+      ANTHROPIC_AUTH_TOKEN: bearer,
+    },
+  })
+  const mutations = [
+    {
+      text: clean.replace('"theme":"dark"', `"theme":"dark","leak":"${apiKey}"`),
+      mode: 0o640,
+    },
+    { text: clean, mode: 0o600 },
+    {
+      text: clean.replace('"OPERATOR_UNRELATED":"keep-me"', '"OPERATOR_UNRELATED":"changed"'),
+      mode: 0o640,
+    },
+  ]
+
+  await writeFile(settingsPath, clean, { mode: 0o640 })
+  await chmod(settingsPath, 0o640)
+  await expect(auditClaudeDirectSettingsFile(settingsPath, {
+    kind: "direct",
+    expected,
+  }, [bearer, apiKey], 0o640)).resolves.toBeUndefined()
+
+  for (const mutation of mutations) {
+    await writeFile(settingsPath, mutation.text, { mode: mutation.mode })
+    await chmod(settingsPath, mutation.mode)
+    let diagnostic = ""
+    try {
+      try {
+        throw new Error("controlled-earlier-functional-failure")
+      } finally {
+        await runClaudeSecurityFinalizer([{
+          name: "settings",
+          run: () => auditClaudeDirectSettingsFile(settingsPath, {
+            kind: "direct",
+            expected,
+          }, [bearer, apiKey], 0o640),
+        }])
+      }
+    } catch (error) {
+      diagnostic = error instanceof Error ? error.message : String(error)
+    }
+    expect(diagnostic).toBe("claude-security-finalizer-failed:settings")
+    expect(diagnostic.includes(bearer)).toBeFalse()
+    expect(diagnostic.includes(apiKey)).toBeFalse()
+    expect(diagnostic.includes(mutation.text)).toBeFalse()
+  }
 })
 
 test("inbound action barrier rejects a wrong error with fixed diagnostics", async () => {
@@ -2056,6 +2211,34 @@ test("Claude environment trap audit rejects traps stripped before child spawn", 
   expect(diagnostic.includes(requested.HOME)).toBeFalse()
 })
 
+test("Claude Direct environment trap fingerprint rejects mutation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-direct-trap-"))
+  roots.push(root)
+  const canary = join(root, "canary")
+  const secret = "controlled-claude-direct-trap-secret"
+  await writeFile(canary, "unchanged\n", { mode: 0o600 })
+  const fingerprint = await controlledTreeFingerprint(root)
+  await expect(assertControlledTreeUnchanged(
+    root,
+    fingerprint,
+    "claude-direct-environment-trap-mutated",
+  )).resolves.toBeUndefined()
+
+  await writeFile(canary, secret, { mode: 0o600 })
+  let diagnostic = ""
+  try {
+    await assertControlledTreeUnchanged(
+      root,
+      fingerprint,
+      "claude-direct-environment-trap-mutated",
+    )
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(diagnostic).toBe("claude-direct-environment-trap-mutated")
+  expect(diagnostic.includes(secret)).toBeFalse()
+})
+
 test("real service keeps child-visible environment traps outside the explicit target home", async () => {
   const root = await mkdtemp(join(tmpdir(), "ce-"))
   roots.push(root)
@@ -2271,6 +2454,56 @@ test("Claude SQLite recovery audit allows v2 API-key ownership but rejects the s
   expect(diagnostic.includes(secret)).toBeFalse()
 })
 
+test("Claude SQLite recovery audit rejects inconsistent ownership versions scan-first", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-recovery-consistency-audit-"))
+  roots.push(root)
+  const path = join(root, "mutation.db")
+  const secret = "controlled-inconsistent-recovery-api-key"
+  const database = new Database(path, { create: true })
+  database.exec("CREATE TABLE activation_recovery (target TEXT, payload_json TEXT)")
+  const writePayload = (payload: unknown) => {
+    database.query("DELETE FROM activation_recovery").run()
+    database.query("INSERT INTO activation_recovery VALUES ('claude', ?)").run(JSON.stringify(payload))
+  }
+  const policy = {
+    providerSecrets: [{ target: "claude" as const, name: "Prior API Key", secret }],
+    routingSecrets: [],
+  }
+  writePayload({
+    target: "claude",
+    ownership_version: 2,
+    before: {
+      ownership_version: 1,
+      owned: { base_url: null, auth_token: null, model: null, api_key: secret },
+    },
+    desired: {
+      ownership_version: 2,
+      mode: "direct",
+      owned: { base_url: "https://controlled.invalid", auth_token: null, model: "controlled", api_key: null },
+    },
+  })
+  let scanFirstDiagnostic = ""
+  try { auditSqliteSecretLocations(path, policy) } catch (error) {
+    scanFirstDiagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(scanFirstDiagnostic).toBe("secret-scan-failed:claude-sqlite-secret-location")
+  expect(scanFirstDiagnostic.includes(secret)).toBeFalse()
+
+  writePayload({
+    target: "claude",
+    ownership_version: 2,
+    before: { ownership_version: 2, owned: {} },
+    desired: { ownership_version: 1, owned: {} },
+  })
+  database.close()
+  let semanticDiagnostic = ""
+  try { auditSqliteSecretLocations(path, policy) } catch (error) {
+    semanticDiagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(semanticDiagnostic).toBe("claude-sqlite-recovery-ownership-version-invalid")
+  expect(semanticDiagnostic.includes(secret)).toBeFalse()
+})
+
 test("Claude Messages projection rejects contract mutations with fixed diagnostics", () => {
   const exact: ClaudeRequestProjection = {
     method: "POST",
@@ -2341,12 +2574,16 @@ test("fake Claude upstream rejects missing version and altered schema with fixed
   }
 })
 
-test("Claude tracer fixture enforces restrictive umask", async () => {
+async function runClaudeRestrictiveUmaskTracer(input: {
+  label: string
+  pattern: string
+  secrets: readonly string[]
+}): Promise<void> {
   const child = spawn(process.execPath, [
     "test",
     "./packages/control-plane/test/walking-skeleton.e2e.tsx",
     "--test-name-pattern",
-    "real processes prove independent Claude takeover, Messages, hot switch, and restart",
+    input.pattern,
   ], {
     cwd: repoRoot,
     env: { ...process.env, MUXVIA_CLAUDE_RESTRICTIVE_UMASK_CHILD: "1" },
@@ -2360,17 +2597,38 @@ test("Claude tracer fixture enforces restrictive umask", async () => {
   if (!completed) {
     child.kill("SIGKILL")
     await output.completed.catch(() => {})
-    throw new Error("restrictive-umask-claude-tracer-timeout")
+    throw new Error(`restrictive-umask-${input.label}-tracer-timeout`)
   }
-  scanProcessOutputNoSecrets(output.streams, [
-    "claude-api-provider-secret-must-not-escape",
-    "claude-bearer-provider-secret-must-not-escape",
-    providerSecret,
-  ])
+  scanProcessOutputNoSecrets(output.streams, input.secrets)
   if (completed.code !== 0 || completed.signal !== null) {
-    throw new Error("restrictive-umask-claude-tracer-failed")
+    throw new Error(`restrictive-umask-${input.label}-tracer-failed`)
   }
+}
+
+test("Claude tracer fixture enforces restrictive umask", async () => {
+  await runClaudeRestrictiveUmaskTracer({
+    label: "claude",
+    pattern: "real processes prove independent Claude takeover, Messages, hot switch, and restart",
+    secrets: [
+      "claude-api-provider-secret-must-not-escape",
+      "claude-bearer-provider-secret-must-not-escape",
+      providerSecret,
+    ],
+  })
 })
+
+test("Claude Direct tracer fixture enforces restrictive umask", async () => {
+  await runClaudeRestrictiveUmaskTracer({
+    label: "claude-direct",
+    pattern: "real processes prove Claude Direct authentication replacement and natural idle restart",
+    secrets: [
+      "claude-direct-bearer-secret-must-not-escape",
+      "claude-direct-api-key-secret-must-not-escape",
+      "claude-direct-prior-bearer-must-not-escape",
+      "claude-direct-prior-api-key-must-not-escape",
+    ],
+  })
+}, 70_000)
 
 const controlledProviderCredential = "controlled-expected-provider"
 
@@ -3747,6 +4005,11 @@ test("real processes prove Claude Direct authentication replacement and natural 
   const socketPath = join(muxviaHome, "run/control.sock")
   const databasePath = join(muxviaHome, "state/muxvia.db")
   const trapHome = join(root, "outside-home-traps")
+  const inheritedTraps = {
+    HOME: trapHome,
+    CODEX_HOME: join(trapHome, ".codex"),
+    CLAUDE_CONFIG_DIR: join(trapHome, ".claude"),
+  }
   const bearerSecret = "claude-direct-bearer-secret-must-not-escape"
   const apiKeySecret = "claude-direct-api-key-secret-must-not-escape"
   const priorBearer = "claude-direct-prior-bearer-must-not-escape"
@@ -3756,6 +4019,18 @@ test("real processes prove Claude Direct authentication replacement and natural 
   const bearerModel = "claude-direct-bearer-model"
   const apiKeyModel = "claude-direct-api-key-model"
   const directSecrets = [bearerSecret, apiKeySecret, priorBearer, priorApiKey]
+  const bearerSettings: ClaudeDirectSettingsExpectation = {
+    authentication: "anthropic-bearer",
+    baseUrl: bearerBaseUrl,
+    credential: bearerSecret,
+    model: bearerModel,
+  }
+  const apiKeySettings: ClaudeDirectSettingsExpectation = {
+    authentication: "anthropic-api-key",
+    baseUrl: apiKeyBaseUrl,
+    credential: apiKeySecret,
+    model: apiKeyModel,
+  }
   const sqliteSecretPolicy: SqliteSecretPolicy = {
     providerSecrets: [
       { target: "claude", name: "Claude Direct Bearer", secret: bearerSecret },
@@ -3807,24 +4082,34 @@ test("real processes prove Claude Direct authentication replacement and natural 
   let unsubscribes: Array<() => void> = []
   let setup: Awaited<ReturnType<typeof testRender>> | undefined
   let rendererAudit: ReturnType<typeof createRendererAudit> | undefined
-  let activeSettings: ClaudeDirectSettingsExpectation | undefined
+  let settingsPhase: ClaudeDirectSettingsAuditPhase = {
+    kind: "unmanaged",
+    priorAuthToken: priorBearer,
+    priorApiKey,
+  }
 
   const collectView = (view: TargetView, label: string) => {
     assertSecretSafeStructured(view, directSecrets, label)
     views.push(view)
   }
   const startService = async (label: string) => {
+    const inheritedEnvironment: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...inheritedTraps,
+      PATH: `${dirname(fakeClaude)}:/usr/bin:/bin`,
+      MUXVIA_INTEGRATION_TEST: "1",
+    }
+    assertChildVisibleEnvironment(inheritedTraps, inheritedEnvironment, trapHome, trapHome)
+    const environment: NodeJS.ProcessEnv = { ...inheritedEnvironment, HOME: userHome }
+    delete environment.CODEX_HOME
+    delete environment.CLAUDE_CONFIG_DIR
     const child = spawn(serviceBinary, [
       "--home", muxviaHome,
       "--test-codex-executable", fakeCodex,
       "--test-claude-executable", fakeClaude,
     ], {
       cwd: root,
-      env: {
-        HOME: userHome,
-        PATH: `${dirname(fakeClaude)}:/usr/bin:/bin`,
-        MUXVIA_INTEGRATION_TEST: "1",
-      },
+      env: environment,
       stdio: ["ignore", "pipe", "pipe"],
     })
     const record = { child, output: captureProcessOutput(child) }
@@ -3992,6 +4277,7 @@ test("real processes prove Claude Direct authentication replacement and natural 
 
     const bearerFrameStart = decodedFrames.length
     await setup.mockInput.typeText("/direct")
+    settingsPhase = { kind: "direct", expected: bearerSettings }
     setup.mockInput.pressEnter()
     const bearerView = await waitForSecretSafeSession(
       claudeSession!,
@@ -4014,18 +4300,11 @@ test("real processes prove Claude Direct authentication replacement and natural 
       model: bearerModel,
       settingsPath,
     }, directSecrets, "claude-direct-bearer")
-    const bearerSettings: ClaudeDirectSettingsExpectation = {
-      authentication: "anthropic-bearer",
-      baseUrl: bearerBaseUrl,
-      credential: bearerSecret,
-      model: bearerModel,
-    }
     assertExactClaudeDirectSettings(await readFile(settingsPath, "utf8"), bearerSettings, [
       apiKeySecret,
       priorBearer,
       priorApiKey,
     ])
-    activeSettings = bearerSettings
     assertExactFileMode((await stat(settingsPath)).mode & 0o777, originalMode)
     assertSecretSafeStructured(bearerView, directSecrets, "claude-direct-bearer-view", (view) => {
       expect(view).toMatchObject({
@@ -4101,6 +4380,7 @@ test("real processes prove Claude Direct authentication replacement and natural 
     )
     setup.mockInput.pressKey("down")
     const apiFrameStart = decodedFrames.length
+    settingsPhase = { kind: "direct", expected: apiKeySettings }
     leader("a")
     const apiKeyView = await waitForSecretSafeSession(
       claudeSession!,
@@ -4128,19 +4408,12 @@ test("real processes prove Claude Direct authentication replacement and natural 
       model: apiKeyModel,
       settingsPath,
     }, directSecrets, "claude-direct-api-key")
-    const apiKeySettings: ClaudeDirectSettingsExpectation = {
-      authentication: "anthropic-api-key",
-      baseUrl: apiKeyBaseUrl,
-      credential: apiKeySecret,
-      model: apiKeyModel,
-    }
     const finalSettingsBytes = await readFile(settingsPath, "utf8")
     assertExactClaudeDirectSettings(finalSettingsBytes, apiKeySettings, [
       bearerSecret,
       priorBearer,
       priorApiKey,
     ])
-    activeSettings = apiKeySettings
     assertExactFileMode((await stat(settingsPath)).mode & 0o777, originalMode)
     assertSecretSafeStructured(apiKeyView, directSecrets, "claude-direct-api-view", (view) => {
       expect(view).toMatchObject({
@@ -4230,7 +4503,7 @@ test("real processes prove Claude Direct authentication replacement and natural 
       })
     })
     expect(restartedView.service.epoch).not.toBe(firstEpoch)
-    assertExactClaudeDirectSettings(await readFile(settingsPath, "utf8"), activeSettings, [
+    assertExactClaudeDirectSettings(await readFile(settingsPath, "utf8"), apiKeySettings, [
       bearerSecret,
       priorBearer,
       priorApiKey,
@@ -4339,15 +4612,14 @@ test("real processes prove Claude Direct authentication replacement and natural 
         auditSqliteSecretLocations(databasePath, sqliteSecretPolicy)
       } },
       { name: "settings", run: async () => {
-        if (!activeSettings) return
-        const forbidden = directSecrets.filter((secret) => secret !== activeSettings!.credential)
-        assertExactClaudeDirectSettings(await readFile(settingsPath, "utf8"), activeSettings, forbidden)
-        assertExactFileMode((await stat(settingsPath)).mode & 0o777, originalMode)
+        await auditClaudeDirectSettingsFile(settingsPath, settingsPhase, directSecrets, originalMode)
       } },
       { name: "trap", run: async () => {
-        if (await controlledTreeFingerprint(trapHome) !== trapFingerprint) {
-          throw new Error("claude-direct-environment-trap-mutated")
-        }
+        await assertControlledTreeUnchanged(
+          trapHome,
+          trapFingerprint,
+          "claude-direct-environment-trap-mutated",
+        )
       } },
     ])
   }

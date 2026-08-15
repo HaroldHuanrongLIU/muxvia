@@ -52,6 +52,7 @@ pub struct StateStore {
 
 type ActivationPreparationRow = (
     u64,
+    u32,
     String,
     String,
     Option<u16>,
@@ -64,6 +65,7 @@ type ActivationPreparationRow = (
 );
 
 pub struct ActivationPreparation {
+    pub managed_config_version: u32,
     pub provider_id: Uuid,
     pub base_url: String,
     pub model: String,
@@ -104,6 +106,7 @@ pub enum ActivationCommit {
 
 pub struct CommittedTakeover {
     pub route_port: u16,
+    pub managed_config_version: u32,
 }
 
 pub struct RoutingSnapshot {
@@ -163,6 +166,8 @@ impl StateStore {
                 if foreign_key_check.query([])?.next()?.is_some() {
                     return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
                 }
+                drop(foreign_key_check);
+                mark_invalid_managed_config_versions(connection, None)?;
                 Ok(())
             })
             .await
@@ -227,7 +232,8 @@ impl StateStore {
             .call(
                 move |connection| -> Result<Option<CommittedTakeover>, StateError> {
                     let row = connection.query_row(
-                        "SELECT route_port, routing_credential, activated_snapshot_id
+                        "SELECT route_port, routing_credential, activated_snapshot_id,
+                                managed_config_version
                      FROM target_route_state
                      WHERE target = ?1 AND takeover_state = 'active'",
                         [target.as_str()],
@@ -236,20 +242,31 @@ impl StateStore {
                                 row.get::<_, Option<u16>>(0)?,
                                 row.get::<_, Option<String>>(1)?,
                                 row.get::<_, Option<String>>(2)?,
+                                row.get::<_, u32>(3)?,
                             ))
                         },
                     );
                     match row {
-                        Ok((Some(route_port), Some(credential), Some(snapshot)))
-                            if !credential.is_empty() && !snapshot.is_empty() =>
-                        {
+                        Ok((
+                            Some(route_port),
+                            Some(credential),
+                            Some(snapshot),
+                            managed_config_version,
+                        )) if !credential.is_empty() && !snapshot.is_empty() => {
                             let exists: bool = connection.query_row(
                                 "SELECT EXISTS(SELECT 1 FROM activated_snapshots WHERE id = ?1)",
                                 [snapshot],
                                 |row| row.get(0),
                             )?;
                             if exists {
-                                Ok(Some(CommittedTakeover { route_port }))
+                                if valid_managed_config_version(target, managed_config_version) {
+                                    Ok(Some(CommittedTakeover {
+                                        route_port,
+                                        managed_config_version,
+                                    }))
+                                } else {
+                                    Err(StateError::InvalidActivatedSnapshot)
+                                }
                             } else {
                                 Err(StateError::InvalidActivatedSnapshot)
                             }
@@ -282,11 +299,12 @@ impl StateStore {
         let service_epoch = self.service_epoch.clone();
         self.connection
             .call(move |connection| -> Result<Result<ActivationPreparation, ActionFailure>, StateError> {
-                let (revision, recovery_state, takeover_state, route_port, routing_credential,
+                let (revision, managed_config_version, recovery_state, takeover_state, route_port, routing_credential,
                     raw_snapshot_id, joined_snapshot_id, prior_base_url, prior_model,
                     prior_provider_credential):
                     ActivationPreparationRow = connection.query_row(
-                        "SELECT r.management_revision, r.recovery_state, r.takeover_state,
+                        "SELECT r.management_revision, r.managed_config_version,
+                                r.recovery_state, r.takeover_state,
                                 r.route_port, r.routing_credential, r.activated_snapshot_id,
                                 s.id, s.base_url, s.model, s.provider_bearer_token
                          FROM target_route_state r
@@ -296,7 +314,7 @@ impl StateStore {
                         [target.as_str()],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
                             row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?,
-                            row.get(9)?)),
+                            row.get(9)?, row.get(10)?)),
                     )?;
                 let failure = |code: &str, message: &str| -> ActionFailure {
                     ActionFailure {
@@ -310,6 +328,13 @@ impl StateStore {
                 };
                 if recovery_state == "recovery-required" {
                     return Ok(Err(failure("recovery-required", "Managed writes are blocked until recovery is resolved")));
+                }
+                if !valid_managed_config_version(target, managed_config_version) {
+                    mark_invalid_managed_config_versions(connection, Some(target))?;
+                    return Ok(Err(failure(
+                        "recovery-required",
+                        "Managed configuration requires recovery",
+                    )));
                 }
                 let drifted: bool = connection.query_row(
                     "SELECT EXISTS(SELECT 1 FROM target_problems
@@ -368,6 +393,18 @@ impl StateStore {
                         "Managed configuration requires recovery",
                     ))),
                 };
+                if !valid_current_managed_config_version(
+                    target,
+                    managed_config_version,
+                    prior_snapshot.is_some(),
+                    prior_route_runtime.is_some(),
+                ) {
+                    mark_invalid_managed_config_versions(connection, Some(target))?;
+                    return Ok(Err(failure(
+                        "recovery-required",
+                        "Managed configuration requires recovery",
+                    )));
+                }
                 let provider = connection.query_row(
                     "SELECT p.base_url, p.model, c.bearer_token, p.protocol, p.authentication, p.routing_requirement
                      FROM providers p LEFT JOIN credentials c ON c.id = p.credential_id
@@ -411,6 +448,7 @@ impl StateStore {
                     )));
                 }
                 Ok(Ok(ActivationPreparation {
+                    managed_config_version,
                     provider_id,
                     base_url,
                     model,
@@ -444,6 +482,7 @@ impl StateStore {
             expected_revision,
             snapshot,
             runtime,
+            1,
             recovery_id,
             config_path,
             capability_problem,
@@ -459,6 +498,7 @@ impl StateStore {
         expected_revision: u64,
         snapshot: ActivatedSnapshot,
         runtime: ActivationRuntime,
+        managed_config_version: u32,
         recovery_id: Uuid,
         config_path: String,
         capability_problem: Option<ControlProblem>,
@@ -510,6 +550,33 @@ impl StateStore {
             if revision != expected_revision {
                 return Ok(ActivationCommit::Stale(project_target_view_for(&transaction, &service_epoch, target)?));
             }
+            if !valid_commit_managed_config_version(
+                target,
+                managed_config_version,
+                takeover_state,
+            ) {
+                let changed = transaction.execute(
+                    "UPDATE activation_recovery SET state = 'recovery-required'
+                     WHERE id = ?1 AND target = ?2 AND action_id = ?3 AND state = 'pending'",
+                    params![
+                        recovery_id.to_string(),
+                        target.as_str(),
+                        action_id.to_string()
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(StateError::MissingRecoveryIntent);
+                }
+                transaction.execute(
+                    "UPDATE target_route_state
+                     SET recovery_state = 'recovery-required', view_sequence = view_sequence + 1
+                     WHERE target = ?1",
+                    [target.as_str()],
+                )?;
+                let view = project_target_view_for(&transaction, &service_epoch, target)?;
+                transaction.commit()?;
+                return Ok(ActivationCommit::RecoveryRequired(view));
+            }
             transaction.execute(
                 "INSERT INTO activated_snapshots
                  (id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch)
@@ -534,10 +601,12 @@ impl StateStore {
                     serving_provider_id = NULL,
                     takeover_state = ?2, route_port = ?3,
                     routing_credential = ?4, activated_snapshot_id = ?5,
-                    managed_config_path = ?6, recovery_state = 'clean'
-                 WHERE target = ?7",
+                    managed_config_path = ?6, managed_config_version = ?7,
+                    recovery_state = 'clean'
+                 WHERE target = ?8",
                 params![snapshot.provider_id.to_string(), takeover_state, route_port,
-                    routing_credential, snapshot.id.to_string(), config_path, target.as_str()],
+                    routing_credential, snapshot.id.to_string(), config_path,
+                    managed_config_version, target.as_str()],
             )?;
             transaction.execute(
                 "DELETE FROM target_problems
@@ -1223,6 +1292,71 @@ impl StateStore {
             authoritative_view,
         }
     }
+}
+
+fn valid_managed_config_version(target: Target, version: u32) -> bool {
+    matches!(
+        (target, version),
+        (Target::Codex, 1) | (Target::Claude, 1 | 2)
+    )
+}
+
+fn valid_current_managed_config_version(
+    target: Target,
+    version: u32,
+    has_snapshot: bool,
+    has_route_runtime: bool,
+) -> bool {
+    matches!(
+        (target, version, has_snapshot, has_route_runtime),
+        (Target::Codex, 1, _, _)
+            | (Target::Claude, 1, false, false)
+            | (Target::Claude, 1, true, true)
+            | (Target::Claude, 2, true, _)
+    )
+}
+
+fn valid_commit_managed_config_version(target: Target, version: u32, takeover_state: &str) -> bool {
+    matches!(
+        (target, version, takeover_state),
+        (Target::Codex, 1, "inactive" | "active")
+            | (Target::Claude, 1, "active")
+            | (Target::Claude, 2, "inactive" | "active")
+    )
+}
+
+fn mark_invalid_managed_config_versions(
+    connection: &tokio_rusqlite::rusqlite::Connection,
+    target: Option<Target>,
+) -> tokio_rusqlite::rusqlite::Result<()> {
+    connection.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+    let result = match target {
+        Some(target) => connection.execute(
+            "UPDATE target_route_state
+             SET recovery_state = 'recovery-required',
+                 view_sequence = view_sequence + CASE
+                   WHEN recovery_state = 'recovery-required' THEN 0 ELSE 1 END
+             WHERE target = ?1",
+            [target.as_str()],
+        ),
+        None => connection.execute(
+            "UPDATE target_route_state
+             SET recovery_state = 'recovery-required',
+                 view_sequence = view_sequence + CASE
+                   WHEN recovery_state = 'recovery-required' THEN 0 ELSE 1 END
+             WHERE (target = 'codex' AND managed_config_version != 1)
+                OR (target = 'claude' AND managed_config_version NOT IN (1,2))
+                OR (target = 'claude' AND managed_config_version = 1
+                    AND activated_snapshot_id IS NOT NULL AND takeover_state != 'active')
+                OR (target = 'claude' AND managed_config_version = 2
+                    AND activated_snapshot_id IS NULL)",
+            [],
+        ),
+    };
+    let reset = connection.execute_batch("PRAGMA ignore_check_constraints = OFF;");
+    result?;
+    reset?;
+    Ok(())
 }
 
 enum ProviderAttempt {

@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::control::protocol::Target;
 use crate::{
-    claude::{ClaudeConfigSnapshot, DesiredClaudeState},
+    claude::{ClaudeConfigOwnership, ClaudeConfigSnapshot, DesiredClaudeState},
     codex::{ConfigSnapshot, DesiredCodexState},
 };
 
@@ -85,6 +85,7 @@ impl Serialize for RecoveryPayload {
             }),
             Self::Claude { before, desired } => serde_json::json!({
                 "target": "claude",
+                "ownership_version": before.ownership(),
                 "before": before,
                 "desired": desired,
             }),
@@ -141,6 +142,11 @@ impl<'de> Deserialize<'de> for RecoveryPayload {
                 ),
             }),
             "claude" => {
+                let declared_ownership = object
+                    .remove("ownership_version")
+                    .map(serde_json::from_value::<ClaudeConfigOwnership>)
+                    .transpose()
+                    .map_err(D::Error::custom)?;
                 let claude = object
                     .remove("payload")
                     .unwrap_or_else(|| serde_json::Value::Object(object.clone()));
@@ -153,15 +159,24 @@ impl<'de> Deserialize<'de> for RecoveryPayload {
                     .zip(claude_object.get("desired").cloned())
                     .and_then(|(before, desired)| {
                         Some((
-                            serde_json::from_value(before).ok()?,
-                            serde_json::from_value(desired).ok()?,
+                            serde_json::from_value::<ClaudeConfigSnapshot>(before).ok()?,
+                            serde_json::from_value::<DesiredClaudeState>(desired).ok()?,
                         ))
                     });
                 match typed {
-                    Some((before, desired)) => Ok(Self::Claude {
-                        before: Box::new(before),
-                        desired: Box::new(desired),
-                    }),
+                    Some((before, desired))
+                        if before.ownership() == desired.ownership()
+                            && declared_ownership.unwrap_or(ClaudeConfigOwnership::LegacyThree)
+                                == before.ownership() =>
+                    {
+                        Ok(Self::Claude {
+                            before: Box::new(before),
+                            desired: Box::new(desired),
+                        })
+                    }
+                    Some(_) => Err(D::Error::custom(
+                        "inconsistent Claude configuration ownership version",
+                    )),
                     None => Ok(Self::ClaudeLegacy { payload: claude }),
                 }
             }

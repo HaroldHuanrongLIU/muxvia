@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use crate::{
     claude::{
-        ClaudeCapability, ClaudeConfigCodec, ClaudeConfigSnapshot, ClaudeProbe, CommandClaudeProbe,
-        DesiredClaudeState,
+        ClaudeCapability, ClaudeConfigCodec, ClaudeConfigOwnership, ClaudeConfigSnapshot,
+        ClaudeProbe, CommandClaudeProbe, DesiredClaudeState,
     },
     codex::config::ManagedCodexState,
 };
@@ -658,10 +658,11 @@ impl ActivationService {
                         }
                     }
                     ConfigurationPreflight::Claude { codec, before } => {
-                        let desired = codec.desired_takeover(
+                        let desired = codec.desired_takeover_with_ownership(
                             &preparation.model,
                             &format!("http://127.0.0.1:{route_port}"),
                             routing_credential.expose_secret(),
+                            before.ownership(),
                         );
                         ActivationConfiguration::Claude {
                             codec,
@@ -730,6 +731,7 @@ impl ActivationService {
                     command.expected_revision,
                     snapshot,
                     runtime,
+                    preparation.managed_config_version,
                     recovery_id,
                     configuration.config_path().to_string_lossy().into_owned(),
                     capability_problem,
@@ -873,7 +875,11 @@ impl ActivationService {
             return Ok(());
         };
         if !self
-            .configuration_matches_committed_takeover(target, takeover.route_port)
+            .configuration_matches_committed_takeover(
+                target,
+                takeover.route_port,
+                takeover.managed_config_version,
+            )
             .await?
         {
             self.store
@@ -935,6 +941,7 @@ impl ActivationService {
         &self,
         target: Target,
         route_port: u16,
+        managed_config_version: u32,
     ) -> Result<bool, ModelServerError> {
         let snapshot = self
             .store
@@ -965,10 +972,14 @@ impl ActivationService {
             Target::Claude => {
                 let codec = ClaudeConfigCodec::for_user_home(self.home.user_home())
                     .map_err(|_| ModelServerError::TargetConfiguration)?;
-                let expected = codec.desired_takeover(
+                let ownership =
+                    ClaudeConfigOwnership::from_managed_config_version(managed_config_version)
+                        .ok_or(ModelServerError::TargetState)?;
+                let expected = codec.desired_takeover_with_ownership(
                     snapshot.model(),
                     &format!("http://127.0.0.1:{route_port}"),
                     routing_credential.expose_secret(),
+                    ownership,
                 );
                 Ok(codec.inspect_takeover(&expected).is_ok())
             }
@@ -1043,14 +1054,19 @@ impl ActivationService {
                     .ok_or_else(|| PreflightFailure::new("preflight-context-required"))?;
                 let codec = ClaudeConfigCodec::for_user_home(self.home.user_home())
                     .map_err(|problem| PreflightFailure::new(problem.code()))?;
+                let ownership = ClaudeConfigOwnership::from_managed_config_version(
+                    preparation.managed_config_version,
+                )
+                .ok_or_else(|| PreflightFailure::new("recovery-required"))?;
                 let expected = match (
                     &preparation.prior_snapshot,
                     &preparation.prior_route_runtime,
                 ) {
-                    (Some(snapshot), Some(runtime)) => Some(codec.desired_takeover(
+                    (Some(snapshot), Some(runtime)) => Some(codec.desired_takeover_with_ownership(
                         &snapshot.model,
                         &format!("http://127.0.0.1:{}", runtime.route_port),
                         runtime.routing_credential.expose_secret(),
+                        ownership,
                     )),
                     (None, None) => None,
                     (Some(_), None) | (None, Some(_)) => {
@@ -1058,7 +1074,7 @@ impl ActivationService {
                     }
                 };
                 let (_, before) = codec
-                    .preflight_snapshot(context, expected.as_ref())
+                    .preflight_snapshot_with_ownership(context, expected.as_ref(), ownership)
                     .map_err(|problem| {
                         let code = match problem.code() {
                             "configuration-collision" if expected.is_some() => "recovery-required",

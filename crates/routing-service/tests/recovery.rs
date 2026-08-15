@@ -4,7 +4,7 @@ use std::{fs, path::Path};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use muxvia_routing::{
-    claude::ClaudeConfigCodec,
+    claude::{ClaudeConfigCodec, ClaudeConfigOwnership},
     codex::CodexConfigCodec,
     control::protocol::Target,
     home::MuxviaHome,
@@ -931,6 +931,7 @@ fn claude_recovery_payload_is_typed_tagged_and_accepts_legacy_schema_v4_shape() 
         desired: Box::new(desired.clone()),
     };
     let encoded = serde_json::to_value(&payload).unwrap();
+    assert_eq!(encoded["ownership_version"], 2);
     assert_eq!(encoded["target"], "claude");
     assert!(encoded.get("before").is_some());
     assert!(encoded.get("desired").is_some());
@@ -944,19 +945,38 @@ fn claude_recovery_payload_is_typed_tagged_and_accepts_legacy_schema_v4_shape() 
     legacy_before
         .as_object_mut()
         .unwrap()
+        .remove("ownership_version");
+    legacy_before
+        .as_object_mut()
+        .unwrap()
         .insert("unrelated".to_owned(), serde_json::json!({}));
+    let mut legacy_desired = serde_json::to_value(desired).unwrap();
+    legacy_desired
+        .as_object_mut()
+        .unwrap()
+        .remove("ownership_version");
     let legacy = serde_json::json!({
         "target": "claude",
         "before": legacy_before,
-        "desired": serde_json::to_value(desired).unwrap()
+        "desired": legacy_desired
     });
     let decoded: RecoveryPayload = serde_json::from_value(legacy).unwrap();
     match decoded {
         RecoveryPayload::Claude { before, desired } => {
-            assert_eq!(*before, codec.inspect().unwrap());
+            assert_eq!(
+                *before,
+                codec
+                    .inspect_with_ownership(ClaudeConfigOwnership::LegacyThree)
+                    .unwrap()
+            );
             assert_eq!(
                 *desired,
-                codec.desired_takeover("claude-test", "http://127.0.0.1:43124", "routing-secret")
+                codec.desired_takeover_with_ownership(
+                    "claude-test",
+                    "http://127.0.0.1:43124",
+                    "routing-secret",
+                    ClaudeConfigOwnership::LegacyThree,
+                )
             );
         }
         RecoveryPayload::ClaudeLegacy { .. } => panic!("typed Claude payload decoded as legacy"),
@@ -965,7 +985,7 @@ fn claude_recovery_payload_is_typed_tagged_and_accepts_legacy_schema_v4_shape() 
 }
 
 #[tokio::test]
-async fn claude_recovery_payload_persists_only_owned_values_and_unrelated_fingerprint() {
+async fn claude_recovery_payload_persists_version_two_owned_values_and_unrelated_fingerprint() {
     let root = TempDir::new().unwrap();
     let codec = ClaudeConfigCodec::for_user_home(root.path()).unwrap();
     fs::create_dir_all(codec.settings_path().parent().unwrap()).unwrap();
@@ -1002,10 +1022,8 @@ async fn claude_recovery_payload_persists_only_owned_values_and_unrelated_finger
         .unwrap();
     let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
 
-    assert!(
-        !payload_json.contains("unrelated-api-key-sentinel"),
-        "Claude recovery payload retained an unrelated API key"
-    );
+    assert_eq!(payload["before"]["ownership_version"], 2);
+    assert_eq!(payload["desired"]["ownership_version"], 2);
     assert!(
         !payload_json.contains("custom-secret-sentinel"),
         "Claude recovery payload retained an unrelated custom secret"
@@ -1018,6 +1036,11 @@ async fn claude_recovery_payload_persists_only_owned_values_and_unrelated_finger
         payload["desired"]["owned"]["auth_token"] == "routing-token",
         "Claude recovery payload omitted the approved desired owned token field"
     );
+    assert_eq!(
+        payload["before"]["owned"]["api_key"],
+        "unrelated-api-key-sentinel"
+    );
+    assert!(payload["desired"]["owned"]["api_key"].is_null());
     assert!(
         payload["before"].get("unrelated_fingerprint").is_some(),
         "Claude recovery payload omitted the unrelated semantic fingerprint"
@@ -1029,6 +1052,11 @@ async fn claude_recovery_payload_persists_only_owned_values_and_unrelated_finger
     assert!(
         count_json_string(&payload, "routing-token") == 1,
         "Claude recovery payload duplicated the desired owned token"
+    );
+    assert_eq!(
+        count_json_string(&payload, "unrelated-api-key-sentinel"),
+        1,
+        "Claude recovery payload duplicated the prior owned API key"
     );
 }
 
@@ -1045,4 +1073,197 @@ fn count_json_string(value: &serde_json::Value, needle: &str) -> usize {
             .sum(),
         _ => 0,
     }
+}
+
+async fn insert_t05_claude_recovery_intent(
+    codec: &ClaudeConfigCodec,
+    before: serde_json::Value,
+    desired: serde_json::Value,
+) -> (Uuid, Uuid) {
+    let id = Uuid::new_v4();
+    let action_id = Uuid::new_v4();
+    let payload = serde_json::json!({
+        "target": "claude",
+        "before": before,
+        "desired": desired,
+    });
+    let database = tokio_rusqlite::Connection::open(store_database_path(codec))
+        .await
+        .unwrap();
+    let config_path = codec.settings_path().to_string_lossy().into_owned();
+    database
+        .call(move |connection| {
+            connection.execute(
+                "INSERT INTO activation_recovery
+                 (id, target, action_id, config_path, file_identity_json, payload_json,
+                  state, created_revision)
+                 VALUES (?1, 'claude', ?2, ?3, 'null', ?4, 'pending', 0)",
+                tokio_rusqlite::rusqlite::params![
+                    id.to_string(),
+                    action_id.to_string(),
+                    config_path,
+                    payload.to_string()
+                ],
+            )?;
+            Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+    (id, action_id)
+}
+
+fn store_database_path(codec: &ClaudeConfigCodec) -> std::path::PathBuf {
+    codec
+        .settings_path()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".muxvia/state/muxvia.db")
+}
+
+fn t05_wire_value(value: impl serde::Serialize) -> serde_json::Value {
+    let mut value = serde_json::to_value(value).unwrap();
+    value.as_object_mut().unwrap().remove("ownership_version");
+    value["owned"].as_object_mut().unwrap().remove("api_key");
+    value
+}
+
+#[tokio::test]
+async fn claude_ownership_version_legacy_before_and_desired_recovery_leave_api_key_unowned() {
+    for apply_desired in [false, true] {
+        let root = TempDir::new().unwrap();
+        let codec = ClaudeConfigCodec::for_user_home(root.path()).unwrap();
+        fs::create_dir_all(codec.settings_path().parent().unwrap()).unwrap();
+        fs::write(
+            codec.settings_path(),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://prior.test","ANTHROPIC_AUTH_TOKEN":"prior-token","ANTHROPIC_MODEL":"prior-model","ANTHROPIC_API_KEY":"api-key-must-stay"},"operator":true}"#,
+        )
+        .unwrap();
+        let store = StateStore::open(&MuxviaHome::from_user_home(root.path()))
+            .await
+            .unwrap();
+        let before = codec
+            .inspect_with_ownership(ClaudeConfigOwnership::LegacyThree)
+            .unwrap();
+        let desired = codec.desired_takeover_with_ownership(
+            "next-model",
+            "http://127.0.0.1:43124",
+            "routing-secret",
+            ClaudeConfigOwnership::LegacyThree,
+        );
+        let (id, _) = insert_t05_claude_recovery_intent(
+            &codec,
+            t05_wire_value(&before),
+            t05_wire_value(&desired),
+        )
+        .await;
+        if apply_desired {
+            codec.atomic_apply(&before, &desired).unwrap();
+        }
+
+        codec.reconcile_pending(&store).await.unwrap();
+
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(codec.settings_path()).unwrap()).unwrap();
+        assert_eq!(document["env"]["ANTHROPIC_API_KEY"], "api-key-must-stay");
+        assert_eq!(
+            store.recovery_intent(id).await.unwrap().unwrap().state(),
+            RecoveryState::RolledBack
+        );
+    }
+}
+
+#[tokio::test]
+async fn claude_ownership_version_legacy_api_key_change_is_an_unrelated_third_state() {
+    let root = TempDir::new().unwrap();
+    let codec = ClaudeConfigCodec::for_user_home(root.path()).unwrap();
+    fs::create_dir_all(codec.settings_path().parent().unwrap()).unwrap();
+    fs::write(
+        codec.settings_path(),
+        r#"{"env":{"ANTHROPIC_API_KEY":"api-key-before"}}"#,
+    )
+    .unwrap();
+    let store = StateStore::open(&MuxviaHome::from_user_home(root.path()))
+        .await
+        .unwrap();
+    let before = codec
+        .inspect_with_ownership(ClaudeConfigOwnership::LegacyThree)
+        .unwrap();
+    let desired = codec.desired_takeover_with_ownership(
+        "next-model",
+        "http://127.0.0.1:43124",
+        "routing-secret",
+        ClaudeConfigOwnership::LegacyThree,
+    );
+    let (id, _) = insert_t05_claude_recovery_intent(
+        &codec,
+        t05_wire_value(&before),
+        t05_wire_value(&desired),
+    )
+    .await;
+    fs::write(
+        codec.settings_path(),
+        r#"{"env":{"ANTHROPIC_API_KEY":"api-key-after"}}"#,
+    )
+    .unwrap();
+
+    let error = codec.reconcile_pending(&store).await.unwrap_err();
+
+    assert_eq!(error.code(), "recovery-required");
+    assert_eq!(
+        store.recovery_intent(id).await.unwrap().unwrap().state(),
+        RecoveryState::RecoveryRequired
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(codec.settings_path()).unwrap())
+            .unwrap()["env"]["ANTHROPIC_API_KEY"],
+        "api-key-after"
+    );
+}
+
+#[test]
+fn claude_ownership_version_two_payload_serializes_four_owned_values_and_redacts_diagnostics() {
+    let root = TempDir::new().unwrap();
+    let codec = ClaudeConfigCodec::for_user_home(root.path()).unwrap();
+    fs::create_dir_all(codec.settings_path().parent().unwrap()).unwrap();
+    fs::write(
+        codec.settings_path(),
+        r#"{"env":{"ANTHROPIC_BASE_URL":"https://prior.test","ANTHROPIC_AUTH_TOKEN":"prior-token-sentinel","ANTHROPIC_API_KEY":"prior-api-key-sentinel"}}"#,
+    )
+    .unwrap();
+    let before = codec.inspect().unwrap();
+    let desired = codec.desired_takeover(
+        "next-model",
+        "http://127.0.0.1:43124",
+        "routing-token-sentinel",
+    );
+    let payload = RecoveryPayload::Claude {
+        before: Box::new(before.clone()),
+        desired: Box::new(desired.clone()),
+    };
+
+    let encoded = serde_json::to_value(&payload).unwrap();
+    assert_eq!(encoded["ownership_version"], 2);
+    assert_eq!(encoded["before"]["ownership_version"], 2);
+    assert_eq!(encoded["desired"]["ownership_version"], 2);
+    assert_eq!(encoded["before"]["owned"].as_object().unwrap().len(), 4);
+    assert_eq!(encoded["desired"]["owned"].as_object().unwrap().len(), 4);
+    assert_eq!(
+        encoded["before"]["owned"]["api_key"],
+        "prior-api-key-sentinel"
+    );
+    assert!(encoded["desired"]["owned"]["api_key"].is_null());
+    let diagnostics = format!("{before:?}\n{desired:?}\n{payload:?}");
+    for sentinel in [
+        "prior-token-sentinel",
+        "prior-api-key-sentinel",
+        "routing-token-sentinel",
+    ] {
+        assert!(!diagnostics.contains(sentinel));
+    }
+
+    let mut inconsistent = encoded;
+    inconsistent["desired"]["ownership_version"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<RecoveryPayload>(inconsistent).is_err());
 }

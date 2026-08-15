@@ -18,11 +18,10 @@ use crate::{
     state::{RecoveryIntent, RecoveryState, StateStore},
 };
 
-const OWNED_KEYS: [&str; 3] = [
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_MODEL",
-];
+const BASE_URL_KEY: &str = "ANTHROPIC_BASE_URL";
+const AUTH_TOKEN_KEY: &str = "ANTHROPIC_AUTH_TOKEN";
+const MODEL_KEY: &str = "ANTHROPIC_MODEL";
+const API_KEY: &str = "ANTHROPIC_API_KEY";
 
 const PROVIDER_SELECTORS: [ClaudeBlockingSelector; 5] = [
     ClaudeBlockingSelector::Bedrock,
@@ -34,11 +33,61 @@ const PROVIDER_SELECTORS: [ClaudeBlockingSelector; 5] = [
 
 type ClaudePreRenameHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaudeConfigOwnership {
+    LegacyThree,
+    FourField,
+}
+
+impl ClaudeConfigOwnership {
+    pub(crate) fn from_managed_config_version(version: u32) -> Option<Self> {
+        match version {
+            1 => Some(Self::LegacyThree),
+            2 => Some(Self::FourField),
+            _ => None,
+        }
+    }
+
+    fn owned_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::LegacyThree => &[BASE_URL_KEY, AUTH_TOKEN_KEY, MODEL_KEY],
+            Self::FourField => &[BASE_URL_KEY, AUTH_TOKEN_KEY, MODEL_KEY, API_KEY],
+        }
+    }
+}
+
+impl Serialize for ClaudeConfigOwnership {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(match self {
+            Self::LegacyThree => 1,
+            Self::FourField => 2,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ClaudeConfigOwnership {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match u8::deserialize(deserializer)? {
+            1 => Ok(Self::LegacyThree),
+            2 => Ok(Self::FourField),
+            _ => Err(D::Error::custom(
+                "invalid Claude configuration ownership version",
+            )),
+        }
+    }
+}
+
+fn legacy_ownership() -> ClaudeConfigOwnership {
+    ClaudeConfigOwnership::LegacyThree
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct OwnedClaudeState {
     base_url: Option<Value>,
     auth_token: Option<Value>,
     model: Option<Value>,
+    #[serde(default)]
+    api_key: Option<Value>,
 }
 
 impl fmt::Debug for OwnedClaudeState {
@@ -48,12 +97,15 @@ impl fmt::Debug for OwnedClaudeState {
             .field("base_url_present", &self.base_url.is_some())
             .field("auth_token_present", &self.auth_token.is_some())
             .field("model_present", &self.model.is_some())
+            .field("api_key_present", &self.api_key.is_some())
             .finish()
     }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct DesiredClaudeState {
+    #[serde(default = "legacy_ownership")]
+    ownership_version: ClaudeConfigOwnership,
     owned: OwnedClaudeState,
 }
 
@@ -63,8 +115,16 @@ impl fmt::Debug for DesiredClaudeState {
     }
 }
 
+impl DesiredClaudeState {
+    pub(crate) fn ownership(&self) -> ClaudeConfigOwnership {
+        self.ownership_version
+    }
+}
+
 #[derive(Clone, Serialize)]
 pub struct ClaudeConfigSnapshot {
+    #[serde(default = "legacy_ownership")]
+    ownership_version: ClaudeConfigOwnership,
     identity: FileIdentity,
     owned: OwnedClaudeState,
     unrelated_fingerprint: String,
@@ -75,6 +135,7 @@ pub struct ClaudeConfigSnapshot {
 impl PartialEq for ClaudeConfigSnapshot {
     fn eq(&self, other: &Self) -> bool {
         self.identity == other.identity
+            && self.ownership_version == other.ownership_version
             && self.owned == other.owned
             && self.unrelated_fingerprint == other.unrelated_fingerprint
     }
@@ -84,6 +145,8 @@ impl<'de> Deserialize<'de> for ClaudeConfigSnapshot {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct WireSnapshot {
+            #[serde(default = "legacy_ownership")]
+            ownership_version: ClaudeConfigOwnership,
             identity: FileIdentity,
             owned: OwnedClaudeState,
             #[serde(default)]
@@ -99,6 +162,7 @@ impl<'de> Deserialize<'de> for ClaudeConfigSnapshot {
             (None, None) => return Err(D::Error::custom("missing unrelated semantic fingerprint")),
         };
         Ok(Self {
+            ownership_version: wire.ownership_version,
             identity: wire.identity,
             owned: wire.owned,
             unrelated_fingerprint,
@@ -112,6 +176,7 @@ impl fmt::Debug for ClaudeConfigSnapshot {
         formatter
             .debug_struct("ClaudeConfigSnapshot")
             .field("identity", &self.identity)
+            .field("ownership_version", &self.ownership_version)
             .field("owned", &self.owned)
             .field("unrelated", &"<fingerprint>")
             .finish()
@@ -121,6 +186,10 @@ impl fmt::Debug for ClaudeConfigSnapshot {
 impl ClaudeConfigSnapshot {
     pub(crate) fn identity(&self) -> &FileIdentity {
         &self.identity
+    }
+
+    pub(crate) fn ownership(&self) -> ClaudeConfigOwnership {
+        self.ownership_version
     }
 }
 
@@ -196,7 +265,14 @@ impl ClaudeConfigCodec {
     }
 
     pub fn inspect(&self) -> Result<ClaudeConfigSnapshot, ClaudeProblem> {
-        self.read_snapshot().map(|(snapshot, _)| snapshot)
+        self.inspect_with_ownership(ClaudeConfigOwnership::FourField)
+    }
+
+    pub fn inspect_with_ownership(
+        &self,
+        ownership: ClaudeConfigOwnership,
+    ) -> Result<ClaudeConfigSnapshot, ClaudeProblem> {
+        self.read_snapshot(ownership).map(|(snapshot, _)| snapshot)
     }
 
     pub fn desired_takeover(
@@ -205,11 +281,28 @@ impl ClaudeConfigCodec {
         base_url: &str,
         routing_credential: &str,
     ) -> DesiredClaudeState {
+        self.desired_takeover_with_ownership(
+            model,
+            base_url,
+            routing_credential,
+            ClaudeConfigOwnership::FourField,
+        )
+    }
+
+    pub fn desired_takeover_with_ownership(
+        &self,
+        model: &str,
+        base_url: &str,
+        routing_credential: &str,
+        ownership: ClaudeConfigOwnership,
+    ) -> DesiredClaudeState {
         DesiredClaudeState {
+            ownership_version: ownership,
             owned: OwnedClaudeState {
                 base_url: Some(Value::String(base_url.to_owned())),
                 auth_token: Some(Value::String(routing_credential.to_owned())),
                 model: Some(Value::String(model.to_owned())),
+                api_key: None,
             },
         }
     }
@@ -219,6 +312,12 @@ impl ClaudeConfigCodec {
         before: &ClaudeConfigSnapshot,
         desired: &DesiredClaudeState,
     ) -> Result<(), ClaudeProblem> {
+        if before.ownership_version != desired.ownership_version {
+            return Err(ClaudeProblem::new(
+                "configuration-write-failed",
+                Some(self.settings_path()),
+            ));
+        }
         self.write_owned(before, &desired.owned, false)?;
         self.verify(before, desired)
     }
@@ -228,7 +327,7 @@ impl ClaudeConfigCodec {
         before: &ClaudeConfigSnapshot,
         desired: &DesiredClaudeState,
     ) -> Result<(), ClaudeProblem> {
-        let current = self.inspect()?;
+        let current = self.inspect_with_ownership(before.ownership_version)?;
         if current.owned != desired.owned
             || current.unrelated_fingerprint != before.unrelated_fingerprint
         {
@@ -244,7 +343,7 @@ impl ClaudeConfigCodec {
         &self,
         desired: &DesiredClaudeState,
     ) -> Result<ClaudeConfigSnapshot, ClaudeProblem> {
-        let current = self.inspect()?;
+        let current = self.inspect_with_ownership(desired.ownership_version)?;
         if current.owned == desired.owned {
             Ok(current)
         } else {
@@ -260,7 +359,13 @@ impl ClaudeConfigCodec {
         before: &ClaudeConfigSnapshot,
         expected_current: &DesiredClaudeState,
     ) -> Result<(), ClaudeProblem> {
-        let current = self.inspect()?;
+        if before.ownership_version != expected_current.ownership_version {
+            return Err(ClaudeProblem::new(
+                "recovery-required",
+                Some(self.settings_path()),
+            ));
+        }
+        let current = self.inspect_with_ownership(before.ownership_version)?;
         if current.owned != expected_current.owned {
             return Err(ClaudeProblem::new(
                 "recovery-required",
@@ -274,7 +379,7 @@ impl ClaudeConfigCodec {
                 .and_then(Value::as_object)
                 .is_some_and(serde_json::Map::is_empty);
         self.write_owned(&current, &before.owned, remove_file)?;
-        let restored = self.inspect()?;
+        let restored = self.inspect_with_ownership(before.ownership_version)?;
         if restored.owned != before.owned
             || restored.unrelated_fingerprint != current.unrelated_fingerprint
         {
@@ -309,17 +414,18 @@ impl ClaudeConfigCodec {
         &self,
         context: &ClaudePreflightContext,
     ) -> Result<ClaudePreflightReport, ClaudeProblem> {
-        self.preflight_snapshot(context, None)
+        self.preflight_snapshot_with_ownership(context, None, ClaudeConfigOwnership::FourField)
             .map(|(report, _)| report)
     }
 
-    pub(crate) fn preflight_snapshot(
+    pub(crate) fn preflight_snapshot_with_ownership(
         &self,
         context: &ClaudePreflightContext,
         expected_takeover: Option<&DesiredClaudeState>,
+        ownership: ClaudeConfigOwnership,
     ) -> Result<(ClaudePreflightReport, ClaudeConfigSnapshot), ClaudeProblem> {
         self.validate_context(context)?;
-        let (snapshot, document) = self.read_snapshot()?;
+        let (snapshot, document) = self.read_snapshot(ownership)?;
         validate_provider_modes(&document, self.settings_path(), "user-settings")?;
         if expected_takeover.is_some_and(|expected| snapshot.owned != expected.owned) {
             return Err(ClaudeProblem::new(
@@ -344,7 +450,7 @@ impl ClaudeConfigCodec {
             } else {
                 "managed-settings"
             };
-            if has_owned_shadow(&source) {
+            if has_owned_shadow(&source, ownership) {
                 return Err(ClaudeProblem::new("shadowing-configuration", Some(&path))
                     .with_source(source_kind));
             }
@@ -433,7 +539,7 @@ impl ClaudeConfigCodec {
         if intent.config_path() != self.settings_path() {
             return self.mark_recovery_required(store, intent).await;
         }
-        let current = match self.inspect() {
+        let current = match self.inspect_with_ownership(before.ownership_version) {
             Ok(current) => current,
             Err(_) => return self.mark_recovery_required(store, intent).await,
         };
@@ -473,10 +579,11 @@ impl ClaudeConfigCodec {
     }
 
     fn matches_before(&self, before: &ClaudeConfigSnapshot) -> bool {
-        self.inspect().is_ok_and(|current| {
-            current.owned == before.owned
-                && current.unrelated_fingerprint == before.unrelated_fingerprint
-        })
+        self.inspect_with_ownership(before.ownership_version)
+            .is_ok_and(|current| {
+                current.owned == before.owned
+                    && current.unrelated_fingerprint == before.unrelated_fingerprint
+            })
     }
 
     fn write_owned(
@@ -485,14 +592,14 @@ impl ClaudeConfigCodec {
         owned: &OwnedClaudeState,
         remove_file: bool,
     ) -> Result<(), ClaudeProblem> {
-        let (current, mut document) = self.read_snapshot()?;
+        let (current, mut document) = self.read_snapshot(expected.ownership_version)?;
         if current != *expected {
             return Err(ClaudeProblem::new(
                 "configuration-write-failed",
                 Some(self.settings_path()),
             ));
         }
-        apply_owned(&mut document, owned);
+        apply_owned(&mut document, owned, expected.ownership_version);
         let bytes = serde_json::to_vec_pretty(&document).map_err(|_| {
             ClaudeProblem::new("configuration-write-failed", Some(self.settings_path()))
         })?;
@@ -501,7 +608,10 @@ impl ClaudeConfigCodec {
             .map_err(|error| map_file_error(error, Some(self.settings_path())))
     }
 
-    fn read_snapshot(&self) -> Result<(ClaudeConfigSnapshot, Value), ClaudeProblem> {
+    fn read_snapshot(
+        &self,
+        ownership: ClaudeConfigOwnership,
+    ) -> Result<(ClaudeConfigSnapshot, Value), ClaudeProblem> {
         let contents = self
             .file
             .read()
@@ -525,12 +635,13 @@ impl ClaudeConfigCodec {
                 Some(self.settings_path()),
             ));
         }
-        let owned = capture_owned(&document);
-        let unrelated = unrelated_projection(&document);
+        let owned = capture_owned(&document, ownership);
+        let unrelated = unrelated_projection(&document, ownership);
         let unrelated_fingerprint = semantic_fingerprint(&unrelated)
             .map_err(|_| ClaudeProblem::new("invalid-configuration", Some(self.settings_path())))?;
         Ok((
             ClaudeConfigSnapshot {
+                ownership_version: ownership,
                 identity: contents.identity,
                 owned,
                 unrelated_fingerprint,
@@ -552,23 +663,26 @@ fn semantic_fingerprint(unrelated: &Value) -> Result<String, serde_json::Error> 
     Ok(encoded)
 }
 
-fn capture_owned(document: &Value) -> OwnedClaudeState {
+fn capture_owned(document: &Value, ownership: ClaudeConfigOwnership) -> OwnedClaudeState {
     let env = document.get("env").and_then(Value::as_object);
     OwnedClaudeState {
-        base_url: env.and_then(|env| env.get(OWNED_KEYS[0])).cloned(),
-        auth_token: env.and_then(|env| env.get(OWNED_KEYS[1])).cloned(),
-        model: env.and_then(|env| env.get(OWNED_KEYS[2])).cloned(),
+        base_url: env.and_then(|env| env.get(BASE_URL_KEY)).cloned(),
+        auth_token: env.and_then(|env| env.get(AUTH_TOKEN_KEY)).cloned(),
+        model: env.and_then(|env| env.get(MODEL_KEY)).cloned(),
+        api_key: matches!(ownership, ClaudeConfigOwnership::FourField)
+            .then(|| env.and_then(|env| env.get(API_KEY)).cloned())
+            .flatten(),
     }
 }
 
-fn unrelated_projection(document: &Value) -> Value {
+fn unrelated_projection(document: &Value, ownership: ClaudeConfigOwnership) -> Value {
     let mut unrelated = document.clone();
     let object = unrelated
         .as_object_mut()
         .expect("validated Claude settings object");
     if let Some(env) = object.get_mut("env").and_then(Value::as_object_mut) {
-        for key in OWNED_KEYS {
-            env.remove(key);
+        for key in ownership.owned_keys() {
+            env.remove(*key);
         }
         if env.is_empty() {
             object.remove("env");
@@ -577,11 +691,14 @@ fn unrelated_projection(document: &Value) -> Value {
     unrelated
 }
 
-fn apply_owned(document: &mut Value, owned: &OwnedClaudeState) {
+fn apply_owned(document: &mut Value, owned: &OwnedClaudeState, ownership: ClaudeConfigOwnership) {
     let object = document
         .as_object_mut()
         .expect("validated Claude settings object");
-    let needs_env = owned.base_url.is_some() || owned.auth_token.is_some() || owned.model.is_some();
+    let needs_env = owned.base_url.is_some()
+        || owned.auth_token.is_some()
+        || owned.model.is_some()
+        || (ownership == ClaudeConfigOwnership::FourField && owned.api_key.is_some());
     if needs_env {
         object
             .entry("env")
@@ -589,9 +706,9 @@ fn apply_owned(document: &mut Value, owned: &OwnedClaudeState) {
     }
     if let Some(env) = object.get_mut("env").and_then(Value::as_object_mut) {
         for (key, value) in [
-            (OWNED_KEYS[0], &owned.base_url),
-            (OWNED_KEYS[1], &owned.auth_token),
-            (OWNED_KEYS[2], &owned.model),
+            (BASE_URL_KEY, &owned.base_url),
+            (AUTH_TOKEN_KEY, &owned.auth_token),
+            (MODEL_KEY, &owned.model),
         ] {
             match value {
                 Some(value) => {
@@ -599,6 +716,16 @@ fn apply_owned(document: &mut Value, owned: &OwnedClaudeState) {
                 }
                 None => {
                     env.remove(key);
+                }
+            }
+        }
+        if ownership == ClaudeConfigOwnership::FourField {
+            match &owned.api_key {
+                Some(value) => {
+                    env.insert(API_KEY.to_owned(), value.clone());
+                }
+                None => {
+                    env.remove(API_KEY);
                 }
             }
         }
@@ -643,11 +770,16 @@ fn selector_blocks(value: &Value) -> bool {
     }
 }
 
-fn has_owned_shadow(document: &Value) -> bool {
+fn has_owned_shadow(document: &Value, ownership: ClaudeConfigOwnership) -> bool {
     document
         .get("env")
         .and_then(Value::as_object)
-        .is_some_and(|env| OWNED_KEYS.into_iter().any(|key| env.contains_key(key)))
+        .is_some_and(|env| {
+            ownership
+                .owned_keys()
+                .iter()
+                .any(|key| env.contains_key(*key))
+        })
 }
 
 fn fs_read_json(path: &Path) -> Result<Value, ClaudeProblem> {

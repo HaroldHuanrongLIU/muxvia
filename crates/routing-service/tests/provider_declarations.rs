@@ -162,6 +162,18 @@ CREATE TABLE activation_recovery (
 );
 "#;
 
+fn v5_schema() -> String {
+    include_str!("../src/state/schema.sql")
+        .replace(
+            "  managed_config_version INTEGER NOT NULL DEFAULT 1 CHECK (managed_config_version IN (1,2)),\n",
+            "",
+        )
+        .replace(
+            "VALUES ('schema-version', '6')",
+            "VALUES ('schema-version', '5')",
+        )
+}
+
 struct StoreFixture {
     root: PathBuf,
     home: MuxviaHome,
@@ -176,6 +188,241 @@ impl StoreFixture {
         Self {
             root,
             home: MuxviaHome::from_user_home(&user_home),
+        }
+    }
+}
+
+#[tokio::test]
+async fn schema_v6_fresh_database_has_checked_non_null_default_ownership_version() {
+    let fixture = StoreFixture::new();
+    drop(fixture.open().await);
+
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    let (version, not_null, default_value, table_sql, route_versions) = database
+        .call(|connection| -> tokio_rusqlite::rusqlite::Result<_> {
+            let version = connection.query_row(
+                "SELECT value FROM metadata WHERE key = 'schema-version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?;
+            let (not_null, default_value) = connection.query_row(
+                "SELECT \"notnull\", dflt_value
+                 FROM pragma_table_info('target_route_state')
+                 WHERE name = 'managed_config_version'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )?;
+            let table_sql = connection.query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'target_route_state'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?;
+            let route_versions = connection
+                .prepare(
+                    "SELECT target, managed_config_version
+                     FROM target_route_state ORDER BY target",
+                )?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((version, not_null, default_value, table_sql, route_versions))
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(version, "6");
+    assert_eq!(not_null, 1);
+    assert_eq!(default_value.as_deref(), Some("1"));
+    assert!(table_sql.contains("CHECK (managed_config_version IN (1,2))"));
+    assert_eq!(route_versions, [("claude".into(), 1), ("codex".into(), 1)]);
+}
+
+#[tokio::test]
+async fn schema_v6_migrates_real_v5_claude_states_without_rewriting_persisted_artifacts() {
+    for active in [false, true] {
+        let fixture = StoreFixture::new();
+        fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
+        let provider_id = "00000000-0000-4000-8000-000000000201";
+        let snapshot_id = "00000000-0000-4000-8000-000000000202";
+        let action_id = "00000000-0000-4000-8000-000000000203";
+        let recovery_id = "00000000-0000-4000-8000-000000000204";
+        let payload =
+            r#"{"target":"claude","before":{"legacy":"before"},"desired":{"legacy":"desired"}}"#;
+        let receipt = r#"{"status":"applied","legacy":"receipt"}"#;
+        let connection = Connection::open(fixture.home.database_path()).unwrap();
+        connection.execute_batch(&v5_schema()).unwrap();
+        if active {
+            connection
+                .execute(
+                    "INSERT INTO credentials (id, target, bearer_token)
+                     VALUES (?1, 'claude', 'provider-secret')",
+                    [provider_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO providers
+                     (id, target, position, provider_revision, name, base_url, model, protocol,
+                      authentication, credential_id, routing_requirement)
+                     VALUES (?1, 'claude', 0, 1, 'Claude', 'https://provider.test', 'claude-test',
+                             'anthropic-messages', 'anthropic-bearer', ?1, 'direct-compatible')",
+                    [provider_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO activated_snapshots
+                     (id, target, provider_id, base_url, model, protocol, authentication,
+                      provider_bearer_token, epoch)
+                     VALUES (?1, 'claude', ?2, 'https://provider.test', 'claude-test',
+                             'anthropic-messages', 'anthropic-bearer', 'provider-secret',
+                             '00000000-0000-4000-8000-000000000205')",
+                    params![snapshot_id, provider_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE target_route_state SET management_revision = 7, view_sequence = 9,
+                       current_provider_id = ?1, takeover_state = 'active', route_port = 43124,
+                       routing_credential = 'route-secret', activated_snapshot_id = ?2,
+                       managed_config_path = '/tmp/settings.json'
+                     WHERE target = 'claude'",
+                    params![provider_id, snapshot_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO action_receipts
+                     (target, action_id, action_kind, committed_revision, outcome_json)
+                     VALUES ('claude', ?1, 'activate-provider', 7, ?2)",
+                    params![action_id, receipt],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO activation_recovery
+                     (id, target, action_id, config_path, file_identity_json, payload_json,
+                      state, created_revision)
+                     VALUES (?1, 'claude', ?2, '/tmp/settings.json', 'null', ?3,
+                             'committed', 6)",
+                    params![recovery_id, action_id, payload],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        drop(fixture.open().await);
+        let database = Connection::open(fixture.home.database_path()).unwrap();
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema-version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "6"
+        );
+        let route: (
+            i64,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            i64,
+        ) = database
+            .query_row(
+                "SELECT management_revision, takeover_state, route_port, routing_credential,
+                        activated_snapshot_id, managed_config_version
+                 FROM target_route_state WHERE target = 'claude'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(route.5, 1);
+        if active {
+            assert_eq!(
+                (
+                    route.0,
+                    route.1.clone(),
+                    route.2,
+                    route.3.clone(),
+                    route.4.clone()
+                ),
+                (
+                    7,
+                    "active".to_owned(),
+                    Some(43124),
+                    Some("route-secret".to_owned()),
+                    Some(snapshot_id.to_owned())
+                )
+            );
+            assert_eq!(
+                database
+                    .query_row(
+                        "SELECT bearer_token FROM credentials WHERE id = ?1",
+                        [provider_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "provider-secret"
+            );
+            assert_eq!(
+                database
+                    .query_row(
+                        "SELECT name || '|' || base_url || '|' || model || '|' || protocol || '|' || authentication
+                         FROM providers WHERE id = ?1",
+                        [provider_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "Claude|https://provider.test|claude-test|anthropic-messages|anthropic-bearer"
+            );
+            assert_eq!(
+                database
+                    .query_row(
+                        "SELECT provider_bearer_token FROM activated_snapshots WHERE id = ?1",
+                        [snapshot_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "provider-secret"
+            );
+            assert_eq!(
+                database
+                    .query_row(
+                        "SELECT outcome_json FROM action_receipts WHERE action_id = ?1",
+                        [action_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                receipt
+            );
+            assert_eq!(
+                database
+                    .query_row(
+                        "SELECT payload_json FROM activation_recovery WHERE id = ?1",
+                        [recovery_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                payload
+            );
+        } else {
+            assert_eq!(route, (0, "inactive".to_owned(), None, None, None, 1));
         }
     }
 }
@@ -447,7 +694,7 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "5");
+    assert_eq!(schema_version, "6");
     assert_eq!(
         view.providers[0].id,
         Uuid::parse_str(existing_provider_id).unwrap()
@@ -677,7 +924,7 @@ async fn schema_v4_migrates_v2_routing_requirement_and_historical_receipts() {
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "5");
+    assert_eq!(schema_version, "6");
     assert_eq!(
         store.target_view().await.unwrap().providers[0].routing_requirement,
         ProviderRoutingRequirement::DirectCompatible

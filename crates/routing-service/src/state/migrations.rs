@@ -14,7 +14,7 @@ use crate::control::protocol::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -44,21 +44,47 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v2(connection)?;
             migrate_v3(connection)?;
             migrate_v4(connection)?;
+            migrate_v5(connection)?;
         }
         Some(2) => {
             migrate_v2(connection)?;
             migrate_v3(connection)?;
             migrate_v4(connection)?;
+            migrate_v5(connection)?;
         }
         Some(3) => {
             migrate_v3(connection)?;
             migrate_v4(connection)?;
+            migrate_v5(connection)?;
         }
-        Some(4) => migrate_v4(connection)?,
+        Some(4) => {
+            migrate_v4(connection)?;
+            migrate_v5(connection)?;
+        }
+        Some(5) => migrate_v5(connection)?,
         Some(_) => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v5(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "ALTER TABLE target_route_state
+           ADD COLUMN managed_config_version INTEGER NOT NULL DEFAULT 1
+             CHECK (managed_config_version IN (1,2));",
+    )?;
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.execute(
+        "UPDATE metadata SET value = '6' WHERE key = 'schema-version'",
+        [],
+    )?;
+    transaction.commit()
 }
 
 fn migrate_v4(connection: &mut Connection) -> Result<()> {

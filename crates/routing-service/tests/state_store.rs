@@ -1,15 +1,18 @@
 use std::{fs, path::PathBuf};
 
 use muxvia_routing::{
+    claude::ClaudeConfigCodec,
     codex::CodexConfigCodec,
     control::protocol::{
-        ActionStatus, ClientFrame, ControlOperation, CredentialEdit, CredentialPresence, Target,
-        TargetAction,
+        ActionStatus, ClientFrame, ControlOperation, CredentialEdit, CredentialPresence,
+        ProviderAuthentication, ProviderProtocol, Target, TargetAction,
     },
+    domain::activation::ActivatedSnapshot,
     domain::provider::normalize_provider_base_url,
     home::MuxviaHome,
-    state::{RecoveryIntent, RecoveryPayload, StateStore},
+    state::{ActivationCommit, ActivationRuntime, RecoveryIntent, RecoveryPayload, StateStore},
 };
+use secrecy::SecretString;
 use uuid::Uuid;
 
 struct StoreFixture {
@@ -70,8 +73,8 @@ async fn new_database_target_view_matches_the_canonical_protocol_fixture() {
 }
 
 #[tokio::test]
-async fn fresh_schema_v5_reopens_with_codex_and_claude_route_rows() {
-    let root = std::env::temp_dir().join(format!("muxvia-v5-reopen-{}", Uuid::new_v4()));
+async fn fresh_schema_v6_reopens_with_codex_and_claude_route_rows() {
+    let root = std::env::temp_dir().join(format!("muxvia-v6-reopen-{}", Uuid::new_v4()));
     let user_home = root.join("home");
     fs::create_dir_all(&user_home).unwrap();
     let home = MuxviaHome::from_user_home(&user_home);
@@ -98,9 +101,383 @@ async fn fresh_schema_v5_reopens_with_codex_and_claude_route_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, "5");
+    assert_eq!(version, "6");
     assert_eq!(targets, ["claude", "codex"]);
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn managed_config_version_prepare_exposes_valid_target_ownership_version() {
+    let fixture = StoreFixture::new().await;
+    for target in [Target::Codex, Target::Claude] {
+        let result = fixture
+            .store
+            .prepare_activation_for(target, Uuid::new_v4(), 0)
+            .await
+            .unwrap();
+        let failure = match result {
+            Ok(_) => panic!("missing Provider unexpectedly prepared"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.problem.code, "incomplete-provider");
+
+        let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+            .await
+            .unwrap();
+        let version = database
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT managed_config_version FROM target_route_state WHERE target = ?1",
+                    [target.as_str()],
+                    |row| row.get::<_, u32>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(version, 1);
+    }
+
+    let created = fixture
+        .store
+        .apply_provider_action_for(
+            Target::Claude,
+            Uuid::new_v4(),
+            0,
+            serde_json::json!({
+                "kind": "create-provider",
+                "name": "Claude",
+                "baseUrl": "https://api.anthropic.com/v1",
+                "model": "claude-test",
+                "credential": { "kind": "replace", "value": "secret" },
+                "authentication": "anthropic-bearer",
+                "presetKey": "anthropic-api-messages"
+            }),
+        )
+        .await
+        .unwrap();
+    let preparation = fixture
+        .store
+        .prepare_activation_for(Target::Claude, created.view.providers[0].id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(preparation.managed_config_version, 1);
+}
+
+#[tokio::test]
+async fn managed_config_version_invalid_pairs_persist_only_target_recovery_required() {
+    for (target, invalid_version) in [(Target::Claude, 99), (Target::Codex, 2)] {
+        let fixture = StoreFixture::new().await;
+        let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+            .await
+            .unwrap();
+        database
+            .call(move |connection| {
+                connection.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+                connection.execute(
+                    "UPDATE target_route_state SET managed_config_version = ?1 WHERE target = ?2",
+                    tokio_rusqlite::rusqlite::params![invalid_version, target.as_str()],
+                )?;
+                Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        drop(database);
+
+        let result = fixture
+            .store
+            .prepare_activation_for(target, Uuid::new_v4(), 0)
+            .await
+            .unwrap();
+        let failure = match result {
+            Ok(_) => panic!("invalid ownership version unexpectedly prepared"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.problem.code, "recovery-required");
+        assert_eq!(failure.authoritative_view.target, target);
+        assert_eq!(
+            failure.authoritative_view.recovery.state,
+            "recovery-required"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .target_view_for(target)
+                .await
+                .unwrap()
+                .recovery
+                .state,
+            "recovery-required"
+        );
+        let peer = match target {
+            Target::Codex => Target::Claude,
+            Target::Claude => Target::Codex,
+        };
+        assert_eq!(
+            fixture
+                .store
+                .target_view_for(peer)
+                .await
+                .unwrap()
+                .recovery
+                .state,
+            "clean"
+        );
+    }
+}
+
+#[tokio::test]
+async fn managed_config_version_startup_audit_marks_only_an_invalid_target() {
+    let fixture = StoreFixture::new().await;
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(|connection| {
+            connection.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+            connection.execute(
+                "UPDATE target_route_state SET managed_config_version = 99 WHERE target = 'claude'",
+                [],
+            )?;
+            Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+    drop(database);
+
+    let reopened = StateStore::open(&fixture.home).await.unwrap();
+    assert_eq!(
+        reopened
+            .target_view_for(Target::Claude)
+            .await
+            .unwrap()
+            .recovery
+            .state,
+        "recovery-required"
+    );
+    assert_eq!(
+        reopened.target_view().await.unwrap().recovery.state,
+        "clean"
+    );
+}
+
+#[tokio::test]
+async fn managed_config_version_two_without_a_committed_claude_snapshot_requires_recovery() {
+    let fixture = StoreFixture::new().await;
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(|connection| {
+            connection.execute(
+                "UPDATE target_route_state SET managed_config_version = 2
+                 WHERE target = 'claude'",
+                [],
+            )?;
+            Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+    drop(database);
+
+    let result = fixture
+        .store
+        .prepare_activation_for(Target::Claude, Uuid::new_v4(), 0)
+        .await
+        .unwrap();
+    let failure = match result {
+        Ok(_) => panic!("inconsistent ownership/runtime unexpectedly prepared"),
+        Err(failure) => failure,
+    };
+    assert_eq!(failure.problem.code, "recovery-required");
+    assert_eq!(
+        failure.authoritative_view.recovery.state,
+        "recovery-required"
+    );
+    assert_eq!(
+        fixture.store.target_view().await.unwrap().recovery.state,
+        "clean"
+    );
+}
+
+#[tokio::test]
+async fn managed_config_version_commit_writes_requested_version_atomically_without_wire_projection()
+{
+    let fixture = StoreFixture::new().await;
+    let created = fixture
+        .store
+        .apply_provider_action_for(
+            Target::Claude,
+            Uuid::new_v4(),
+            0,
+            serde_json::json!({
+                "kind": "create-provider", "name": "Claude",
+                "baseUrl": "https://api.anthropic.com/v1", "model": "claude-test",
+                "credential": { "kind": "replace", "value": "provider-secret" },
+                "authentication": "anthropic-bearer", "presetKey": "anthropic-api-messages"
+            }),
+        )
+        .await
+        .unwrap();
+    let provider_id = created.view.providers[0].id;
+    let codec = ClaudeConfigCodec::for_user_home(fixture.home.user_home()).unwrap();
+    let action_id = Uuid::new_v4();
+    let recovery_id = Uuid::new_v4();
+    let intent = RecoveryIntent::pending_claude(
+        recovery_id,
+        action_id,
+        codec.settings_path().to_owned(),
+        codec.inspect().unwrap(),
+        codec.desired_takeover("claude-test", "http://127.0.0.1:43124", "route-secret"),
+        1,
+    );
+    fixture.store.insert_recovery_intent(&intent).await.unwrap();
+    let snapshot_id = Uuid::new_v4();
+    let commit = fixture
+        .store
+        .commit_activation_for(
+            Target::Claude,
+            action_id,
+            1,
+            ActivatedSnapshot {
+                id: snapshot_id,
+                target: Target::Claude,
+                provider_id,
+                base_url: "https://api.anthropic.com/v1".into(),
+                model: "claude-test".into(),
+                protocol: ProviderProtocol::AnthropicMessages,
+                authentication: ProviderAuthentication::AnthropicBearer,
+                provider_credential: SecretString::from("provider-secret"),
+                epoch: fixture.store.service_epoch(),
+            },
+            ActivationRuntime::Takeover {
+                route_port: 43124,
+                routing_credential: SecretString::from("route-secret"),
+            },
+            2,
+            recovery_id,
+            codec.settings_path().to_string_lossy().into_owned(),
+            None,
+        )
+        .await
+        .unwrap();
+    let outcome = match commit {
+        ActivationCommit::Applied(outcome) => outcome,
+        _ => panic!("valid Claude version-two commit did not apply"),
+    };
+    assert!(
+        !serde_json::to_string(&outcome)
+            .unwrap()
+            .contains("managedConfigVersion")
+    );
+
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    let persisted = database
+        .call(move |connection| {
+            connection.query_row(
+                "SELECT r.managed_config_version, a.state, r.activated_snapshot_id
+                 FROM target_route_state r JOIN activation_recovery a
+                   ON a.target = r.target AND a.id = ?1
+                 WHERE r.target = 'claude'",
+                [recovery_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(persisted, (2, "committed".into(), snapshot_id.to_string()));
+}
+
+#[tokio::test]
+async fn managed_config_version_invalid_commit_marks_only_its_target_before_snapshot_mutation() {
+    let fixture = StoreFixture::new().await;
+    let codec = ClaudeConfigCodec::for_user_home(fixture.home.user_home()).unwrap();
+    let action_id = Uuid::new_v4();
+    let recovery_id = Uuid::new_v4();
+    fixture
+        .store
+        .insert_recovery_intent(&RecoveryIntent::pending_claude(
+            recovery_id,
+            action_id,
+            codec.settings_path().to_owned(),
+            codec.inspect().unwrap(),
+            codec.desired_takeover("claude-test", "http://127.0.0.1:43124", "route-secret"),
+            0,
+        ))
+        .await
+        .unwrap();
+    let commit = fixture
+        .store
+        .commit_activation_for(
+            Target::Claude,
+            action_id,
+            0,
+            ActivatedSnapshot {
+                id: Uuid::new_v4(),
+                target: Target::Claude,
+                provider_id: Uuid::new_v4(),
+                base_url: "https://api.anthropic.com/v1".into(),
+                model: "claude-test".into(),
+                protocol: ProviderProtocol::AnthropicMessages,
+                authentication: ProviderAuthentication::AnthropicBearer,
+                provider_credential: SecretString::from("provider-secret"),
+                epoch: fixture.store.service_epoch(),
+            },
+            ActivationRuntime::Takeover {
+                route_port: 43124,
+                routing_credential: SecretString::from("route-secret"),
+            },
+            99,
+            recovery_id,
+            codec.settings_path().to_string_lossy().into_owned(),
+            None,
+        )
+        .await
+        .unwrap();
+    let view = match commit {
+        ActivationCommit::RecoveryRequired(view) => view,
+        _ => panic!("invalid Claude ownership version did not require recovery"),
+    };
+    assert_eq!(view.target, Target::Claude);
+    assert_eq!(view.recovery.state, "recovery-required");
+    assert_eq!(
+        fixture.store.target_view().await.unwrap().recovery.state,
+        "clean"
+    );
+
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    let persisted = database
+        .call(move |connection| {
+            let snapshot_count = connection.query_row(
+                "SELECT COUNT(*) FROM activated_snapshots WHERE target = 'claude'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            let recovery_state = connection.query_row(
+                "SELECT state FROM activation_recovery WHERE id = ?1",
+                [recovery_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )?;
+            let version = connection.query_row(
+                "SELECT managed_config_version FROM target_route_state WHERE target = 'claude'",
+                [],
+                |row| row.get::<_, u32>(0),
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>((snapshot_count, recovery_state, version))
+        })
+        .await
+        .unwrap();
+    assert_eq!(persisted, (0, "recovery-required".into(), 1));
 }
 
 #[tokio::test]

@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS target_route_state (
   routing_credential TEXT,
   activated_snapshot_id TEXT,
   managed_config_path TEXT,
+  managed_config_version INTEGER NOT NULL DEFAULT 1 CHECK (managed_config_version IN (1,2)),
   recovery_state TEXT NOT NULL
 );
 
@@ -91,7 +92,7 @@ CREATE TABLE IF NOT EXISTS activation_recovery (
   UNIQUE (target, action_id)
 );
 
-INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '5');
+INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '6');
 INSERT OR IGNORE INTO target_route_state (
   target,
   management_revision,

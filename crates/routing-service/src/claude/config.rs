@@ -1139,36 +1139,108 @@ mod tests {
     }
 
     #[test]
-    fn managed_state_reports_owned_or_unrelated_committed_drift_as_collision() {
-        for mutate in [
-            |document: &mut Value| document["env"][MODEL_KEY] = Value::String("drift".into()),
-            |document: &mut Value| document["operator"] = Value::String("drift".into()),
-        ] {
-            let (_home, codec) = fixture(r#"{"operator":"keep"}"#);
-            let committed_before = codec.inspect().expect("inspect unmanaged settings");
-            let desired =
-                codec.desired_takeover_v2("model", "http://127.0.0.1:9", "routing-secret");
-            codec
-                .atomic_apply(&committed_before, &desired)
-                .expect("apply Takeover state");
-            assert!(matches!(
-                codec
-                    .inspect_managed_state(Some((&desired, &committed_before)))
-                    .expect("inspect committed Takeover"),
-                ManagedClaudeState::Takeover { .. }
-            ));
-            let mut live = read_settings(&codec);
-            mutate(&mut live);
-            fs::write(
-                codec.settings_path(),
-                serde_json::to_vec_pretty(&live).expect("serialize drift"),
-            )
-            .expect("write drift");
+    fn managed_state_reports_every_direct_and_takeover_drift_as_collision() {
+        #[derive(Clone, Copy, Debug)]
+        enum Mode {
+            Direct,
+            Takeover,
+        }
 
-            let error = codec
-                .inspect_managed_state(Some((&desired, &committed_before)))
-                .expect_err("committed drift must collide");
-            assert_eq!(error.code(), "configuration-collision");
+        fn mutate_base_url(document: &mut Value) {
+            document["env"][BASE_URL_KEY] =
+                Value::String("https://drift-base-91827.example".into());
+        }
+        fn mutate_model(document: &mut Value) {
+            document["env"][MODEL_KEY] = Value::String("drift-model-82917".into());
+        }
+        fn mutate_auth_token(document: &mut Value) {
+            document["env"][AUTH_TOKEN_KEY] = Value::String("drift-auth-73129".into());
+        }
+        fn mutate_api_key(document: &mut Value) {
+            document["env"][API_KEY] = Value::String("drift-api-64219".into());
+        }
+        fn mutate_unrelated(document: &mut Value) {
+            document["operator"] = serde_json::json!({"nested": [53921, true]});
+        }
+
+        type DriftMutation = (&'static str, fn(&mut Value));
+        let mutations: [DriftMutation; 5] = [
+            ("base-url", mutate_base_url),
+            ("model", mutate_model),
+            ("auth-token", mutate_auth_token),
+            ("api-key", mutate_api_key),
+            ("unrelated", mutate_unrelated),
+        ];
+        for mode in [Mode::Direct, Mode::Takeover] {
+            for (field, mutate) in mutations {
+                let (_home, codec) = fixture(r#"{"operator":{"nested":[1,true]}}"#);
+                let committed_before = codec.inspect().expect("inspect unmanaged settings");
+                let desired = match mode {
+                    Mode::Direct => codec
+                        .desired_direct(
+                            "direct-model-35719",
+                            "https://direct-base-46831.example",
+                            ProviderAuthentication::AnthropicBearer,
+                            "direct-credential-24691",
+                        )
+                        .expect("valid Direct state"),
+                    Mode::Takeover => codec.desired_takeover_v2(
+                        "takeover-model-17539",
+                        "http://127.0.0.1:43124",
+                        "routing-credential-86413",
+                    ),
+                };
+                codec
+                    .atomic_apply(&committed_before, &desired)
+                    .expect("apply committed state");
+                let observed = codec
+                    .inspect_managed_state(Some((&desired, &committed_before)))
+                    .expect("inspect exact committed state");
+                assert!(matches!(
+                    (mode, observed),
+                    (Mode::Direct, ManagedClaudeState::Direct { .. })
+                        | (Mode::Takeover, ManagedClaudeState::Takeover { .. })
+                ));
+                let mut live = read_settings(&codec);
+                mutate(&mut live);
+                fs::write(
+                    codec.settings_path(),
+                    serde_json::to_vec_pretty(&live).expect("serialize drift"),
+                )
+                .expect("write drift");
+
+                let error = match codec.inspect_managed_state(Some((&desired, &committed_before))) {
+                    Ok(state) => {
+                        panic!("{mode:?} {field} committed drift was accepted: {state:?}")
+                    }
+                    Err(error) => error,
+                };
+                let diagnostic = format!("{error:?}\n{error}");
+                for forbidden in [
+                    "direct-credential-24691",
+                    "routing-credential-86413",
+                    "drift-auth-73129",
+                    "drift-api-64219",
+                    "24691",
+                    "86413",
+                    "91827",
+                    "82917",
+                    "73129",
+                    "64219",
+                    "35719",
+                    "46831",
+                    "17539",
+                    "53921",
+                    "100, 105, 114, 101, 99, 116",
+                ] {
+                    assert!(
+                        !diagnostic.contains(forbidden),
+                        "{field} drift diagnostic exposed controlled secret material"
+                    );
+                }
+                // The activation adapter maps this stable codec collision to recovery-required.
+                assert_eq!(error.code(), "configuration-collision");
+            }
         }
     }
 

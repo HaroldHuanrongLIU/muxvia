@@ -4,7 +4,10 @@ use std::{
     fs,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -44,6 +47,17 @@ struct ControlClaudeProbe;
 
 impl ClaudeProbe for ControlClaudeProbe {
     fn probe(&self, _: &Path) -> Result<ClaudeCapability, ClaudeProblem> {
+        Ok(ClaudeCapability::Tested {
+            version: "test".into(),
+        })
+    }
+}
+
+struct CountingClaudeProbe(AtomicUsize);
+
+impl ClaudeProbe for CountingClaudeProbe {
+    fn probe(&self, _: &Path) -> Result<ClaudeCapability, ClaudeProblem> {
+        self.0.fetch_add(1, Ordering::SeqCst);
         Ok(ClaudeCapability::Tested {
             version: "test".into(),
         })
@@ -1882,6 +1896,143 @@ async fn stale_socket_is_replaced_only_when_it_is_a_socket() {
     let home = MuxviaHome::from_user_home(user_home);
     let store = Arc::new(StateStore::open(&home).await.unwrap());
     let handle = ControlServer::bind(&home, store, "test").await.unwrap();
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn claude_unknown_nonempty_session_opens_read_only_but_takeover_has_no_side_effects() {
+    let root = short_temp_root("mx-claude-unknown");
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    let saved = store
+        .apply_provider_action_for(
+            muxvia_routing::control::protocol::Target::Claude,
+            Uuid::new_v4(),
+            0,
+            json!({
+                "kind": "create-provider", "name": "Claude",
+                "baseUrl": "https://api.anthropic.test", "model": "claude-test",
+                "credential": {"kind": "replace", "value": "provider-secret"},
+                "authentication": "anthropic-api-key", "presetKey": null
+            }),
+        )
+        .await
+        .unwrap();
+    let provider_id = saved.view.providers[0].id;
+    let before = saved.view;
+    let codex_before = store.target_view().await.unwrap();
+    let probe = Arc::new(CountingClaudeProbe(AtomicUsize::new(0)));
+    let activation = Arc::new(
+        ActivationService::new(
+            Arc::clone(&store),
+            home.clone(),
+            Arc::new(ControlCodexProbe),
+            "/usr/bin/codex".into(),
+            Arc::new(ControlNoopUpstream),
+        )
+        .with_claude_runtime(probe.clone(), "/usr/bin/claude".into()),
+    );
+    let handle = ControlServer::bind_with_activation(
+        &home,
+        Arc::clone(&store),
+        "routing-test",
+        Arc::clone(&activation),
+    )
+    .await
+    .unwrap();
+    let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut stream).await;
+    let opened = request(
+        &mut stream,
+        "open",
+        json!({
+            "kind": "open-target", "target": "claude",
+            "claudeContext": {
+                "claudeConfigDir": null,
+                "selectorState": "unknown-nonempty",
+                "hostManagedState": "unmanaged",
+                "cwd": user_home
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        opened["result"]["view"],
+        serde_json::to_value(&before).unwrap()
+    );
+    let action_id = Uuid::new_v4();
+
+    let blocked = request(
+        &mut stream,
+        "activate",
+        json!({
+            "kind": "act", "target": "claude", "actionId": action_id,
+            "expectedRevision": before.management_revision,
+            "action": {
+                "kind": "activate-provider", "providerId": provider_id,
+                "mode": "takeover"
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(blocked["problem"]["code"], "provider-mode-active");
+    assert_eq!(
+        blocked["authoritativeView"],
+        serde_json::to_value(&before).unwrap()
+    );
+    assert_eq!(probe.0.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store
+            .target_view_for(muxvia_routing::control::protocol::Target::Claude)
+            .await
+            .unwrap(),
+        before
+    );
+    assert_eq!(store.target_view().await.unwrap(), codex_before);
+    assert!(
+        store
+            .receipt_for(muxvia_routing::control::protocol::Target::Claude, action_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .recovery_intent_for(muxvia_routing::control::protocol::Target::Claude, action_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .activated_snapshot_for(muxvia_routing::control::protocol::Target::Claude)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .routing_credential_for(muxvia_routing::control::protocol::Target::Claude)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        activation
+            .model_endpoint_for(muxvia_routing::control::protocol::Target::Claude)
+            .await
+            .is_none()
+    );
+    assert!(!user_home.join(".claude/settings.json").exists());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), read_frame(&mut stream))
+            .await
+            .is_err(),
+        "a pre-side-effect blocker published a Target View"
+    );
     handle.shutdown().await.unwrap();
 }
 

@@ -698,6 +698,96 @@ async fn claude_unverifiable_restore_marks_only_claude_recovery_required() {
 }
 
 #[tokio::test]
+async fn claude_unverifiable_hot_switch_drains_only_the_claude_runtime() {
+    let fixture = Fixture::new().await;
+    let (codex_provider, codex_revision) = fixture
+        .save("Codex", "gpt-peer", "codex-provider-secret")
+        .await;
+    let (first_claude, first_revision) = fixture
+        .save_claude("Claude One", "claude-one", "first-provider-secret")
+        .await;
+    let first = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let codex_applied = first
+        .activate(command(codex_provider, codex_revision, Uuid::new_v4()))
+        .await
+        .unwrap();
+    let claude_applied = first
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            first_revision,
+            takeover_action(first_claude),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    let codex_endpoint: std::net::SocketAddr = codex_applied
+        .view
+        .takeover
+        .endpoint
+        .as_deref()
+        .unwrap()
+        .trim_start_matches("http://")
+        .parse()
+        .unwrap();
+    let claude_endpoint: std::net::SocketAddr = claude_applied
+        .view
+        .takeover
+        .endpoint
+        .as_deref()
+        .unwrap()
+        .trim_start_matches("http://")
+        .parse()
+        .unwrap();
+    first.shutdown_models().await.unwrap();
+
+    let faulting = fixture.dual_service(
+        ActivationHooks::failing(ActivationFailpoint::RestoreVerify),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    faulting.bootstrap_committed_takeovers().await.unwrap();
+    assert_eq!(faulting.model_endpoint().await, Some(codex_endpoint));
+    assert_eq!(
+        faulting.model_endpoint_for(Target::Claude).await,
+        Some(claude_endpoint)
+    );
+    let codex_before = fixture.store.target_view().await.unwrap();
+    let (second_claude, second_revision) = fixture
+        .save_claude("Claude Two", "claude-two", "second-provider-secret")
+        .await;
+
+    let failure = faulting
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            second_revision,
+            takeover_action(second_claude),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.problem.code, "recovery-required");
+    assert_eq!(
+        failure.authoritative_view.recovery.state,
+        "recovery-required"
+    );
+    assert!(faulting.model_endpoint_for(Target::Claude).await.is_none());
+    assert!(
+        tokio::net::TcpStream::connect(claude_endpoint)
+            .await
+            .is_err()
+    );
+    assert_eq!(faulting.model_endpoint().await, Some(codex_endpoint));
+    assert!(tokio::net::TcpStream::connect(codex_endpoint).await.is_ok());
+    assert_eq!(fixture.store.target_view().await.unwrap(), codex_before);
+    faulting.shutdown_models().await.unwrap();
+}
+
+#[tokio::test]
 async fn claude_publication_failure_keeps_the_commit_and_replay_is_side_effect_free() {
     let fixture = Fixture::new().await;
     let (provider_id, revision) = fixture
@@ -741,6 +831,81 @@ async fn claude_publication_failure_keeps_the_commit_and_replay_is_side_effect_f
     assert_eq!(replay.status, ActionStatus::Replayed);
     assert_eq!(replay.view, applied.view);
     assert!(updates.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn claude_post_commit_runtime_handoff_failure_is_explicit_committed_and_control_only() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture
+        .save_claude("Claude", "claude-handoff-test", "provider-secret")
+        .await;
+    let codex_before = fixture.store.target_view().await.unwrap();
+    let service = fixture.dual_service(
+        ActivationHooks::failing(ActivationFailpoint::RuntimeHandoff),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let mut updates = fixture.store.subscribe_target_views();
+    let action_id = Uuid::new_v4();
+
+    let failure = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            action_id,
+            revision,
+            takeover_action(provider_id),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.problem.code, "recovery-required");
+    let receipt = fixture
+        .store
+        .receipt_for(Target::Claude, action_id)
+        .await
+        .unwrap()
+        .expect("the database commit must remain authoritative");
+    assert_eq!(receipt.status, ActionStatus::Replayed);
+    assert_eq!(
+        receipt.view.current_provider_id,
+        Some(provider_id.to_string())
+    );
+    assert_eq!(
+        receipt.view.activated_snapshot.as_ref().unwrap().model,
+        "claude-handoff-test"
+    );
+    let endpoint: std::net::SocketAddr = receipt
+        .view
+        .takeover
+        .endpoint
+        .as_deref()
+        .unwrap()
+        .trim_start_matches("http://")
+        .parse()
+        .unwrap();
+    let current = fixture.store.target_view_for(Target::Claude).await.unwrap();
+    assert_eq!(failure.authoritative_view, current);
+    assert_eq!(current.recovery.state, "recovery-required");
+    assert_eq!(current.managed_configuration.state, "recovery-required");
+    assert_eq!(current.takeover.endpoint, receipt.view.takeover.endpoint);
+    assert_eq!(fixture.count("activated_snapshots").await, 1);
+    assert_eq!(
+        fixture
+            .recovery_state_for_action(action_id)
+            .await
+            .as_deref(),
+        Some("recovery-required")
+    );
+    let settings: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.home.user_home().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(settings["env"]["ANTHROPIC_MODEL"], "claude-handoff-test");
+    assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+    assert!(tokio::net::TcpStream::connect(endpoint).await.is_err());
+    assert_eq!(updates.recv().await.unwrap(), current);
+    assert!(updates.try_recv().is_err());
+    assert_eq!(fixture.store.target_view().await.unwrap(), codex_before);
 }
 
 #[tokio::test]
@@ -1695,6 +1860,7 @@ async fn activation_commits_one_complete_view_in_exact_observer_order_and_replay
             ActivationStep::AtomicConfigWrite,
             ActivationStep::ConfigVerify,
             ActivationStep::StateAndReceiptCommit,
+            ActivationStep::RuntimeHandoff,
             ActivationStep::PublishView,
         ]
     );

@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use axum::{Router, routing::post};
 use fs2::FileExt;
 use muxvia_routing::{
     claude::ClaudeConfigCodec,
@@ -22,7 +23,7 @@ use muxvia_routing::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
-    net::UnixStream,
+    net::{TcpListener, UnixStream},
     process::{Child, Command},
     time::timeout,
 };
@@ -558,6 +559,243 @@ async fn either_takeover_keeps_the_process_alive_and_shutdown_drains_both_routes
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn clean_dual_takeover_restart_resumes_exact_claude_route_snapshot_and_credential() {
+    let root = TempDir::new().unwrap();
+    let user_home = root.path().join("home");
+    let home = user_home.join(".muxvia");
+    let first_shutdown = root.path().join("shutdown-first");
+    let second_shutdown = root.path().join("shutdown-second");
+    fs::create_dir_all(&user_home).unwrap();
+    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.106.0");
+    let claude = fake_cli(root.path(), "fake-claude", "2.1.37 (Claude Code)");
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_base = format!("http://{}/v1", upstream_listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move {
+        axum::serve(
+            upstream_listener,
+            Router::new().route("/v1/messages", post(|| async { "claude-restarted" })),
+        )
+        .await
+        .unwrap();
+    });
+    let mut first = command(&home, &first_shutdown)
+        .arg("--test-codex-executable")
+        .arg(&codex)
+        .arg("--test-claude-executable")
+        .arg(&claude)
+        .spawn()
+        .unwrap();
+    let socket = home.join("run/control.sock");
+    wait_for_socket(&socket).await;
+
+    let mut claude_stream = UnixStream::connect(&socket).await.unwrap();
+    hello(&mut claude_stream).await;
+    request(
+        &mut claude_stream,
+        "open-claude",
+        json!({
+            "kind": "open-target", "target": "claude",
+            "claudeContext": {
+                "claudeConfigDir": null, "selectorState": "unset",
+                "hostManagedState": "unmanaged", "cwd": user_home
+            }
+        }),
+    )
+    .await;
+    let claude_saved = request(
+        &mut claude_stream,
+        "save-claude",
+        json!({
+            "kind": "act", "target": "claude", "actionId": Uuid::new_v4(),
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-provider", "name": "Claude",
+                "baseUrl": upstream_base, "model": "claude-restart-model",
+                "credential": {"kind": "replace", "value": "provider-secret"},
+                "authentication": "anthropic-api-key", "presetKey": null
+            }
+        }),
+    )
+    .await;
+    read_frame(&mut claude_stream).await.unwrap();
+    let claude_provider = claude_saved["result"]["outcome"]["view"]["providers"][0]["id"].clone();
+    let claude_applied = request(
+        &mut claude_stream,
+        "activate-claude",
+        json!({
+            "kind": "act", "target": "claude", "actionId": Uuid::new_v4(),
+            "expectedRevision": 1,
+            "action": {
+                "kind": "activate-provider", "providerId": claude_provider,
+                "mode": "takeover"
+            }
+        }),
+    )
+    .await;
+    read_frame(&mut claude_stream).await.unwrap();
+    let claude_view = &claude_applied["result"]["outcome"]["view"];
+    let claude_endpoint = claude_view["takeover"]["endpoint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let claude_snapshot = claude_view["activatedSnapshot"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut codex_stream = UnixStream::connect(&socket).await.unwrap();
+    hello(&mut codex_stream).await;
+    request(
+        &mut codex_stream,
+        "open-codex",
+        json!({"kind": "open-target", "target": "codex"}),
+    )
+    .await;
+    let codex_saved = request(
+        &mut codex_stream,
+        "save-codex",
+        json!({
+            "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-provider", "name": "Codex",
+                "baseUrl": "https://api.openai.test/v1", "model": "gpt-peer",
+                "credential": {"kind": "replace", "value": "codex-provider-secret"},
+                "presetKey": null
+            }
+        }),
+    )
+    .await;
+    read_frame(&mut codex_stream).await.unwrap();
+    let codex_provider = codex_saved["result"]["outcome"]["view"]["providers"][0]["id"].clone();
+    let codex_applied = request(
+        &mut codex_stream,
+        "activate-codex",
+        json!({
+            "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
+            "expectedRevision": 1,
+            "action": {
+                "kind": "activate-provider", "providerId": codex_provider,
+                "mode": "takeover"
+            }
+        }),
+    )
+    .await;
+    read_frame(&mut codex_stream).await.unwrap();
+    let codex_view = &codex_applied["result"]["outcome"]["view"];
+    let codex_endpoint = codex_view["takeover"]["endpoint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let codex_snapshot = codex_view["activatedSnapshot"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(claude_endpoint, codex_endpoint);
+    let settings_path = user_home.join(".claude/settings.json");
+    let settings_before = fs::read(&settings_path).unwrap();
+    let settings: Value = serde_json::from_slice(&settings_before).unwrap();
+    let claude_credential = settings["env"]["ANTHROPIC_AUTH_TOKEN"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    drop(claude_stream);
+    drop(codex_stream);
+    fs::write(&first_shutdown, b"shutdown\n").unwrap();
+    assert!(
+        timeout(PROCESS_TIMEOUT, first.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(!socket.exists());
+
+    let mut second = command(&home, &second_shutdown)
+        .arg("--test-codex-executable")
+        .arg(&codex)
+        .arg("--test-claude-executable")
+        .arg(&claude)
+        .spawn()
+        .unwrap();
+    wait_for_socket(&socket).await;
+    assert!(
+        fs::read(&settings_path).unwrap() == settings_before,
+        "clean restart changed Claude managed settings or Routing Credential"
+    );
+
+    let mut reopened_claude = UnixStream::connect(&socket).await.unwrap();
+    hello(&mut reopened_claude).await;
+    let reopened_claude_view = request(
+        &mut reopened_claude,
+        "reopen-claude",
+        json!({"kind": "open-target", "target": "claude"}),
+    )
+    .await;
+    let reopened_claude_view = &reopened_claude_view["result"]["view"];
+    assert_eq!(
+        reopened_claude_view["takeover"]["endpoint"],
+        claude_endpoint
+    );
+    assert_eq!(
+        reopened_claude_view["activatedSnapshot"]["id"],
+        claude_snapshot
+    );
+
+    let mut reopened_codex = UnixStream::connect(&socket).await.unwrap();
+    hello(&mut reopened_codex).await;
+    let reopened_codex_view = request(
+        &mut reopened_codex,
+        "reopen-codex",
+        json!({"kind": "open-target", "target": "codex"}),
+    )
+    .await;
+    let reopened_codex_view = &reopened_codex_view["result"]["view"];
+    assert_eq!(reopened_codex_view["takeover"]["endpoint"], codex_endpoint);
+    assert_eq!(
+        reopened_codex_view["activatedSnapshot"]["id"],
+        codex_snapshot
+    );
+    assert_ne!(
+        reopened_claude_view["takeover"]["endpoint"],
+        reopened_codex_view["takeover"]["endpoint"]
+    );
+
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("{claude_endpoint}/v1/messages"))
+        .header("authorization", format!("Bearer {claude_credential}"))
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(
+            serde_json::to_vec(&json!({
+                "model": "caller-model", "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "claude-restarted");
+
+    fs::write(&second_shutdown, b"shutdown\n").unwrap();
+    assert!(
+        timeout(PROCESS_TIMEOUT, second.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(!socket.exists());
+    upstream.abort();
 }
 
 #[tokio::test]

@@ -160,6 +160,7 @@ pub enum ActivationStep {
     AtomicConfigWrite,
     ConfigVerify,
     StateAndReceiptCommit,
+    RuntimeHandoff,
     PublishView,
 }
 
@@ -183,6 +184,7 @@ pub enum ActivationFailpoint {
     ConfigVerify,
     FinalCommit,
     RestoreVerify,
+    RuntimeHandoff,
     PublishView,
 }
 
@@ -256,6 +258,9 @@ impl ActivationHooks {
             ) | (
                 Some(ActivationFailpoint::FinalCommit),
                 ActivationStep::StateAndReceiptCommit
+            ) | (
+                Some(ActivationFailpoint::RuntimeHandoff),
+                ActivationStep::RuntimeHandoff
             ) | (
                 Some(ActivationFailpoint::PublishView),
                 ActivationStep::PublishView
@@ -716,7 +721,13 @@ impl ActivationService {
         match activation {
             Ok(ActivationCommit::Applied(outcome)) => {
                 if let Some(mut handle) = candidate.take() {
-                    let _ = handle.activate().await;
+                    if self.hooks.reached(ActivationStep::RuntimeHandoff).is_err() {
+                        handle.abort();
+                        tokio::task::yield_now().await;
+                    }
+                    if handle.activate().await.is_err() {
+                        return Err(self.committed_handoff_failure(&intent, Some(handle)).await);
+                    }
                     *self.model_for(target).lock().await = Some(handle);
                 }
                 if self.hooks.reached(ActivationStep::PublishView).is_ok() {
@@ -1125,6 +1136,26 @@ impl ActivationService {
             .set_recovery_state(intent.id(), RecoveryState::RecoveryRequired)
             .await;
         self.shutdown_candidate(candidate).await;
+        let _ = self.shutdown_model_for(intent.target()).await;
+    }
+
+    async fn committed_handoff_failure(
+        &self,
+        intent: &RecoveryIntent,
+        candidate: Option<ModelServerHandle>,
+    ) -> ActionFailure {
+        self.mark_required(intent, candidate).await;
+        let failure = self
+            .store
+            .failure_for(
+                intent.target(),
+                "recovery-required",
+                "Committed model runtime requires recovery",
+            )
+            .await;
+        self.store
+            .publish_target_view(failure.authoritative_view.clone());
+        failure
     }
 
     async fn shutdown_candidate(&self, candidate: Option<ModelServerHandle>) {

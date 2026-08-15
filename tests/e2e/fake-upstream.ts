@@ -6,14 +6,26 @@ export const SSE_BYTES = [
   "event: response.completed\ndata: {}\n\n",
 ] as const
 
+export const CLAUDE_SSE_BYTES = [
+  "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+  "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hello\"}}\n\n",
+  "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+] as const
+
 export interface CapturedRequest {
   authorization: string | null
+  apiKey?: string | null
   headers: Record<string, string | null>
   contentType: string | null
   method: string
   testHeader: string | null
   body: string
   path: string
+}
+
+export interface FakeUpstreamOptions {
+  apiKeyCredentials?: readonly string[]
+  bearerCredentials?: readonly string[]
 }
 
 function header(value: string | string[] | undefined): string | null {
@@ -23,6 +35,7 @@ function header(value: string | string[] | undefined): string | null {
 export async function startFakeUpstream(
   expectedProviderCredential: string,
   onCapturedRequest?: (request: CapturedRequest) => void,
+  options: FakeUpstreamOptions = {},
 ) {
   const calls: CapturedRequest[] = []
   const callWaiters = new Set<() => void>()
@@ -30,6 +43,10 @@ export async function startFakeUpstream(
   const handlerCountWaiters = new Set<() => void>()
   let activeHandlers = 0
   let quiescePromise: Promise<void> | undefined
+  let delayedStartedResolve = () => {}
+  let delayedReleaseResolve = () => {}
+  const delayedStarted = new Promise<void>((resolve) => { delayedStartedResolve = resolve })
+  const delayedRelease = new Promise<void>((resolve) => { delayedReleaseResolve = resolve })
   const server = createServer(async (request, response) => {
     activeHandlers++
     response.once("close", () => {
@@ -48,6 +65,7 @@ export async function startFakeUpstream(
     ]))
     const capturedRequest = {
       authorization: header(request.headers.authorization),
+      apiKey: header(request.headers["x-api-key"]),
       headers,
       contentType: header(request.headers["content-type"]),
       method: request.method ?? "",
@@ -59,19 +77,58 @@ export async function startFakeUpstream(
     calls.push(capturedRequest)
     for (const notify of callWaiters) notify()
 
-    if (request.method === "GET" && request.url === "/v1/models") {
-      if (request.headers.authorization !== `Bearer ${expectedProviderCredential}`) {
+    if (request.method === "GET" && request.url?.startsWith("/v1/models")) {
+      const authorized = request.headers.authorization === `Bearer ${expectedProviderCredential}`
+        || options.bearerCredentials?.includes(header(request.headers.authorization)?.replace(/^Bearer /, "") ?? "")
+        || options.apiKeyCredentials?.includes(header(request.headers["x-api-key"]) ?? "")
+      if (!authorized) {
         response.writeHead(403).end()
         return
       }
       response.writeHead(200, { "content-type": "application/json" })
       response.end(JSON.stringify({
         data: [
-          { id: "gpt-fixture-b", owned_by: "fixture" },
-          { id: "gpt-fixture-a" },
-          { id: "gpt-fixture-b", owned_by: "duplicate" },
+          { id: "gpt-fixture-b", owned_by: "fixture", display_name: "Fixture B" },
+          { id: "gpt-fixture-a", display_name: "Fixture A" },
+          { id: "gpt-fixture-b", owned_by: "duplicate", display_name: "Fixture B duplicate" },
         ],
+        has_more: false,
       }))
+      return
+    }
+    if (request.method === "POST" && request.url?.startsWith("/v1/messages")) {
+      const apiKey = header(request.headers["x-api-key"])
+      const bearer = header(request.headers.authorization)?.replace(/^Bearer /, "") ?? null
+      const authorized = (apiKey !== null && options.apiKeyCredentials?.includes(apiKey))
+        || (bearer !== null && options.bearerCredentials?.includes(bearer))
+      if (!authorized) {
+        response.writeHead(403).end()
+        return
+      }
+      const parsed = JSON.parse(capturedRequest.body) as Record<string, unknown>
+      if (request.url.startsWith("/v1/messages/count_tokens")) {
+        response.writeHead(200, { "content-type": "application/json", "x-upstream": "claude-fixture" })
+        response.end('{"input_tokens":7}')
+        return
+      }
+      if (parsed.fixture_error === true) {
+        response.writeHead(429, { "content-type": "application/json", "x-upstream": "claude-fixture" })
+        response.end('{"type":"error","error":{"type":"rate_limit_error","message":"fixture"}}')
+        return
+      }
+      if (parsed.stream === true) {
+        response.writeHead(200, { "content-type": "text/event-stream", "x-upstream": "claude-fixture" })
+        response.write(CLAUDE_SSE_BYTES[0])
+        if (parsed.fixture_delay === true) {
+          delayedStartedResolve()
+          await delayedRelease
+        }
+        for (const part of CLAUDE_SSE_BYTES.slice(1)) response.write(part)
+        response.end()
+        return
+      }
+      response.writeHead(200, { "content-type": "application/json", "x-upstream": "claude-fixture" })
+      response.end('{"id":"msg_fixture","type":"message","role":"assistant","content":[]}')
       return
     }
     if (request.method === "GET") {
@@ -144,6 +201,8 @@ export async function startFakeUpstream(
         handlerCountWaiters.add(notify)
       })
     },
+    waitForDelayedStart: () => delayedStarted,
+    releaseDelayed: () => delayedReleaseResolve(),
     quiesce,
     stop: async () => {
       const quiesced = quiesce()

@@ -17,7 +17,7 @@ import { encodeFrame, FrameDecoder } from "../src/control/framing"
 import { App } from "../src/ui/app"
 import type { TargetSession } from "../src/control/target-session"
 import { parseClientFrame, type TargetAction, type TargetView } from "../src/control/types"
-import { SSE_BYTES, startFakeUpstream, type CapturedRequest } from "../../../tests/e2e/fake-upstream"
+import { CLAUDE_SSE_BYTES, SSE_BYTES, startFakeUpstream, type CapturedRequest } from "../../../tests/e2e/fake-upstream"
 
 const providerSecret = "provider-secret-must-not-escape"
 const wrongRoutingSecret = "routing-secret-must-not-escape"
@@ -25,10 +25,14 @@ const authSentinel = "auth-sentinel-must-not-escape"
 const repoRoot = resolve(import.meta.dir, "../../..")
 const serviceBinary = resolve(repoRoot, "target/debug/muxvia-routing")
 const fakeCodex = resolve(repoRoot, "tests/e2e/fixtures/fake-codex")
+const fakeClaude = resolve(repoRoot, "tests/e2e/fixtures/fake-claude")
 const deadlineMs = 10_000
 const roots: string[] = []
 
-if (process.env.MUXVIA_DIRECT_RESTRICTIVE_UMASK_CHILD === "1") process.umask(0o077)
+if (
+  process.env.MUXVIA_DIRECT_RESTRICTIVE_UMASK_CHILD === "1"
+  || process.env.MUXVIA_CLAUDE_RESTRICTIVE_UMASK_CHILD === "1"
+) process.umask(0o077)
 
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
@@ -162,6 +166,178 @@ async function chunkedPost(endpoint: string, credential: string) {
     request.write('{"model":"gpt-test",')
     request.end('"input":"hello"}')
   })
+}
+
+async function claudePost(
+  endpoint: string,
+  credential: string,
+  path: string,
+  body: Record<string, unknown>,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; headers: Headers; body: string }> {
+  const response = await fetch(`${endpoint}${path}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${credential}`,
+      "content-type": "application/json",
+      ...headers,
+    },
+    body: JSON.stringify(body),
+  })
+  return { status: response.status, headers: response.headers, body: await response.text() }
+}
+
+function extractClaudeManagedSettings(
+  text: string,
+  expectedModel: string,
+): { endpoint: string; credential: string; semantic: unknown } {
+  const parsed = JSON.parse(text) as Record<string, unknown> & { env?: Record<string, unknown> }
+  const env = parsed.env
+  if (!env || typeof env !== "object") throw new Error("claude-managed-settings-invalid")
+  const endpoint = env.ANTHROPIC_BASE_URL
+  const credential = env.ANTHROPIC_AUTH_TOKEN
+  if (typeof endpoint !== "string" || !/^http:\/\/127\.0\.0\.1:\d+$/.test(endpoint)) {
+    throw new Error("claude-managed-endpoint-invalid")
+  }
+  if (typeof credential !== "string" || !/^[a-f0-9]{64}$/.test(credential)) {
+    throw new Error("claude-managed-credential-invalid")
+  }
+  const rootKeys = Object.keys(parsed).sort()
+  const envKeys = Object.keys(env).sort()
+  const expectedEnvKeys = [
+      "ANTHROPIC_AUTH_TOKEN",
+      "ANTHROPIC_BASE_URL",
+      "ANTHROPIC_MODEL",
+      "OPERATOR_UNRELATED",
+    ]
+  const operator = parsed.operator as Record<string, unknown> | undefined
+  const mismatch = [
+    JSON.stringify(rootKeys) !== JSON.stringify(["env", "operator"]),
+    JSON.stringify(envKeys) !== JSON.stringify(expectedEnvKeys),
+    !operator
+      || JSON.stringify(Object.keys(operator).sort()) !== JSON.stringify(["hooks", "theme"])
+      || operator.theme !== "dark"
+      || JSON.stringify(operator.hooks) !== JSON.stringify(["keep"]),
+    env.OPERATOR_UNRELATED !== "keep-me",
+    env.ANTHROPIC_MODEL !== expectedModel,
+  ]
+  if (mismatch.some(Boolean)) {
+    throw new Error("claude-managed-settings-mismatch")
+  }
+  return { endpoint, credential, semantic: parsed }
+}
+
+function auditClaudeSettingsSecrets(
+  text: string,
+  routingCredential: string,
+  forbiddenSecrets: readonly string[],
+): void {
+  const parsed = JSON.parse(text) as { env?: Record<string, unknown> }
+  scanNoSecrets([parsed], forbiddenSecrets, "claude-settings-forbidden-secret")
+  if (parsed.env?.ANTHROPIC_AUTH_TOKEN !== routingCredential) {
+    throw new Error("claude-settings-routing-location-invalid")
+  }
+  const redacted = {
+    ...parsed,
+    env: { ...parsed.env, ANTHROPIC_AUTH_TOKEN: null },
+  }
+  scanNoSecrets([redacted], [routingCredential], "claude-settings-routing-secret")
+}
+
+type ClaudeRequestProjection = {
+  method: string
+  pathClass: "models" | "messages" | "count-tokens" | "reachability" | "other"
+  authentication: "api-key" | "bearer" | "absent"
+  model: string | null
+  stream: boolean
+  delayed: boolean
+  error: boolean
+  hasTools: boolean
+  hasUnknown: boolean
+  hasClaudeCodeHeader: boolean
+  hasQuery: boolean
+  beta: string | null
+  bodyDigest: string
+}
+
+function auditClaudeRequestAndProject(
+  request: CapturedRequest,
+  policy: {
+    apiKeyCredential: string
+    bearerCredential: string
+    forbiddenRoutingCredentials: readonly string[]
+  },
+): ClaudeRequestProjection {
+  scanNoSecrets([request], policy.forbiddenRoutingCredentials, "claude-captured-routing-credential")
+  const apiKeyMatches = request.apiKey === policy.apiKeyCredential
+  const bearerMatches = request.authorization === `Bearer ${policy.bearerCredential}`
+  const noApiKey = request.apiKey === null || request.apiKey === undefined
+  const noBearer = request.authorization === null
+  const authentication = apiKeyMatches && noBearer
+    ? "api-key"
+    : bearerMatches && noApiKey
+      ? "bearer"
+      : noApiKey && noBearer
+        ? "absent"
+        : undefined
+  const redacted = {
+    ...request,
+    apiKey: apiKeyMatches ? null : request.apiKey,
+    authorization: bearerMatches ? null : request.authorization,
+    headers: {
+      ...request.headers,
+      "x-api-key": apiKeyMatches ? null : request.headers["x-api-key"],
+      authorization: bearerMatches ? null : request.headers.authorization,
+    },
+  }
+  scanNoSecrets(
+    [redacted],
+    [policy.apiKeyCredential, policy.bearerCredential],
+    "claude-captured-provider-credential",
+  )
+  if (!authentication) throw new Error("claude-captured-authentication-invalid")
+  let parsed: Record<string, unknown> = {}
+  if (request.body !== "") {
+    try {
+      parsed = JSON.parse(request.body) as Record<string, unknown>
+    } catch {
+      throw new Error("claude-captured-body-invalid")
+    }
+  }
+  const path = request.path.split("?", 1)[0]
+  return {
+    method: request.method,
+    pathClass: path === "/v1/models"
+      ? "models"
+      : path === "/v1/messages"
+        ? "messages"
+        : path === "/v1/messages/count_tokens"
+          ? "count-tokens"
+          : request.method === "GET"
+            ? "reachability"
+            : "other",
+    authentication,
+    model: typeof parsed.model === "string" ? parsed.model : null,
+    stream: parsed.stream === true,
+    delayed: parsed.fixture_delay === true,
+    error: parsed.fixture_error === true,
+    hasTools: Array.isArray(parsed.tools),
+    hasUnknown: parsed.future_extension !== undefined,
+    hasClaudeCodeHeader: request.headers["x-claude-code-fixture"] === "preserved",
+    hasQuery: request.path.includes("?"),
+    beta: request.headers["anthropic-beta"] ?? null,
+    bodyDigest: sensitiveDigest(request.body)!,
+  }
+}
+
+function fixedClaudeRequestAuditDiagnostic(error: unknown): string {
+  const message = error instanceof Error ? error.message : ""
+  return [
+    "secret-scan-failed:claude-captured-routing-credential",
+    "secret-scan-failed:claude-captured-provider-credential",
+    "claude-captured-authentication-invalid",
+    "claude-captured-body-invalid",
+  ].includes(message) ? message : "claude-captured-request-audit-failed"
 }
 
 function extractManagedConfig(text: string, expectedModel: string): { endpoint: string; credential: string } {
@@ -788,16 +964,14 @@ function readDatabaseProjection(path: string): unknown {
     const snapshots = database.query(`SELECT id, target, provider_id, base_url, model,
       provider_bearer_token AS providerBearerToken, epoch
       FROM activated_snapshots ORDER BY id`).all() as Array<Record<string, unknown> & { providerBearerToken: string }>
-    const receipts = database.query(`SELECT action_id, action_kind, committed_revision,
+    const receipts = database.query(`SELECT target, action_id, action_kind, committed_revision,
       outcome_json AS outcomeJson FROM action_receipts ORDER BY committed_revision, action_id`
     ).all() as Array<Record<string, unknown> & { outcomeJson: string }>
     const recovery = database.query(`SELECT id, target, action_id, config_path,
-      file_identity_json AS fileIdentityJson, before_owned_json AS beforeOwnedJson,
-      desired_owned_json AS desiredOwnedJson, state, created_revision
+      file_identity_json AS fileIdentityJson, payload_json AS payloadJson, state, created_revision
       FROM activation_recovery ORDER BY created_revision, id`).all() as Array<Record<string, unknown> & {
         fileIdentityJson: string
-        beforeOwnedJson: string
-        desiredOwnedJson: string
+        payloadJson: string
       }>
     return [
       ["metadata", database.query("SELECT key, value FROM metadata ORDER BY key").all()],
@@ -805,7 +979,7 @@ function readDatabaseProjection(path: string): unknown {
         ...row,
         bearerTokenDigest: sensitiveDigest(bearerToken),
       }))],
-      ["providers", database.query(`SELECT id, target, position, provider_revision, name, base_url, model, protocol,
+      ["providers", database.query(`SELECT id, target, position, provider_revision, name, base_url, model, protocol, authentication,
         credential_id, provenance_kind, provenance_key, generated_owner_id FROM providers ORDER BY position`).all()],
       ["target-route", targetRoute.map(({ routingCredential, ...row }) => ({
         ...row,
@@ -825,14 +999,12 @@ function readDatabaseProjection(path: string): unknown {
       }))],
       ["recovery", recovery.map(({
         fileIdentityJson,
-        beforeOwnedJson,
-        desiredOwnedJson,
+        payloadJson,
         ...row
       }) => ({
         ...row,
         fileIdentityJsonDigest: sensitiveDigest(fileIdentityJson),
-        beforeOwnedJsonDigest: sensitiveDigest(beforeOwnedJson),
-        desiredOwnedJsonDigest: sensitiveDigest(desiredOwnedJson),
+        payloadJsonDigest: sensitiveDigest(payloadJson),
       }))],
     ]
   } finally {
@@ -853,6 +1025,24 @@ async function readOnlyStateFingerprint(databasePath: string, configPath: string
   return {
     database: readDatabaseProjection(databasePath),
     managedConfiguration: await readManagedConfigurationFingerprint(configPath),
+  }
+}
+
+function readTargetDatabaseFingerprint(databasePath: string, target: "codex" | "claude"): string {
+  const database = new Database(databasePath, { readonly: true })
+  try {
+    const state = [
+      database.query("SELECT * FROM target_route_state WHERE target = ?").get(target),
+      database.query("SELECT * FROM target_problems WHERE target = ? ORDER BY code").all(target),
+      database.query("SELECT * FROM providers WHERE target = ? ORDER BY position").all(target),
+      database.query("SELECT * FROM credentials WHERE target = ? ORDER BY id").all(target),
+      database.query("SELECT * FROM activated_snapshots WHERE target = ? ORDER BY id").all(target),
+      database.query("SELECT * FROM action_receipts WHERE target = ? ORDER BY committed_revision, action_id").all(target),
+      database.query("SELECT * FROM activation_recovery WHERE target = ? ORDER BY created_revision, id").all(target),
+    ]
+    return sensitiveDigest(JSON.stringify(state))!
+  } finally {
+    database.close()
   }
 }
 
@@ -1143,15 +1333,14 @@ test("read-only fingerprints change for every sensitive database payload without
       INSERT INTO credentials (id, target, bearer_token)
         VALUES ('credential-id', 'codex', 'credential-sensitive-one');
       INSERT INTO activated_snapshots
-        (id, target, provider_id, base_url, model, provider_bearer_token, epoch)
+        (id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch)
         VALUES ('snapshot-id', 'codex', 'provider-id', 'https://snapshot.invalid/v1', 'model',
-          'snapshot-sensitive-one', 'epoch');
+          'openai-responses', 'openai-bearer', 'snapshot-sensitive-one', 'epoch');
       UPDATE target_route_state SET routing_credential = 'routing-sensitive-one' WHERE target = 'codex';
       INSERT INTO activation_recovery
-        (id, target, action_id, config_path, file_identity_json, before_owned_json,
-          desired_owned_json, state, created_revision)
+        (id, target, action_id, config_path, file_identity_json, payload_json, state, created_revision)
         VALUES ('recovery-id', 'codex', 'action-id', '/controlled/config',
-          'identity-sensitive-one', 'before-sensitive-one', 'desired-sensitive-one', 'pending', 1);
+          'identity-sensitive-one', 'payload-sensitive-one', 'pending', 1);
     `)
     await writeFile(configPath, "managed-sensitive-one")
 
@@ -1160,8 +1349,7 @@ test("read-only fingerprints change for every sensitive database payload without
       "UPDATE target_route_state SET routing_credential = 'routing-sensitive-two' WHERE target = 'codex'",
       "UPDATE activated_snapshots SET provider_bearer_token = 'snapshot-sensitive-two'",
       "UPDATE activation_recovery SET file_identity_json = 'identity-sensitive-two'",
-      "UPDATE activation_recovery SET before_owned_json = 'before-sensitive-two'",
-      "UPDATE activation_recovery SET desired_owned_json = 'desired-sensitive-two'",
+      "UPDATE activation_recovery SET payload_json = 'payload-sensitive-two'",
     ]
     for (const mutation of mutations) {
       const before = JSON.stringify(readDatabaseProjection(databasePath))
@@ -1297,6 +1485,100 @@ test("CapturedRequest secret scanning precedes safe semantic projection", () => 
   expect(diagnostic === "secret-scan-failed:captured-request-routing-credential").toBeTrue()
   expect(diagnostic.includes(wrongRoutingSecret)).toBeFalse()
   expect(diagnostic.includes(request.body)).toBeFalse()
+})
+
+test("Claude request audit rejects misplaced credentials with fixed diagnostics", () => {
+  const apiKey = "controlled-claude-api-key"
+  const bearer = "controlled-claude-bearer"
+  const routing = "controlled-claude-routing"
+  const mutations: CapturedRequest[] = [
+    {
+      authorization: null,
+      apiKey,
+      headers: { "x-api-key": apiKey, "x-misplaced": bearer },
+      contentType: "application/json",
+      method: "POST",
+      testHeader: null,
+      body: '{"messages":[]}',
+      path: "/v1/messages",
+    },
+    {
+      authorization: `Bearer ${bearer}`,
+      apiKey: null,
+      headers: { authorization: `Bearer ${bearer}` },
+      contentType: "application/json",
+      method: "POST",
+      testHeader: null,
+      body: `{"messages":[],"misplaced":"${routing}"}`,
+      path: "/v1/messages",
+    },
+  ]
+  const expected = [
+    "secret-scan-failed:claude-captured-provider-credential",
+    "secret-scan-failed:claude-captured-routing-credential",
+  ]
+  mutations.forEach((request, index) => {
+    let diagnostic = ""
+    try {
+      auditClaudeRequestAndProject(request, {
+        apiKeyCredential: apiKey,
+        bearerCredential: bearer,
+        forbiddenRoutingCredentials: [routing],
+      })
+    } catch (error) {
+      diagnostic = fixedClaudeRequestAuditDiagnostic(error)
+    }
+    expect(diagnostic === expected[index]).toBeTrue()
+    expect(diagnostic.includes(apiKey)).toBeFalse()
+    expect(diagnostic.includes(bearer)).toBeFalse()
+    expect(diagnostic.includes(routing)).toBeFalse()
+    expect(diagnostic.includes(request.body)).toBeFalse()
+  })
+
+  const settingsMutation = JSON.stringify({
+    operator: { misplaced: routing },
+    env: { ANTHROPIC_AUTH_TOKEN: routing },
+  })
+  let settingsDiagnostic = ""
+  try {
+    auditClaudeSettingsSecrets(settingsMutation, routing, [])
+  } catch (error) {
+    settingsDiagnostic = error instanceof Error ? error.message : ""
+  }
+  expect(settingsDiagnostic === "secret-scan-failed:claude-settings-routing-secret").toBeTrue()
+  expect(settingsDiagnostic.includes(routing)).toBeFalse()
+  expect(settingsDiagnostic.includes(settingsMutation)).toBeFalse()
+})
+
+test("Claude tracer fixture enforces restrictive umask and home traps", async () => {
+  const child = spawn(process.execPath, [
+    "test",
+    "./packages/control-plane/test/walking-skeleton.e2e.tsx",
+    "--test-name-pattern",
+    "real processes prove independent Claude takeover, Messages, hot switch, and restart",
+  ], {
+    cwd: repoRoot,
+    env: { ...process.env, MUXVIA_CLAUDE_RESTRICTIVE_UMASK_CHILD: "1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+  const output = captureProcessOutput(child)
+  const completed = await Promise.race([
+    output.completed,
+    Bun.sleep(60_000).then(() => undefined),
+  ])
+  if (!completed) {
+    child.kill("SIGKILL")
+    await output.completed.catch(() => {})
+    throw new Error("restrictive-umask-claude-tracer-timeout")
+  }
+  scanProcessOutputNoSecrets(output.streams, [
+    "claude-api-provider-secret-must-not-escape",
+    "claude-bearer-provider-secret-must-not-escape",
+    providerSecret,
+  ])
+  if (completed.code !== 0 || completed.signal !== null) {
+    throw new Error("restrictive-umask-claude-tracer-failed")
+  }
 })
 
 const controlledProviderCredential = "controlled-expected-provider"
@@ -1446,6 +1728,651 @@ test("fake upstream quiesce audits a delayed forbidden seventh request before cl
   expect(finalDiagnostic.includes(wrongRoutingSecret)).toBeFalse()
   expect(finalDiagnostic.includes(requestBody)).toBeFalse()
 })
+
+test("real processes prove independent Claude takeover, Messages, hot switch, and restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "m5-"))
+  roots.push(root)
+  const userHome = join(root, "h")
+  const muxviaHome = join(userHome, ".muxvia")
+  const codexHome = join(userHome, ".codex")
+  const claudeHome = join(userHome, ".claude")
+  const socketPath = join(muxviaHome, "run/control.sock")
+  const databasePath = join(muxviaHome, "state/muxvia.db")
+  const codexConfigPath = join(codexHome, "config.toml")
+  const claudeSettingsPath = join(claudeHome, "settings.json")
+  const firstShutdown = join(root, "shutdown-first")
+  const secondShutdown = join(root, "shutdown-second")
+  const trapHome = join(root, "operator-home-trap")
+  const trapCodex = join(trapHome, ".codex")
+  const trapClaude = join(trapHome, ".claude")
+  const apiKeySecret = "claude-api-provider-secret-must-not-escape"
+  const bearerSecret = "claude-bearer-provider-secret-must-not-escape"
+  const wrongClaudeRouting = "wrong-claude-routing-must-not-escape"
+  const allStaticSecrets = [providerSecret, apiKeySecret, bearerSecret, wrongClaudeRouting]
+
+  await mkdir(codexHome, { recursive: true, mode: 0o700 })
+  await mkdir(claudeHome, { recursive: true, mode: 0o700 })
+  await mkdir(join(trapHome, ".muxvia/state"), { recursive: true, mode: 0o700 })
+  await mkdir(trapCodex, { recursive: true, mode: 0o700 })
+  await mkdir(trapClaude, { recursive: true, mode: 0o700 })
+  await writeFile(codexConfigPath, '# operator comment survives\nunrelated = "keep-me"\n', { mode: 0o600 })
+  const originalClaudeSettings = JSON.stringify({
+    operator: { theme: "dark", hooks: ["keep"] },
+    env: { OPERATOR_UNRELATED: "keep-me" },
+  })
+  await writeFile(claudeSettingsPath, originalClaudeSettings, { mode: 0o640 })
+  await chmod(claudeSettingsPath, 0o640)
+  await writeFile(join(trapCodex, "config.toml"), 'trap = "codex"\n', { mode: 0o600 })
+  await writeFile(join(trapClaude, "settings.json"), '{"trap":"claude"}\n', { mode: 0o600 })
+  await writeFile(join(trapHome, ".muxvia/state/trap"), "trap\n", { mode: 0o600 })
+  await chmod(fakeCodex, 0o755)
+  await chmod(fakeClaude, 0o755)
+  const trapFingerprint = await controlledTreeFingerprint(trapHome)
+
+  let codexRoutingCredential: string | undefined
+  let claudeRoutingCredential: string | undefined
+  let requestAuditFailure: string | undefined
+  const claudeRequestProjections: ClaudeRequestProjection[] = []
+  const upstream = await startFakeUpstream(providerSecret, (request) => {
+    try {
+      const path = request.path.split("?", 1)[0]
+      if (path === "/v1/responses") {
+        auditCapturedRequestAndProject(request, {
+          providerCredential: providerSecret,
+          forbiddenRoutingCredentials: [
+            wrongClaudeRouting,
+            ...(codexRoutingCredential ? [codexRoutingCredential] : []),
+            ...(claudeRoutingCredential ? [claudeRoutingCredential] : []),
+          ],
+          authorization: "expected-provider",
+        })
+      } else {
+        claudeRequestProjections.push(auditClaudeRequestAndProject(request, {
+          apiKeyCredential: apiKeySecret,
+          bearerCredential: bearerSecret,
+          forbiddenRoutingCredentials: [
+            wrongClaudeRouting,
+            ...(codexRoutingCredential ? [codexRoutingCredential] : []),
+            ...(claudeRoutingCredential ? [claudeRoutingCredential] : []),
+          ],
+        }))
+      }
+    } catch (error) {
+      requestAuditFailure ??= fixedClaudeRequestAuditDiagnostic(error)
+    }
+  }, {
+    apiKeyCredentials: [apiKeySecret],
+    bearerCredentials: [bearerSecret],
+  })
+
+  const services: Array<{ child: ReturnType<typeof spawn>; output: ReturnType<typeof captureProcessOutput> }> = []
+  const rpcStreams: Buffer[][] = []
+  const decodedFrames: unknown[] = []
+  const views: TargetView[] = []
+  const selectedFrames: string[] = []
+  const nativeFrames: string[] = []
+  let codexClient: RpcClient | undefined
+  let claudeClient: RpcClient | undefined
+  let codexSession: TargetSession | undefined
+  let claudeSession: TargetSession | undefined
+  let setup: Awaited<ReturnType<typeof testRender>> | undefined
+  let rendererAudit: ReturnType<typeof createRendererAudit> | undefined
+  let unsubscribes: Array<() => void> = []
+
+  const startService = async (shutdownFile: string, label: string) => {
+    const serviceEnvironment: NodeJS.ProcessEnv = {
+      HOME: trapHome,
+      CODEX_HOME: trapCodex,
+      CLAUDE_CONFIG_DIR: trapClaude,
+      PATH: `${dirname(fakeCodex)}:/usr/bin:/bin`,
+      MUXVIA_INTEGRATION_TEST: "1",
+    }
+    serviceEnvironment.HOME = userHome
+    delete serviceEnvironment.CODEX_HOME
+    delete serviceEnvironment.CLAUDE_CONFIG_DIR
+    const child = spawn(serviceBinary, [
+      "--home", muxviaHome,
+      "--test-shutdown-file", shutdownFile,
+      "--test-codex-executable", fakeCodex,
+      "--test-claude-executable", fakeClaude,
+    ], {
+      cwd: root,
+      env: serviceEnvironment,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    const record = { child, output: captureProcessOutput(child) }
+    services.push(record)
+    await waitFor(async () => {
+      if (child.exitCode !== null) {
+        scanProcessOutputNoSecrets(record.output.streams, allStaticSecrets)
+        const output = Buffer.concat(record.output.streams.flat()).toString("utf8")
+        const category = output.includes("another Routing Service")
+          ? "lock-collision"
+          : output.includes("state is unavailable")
+            ? "state"
+            : output.includes("control transport failed")
+              ? "control"
+              : output.includes("I/O failed")
+                ? "io"
+                : output.includes("test-only Routing Service options")
+                  ? "integration-guard"
+                  : "unknown"
+        throw new Error(`claude-routing-service-exited:${label}:${child.exitCode}:${category}`)
+      }
+      try { return (await stat(socketPath)).isSocket() } catch { return false }
+    }, `Claude tracer ${label} control socket`)
+    return record
+  }
+  const connect = async (release: string) => {
+    const stream: Buffer[] = []
+    const decoder = new FrameDecoder()
+    rpcStreams.push(stream)
+    return await RpcClient.connect(socketPath, release, undefined, (path) => {
+      const socket = createConnection({ path })
+      socket.on("data", (chunk) => {
+        const bytes = Buffer.from(chunk)
+        stream.push(bytes)
+        for (const frame of decoder.push(bytes)) {
+          assertSecretSafeStructured(frame, [
+            ...allStaticSecrets,
+            ...(codexRoutingCredential ? [codexRoutingCredential] : []),
+            ...(claudeRoutingCredential ? [claudeRoutingCredential] : []),
+          ], "claude-decoded-rpc-frame")
+          decodedFrames.push(frame)
+        }
+      })
+      return socket
+    })
+  }
+  const openSessions = async (release: string) => {
+    codexClient = await connect(`${release}-codex`)
+    claudeClient = await connect(`${release}-claude`)
+    codexSession = await codexClient.openTarget("codex")
+    claudeSession = await claudeClient.openTarget("claude", {
+      claudeConfigDir: null,
+      selectorState: "unset",
+      hostManagedState: "unmanaged",
+      cwd: root,
+    })
+    const collect = (view: TargetView) => {
+      assertSecretSafeStructured(view, [
+        ...allStaticSecrets,
+        ...(codexRoutingCredential ? [codexRoutingCredential] : []),
+        ...(claudeRoutingCredential ? [claudeRoutingCredential] : []),
+      ], "claude-target-view")
+      views.push(view)
+    }
+    collect(codexSession.get() as TargetView)
+    collect(claudeSession.get() as TargetView)
+    unsubscribes = [
+      codexSession.subscribe((view) => collect(view as TargetView)),
+      claudeSession.subscribe((view) => collect(view as TargetView)),
+    ]
+  }
+  const closeSessions = async () => {
+    unsubscribes.splice(0).forEach((unsubscribe) => unsubscribe())
+    await Promise.all([codexSession?.close(), claudeSession?.close()])
+    codexSession = undefined
+    claudeSession = undefined
+    codexClient = undefined
+    claudeClient = undefined
+  }
+  const stopService = async (
+    record: { child: ReturnType<typeof spawn>; output: ReturnType<typeof captureProcessOutput> },
+    shutdownFile: string,
+  ) => {
+    await writeFile(shutdownFile, "shutdown\n", { mode: 0o600 })
+    const result = await Promise.race([record.output.completed, Bun.sleep(deadlineMs).then(() => undefined)])
+    if (!result) throw new Error("claude-routing-service-shutdown-timeout")
+    expect(result).toEqual({ code: 0, signal: null })
+    await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" })
+  }
+  const leader = (key: string) => {
+    setup!.mockInput.pressKey("x", { ctrl: true })
+    setup!.mockInput.pressKey(key)
+  }
+  const assertAuditHealthy = () => {
+    if (requestAuditFailure) throw new Error(requestAuditFailure)
+  }
+
+  try {
+    const firstService = await startService(firstShutdown, "first")
+    await openSessions("claude-e2e")
+
+    const codexSaved = await actSecretSafe(codexSession!, {
+      kind: "create-provider",
+      name: "Codex Baseline",
+      baseUrl: upstream.baseUrl,
+      model: "gpt-codex-baseline",
+      credential: { kind: "replace", value: providerSecret },
+      authentication: "openai-bearer",
+      presetKey: null,
+    }, allStaticSecrets, "codex-baseline-save")
+    const codexProvider = codexSaved.view.providers[0]!
+    const codexApplied = await actSecretSafe(codexSession!, {
+      kind: "activate-provider",
+      providerId: codexProvider.id,
+      mode: "takeover",
+    }, allStaticSecrets, "codex-baseline-takeover")
+    const codexConfig = extractManagedConfig(await readFile(codexConfigPath, "utf8"), "gpt-codex-baseline")
+    codexRoutingCredential = codexConfig.credential
+    const codexBaseline = {
+      endpoint: codexApplied.view.takeover.endpoint!,
+      credentialDigest: sensitiveDigest(codexConfig.credential),
+      snapshotId: codexApplied.view.activatedSnapshot!.id,
+      config: await safeFileFingerprint(codexConfigPath),
+      database: readTargetDatabaseFingerprint(databasePath, "codex"),
+    }
+
+    setup = await testRender(() => <App sessions={{ codex: codexSession!, claude: claudeSession! }} />, {
+      width: 100,
+      height: 28,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    rendererAudit = createRendererAudit(setup)
+    rendererAudit.start()
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.waitForFrame((frame) => frame.includes("Claude Code") && frame.includes("Run a target action"))
+
+    await setup.mockInput.typeText("/provider")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Anthropic API (Messages)"))
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Anthropic API key"))
+    await setup.mockInput.typeText("Claude API Key")
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(upstream.baseUrl)
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText("claude-api-model")
+    setup.mockInput.pressTab()
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(apiKeySecret)
+    captureSecretSafeFrame(setup, selectedFrames, allStaticSecrets, "claude-api-key-entry")
+    setup.mockInput.pressEnter()
+    await waitForSecretSafeSession(
+      claudeSession!,
+      (view) => view.providers.length === 1,
+      allStaticSecrets,
+      "claude-api-key-save",
+    )
+    const apiProvider = claudeSession!.get().providers[0]!
+    expect(apiProvider).toMatchObject({
+      name: "Claude API Key",
+      authentication: "anthropic-api-key",
+      protocol: "anthropic-messages",
+      credential: "present",
+    })
+
+    const beforeInspection = await readOnlyStateFingerprint(databasePath, claudeSettingsPath)
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Claude API Key"))
+    setup.mockInput.pressEnter()
+    await waitFor(() => claudeRequestProjections.length >= 1, "Claude automatic discovery")
+    assertAuditHealthy()
+    expect(claudeRequestProjections[0]).toMatchObject({
+      method: "GET", pathClass: "models", authentication: "api-key",
+    })
+    await waitForSecretSafeFrame(setup, (frame) => frame.includes("2 models available"), allStaticSecrets, "claude-auto-discovery")
+    expect(await readOnlyStateFingerprint(databasePath, claudeSettingsPath)).toEqual(beforeInspection)
+    leader("f")
+    await waitFor(() => claudeRequestProjections.length >= 2, "Claude explicit discovery")
+    assertAuditHealthy()
+    expect(claudeRequestProjections[1]).toMatchObject({
+      method: "GET", pathClass: "models", authentication: "api-key",
+    })
+    expect(await readOnlyStateFingerprint(databasePath, claudeSettingsPath)).toEqual(beforeInspection)
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Run a target action") && !frame.includes("Enter save"))
+    await setup.renderOnce()
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Providers") && frame.includes("Claude API Key"))
+    leader("t")
+    await waitFor(() => claudeRequestProjections.length >= 3, "Claude reachability")
+    assertAuditHealthy()
+    expect(claudeRequestProjections[2]).toMatchObject({ authentication: "absent", pathClass: "reachability" })
+    expect(await readOnlyStateFingerprint(databasePath, claudeSettingsPath)).toEqual(beforeInspection)
+    expect(claudeSession!.get().routeHealth).toEqual({ state: "unobserved" })
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Run a target action") && !frame.includes("Providers"))
+    await setup.renderOnce()
+
+    await setup.mockInput.typeText("/takeover")
+    setup.mockInput.pressEnter()
+    const apiApplied = await waitForSecretSafeSession(
+      claudeSession!,
+      (view) => view.takeover.state === "active",
+      allStaticSecrets,
+      "claude-api-key-takeover",
+    )
+    const appliedFrame = await waitForSecretSafeFrame(
+      setup,
+      (frame) => frame.includes("Mode       Takeover")
+        && frame.includes("Current Target Provider  Claude API Key")
+        && frame.includes("Restart Claude Code to use the managed configuration."),
+      allStaticSecrets,
+      "claude-api-key-applied",
+    )
+    selectedFrames.push(appliedFrame)
+    const settingsBytes = await readFile(claudeSettingsPath, "utf8")
+    const claudeManaged = extractClaudeManagedSettings(settingsBytes, "claude-api-model")
+    claudeRoutingCredential = claudeManaged.credential
+    auditClaudeSettingsSecrets(settingsBytes, claudeManaged.credential, [
+      ...allStaticSecrets,
+      codexConfig.credential,
+    ])
+    expect((await stat(claudeSettingsPath)).mode & 0o777).toBe(0o640)
+    expect(apiApplied.activatedSnapshot).toMatchObject({
+      providerId: apiProvider.id,
+      model: "claude-api-model",
+      protocol: "anthropic-messages",
+      authentication: "anthropic-api-key",
+    })
+    expect(claudeManaged.endpoint).not.toBe(codexBaseline.endpoint)
+    expect(sensitiveDigest(claudeManaged.credential)).not.toBe(codexBaseline.credentialDigest)
+    expect(readTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
+    expect(await safeFileFingerprint(codexConfigPath)).toEqual(codexBaseline.config)
+
+    const callsBeforeRejected = upstream.calls.length
+    expect((await claudePost(claudeManaged.endpoint, wrongClaudeRouting, "/v1/messages", { messages: [] })).status).toBe(401)
+    expect((await claudePost(claudeManaged.endpoint, codexConfig.credential, "/v1/messages", { messages: [] })).status).toBe(401)
+    expect(upstream.calls.length).toBe(callsBeforeRejected)
+    expect((await chunkedPost(codexConfig.endpoint, claudeManaged.credential)).status).toBe(401)
+    expect(upstream.calls.length).toBe(callsBeforeRejected)
+
+    const message = await claudePost(
+      claudeManaged.endpoint,
+      claudeManaged.credential,
+      "/v1/messages?beta=true",
+      {
+        model: "client-must-be-replaced",
+        messages: [{ role: "user", content: "hello" }],
+        tools: [{ name: "fixture_tool", input_schema: { type: "object" } }],
+        future_extension: { retained: true },
+      },
+      { "anthropic-beta": "tools-2025-01-01", "x-claude-code-fixture": "preserved" },
+    )
+    expect(message.status).toBe(200)
+    expect(JSON.parse(message.body)).toMatchObject({ id: "msg_fixture", type: "message" })
+    const counted = await claudePost(
+      claudeManaged.endpoint,
+      claudeManaged.credential,
+      "/v1/messages/count_tokens",
+      { model: "wrong", messages: [] },
+    )
+    expect(counted.status).toBe(200)
+    expect(JSON.parse(counted.body)).toEqual({ input_tokens: 7 })
+    const errored = await claudePost(
+      claudeManaged.endpoint,
+      claudeManaged.credential,
+      "/v1/messages",
+      { messages: [], fixture_error: true },
+    )
+    expect(errored.status).toBe(429)
+    expect(errored.body).toBe('{"type":"error","error":{"type":"rate_limit_error","message":"fixture"}}')
+    assertAuditHealthy()
+    expect(claudeRequestProjections.slice(3, 6)).toMatchObject([
+      {
+        pathClass: "messages", authentication: "api-key", model: "claude-api-model",
+        hasTools: true, hasUnknown: true, hasClaudeCodeHeader: true,
+        hasQuery: true, beta: "tools-2025-01-01",
+      },
+      { pathClass: "count-tokens", authentication: "api-key", model: "claude-api-model" },
+      { pathClass: "messages", authentication: "api-key", model: "claude-api-model", error: true },
+    ])
+
+    const delayedResponse = fetch(`${claudeManaged.endpoint}/v1/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${claudeManaged.credential}`, "content-type": "application/json" },
+      body: JSON.stringify({ messages: [], stream: true, fixture_delay: true }),
+    })
+    await upstream.waitForDelayedStart()
+
+    await setup.mockInput.typeText("/provider")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Anthropic API (Messages)"))
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Anthropic API key"))
+    await setup.mockInput.typeText("Claude Bearer")
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(upstream.baseUrl)
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText("claude-bearer-model")
+    setup.mockInput.pressTab()
+    leader("h")
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(bearerSecret)
+    captureSecretSafeFrame(setup, selectedFrames, [
+      ...allStaticSecrets,
+      claudeManaged.credential,
+      codexConfig.credential,
+    ], "claude-bearer-entry")
+    setup.mockInput.pressEnter()
+    await waitForSecretSafeSession(
+      claudeSession!,
+      (view) => view.providers.length === 2,
+      [...allStaticSecrets, claudeManaged.credential, codexConfig.credential],
+      "claude-bearer-save",
+    )
+    const bearerProvider = claudeSession!.get().providers.find((provider) => provider.name === "Claude Bearer")!
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Claude Bearer"))
+    setup.mockInput.pressKey("down")
+    leader("a")
+    const bearerApplied = await waitForSecretSafeSession(
+      claudeSession!,
+      (view) => view.currentProviderId === bearerProvider.id,
+      [...allStaticSecrets, claudeManaged.credential, codexConfig.credential],
+      "claude-bearer-switch",
+    )
+    expect(bearerApplied.takeover.endpoint).toBe(claudeManaged.endpoint)
+    const switchedSettingsBytes = await readFile(claudeSettingsPath, "utf8")
+    const switchedSettings = extractClaudeManagedSettings(switchedSettingsBytes, "claude-bearer-model")
+    auditClaudeSettingsSecrets(switchedSettingsBytes, claudeManaged.credential, [
+      ...allStaticSecrets,
+      codexConfig.credential,
+    ])
+    expect(switchedSettings.credential).toBe(claudeManaged.credential)
+    expect(bearerApplied.activatedSnapshot!.id).not.toBe(apiApplied.activatedSnapshot!.id)
+
+    const bearerResponse = await claudePost(
+      claudeManaged.endpoint,
+      claudeManaged.credential,
+      "/v1/messages",
+      { messages: [], future_extension: "new-snapshot" },
+    )
+    expect(bearerResponse.status).toBe(200)
+    upstream.releaseDelayed()
+    const oldStream = await delayedResponse
+    expect(oldStream.status).toBe(200)
+    expect(await oldStream.text()).toBe(CLAUDE_SSE_BYTES.join(""))
+    assertAuditHealthy()
+    const delayedProjection = claudeRequestProjections.find((projection) => projection.delayed)
+    expect(delayedProjection).toMatchObject({
+      pathClass: "messages", authentication: "api-key", model: "claude-api-model", stream: true,
+    })
+    expect(claudeRequestProjections.at(-1)).toMatchObject({
+      pathClass: "messages", authentication: "bearer", model: "claude-bearer-model", hasUnknown: true,
+    })
+    await waitForSecretSafeSession(
+      claudeSession!,
+      (view) => view.servingProviderId === bearerProvider.id,
+      [...allStaticSecrets, claudeManaged.credential, codexConfig.credential],
+      "claude-bearer-serving",
+    )
+
+    expect(await safeFileFingerprint(codexConfigPath)).toEqual(codexBaseline.config)
+    expect(readTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
+    expect(codexSession!.get()).toMatchObject({
+      currentProviderId: codexProvider.id,
+      servingProviderId: null,
+      activatedSnapshot: { id: codexBaseline.snapshotId },
+      takeover: { endpoint: codexBaseline.endpoint },
+    })
+    const codexResponse = await chunkedPost(codexConfig.endpoint, codexConfig.credential)
+    expect(codexResponse.status).toBe(201)
+    expect(codexResponse.body).toBe(SSE_BYTES.join(""))
+    await waitForSecretSafeSession(
+      codexSession!,
+      (view) => view.servingProviderId === codexProvider.id,
+      [...allStaticSecrets, claudeManaged.credential, codexConfig.credential],
+      "codex-baseline-serving",
+    )
+    expect(await safeFileFingerprint(codexConfigPath)).toEqual(codexBaseline.config)
+    expect(readTargetDatabaseFingerprint(databasePath, "codex")).not.toBe(codexBaseline.database)
+    expect(codexSession!.get()).toMatchObject({
+      currentProviderId: codexProvider.id,
+      servingProviderId: codexProvider.id,
+      activatedSnapshot: { id: codexBaseline.snapshotId },
+      takeover: { endpoint: codexBaseline.endpoint },
+    })
+    expect(claudeSession!.get().servingProviderId).toBe(bearerProvider.id)
+
+    setup.mockInput.pressCtrlC()
+    await waitFor(() => setup!.renderer.isDestroyed, "Claude tracer renderer close")
+    rendererAudit.stop()
+    nativeFrames.push(...rendererAudit.frames())
+    setup = undefined
+    rendererAudit = undefined
+    await closeSessions()
+    const afterCloseClaude = await claudePost(
+      claudeManaged.endpoint,
+      claudeManaged.credential,
+      "/v1/messages",
+      { messages: [] },
+    )
+    const afterCloseCodex = await chunkedPost(codexConfig.endpoint, codexConfig.credential)
+    expect(afterCloseClaude.status).toBe(200)
+    expect(afterCloseCodex.status).toBe(201)
+    expect(firstService.child.exitCode).toBeNull()
+
+    await stopService(firstService, firstShutdown)
+    await expect(claudePost(claudeManaged.endpoint, claudeManaged.credential, "/v1/messages", { messages: [] })).rejects.toBeDefined()
+    await expect(chunkedPost(codexConfig.endpoint, codexConfig.credential)).rejects.toBeDefined()
+
+    const secondService = await startService(secondShutdown, "restart")
+    await openSessions("claude-e2e-restart")
+    expect(codexSession!.get()).toMatchObject({
+      currentProviderId: codexProvider.id,
+      activatedSnapshot: { id: codexBaseline.snapshotId },
+      takeover: { endpoint: codexBaseline.endpoint },
+    })
+    expect(claudeSession!.get()).toMatchObject({
+      currentProviderId: bearerProvider.id,
+      activatedSnapshot: { id: bearerApplied.activatedSnapshot!.id, model: "claude-bearer-model" },
+      takeover: { endpoint: claudeManaged.endpoint },
+    })
+    expect(extractManagedConfig(await readFile(codexConfigPath, "utf8"), "gpt-codex-baseline")).toEqual(codexConfig)
+    const restartedSettingsBytes = await readFile(claudeSettingsPath, "utf8")
+    expect(extractClaudeManagedSettings(restartedSettingsBytes, "claude-bearer-model").credential).toBe(claudeManaged.credential)
+    auditClaudeSettingsSecrets(restartedSettingsBytes, claudeManaged.credential, [
+      ...allStaticSecrets,
+      codexConfig.credential,
+    ])
+    expect((await claudePost(claudeManaged.endpoint, claudeManaged.credential, "/v1/messages", { messages: [] })).status).toBe(200)
+    expect((await chunkedPost(codexConfig.endpoint, codexConfig.credential)).status).toBe(201)
+
+    const database = new Database(databasePath, { readonly: true })
+    try {
+      const credentialRows = database.query(`SELECT p.target, p.name, c.bearer_token AS secret
+        FROM providers p JOIN credentials c ON c.id = p.credential_id ORDER BY p.target, p.position`).all() as Array<{
+          target: string; name: string; secret: string
+        }>
+      expect(credentialRows.map(({ target, name, secret }) => ({
+        target, name, digest: sensitiveDigest(secret),
+      }))).toEqual([
+        { target: "claude", name: "Claude API Key", digest: sensitiveDigest(apiKeySecret) },
+        { target: "claude", name: "Claude Bearer", digest: sensitiveDigest(bearerSecret) },
+        { target: "codex", name: "Codex Baseline", digest: sensitiveDigest(providerSecret) },
+      ])
+      const routes = database.query("SELECT target, routing_credential AS secret FROM target_route_state ORDER BY target").all() as Array<{
+        target: string; secret: string
+      }>
+      expect(routes.map(({ target, secret }) => ({ target, digest: sensitiveDigest(secret) }))).toEqual([
+        { target: "claude", digest: sensitiveDigest(claudeManaged.credential) },
+        { target: "codex", digest: sensitiveDigest(codexConfig.credential) },
+      ])
+      const snapshots = database.query(`SELECT s.target, p.name,
+        s.provider_bearer_token AS secret FROM activated_snapshots s
+        JOIN providers p ON p.id = s.provider_id ORDER BY s.target, p.position`).all() as Array<{
+          target: string; name: string; secret: string
+        }>
+      expect(snapshots.map(({ target, name, secret }) => ({
+        target, name, digest: sensitiveDigest(secret),
+      }))).toEqual([
+        { target: "claude", name: "Claude API Key", digest: sensitiveDigest(apiKeySecret) },
+        { target: "claude", name: "Claude Bearer", digest: sensitiveDigest(bearerSecret) },
+        { target: "codex", name: "Codex Baseline", digest: sensitiveDigest(providerSecret) },
+      ])
+      const receipts = database.query("SELECT outcome_json FROM action_receipts ORDER BY target, committed_revision").all()
+      scanNoSecrets(receipts, [
+        ...allStaticSecrets,
+        claudeManaged.credential,
+        codexConfig.credential,
+      ], "claude-action-receipts")
+    } finally {
+      database.close()
+    }
+
+    await writeFile(secondShutdown, "shutdown\n", { mode: 0o600 })
+    const finalResult = await Promise.race([secondService.output.completed, Bun.sleep(deadlineMs).then(() => undefined)])
+    if (!finalResult) throw new Error("claude-final-drain-timeout")
+    expect(finalResult).toEqual({ code: 0, signal: null })
+    await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" })
+    await expect(claudePost(claudeManaged.endpoint, claudeManaged.credential, "/v1/messages", { messages: [] })).rejects.toBeDefined()
+    await expect(chunkedPost(codexConfig.endpoint, codexConfig.credential)).rejects.toBeDefined()
+    const assertSessionDrained = async (session: TargetSession, target: "codex" | "claude") => {
+      let rejected = false
+      try {
+        await Promise.race([
+          session.act({
+            kind: "reorder-providers",
+            providerIds: session.get().providers.map(({ id }) => id),
+          }),
+          Bun.sleep(1_000).then(() => { throw new Error("drained-session-action-timeout") }),
+        ])
+      } catch (error) {
+        scanNoSecrets([asyncErrorSurface(error)], [
+          ...allStaticSecrets,
+          claudeManaged.credential,
+          codexConfig.credential,
+        ], `drained-${target}-session-error`)
+        rejected = true
+      }
+      if (!rejected) throw new Error(`drained-${target}-session-accepted-action`)
+    }
+    await assertSessionDrained(codexSession!, "codex")
+    await assertSessionDrained(claudeSession!, "claude")
+
+    await upstream.quiesce()
+    assertAuditHealthy()
+    const completeSecrets = [
+      ...allStaticSecrets,
+      claudeManaged.credential,
+      codexConfig.credential,
+    ]
+    scanRawRpcFramesNoSecrets(rpcStreams, completeSecrets)
+    scanNoSecrets([decodedFrames, views, selectedFrames, nativeFrames], completeSecrets, "claude-zero-secret-observations")
+    scanProcessOutputNoSecrets(services.map(({ output }) => output.streams).flat(), completeSecrets)
+    expect(await controlledTreeFingerprint(trapHome)).toBe(trapFingerprint)
+    expect((await stat(databasePath)).mode & 0o777).toBe(0o600)
+    expect((await stat(muxviaHome)).mode & 0o777).toBe(0o700)
+  } finally {
+    upstream.releaseDelayed()
+    rendererAudit?.stop()
+    if (setup && !setup.renderer.isDestroyed) setup.renderer.destroy()
+    await closeSessions().catch(() => {})
+    await writeFile(firstShutdown, "shutdown\n").catch(() => {})
+    await writeFile(secondShutdown, "shutdown\n").catch(() => {})
+    for (const { child } of services) if (child.exitCode === null) child.kill("SIGKILL")
+    await Promise.all(services.map(({ output }) => output.completed.catch(() => undefined)))
+    await upstream.stop()
+  }
+}, 60_000)
 
 test("real processes prove Codex direct activation is control-only and survives restart", async () => {
   const root = await mkdtemp(join(tmpdir(), "muxvia-direct-e2e-"))
@@ -1597,7 +2524,7 @@ test("real processes prove Codex direct activation is control-only and survives 
     unsubscribe = session.subscribe((view) => collectView(view, "direct-subscribed-view"))
     setup = await testRender(() => <App session={session!} />, {
       width: 80,
-      height: 24,
+      height: 28,
       useThread: false,
       kittyKeyboard: true,
     })
@@ -1830,7 +2757,7 @@ test("real processes prove Codex direct activation is control-only and survives 
     unsubscribe = session.subscribe((view) => collectView(view, "direct-restarted-subscribed-view"))
     setup = await testRender(() => <App session={session!} />, {
       width: 80,
-      height: 24,
+      height: 28,
       useThread: false,
       kittyKeyboard: true,
     })

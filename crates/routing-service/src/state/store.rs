@@ -117,6 +117,12 @@ pub enum ActivationCommit {
 pub struct CommittedTakeover {
     pub route_port: u16,
     pub managed_config_version: u32,
+    pub(crate) recovery_expectation: Option<CommittedRecoveryExpectation>,
+}
+
+pub(crate) struct CommittedRecoveryExpectation {
+    pub id: Uuid,
+    pub payload: RecoveryPayload,
 }
 
 pub struct RoutingSnapshot {
@@ -243,7 +249,8 @@ impl StateStore {
                 move |connection| -> Result<Option<CommittedTakeover>, StateError> {
                     let row = connection.query_row(
                         "SELECT r.route_port, r.routing_credential, r.activated_snapshot_id,
-                                r.managed_config_version, r.recovery_intent_id, a.id, a.state
+                                r.managed_config_version, r.recovery_intent_id, a.id, a.state,
+                                a.payload_json
                          FROM target_route_state r
                          LEFT JOIN activation_recovery a
                            ON a.id = r.recovery_intent_id AND a.target = r.target
@@ -258,6 +265,7 @@ impl StateStore {
                                 row.get::<_, Option<String>>(4)?,
                                 row.get::<_, Option<String>>(5)?,
                                 row.get::<_, Option<String>>(6)?,
+                                row.get::<_, Option<String>>(7)?,
                             ))
                         },
                     );
@@ -270,6 +278,7 @@ impl StateStore {
                             raw_recovery_id,
                             joined_recovery_id,
                             recovery_intent_state,
+                            recovery_payload_json,
                         )) if !credential.is_empty() && !snapshot.is_empty() => {
                             if !valid_committed_managed_configuration(
                                 target,
@@ -298,11 +307,34 @@ impl StateStore {
                                 |row| row.get(0),
                             )?;
                             if exists {
+                                let recovery_expectation =
+                                    match validate_committed_recovery_binding(
+                                        target,
+                                        u32::try_from(managed_config_version).map_err(|_| {
+                                            StateError::InvalidActivatedSnapshot
+                                        })?,
+                                        raw_recovery_id.as_deref(),
+                                        joined_recovery_id.as_deref(),
+                                        recovery_intent_state.as_deref(),
+                                        recovery_payload_json.as_deref(),
+                                        managed_config_version == 1,
+                                    ) {
+                                        Ok(expectation) => expectation,
+                                        Err(_) => {
+                                            mark_invalid_current_recovery_binding(
+                                                connection,
+                                                target,
+                                                raw_recovery_id.as_deref(),
+                                            )?;
+                                            return Ok(None);
+                                        }
+                                    };
                                 Ok(Some(CommittedTakeover {
                                     route_port: u16::try_from(route_port)
                                         .expect("validated route port"),
                                     managed_config_version: u32::try_from(managed_config_version)
                                         .expect("validated managed configuration version"),
+                                    recovery_expectation,
                                 }))
                             } else {
                                 Err(StateError::InvalidActivatedSnapshot)
@@ -454,30 +486,36 @@ impl StateStore {
                         ),
                     _ => unreachable!("validated committed managed configuration shape"),
                 };
-                let prior_recovery_payload = if target == Target::Claude && prior_snapshot.is_some() {
+                let committed_recovery = if prior_snapshot.is_some() {
                     let version = u32::try_from(managed_config_version)
                         .expect("validated managed configuration version");
-                    let payload = recovery_payload_json
-                        .and_then(|payload| serde_json::from_str::<RecoveryPayload>(&payload).ok())
-                        .filter(|payload| payload.matches_managed_config_version(target, version));
-                    if payload.is_none()
-                        && version == 1
-                        && raw_recovery_id.is_none()
-                        && prior_route_runtime.is_some()
-                    {
-                        None
-                    } else if let Some(payload) = payload {
-                        Some(payload)
-                    } else {
-                        let recovery_id = raw_recovery_id
-                            .as_deref()
-                            .expect("validated managed Claude configuration has a recovery binding");
-                        mark_invalid_committed_recovery_payload(connection, target, recovery_id)?;
-                        return Ok(Err(failure(connection,
-                            "recovery-required",
-                            "Managed configuration requires recovery",
-                        )));
+                    match validate_committed_recovery_binding(
+                        target,
+                        version,
+                        raw_recovery_id.as_deref(),
+                        joined_recovery_id.as_deref(),
+                        recovery_intent_state.as_deref(),
+                        recovery_payload_json.as_deref(),
+                        version == 1,
+                    ) {
+                        Ok(expectation) => expectation,
+                        Err(_) => {
+                            mark_invalid_current_recovery_binding(
+                                connection,
+                                target,
+                                raw_recovery_id.as_deref(),
+                            )?;
+                            return Ok(Err(failure(connection,
+                                "recovery-required",
+                                "Managed configuration requires recovery",
+                            )));
+                        }
                     }
+                } else {
+                    None
+                };
+                let prior_recovery_payload = if target == Target::Claude {
+                    committed_recovery.map(|expectation| expectation.payload)
                 } else {
                     None
                 };
@@ -1513,25 +1551,58 @@ fn valid_commit_managed_config_version(target: Target, version: u32, takeover_st
     )
 }
 
-fn mark_invalid_committed_recovery_payload(
+fn validate_committed_recovery_binding(
+    target: Target,
+    managed_config_version: u32,
+    raw_recovery_id: Option<&str>,
+    joined_recovery_id: Option<&str>,
+    recovery_state: Option<&str>,
+    payload_json: Option<&str>,
+    allow_legacy_unbound: bool,
+) -> Result<Option<CommittedRecoveryExpectation>, StateError> {
+    match (
+        raw_recovery_id,
+        joined_recovery_id,
+        recovery_state,
+        payload_json,
+    ) {
+        (None, None, None, None) if allow_legacy_unbound && managed_config_version == 1 => Ok(None),
+        (Some(raw_id), Some(joined_id), Some("committed"), Some(payload_json))
+            if raw_id == joined_id =>
+        {
+            let id = Uuid::parse_str(raw_id).map_err(|_| StateError::InvalidRecoveryPayload)?;
+            let payload: RecoveryPayload = serde_json::from_str(payload_json)
+                .map_err(|_| StateError::InvalidRecoveryPayload)?;
+            if !payload.matches_managed_config_version(target, managed_config_version) {
+                return Err(StateError::InvalidRecoveryPayload);
+            }
+            Ok(Some(CommittedRecoveryExpectation { id, payload }))
+        }
+        _ => Err(StateError::InvalidRecoveryPayload),
+    }
+}
+
+fn mark_invalid_current_recovery_binding(
     connection: &mut tokio_rusqlite::rusqlite::Connection,
     target: Target,
-    recovery_id: &str,
+    recovery_id: Option<&str>,
 ) -> tokio_rusqlite::rusqlite::Result<()> {
     let transaction = connection
         .transaction_with_behavior(tokio_rusqlite::rusqlite::TransactionBehavior::Immediate)?;
-    transaction.execute(
-        "UPDATE activation_recovery SET state = 'recovery-required'
-         WHERE id = ?1 AND target = ?2 AND state = 'committed'",
-        [recovery_id, target.as_str()],
-    )?;
+    if let Some(recovery_id) = recovery_id {
+        transaction.execute(
+            "UPDATE activation_recovery SET state = 'recovery-required'
+             WHERE id = ?1 AND target = ?2 AND state = 'committed'",
+            [recovery_id, target.as_str()],
+        )?;
+    }
     transaction.execute(
         "UPDATE target_route_state
          SET recovery_state = 'recovery-required',
              view_sequence = view_sequence + CASE
                WHEN recovery_state = 'recovery-required' THEN 0 ELSE 1 END
-         WHERE target = ?1 AND recovery_intent_id = ?2",
-        [target.as_str(), recovery_id],
+         WHERE target = ?1",
+        [target.as_str()],
     )?;
     transaction.commit()
 }

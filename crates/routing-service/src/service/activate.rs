@@ -56,6 +56,12 @@ enum ActivationConfiguration {
     },
 }
 
+enum CommittedConfigurationStatus {
+    Matches,
+    ConfigurationDrift,
+    RecoveryRequired(Uuid),
+}
+
 impl ActivationConfiguration {
     fn config_path(&self) -> &std::path::Path {
         match self {
@@ -910,19 +916,25 @@ impl ActivationService {
         let Some(takeover) = takeover else {
             return Ok(());
         };
-        if !self
-            .configuration_matches_committed_takeover(
-                target,
-                takeover.route_port,
-                takeover.managed_config_version,
-            )
+        match self
+            .configuration_matches_committed_takeover(target, &takeover)
             .await?
         {
-            self.store
-                .mark_configuration_drift_for(target)
-                .await
-                .map_err(|_| ModelServerError::State)?;
-            return Ok(());
+            CommittedConfigurationStatus::Matches => {}
+            CommittedConfigurationStatus::ConfigurationDrift => {
+                self.store
+                    .mark_configuration_drift_for(target)
+                    .await
+                    .map_err(|_| ModelServerError::State)?;
+                return Ok(());
+            }
+            CommittedConfigurationStatus::RecoveryRequired(recovery_id) => {
+                self.store
+                    .mark_current_activation_recovery_required(target, recovery_id)
+                    .await
+                    .map_err(|_| ModelServerError::State)?;
+                return Ok(());
+            }
         }
         let mut model = self.model_for(target).lock().await;
         if model.as_ref().is_some_and(ModelServerHandle::is_running) {
@@ -976,9 +988,8 @@ impl ActivationService {
     async fn configuration_matches_committed_takeover(
         &self,
         target: Target,
-        route_port: u16,
-        managed_config_version: u32,
-    ) -> Result<bool, ModelServerError> {
+        takeover: &crate::state::CommittedTakeover,
+    ) -> Result<CommittedConfigurationStatus, ModelServerError> {
         let snapshot = self
             .store
             .activated_snapshot_for(target)
@@ -997,27 +1008,57 @@ impl ActivationService {
                     .map_err(|_| ModelServerError::TargetConfiguration)?;
                 let expected = codec.desired_takeover(
                     snapshot.model(),
-                    &format!("http://127.0.0.1:{route_port}/v1"),
+                    &format!("http://127.0.0.1:{}/v1", takeover.route_port),
                     routing_credential.expose_secret(),
                 );
-                Ok(matches!(
-                    codec.inspect_managed_state(&expected),
-                    Ok(ManagedCodexState::Takeover { .. })
-                ))
+                Ok(
+                    if matches!(
+                        codec.inspect_managed_state(&expected),
+                        Ok(ManagedCodexState::Takeover { .. })
+                    ) {
+                        CommittedConfigurationStatus::Matches
+                    } else {
+                        CommittedConfigurationStatus::ConfigurationDrift
+                    },
+                )
             }
             Target::Claude => {
                 let codec = ClaudeConfigCodec::for_user_home(self.home.user_home())
                     .map_err(|_| ModelServerError::TargetConfiguration)?;
-                let ownership =
-                    ClaudeConfigOwnership::from_managed_config_version(managed_config_version)
-                        .ok_or(ModelServerError::TargetState)?;
+                let ownership = ClaudeConfigOwnership::from_managed_config_version(
+                    takeover.managed_config_version,
+                )
+                .ok_or(ModelServerError::TargetState)?;
                 let expected = codec.desired_takeover_with_ownership(
                     snapshot.model(),
-                    &format!("http://127.0.0.1:{route_port}"),
+                    &format!("http://127.0.0.1:{}", takeover.route_port),
                     routing_credential.expose_secret(),
                     ownership,
                 );
-                Ok(codec.inspect_takeover(&expected).is_ok())
+                if codec.inspect_takeover(&expected).is_err() {
+                    return Ok(CommittedConfigurationStatus::ConfigurationDrift);
+                }
+                let Some(recovery) = takeover.recovery_expectation.as_ref() else {
+                    return if ownership == ClaudeConfigOwnership::LegacyThree {
+                        Ok(CommittedConfigurationStatus::Matches)
+                    } else {
+                        Err(ModelServerError::TargetState)
+                    };
+                };
+                let RecoveryPayload::Claude { before, desired } = &recovery.payload else {
+                    return Ok(CommittedConfigurationStatus::RecoveryRequired(recovery.id));
+                };
+                if desired.as_ref() != &expected || before.ownership() != ownership {
+                    return Ok(CommittedConfigurationStatus::RecoveryRequired(recovery.id));
+                }
+                if matches!(
+                    codec.inspect_managed_state(Some((&expected, before.as_ref()))),
+                    Ok(ManagedClaudeState::Takeover { .. })
+                ) {
+                    Ok(CommittedConfigurationStatus::Matches)
+                } else {
+                    Ok(CommittedConfigurationStatus::RecoveryRequired(recovery.id))
+                }
             }
         }
     }

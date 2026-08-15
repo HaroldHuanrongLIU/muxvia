@@ -78,25 +78,84 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
 
 fn migrate_v6(connection: &mut Connection) -> Result<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(
-        "ALTER TABLE target_route_state ADD COLUMN recovery_intent_id TEXT;
-         UPDATE target_route_state
-         SET recovery_intent_id = (
-           SELECT id FROM activation_recovery a
-           WHERE a.target = target_route_state.target AND a.state = 'committed'
-         )
-         WHERE activated_snapshot_id IS NOT NULL
-           AND (SELECT COUNT(*) FROM activation_recovery a
-                WHERE a.target = target_route_state.target AND a.state = 'committed') = 1;
-         UPDATE target_route_state
-         SET recovery_state = 'recovery-required'
-         WHERE target = 'claude' AND activated_snapshot_id IS NOT NULL
-           AND recovery_intent_id IS NULL
-           AND (SELECT COUNT(*) FROM activation_recovery a
-                WHERE a.target = target_route_state.target AND a.state = 'committed') > 1;
-         UPDATE metadata SET value = '7' WHERE key = 'schema-version';",
+    transaction
+        .execute_batch("ALTER TABLE target_route_state ADD COLUMN recovery_intent_id TEXT;")?;
+    bind_current_recovery_intents(&transaction)?;
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.execute(
+        "UPDATE metadata SET value = '7' WHERE key = 'schema-version'",
+        [],
     )?;
     transaction.commit()
+}
+
+fn bind_current_recovery_intents(transaction: &Transaction<'_>) -> Result<()> {
+    let routes = transaction
+        .prepare(
+            "SELECT target, activated_snapshot_id
+             FROM target_route_state WHERE activated_snapshot_id IS NOT NULL",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>>>()?;
+
+    for (target, snapshot_id) in routes {
+        let candidates = transaction
+            .prepare(
+                "SELECT a.id
+                 FROM activation_recovery a
+                 JOIN action_receipts receipt
+                   ON receipt.target = a.target AND receipt.action_id = a.action_id
+                 WHERE a.target = ?1 AND a.state = 'committed'
+                   AND receipt.action_kind = 'activate-provider'
+                   AND receipt.committed_revision = a.created_revision + 1
+                   AND json_valid(receipt.outcome_json)
+                   AND json_extract(receipt.outcome_json, '$.status') = 'applied'
+                   AND json_extract(receipt.outcome_json, '$.view.target') = ?1
+                   AND json_extract(receipt.outcome_json,
+                                    '$.view.managementRevision') = receipt.committed_revision
+                   AND json_extract(receipt.outcome_json,
+                                    '$.view.activatedSnapshot.id') = ?2",
+            )?
+            .query_map(params![target, snapshot_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>>>()?;
+        match candidates.as_slice() {
+            [recovery_id] => {
+                transaction.execute(
+                    "UPDATE target_route_state SET recovery_intent_id = ?1 WHERE target = ?2",
+                    params![recovery_id, target],
+                )?;
+            }
+            [] => {
+                let committed_count: u64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM activation_recovery
+                     WHERE target = ?1 AND state = 'committed'",
+                    [&target],
+                    |row| row.get(0),
+                )?;
+                if committed_count != 0 {
+                    transaction.execute(
+                        "UPDATE target_route_state SET recovery_state = 'recovery-required'
+                         WHERE target = ?1",
+                        [&target],
+                    )?;
+                }
+            }
+            _ => {
+                transaction.execute(
+                    "UPDATE target_route_state SET recovery_state = 'recovery-required'
+                     WHERE target = ?1",
+                    [&target],
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn migrate_v5(connection: &mut Connection) -> Result<()> {

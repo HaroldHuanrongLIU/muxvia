@@ -4721,6 +4721,165 @@ async fn startup_marks_only_claude_configuration_drift_and_resumes_clean_codex()
 }
 
 #[tokio::test]
+async fn claude_bound_takeover_bootstrap_requires_exact_recovery_expectation() {
+    for mutation in [
+        "v1-api-key",
+        "v1-unrelated",
+        "v2-unrelated",
+        "malformed-payload",
+        "missing-payload",
+    ] {
+        let fixture = Fixture::new().await;
+        let settings_path = fixture.home.user_home().join(".claude/settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(&settings_path, br#"{"permissions":{"allow":["Read"]}}"#).unwrap();
+        let (codex_provider, codex_revision) = fixture
+            .save("Codex", "gpt-peer", "codex-provider-secret")
+            .await;
+        let (claude_provider, claude_revision) = fixture
+            .save_claude("Claude", "claude-bound", "claude-provider-secret")
+            .await;
+        let first = fixture.dual_service(
+            ActivationHooks::default(),
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+        );
+        let codex = first
+            .activate(command(codex_provider, codex_revision, Uuid::new_v4()))
+            .await
+            .expect_applied_redacted();
+        let claude = first
+            .apply_raw_for_with_context(
+                Target::Claude,
+                Uuid::new_v4(),
+                claude_revision,
+                takeover_action(claude_provider),
+                Some(&claude_context(&fixture.home)),
+            )
+            .await
+            .expect_applied_redacted();
+        let codex_endpoint: std::net::SocketAddr = codex
+            .view
+            .takeover
+            .endpoint
+            .as_deref()
+            .unwrap()
+            .trim_start_matches("http://")
+            .parse()
+            .unwrap();
+        let claude_endpoint: std::net::SocketAddr = claude
+            .view
+            .takeover
+            .endpoint
+            .as_deref()
+            .unwrap()
+            .trim_start_matches("http://")
+            .parse()
+            .unwrap();
+        first.shutdown_models().await.unwrap();
+
+        if mutation.starts_with("v1-") {
+            fixture
+                .downgrade_latest_claude_takeover_to_v1("legacy-api-key")
+                .await;
+        }
+        match mutation {
+            "v1-api-key" => {
+                let mut document: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+                document["env"]["ANTHROPIC_API_KEY"] = serde_json::json!("offline-api-key-secret");
+                fs::write(
+                    &settings_path,
+                    serde_json::to_vec_pretty(&document).unwrap(),
+                )
+                .unwrap();
+            }
+            "v1-unrelated" | "v2-unrelated" => {
+                let mut document: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+                document["permissions"]["allow"] = serde_json::json!(["Bash"]);
+                fs::write(
+                    &settings_path,
+                    serde_json::to_vec_pretty(&document).unwrap(),
+                )
+                .unwrap();
+            }
+            "malformed-payload" | "missing-payload" => {
+                let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+                    .await
+                    .unwrap();
+                let remove = mutation == "missing-payload";
+                database
+                    .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                        if remove {
+                            connection.execute(
+                                "DELETE FROM activation_recovery
+                                 WHERE id = (SELECT recovery_intent_id FROM target_route_state
+                                             WHERE target = 'claude')",
+                                [],
+                            )?;
+                        } else {
+                            connection.execute(
+                                "UPDATE activation_recovery SET payload_json = '{malformed'
+                                 WHERE id = (SELECT recovery_intent_id FROM target_route_state
+                                             WHERE target = 'claude')",
+                                [],
+                            )?;
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let restarted_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+        let restarted = ActivationService::new(
+            Arc::clone(&restarted_store),
+            fixture.home.clone(),
+            fixture.probe.clone(),
+            "/usr/bin/codex".into(),
+            Arc::new(NoopUpstream),
+        )
+        .with_claude_runtime(
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+            "/usr/bin/claude".into(),
+        );
+        restarted.bootstrap_committed_takeovers().await.unwrap();
+
+        assert_eq!(restarted.model_endpoint().await, Some(codex_endpoint));
+        assert!(
+            restarted.model_endpoint_for(Target::Claude).await.is_none(),
+            "{mutation}"
+        );
+        let view = restarted_store
+            .target_view_for(Target::Claude)
+            .await
+            .unwrap();
+        assert!(
+            public_surface_is_secret_free(
+                &view,
+                &[
+                    "codex-provider-secret",
+                    "claude-provider-secret",
+                    "legacy-api-key",
+                    "offline-api-key-secret"
+                ]
+            )
+            .is_ok(),
+            "bootstrap recovery view exposed a credential"
+        );
+        assert_eq!(view.recovery.state, "recovery-required", "{mutation}");
+        assert_eq!(view.managed_configuration.state, "recovery-required");
+        let unbound = tokio::net::TcpListener::bind(claude_endpoint)
+            .await
+            .unwrap();
+        drop(unbound);
+        restarted.shutdown_models().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn startup_keeps_claude_recovery_control_only_while_resuming_clean_codex() {
     let fixture = Fixture::new().await;
     let (codex_provider, codex_revision) = fixture

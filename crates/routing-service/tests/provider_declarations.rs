@@ -12,7 +12,7 @@ use muxvia_routing::{
     home::MuxviaHome,
     model::ReqwestUpstream,
     service::activate::ActivationService,
-    state::StateStore,
+    state::{RecoveryPayload, StateStore},
 };
 use tokio_rusqlite::rusqlite::{Connection, params};
 use uuid::Uuid;
@@ -166,6 +166,7 @@ CREATE TABLE activation_recovery (
 "#;
 
 const V5_SCHEMA: &str = include_str!("fixtures/state-schema-v5.sql");
+const T05_CLAUDE_RECOVERY_PAYLOAD: &str = include_str!("fixtures/claude-recovery-t05.json");
 
 struct StoreFixture {
     root: PathBuf,
@@ -260,7 +261,7 @@ async fn schema_v7_migrates_real_v5_claude_states_and_binds_the_unique_committed
         let recovery_id = "00000000-0000-4000-8000-000000000204";
         let payload =
             r#"{"target":"claude","before":{"legacy":"before"},"desired":{"legacy":"desired"}}"#;
-        let receipt = r#"{"status":"applied","legacy":"receipt"}"#;
+        let receipt = migration_receipt("claude", 7, snapshot_id);
         let connection = Connection::open(fixture.home.database_path()).unwrap();
         connection.execute_batch(V5_SCHEMA).unwrap();
         if active {
@@ -438,6 +439,199 @@ async fn schema_v7_migrates_real_v5_claude_states_and_binds_the_unique_committed
 }
 
 #[tokio::test]
+async fn schema_v7_selects_current_bindings_from_v6_receipts_after_retry_history() {
+    let fixture = StoreFixture::new();
+    fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    connection.execute_batch(V5_SCHEMA).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE target_route_state
+               ADD COLUMN managed_config_version INTEGER NOT NULL DEFAULT 1
+                 CHECK (managed_config_version IN (1,2));
+             UPDATE metadata SET value = '6' WHERE key = 'schema-version';",
+        )
+        .unwrap();
+
+    for (target, protocol, authentication, base) in [
+        ("codex", "openai-responses", "openai-bearer", 400_u16),
+        ("claude", "anthropic-messages", "anthropic-bearer", 500_u16),
+    ] {
+        let route_port = i64::from(base) + 43100;
+        let prior_snapshot = format!("00000000-0000-4000-8000-000000000{base}");
+        let current_snapshot = format!("00000000-0000-4000-8000-000000000{}", base + 1);
+        let provider_id = format!("00000000-0000-4000-8000-000000000{}", base + 2);
+        let prior_action = format!("10000000-0000-4000-8000-000000000{}", base + 3);
+        let retry_action = format!("10000000-0000-4000-8000-000000000{}", base + 4);
+        let prior_recovery = format!("20000000-0000-4000-8000-000000000{}", base + 5);
+        let rolled_back_recovery = format!("20000000-0000-4000-8000-000000000{}", base + 6);
+        let retried_recovery = format!("20000000-0000-4000-8000-000000000{}", base + 7);
+        for (snapshot_id, model, epoch) in [
+            (&prior_snapshot, "prior-model", base + 8),
+            (&current_snapshot, "current-model", base + 9),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO activated_snapshots
+                     (id, target, provider_id, base_url, model, protocol, authentication,
+                      provider_bearer_token, epoch)
+                     VALUES (?1, ?2, ?3, 'https://provider.test', ?4, ?5, ?6,
+                             'provider-secret', ?7)",
+                    params![
+                        snapshot_id,
+                        target,
+                        provider_id,
+                        model,
+                        protocol,
+                        authentication,
+                        format!("00000000-0000-4000-8000-000000000{epoch}")
+                    ],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "UPDATE target_route_state SET management_revision = 9, view_sequence = 9,
+                   current_provider_id = ?1, takeover_state = 'active', route_port = ?2,
+                   routing_credential = 'route-secret', activated_snapshot_id = ?3,
+                   managed_config_path = '/tmp/managed-config'
+                 WHERE target = ?4",
+                params![provider_id, route_port, current_snapshot, target],
+            )
+            .unwrap();
+
+        let payload_for = |model: &str| {
+            if target == "codex" {
+                let codec = CodexConfigCodec::for_user_home(fixture.home.user_home()).unwrap();
+                serde_json::to_string(&RecoveryPayload::Codex {
+                    before: Box::new(codec.inspect().unwrap()),
+                    desired: Box::new(codec.desired_takeover(
+                        model,
+                        &format!("http://127.0.0.1:{route_port}/v1"),
+                        "route-secret",
+                    )),
+                })
+                .unwrap()
+            } else {
+                legacy_claude_migration_payload(model, route_port)
+            }
+        };
+
+        connection
+            .execute(
+                "INSERT INTO activation_recovery
+                 (id, target, action_id, config_path, file_identity_json, payload_json,
+                  state, created_revision)
+                 VALUES (?1, ?2, ?3, '/tmp/managed-config', 'null', ?4, 'committed', 4)",
+                params![
+                    prior_recovery,
+                    target,
+                    prior_action,
+                    payload_for("prior-model")
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO action_receipts
+                 (target, action_id, action_kind, committed_revision, outcome_json)
+                 VALUES (?1, ?2, 'activate-provider', 5, ?3)",
+                params![
+                    target,
+                    prior_action,
+                    migration_receipt(target, 5, &prior_snapshot)
+                ],
+            )
+            .unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO activation_recovery
+                 (id, target, action_id, config_path, file_identity_json, payload_json,
+                  state, created_revision)
+                 VALUES (?1, ?2, ?3, '/tmp/managed-config', 'null', ?4, 'rolled-back', 2)",
+                params![
+                    rolled_back_recovery,
+                    target,
+                    retry_action,
+                    payload_for("rolled-back-model")
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE activation_recovery
+                 SET id = ?1, payload_json = ?2, state = 'committed', created_revision = 7
+                 WHERE target = ?3 AND action_id = ?4 AND state = 'rolled-back'",
+                params![
+                    retried_recovery,
+                    payload_for("current-model"),
+                    target,
+                    retry_action
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO action_receipts
+                 (target, action_id, action_kind, committed_revision, outcome_json)
+                 VALUES (?1, ?2, 'activate-provider', 8, ?3)",
+                params![
+                    target,
+                    retry_action,
+                    migration_receipt(target, 8, &current_snapshot)
+                ],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    drop(fixture.open().await);
+    let database = Connection::open(fixture.home.database_path()).unwrap();
+    let bindings = database
+        .prepare(
+            "SELECT target, recovery_intent_id, recovery_state
+             FROM target_route_state ORDER BY target",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        bindings,
+        [
+            (
+                "claude".to_owned(),
+                Some("20000000-0000-4000-8000-000000000507".to_owned()),
+                "clean".to_owned(),
+            ),
+            (
+                "codex".to_owned(),
+                Some("20000000-0000-4000-8000-000000000407".to_owned()),
+                "clean".to_owned(),
+            ),
+        ]
+    );
+    assert!(
+        database
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .query([])
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn schema_v7_does_not_guess_between_multiple_legacy_committed_intents() {
     let fixture = StoreFixture::new();
     fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
@@ -465,6 +659,7 @@ async fn schema_v7_does_not_guess_between_multiple_legacy_committed_intents() {
         )
         .unwrap();
     for suffix in ["221", "222"] {
+        let action_id = format!("10000000-0000-4000-8000-000000000{suffix}");
         connection
             .execute(
                 "INSERT INTO activation_recovery
@@ -474,7 +669,18 @@ async fn schema_v7_does_not_guess_between_multiple_legacy_committed_intents() {
                          'committed', 0)",
                 params![
                     format!("00000000-0000-4000-8000-000000000{suffix}"),
-                    format!("10000000-0000-4000-8000-000000000{suffix}")
+                    action_id
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO action_receipts
+                 (target, action_id, action_kind, committed_revision, outcome_json)
+                 VALUES ('claude', ?1, 'activate-provider', 1, ?2)",
+                params![
+                    action_id,
+                    migration_receipt("claude", 1, "00000000-0000-4000-8000-000000000211")
                 ],
             )
             .unwrap();
@@ -496,6 +702,28 @@ async fn schema_v7_does_not_guess_between_multiple_legacy_committed_intents() {
         migrated,
         ("7".to_owned(), None, "recovery-required".to_owned())
     );
+}
+
+fn migration_receipt(target: &str, revision: u64, snapshot_id: &str) -> String {
+    serde_json::json!({
+        "status": "applied",
+        "view": {
+            "target": target,
+            "managementRevision": revision,
+            "mode": "takeover",
+            "activatedSnapshot": {"id": snapshot_id},
+        }
+    })
+    .to_string()
+}
+
+fn legacy_claude_migration_payload(model: &str, route_port: i64) -> String {
+    let mut payload: serde_json::Value = serde_json::from_str(T05_CLAUDE_RECOVERY_PAYLOAD).unwrap();
+    payload["desired"]["owned"]["base_url"] =
+        serde_json::json!(format!("http://127.0.0.1:{route_port}"));
+    payload["desired"]["owned"]["auth_token"] = serde_json::json!("route-secret");
+    payload["desired"]["owned"]["model"] = serde_json::json!(model);
+    payload.to_string()
 }
 
 #[cfg(unix)]

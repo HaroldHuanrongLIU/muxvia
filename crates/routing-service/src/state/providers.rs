@@ -4,6 +4,7 @@ use secrecy::SecretString;
 use tokio_rusqlite::rusqlite::{OptionalExtension, Transaction, params};
 use uuid::Uuid;
 
+use crate::domain::provider::has_valid_provider_declaration;
 use crate::{
     control::protocol::{
         CredentialEdit, DuplicateCredential, ProviderAuthentication, ProviderPresetView,
@@ -100,6 +101,7 @@ pub(super) enum ProviderAction {
         base_url: String,
         model: String,
         credential: CredentialEdit,
+        authentication: Option<ProviderAuthentication>,
         preset_key: Option<String>,
     },
     Update {
@@ -109,6 +111,7 @@ pub(super) enum ProviderAction {
         base_url: String,
         model: String,
         credential: CredentialEdit,
+        authentication: Option<ProviderAuthentication>,
     },
     Reorder {
         provider_ids: Vec<Uuid>,
@@ -137,6 +140,7 @@ pub(super) enum ProviderMutationError {
 
 pub(super) fn mutate_provider(
     transaction: &Transaction<'_>,
+    target: Target,
     action: ProviderAction,
 ) -> Result<(), ProviderMutationError> {
     match action {
@@ -145,8 +149,18 @@ pub(super) fn mutate_provider(
             base_url,
             model,
             credential,
+            authentication,
             preset_key,
-        } => create_provider(transaction, name, base_url, model, credential, preset_key),
+        } => create_provider(
+            transaction,
+            target,
+            name,
+            base_url,
+            model,
+            credential,
+            authentication,
+            preset_key,
+        ),
         ProviderAction::Update {
             provider_id,
             provider_revision,
@@ -154,20 +168,25 @@ pub(super) fn mutate_provider(
             base_url,
             model,
             credential,
+            authentication,
         } => update_provider(
             transaction,
+            target,
             provider_id,
             provider_revision,
             name,
             base_url,
             model,
             credential,
+            authentication,
         ),
-        ProviderAction::Reorder { provider_ids } => reorder_providers(transaction, &provider_ids),
+        ProviderAction::Reorder { provider_ids } => {
+            reorder_providers_for(transaction, target, &provider_ids)
+        }
         ProviderAction::Delete {
             provider_id,
             provider_revision,
-        } => delete_provider(transaction, provider_id, provider_revision),
+        } => delete_provider_for(transaction, target, provider_id, provider_revision),
         ProviderAction::Duplicate {
             source_provider_id,
             source_provider_revision,
@@ -177,6 +196,7 @@ pub(super) fn mutate_provider(
             credential,
         } => duplicate_provider(
             transaction,
+            target,
             source_provider_id,
             source_provider_revision,
             name,
@@ -187,10 +207,14 @@ pub(super) fn mutate_provider(
     }
 }
 
-pub(super) fn reorder_providers(
+pub(super) fn reorder_providers_for(
     transaction: &Transaction<'_>,
+    target: Target,
     provider_ids: &[Uuid],
 ) -> Result<(), ProviderMutationError> {
+    if target != Target::Codex {
+        return Err(ProviderMutationError::Invalid);
+    }
     let existing = transaction
         .prepare("SELECT id FROM providers WHERE target = 'codex' ORDER BY position")
         .map_err(|_| ProviderMutationError::Invalid)?
@@ -242,11 +266,15 @@ pub(super) fn reorder_providers(
     Ok(())
 }
 
-pub(super) fn delete_provider(
+pub(super) fn delete_provider_for(
     transaction: &Transaction<'_>,
+    target: Target,
     provider_id: Uuid,
     provider_revision: u64,
 ) -> Result<(), ProviderMutationError> {
+    if target != Target::Codex {
+        return Err(ProviderMutationError::Invalid);
+    }
     let (position, credential_id, revision, generated_owner_id): (
         u32,
         Option<String>,
@@ -311,19 +339,22 @@ pub(super) fn delete_provider(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_provider(
     transaction: &Transaction<'_>,
+    target: Target,
     name: String,
     base_url: String,
     model: String,
     credential: CredentialEdit,
+    authentication: Option<ProviderAuthentication>,
     preset_key: Option<String>,
 ) -> Result<(), ProviderMutationError> {
     let name = normalized_name(name)?;
     let base_url = normalized_base_url(base_url)?;
     let provenance = match preset_key {
-        Some(key) if key == OPENAI_API_RESPONSES_PRESET_KEY => {
-            (Some("preset"), Some(OPENAI_API_RESPONSES_PRESET_KEY))
+        Some(key) if key == preset_key_for(target) => {
+            (Some("preset"), Some(preset_key_for(target)))
         }
         Some(_) => return Err(ProviderMutationError::Invalid),
         None => (None, None),
@@ -331,12 +362,17 @@ fn create_provider(
     let credential_id = match credential {
         CredentialEdit::Keep => return Err(ProviderMutationError::Invalid),
         CredentialEdit::Remove => None,
-        CredentialEdit::Replace { value } => Some(insert_credential(transaction, value)?),
+        CredentialEdit::Replace { value } => Some(insert_credential(transaction, target, value)?),
     };
+    let authentication = authentication.unwrap_or(ProviderAuthentication::OpenaiBearer);
+    let protocol = protocol_for(target);
+    if !has_valid_provider_declaration(target, protocol, authentication) {
+        return Err(ProviderMutationError::Invalid);
+    }
     let position = transaction
         .query_row(
-            "SELECT COALESCE(MAX(position) + 1, 0) FROM providers WHERE target = 'codex'",
-            [],
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM providers WHERE target = ?1",
+            [target.as_str()],
             |row| row.get::<_, u32>(0),
         )
         .map_err(|_| ProviderMutationError::Invalid)?;
@@ -346,14 +382,17 @@ fn create_provider(
              (id, target, position, provider_revision, name, base_url, model, protocol,
               authentication, routing_requirement, credential_id, provenance_kind, provenance_key,
               generated_owner_id)
-             VALUES (?1, 'codex', ?2, 1, ?3, ?4, ?5, 'openai-responses', 'openai-bearer',
-                     'direct-compatible', ?6, ?7, ?8, NULL)",
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8,
+                     'direct-compatible', ?9, ?10, ?11, NULL)",
             params![
                 Uuid::new_v4().to_string(),
+                target.as_str(),
                 position,
                 name,
                 base_url,
                 model,
+                protocol.to_string(),
+                authentication.to_string(),
                 credential_id,
                 provenance.0,
                 provenance.1,
@@ -366,6 +405,7 @@ fn create_provider(
 #[allow(clippy::too_many_arguments)]
 fn duplicate_provider(
     transaction: &Transaction<'_>,
+    target: Target,
     source_provider_id: Uuid,
     source_provider_revision: u64,
     name: String,
@@ -379,8 +419,8 @@ fn duplicate_provider(
         .query_row(
             "SELECT target, position, provider_revision, protocol, authentication, routing_requirement, credential_id,
                     provenance_kind, provenance_key, generated_owner_id
-             FROM providers WHERE id = ?1 AND target = 'codex'",
-            [source_provider_id.to_string()],
+             FROM providers WHERE id = ?1 AND target = ?2",
+            params![source_provider_id.to_string(), target.as_str()],
             |row| {
                 Ok(SourceDeclaration {
                     target: row.get(0)?,
@@ -405,7 +445,9 @@ fn duplicate_provider(
     let credential_id = match credential {
         DuplicateCredential::Without => None,
         DuplicateCredential::ReuseSource => source.credential_id.clone(),
-        DuplicateCredential::Replace { value } => Some(insert_credential(transaction, value)?),
+        DuplicateCredential::Replace { value } => {
+            Some(insert_credential(transaction, target, value)?)
+        }
     };
     let position = source
         .position
@@ -421,8 +463,8 @@ fn duplicate_provider(
     transaction
         .execute(
             "UPDATE providers SET position = position + 1
-             WHERE target = 'codex' AND position > ?1",
-            [source.position],
+             WHERE target = ?2 AND position > ?1",
+            params![source.position, target.as_str()],
         )
         .map_err(|_| ProviderMutationError::Invalid)?;
     transaction
@@ -454,28 +496,30 @@ fn duplicate_provider(
 #[allow(clippy::too_many_arguments)]
 fn update_provider(
     transaction: &Transaction<'_>,
+    target: Target,
     provider_id: String,
     provider_revision: u64,
     name: String,
     base_url: String,
     model: String,
     credential: CredentialEdit,
+    authentication: Option<ProviderAuthentication>,
 ) -> Result<(), ProviderMutationError> {
     let provider_id = Uuid::parse_str(&provider_id).map_err(|_| ProviderMutationError::Invalid)?;
     let name = normalized_name(name)?;
     let base_url = normalized_base_url(base_url)?;
     let existing = transaction
         .query_row(
-            "SELECT name, base_url, model, credential_id, provider_revision
-             FROM providers WHERE id = ?1 AND target = 'codex'",
-            [provider_id.to_string()],
+            "SELECT name, base_url, model, credential_id, provider_revision, authentication, protocol
+             FROM providers WHERE id = ?1 AND target = ?2",
+            params![provider_id.to_string(), target.as_str()],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, u64>(4)?,
+                    row.get::<_, u64>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?,
                 ))
             },
         )
@@ -489,27 +533,36 @@ fn update_provider(
     let credential_id = match credential {
         CredentialEdit::Keep => existing.3.clone(),
         CredentialEdit::Remove => None,
-        CredentialEdit::Replace { value } => Some(insert_credential(transaction, value)?),
+        CredentialEdit::Replace { value } => Some(insert_credential(transaction, target, value)?),
     };
+    let authentication = authentication.unwrap_or_else(|| parse_authentication(&existing.5));
+    if existing.6 != protocol_for(target).to_string()
+        || !has_valid_provider_declaration(target, protocol_for(target), authentication)
+    {
+        return Err(ProviderMutationError::Invalid);
+    }
     if existing.0 == name
         && existing.1 == base_url
         && existing.2 == model
         && existing.3 == credential_id
+        && existing.5 == authentication.to_string()
     {
         return Err(ProviderMutationError::NoProviderChange);
     }
     transaction
         .execute(
             "UPDATE providers
-             SET name = ?1, base_url = ?2, model = ?3, credential_id = ?4,
+             SET name = ?1, base_url = ?2, model = ?3, credential_id = ?4, authentication = ?5,
                  provider_revision = provider_revision + 1
-             WHERE id = ?5",
+             WHERE id = ?6 AND target = ?7",
             params![
                 name,
                 base_url,
                 model,
                 credential_id,
-                provider_id.to_string()
+                authentication.to_string(),
+                provider_id.to_string(),
+                target.as_str()
             ],
         )
         .map_err(|_| ProviderMutationError::Invalid)?;
@@ -544,6 +597,7 @@ fn normalized_base_url(base_url: String) -> Result<String, ProviderMutationError
 
 fn insert_credential(
     transaction: &Transaction<'_>,
+    target: Target,
     value: String,
 ) -> Result<String, ProviderMutationError> {
     if value.trim().is_empty() {
@@ -552,9 +606,29 @@ fn insert_credential(
     let id = Uuid::new_v4().to_string();
     transaction
         .execute(
-            "INSERT INTO credentials (id, target, bearer_token) VALUES (?1, 'codex', ?2)",
-            params![id, value],
+            "INSERT INTO credentials (id, target, bearer_token) VALUES (?1, ?2, ?3)",
+            params![id, target.as_str(), value],
         )
         .map_err(|_| ProviderMutationError::Invalid)?;
     Ok(id)
+}
+
+fn protocol_for(target: Target) -> ProviderProtocol {
+    match target {
+        Target::Codex => ProviderProtocol::OpenaiResponses,
+        Target::Claude => ProviderProtocol::AnthropicMessages,
+    }
+}
+fn preset_key_for(target: Target) -> &'static str {
+    match target {
+        Target::Codex => OPENAI_API_RESPONSES_PRESET_KEY,
+        Target::Claude => ANTHROPIC_API_MESSAGES_PRESET_KEY,
+    }
+}
+fn parse_authentication(value: &str) -> ProviderAuthentication {
+    match value {
+        "anthropic-api-key" => ProviderAuthentication::AnthropicApiKey,
+        "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
+        _ => ProviderAuthentication::OpenaiBearer,
+    }
 }

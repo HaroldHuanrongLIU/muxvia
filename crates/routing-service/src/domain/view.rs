@@ -25,6 +25,15 @@ pub(crate) fn project_target_view(
     connection: &Connection,
     service_epoch: &str,
 ) -> Result<TargetView> {
+    project_target_view_for(connection, service_epoch, Target::Codex)
+}
+
+pub(crate) fn project_target_view_for(
+    connection: &Connection,
+    service_epoch: &str,
+    target: Target,
+) -> Result<TargetView> {
+    let target_name = target.as_str();
     let (
         management_revision,
         view_sequence,
@@ -39,8 +48,8 @@ pub(crate) fn project_target_view(
         "SELECT management_revision, view_sequence, current_provider_id, serving_provider_id,
                 takeover_state, route_port, recovery_state, managed_config_path,
                 activated_snapshot_id
-         FROM target_route_state WHERE target = 'codex'",
-        [],
+         FROM target_route_state WHERE target = ?1",
+        [target_name],
         |row| {
             Ok((
                 row.get(0)?,
@@ -62,17 +71,17 @@ pub(crate) fn project_target_view(
                 p.credential_id IS NOT NULL,
                 EXISTS(
                     SELECT 1 FROM target_route_state r
-                    WHERE r.target = 'codex' AND r.current_provider_id = p.id
+                    WHERE r.target = ?1 AND r.current_provider_id = p.id
                 ),
                 EXISTS(
                     SELECT 1 FROM target_route_state r
                     JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
-                    WHERE r.target = 'codex' AND s.provider_id = p.id
+                    WHERE r.target = ?1 AND s.provider_id = p.id
                 )
-         FROM providers p WHERE p.target = 'codex' ORDER BY p.position",
+         FROM providers p WHERE p.target = ?1 ORDER BY p.position",
     )?;
     let providers = statement
-        .query_map([], |row| {
+        .query_map([target_name], |row| {
             let id = uuid::Uuid::parse_str(&row.get::<_, String>(0)?).map_err(conversion_error)?;
             let has_credential: bool = row.get(12)?;
             let base_url: String = row.get(4)?;
@@ -98,7 +107,7 @@ pub(crate) fn project_target_view(
                 "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
                 _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
             };
-            if !has_valid_provider_declaration(Target::Codex, protocol, authentication) {
+            if !has_valid_provider_declaration(target, protocol, authentication) {
                 return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
             }
             let provenance_kind: Option<String> = row.get(9)?;
@@ -155,8 +164,8 @@ pub(crate) fn project_target_view(
     };
     let recovery = connection
         .query_row(
-            "SELECT id, state FROM activation_recovery WHERE target = 'codex' ORDER BY rowid DESC LIMIT 1",
-            [],
+            "SELECT id, state FROM activation_recovery WHERE target = ?1 ORDER BY rowid DESC LIMIT 1",
+            [target_name],
             |row| Ok((Some(row.get::<_, String>(0)?), row.get::<_, String>(1)?)),
         )
         .unwrap_or((None, recovery_state.clone()));
@@ -164,8 +173,8 @@ pub(crate) fn project_target_view(
         "SELECT s.id, s.provider_id, s.model, s.protocol, s.authentication, s.epoch
              FROM target_route_state r
              JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
-             WHERE r.target = 'codex'",
-        [],
+             WHERE r.target = ?1",
+        [target_name],
         |row| {
             let id = uuid::Uuid::parse_str(&row.get::<_, String>(0)?).map_err(conversion_error)?;
             let provider_id =
@@ -197,11 +206,10 @@ pub(crate) fn project_target_view(
         Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => None,
         Err(error) => return Err(error),
     };
-    let mut problem_statement = connection.prepare(
-        "SELECT code, message FROM target_problems WHERE target = 'codex' ORDER BY code",
-    )?;
+    let mut problem_statement = connection
+        .prepare("SELECT code, message FROM target_problems WHERE target = ?1 ORDER BY code")?;
     let problems = problem_statement
-        .query_map([], |row| {
+        .query_map([target_name], |row| {
             Ok(ControlProblem {
                 code: row.get(0)?,
                 message: row.get(1)?,
@@ -210,7 +218,7 @@ pub(crate) fn project_target_view(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(TargetView {
-        target: Target::Codex,
+        target,
         management_revision,
         view_sequence,
         service: ServiceView {
@@ -226,7 +234,7 @@ pub(crate) fn project_target_view(
             state: "unobserved".to_owned(),
         },
         providers,
-        provider_presets: provider_presets(Target::Codex),
+        provider_presets: provider_presets(target),
         current_provider_id,
         serving_provider_id,
         managed_configuration: ManagedConfigurationView {
@@ -260,8 +268,12 @@ fn conversion_error(
 }
 
 pub(crate) fn empty_target_view(service_epoch: &str) -> TargetView {
+    empty_target_view_for(service_epoch, Target::Codex)
+}
+
+pub(crate) fn empty_target_view_for(service_epoch: &str, target: Target) -> TargetView {
     TargetView {
-        target: Target::Codex,
+        target,
         management_revision: 0,
         view_sequence: 0,
         service: ServiceView {
@@ -277,7 +289,7 @@ pub(crate) fn empty_target_view(service_epoch: &str) -> TargetView {
             state: "unobserved".to_owned(),
         },
         providers: Vec::new(),
-        provider_presets: provider_presets(Target::Codex),
+        provider_presets: provider_presets(target),
         current_provider_id: None,
         serving_provider_id: None,
         managed_configuration: ManagedConfigurationView {

@@ -1,6 +1,6 @@
 use std::{fmt, path::PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as _};
 use tokio_rusqlite::rusqlite::params;
 use uuid::Uuid;
 
@@ -45,7 +45,7 @@ impl RecoveryState {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize)]
 pub struct RecoveryIntent {
     id: Uuid,
     target: Target,
@@ -56,7 +56,7 @@ pub struct RecoveryIntent {
     created_revision: u64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize)]
 #[serde(tag = "target", rename_all = "lowercase")]
 pub enum RecoveryPayload {
     Codex {
@@ -66,6 +66,56 @@ pub enum RecoveryPayload {
     Claude {
         payload: serde_json::Value,
     },
+}
+
+impl<'de> Deserialize<'de> for RecoveryPayload {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let target = value
+            .get("target")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| D::Error::custom("missing recovery target"))?
+            .to_owned();
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| D::Error::custom("invalid recovery payload"))?;
+        object.remove("target");
+        match target.as_str() {
+            "codex" => Ok(Self::Codex {
+                before: Box::new(
+                    serde_json::from_value(
+                        object
+                            .remove("before")
+                            .ok_or_else(|| D::Error::custom("missing Codex before"))?,
+                    )
+                    .map_err(D::Error::custom)?,
+                ),
+                desired: Box::new(
+                    serde_json::from_value(
+                        object
+                            .remove("desired")
+                            .ok_or_else(|| D::Error::custom("missing Codex desired"))?,
+                    )
+                    .map_err(D::Error::custom)?,
+                ),
+            }),
+            "claude" => Ok(Self::Claude {
+                payload: object
+                    .remove("payload")
+                    .unwrap_or_else(|| serde_json::Value::Object(object.clone())),
+            }),
+            _ => Err(D::Error::custom("invalid recovery target")),
+        }
+    }
+}
+
+impl RecoveryPayload {
+    pub fn target(&self) -> Target {
+        match self {
+            Self::Codex { .. } => Target::Codex,
+            Self::Claude { .. } => Target::Claude,
+        }
+    }
 }
 
 impl fmt::Debug for RecoveryIntent {
@@ -102,6 +152,7 @@ impl RecoveryIntent {
             },
             created_revision,
         )
+        .expect("Codex payload has the Codex target")
     }
 
     pub fn pending_for_target(
@@ -111,8 +162,11 @@ impl RecoveryIntent {
         config_path: PathBuf,
         payload: RecoveryPayload,
         created_revision: u64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, StateError> {
+        if target != payload.target() {
+            return Err(StateError::InvalidRecoveryPayload);
+        }
+        Ok(Self {
             id,
             target,
             action_id,
@@ -120,7 +174,7 @@ impl RecoveryIntent {
             payload,
             state: RecoveryState::Pending,
             created_revision,
-        }
+        })
     }
 
     pub fn id(&self) -> Uuid {
@@ -349,7 +403,10 @@ fn parse_intent_row(
         "claude" => Target::Claude,
         _ => return Err(conversion_error(StateError::InvalidRecoveryState)),
     };
-    let payload = serde_json::from_str(&payload_json).map_err(conversion_error)?;
+    let payload: RecoveryPayload = serde_json::from_str(&payload_json).map_err(conversion_error)?;
+    if payload.target() != target {
+        return Err(conversion_error(StateError::InvalidRecoveryPayload));
+    }
     Ok(RecoveryIntent {
         id: Uuid::parse_str(&id).map_err(conversion_error)?,
         target,

@@ -134,6 +134,7 @@ const targetActionSchema = z.discriminatedUnion("kind", [
     baseUrl: z.string(),
     model: z.string(),
     credential: credentialEditSchema,
+    authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]).optional(),
     presetKey: z.enum(["openai-api-responses", "anthropic-api-messages"]).nullable().optional(),
   }),
   z.object({
@@ -144,6 +145,7 @@ const targetActionSchema = z.discriminatedUnion("kind", [
     baseUrl: z.string(),
     model: z.string(),
     credential: credentialEditSchema,
+    authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]).optional(),
   }),
   z.object({
     kind: z.literal("reorder-providers"),

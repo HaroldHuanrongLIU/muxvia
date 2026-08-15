@@ -104,6 +104,124 @@ async fn fresh_schema_v4_reopens_with_codex_and_claude_route_rows() {
 }
 
 #[tokio::test]
+async fn claude_target_view_projects_only_the_messages_preset() {
+    let fixture = StoreFixture::new().await;
+    let view = fixture.store.target_view_for(Target::Claude).await.unwrap();
+    assert_eq!(view.target, Target::Claude);
+    assert_eq!(view.route_health.state, "unobserved");
+    assert_eq!(view.provider_presets.len(), 1);
+    assert_eq!(view.provider_presets[0].key, "anthropic-api-messages");
+    assert_eq!(
+        view.provider_presets[0].protocol.to_string(),
+        "anthropic-messages"
+    );
+    assert_eq!(
+        view.provider_presets[0].authentication.to_string(),
+        "anthropic-api-key"
+    );
+}
+
+#[tokio::test]
+async fn claude_provider_create_update_and_duplicate_preserve_its_declaration() {
+    let fixture = StoreFixture::new().await;
+    let created = fixture.store.apply_provider_action_for(Target::Claude, fixed_uuid(91), 0, serde_json::json!({
+        "kind": "create-provider", "name": "Claude", "baseUrl": "https://api.anthropic.com/v1",
+        "model": "claude-test", "credential": { "kind": "replace", "value": "secret" },
+        "authentication": "anthropic-bearer", "presetKey": "anthropic-api-messages"
+    })).await.unwrap();
+    let provider = &created.view.providers[0];
+    assert_eq!(provider.protocol.to_string(), "anthropic-messages");
+    assert_eq!(provider.authentication.to_string(), "anthropic-bearer");
+    let duplicate = fixture.store.apply_provider_action_for(Target::Claude, fixed_uuid(92), 1, serde_json::json!({
+        "kind": "duplicate-provider", "sourceProviderId": provider.id, "sourceProviderRevision": 1,
+        "name": "Claude copy", "baseUrl": "https://api.anthropic.com/v1", "model": "claude-test",
+        "credential": { "kind": "reuse-source" }
+    })).await.unwrap();
+    assert_eq!(
+        duplicate.view.providers[1].authentication.to_string(),
+        "anthropic-bearer"
+    );
+    let updated = fixture
+        .store
+        .apply_provider_action_for(
+            Target::Claude,
+            fixed_uuid(93),
+            2,
+            serde_json::json!({
+                "kind": "update-provider", "providerId": provider.id, "providerRevision": 1,
+                "name": "Claude", "baseUrl": "https://api.anthropic.com/v1", "model": "claude-test",
+                "credential": { "kind": "keep" }, "authentication": "anthropic-api-key"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.view.providers[0].authentication.to_string(),
+        "anthropic-api-key"
+    );
+    let api_key = fixture.store.apply_provider_action_for(Target::Claude, fixed_uuid(94), 3, serde_json::json!({
+        "kind": "create-provider", "name": "Claude key", "baseUrl": "", "model": "", "credential": { "kind": "remove" },
+        "authentication": "anthropic-api-key"
+    })).await.unwrap();
+    assert_eq!(
+        api_key.view.providers[2].authentication.to_string(),
+        "anthropic-api-key"
+    );
+    let rejected = fixture.store.apply_provider_action_for(Target::Claude, fixed_uuid(95), 4, serde_json::json!({
+        "kind": "create-provider", "name": "Bad", "baseUrl": "", "model": "", "credential": { "kind": "remove" },
+        "authentication": "openai-bearer"
+    })).await.unwrap_err();
+    assert_eq!(rejected.problem.code, "invalid-provider");
+}
+
+#[tokio::test]
+async fn reopen_decodes_legacy_v4_claude_recovery_payload() {
+    let root = std::env::temp_dir().join(format!("muxvia-legacy-v4-{}", Uuid::new_v4()));
+    let home = MuxviaHome::from_user_home(&root);
+    drop(StateStore::open(&home).await.unwrap());
+    let id = Uuid::new_v4();
+    let action_id = Uuid::new_v4();
+    let database = tokio_rusqlite::Connection::open(home.database_path())
+        .await
+        .unwrap();
+    database.call(move |connection| {
+        connection.execute(
+            "INSERT INTO activation_recovery (id, target, action_id, config_path, file_identity_json, payload_json, state, created_revision) VALUES (?1, 'claude', ?2, '/tmp/claude', 'null', ?3, 'pending', 0)",
+            tokio_rusqlite::rusqlite::params![id.to_string(), action_id.to_string(), r#"{"target":"claude","before":{"legacy":true},"desired":{"legacy":true}}"#],
+        )?;
+        Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+    }).await.unwrap();
+    drop(database);
+    let store = StateStore::open(&home).await.unwrap();
+    assert_eq!(
+        store
+            .recovery_intent_for(Target::Claude, action_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .target(),
+        Target::Claude
+    );
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn recovery_constructor_rejects_a_target_payload_mismatch() {
+    let result = RecoveryIntent::pending_for_target(
+        Target::Codex,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        PathBuf::from("/tmp/claude"),
+        RecoveryPayload::Claude {
+            payload: serde_json::json!({ "opaque": true }),
+        },
+        0,
+    );
+    assert!(result.is_err());
+}
+
+#[tokio::test]
 async fn save_provider_persists_secret_separately_and_projects_no_secret() {
     let fixture = StoreFixture::new().await;
     let result = fixture
@@ -585,7 +703,8 @@ async fn target_scoped_receipts_and_recovery_action_ids_do_not_cross_targets() {
             payload: serde_json::json!({ "owned": "claude" }),
         },
         0,
-    );
+    )
+    .unwrap();
     fixture
         .store
         .insert_recovery_intent(&codex_intent)
@@ -660,6 +779,7 @@ fn typed_and_raw_action_debug_output_redacts_credentials() {
         credential: CredentialEdit::Replace {
             value: secret.into(),
         },
+        authentication: None,
         preset_key: None,
     };
     let operation = ControlOperation::Act {

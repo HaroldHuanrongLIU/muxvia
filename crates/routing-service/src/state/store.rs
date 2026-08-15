@@ -11,7 +11,7 @@ use crate::{
     domain::{
         activation::ActivatedSnapshot,
         provider::has_valid_provider_declaration,
-        view::{empty_target_view, project_target_view},
+        view::{empty_target_view, project_target_view, project_target_view_for},
     },
     home::MuxviaHome,
 };
@@ -35,6 +35,8 @@ pub enum StateError {
     Serialization(#[from] serde_json::Error),
     #[error("state store contains an invalid recovery state")]
     InvalidRecoveryState,
+    #[error("state store contains an invalid recovery payload")]
+    InvalidRecoveryPayload,
     #[error("recovery intent does not exist")]
     MissingRecoveryIntent,
     #[error("state store contains an invalid activated snapshot")]
@@ -166,9 +168,13 @@ impl StateStore {
     }
 
     pub async fn target_view(&self) -> Result<TargetView, StateError> {
+        self.target_view_for(Target::Codex).await
+    }
+
+    pub async fn target_view_for(&self, target: Target) -> Result<TargetView, StateError> {
         let service_epoch = self.service_epoch.clone();
         self.connection
-            .call(move |connection| project_target_view(connection, &service_epoch))
+            .call(move |connection| project_target_view_for(connection, &service_epoch, target))
             .await
             .map_err(map_call_error)
     }
@@ -621,7 +627,18 @@ impl StateStore {
         expected_revision: u64,
         raw_action: serde_json::Value,
     ) -> Result<ActionOutcome, ActionFailure> {
-        match self.receipt(action_id).await {
+        self.apply_provider_action_for(Target::Codex, action_id, expected_revision, raw_action)
+            .await
+    }
+
+    pub async fn apply_provider_action_for(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        expected_revision: u64,
+        raw_action: serde_json::Value,
+    ) -> Result<ActionOutcome, ActionFailure> {
+        match self.receipt_for(target, action_id).await {
             Ok(Some(outcome)) => return Ok(outcome),
             Ok(None) => {}
             Err(_) => {
@@ -631,7 +648,7 @@ impl StateStore {
             }
         }
 
-        if self.ensure_managed_writes_allowed().await.is_err() {
+        if target == Target::Codex && self.ensure_managed_writes_allowed().await.is_err() {
             return Err(self
                 .failure(
                     "recovery-required",
@@ -646,6 +663,7 @@ impl StateStore {
                 base_url,
                 model,
                 credential,
+                authentication,
                 preset_key,
             }) => (
                 super::providers::ProviderAction::Create {
@@ -653,6 +671,7 @@ impl StateStore {
                     base_url,
                     model,
                     credential,
+                    authentication,
                     preset_key,
                 },
                 "create-provider",
@@ -664,6 +683,7 @@ impl StateStore {
                 base_url,
                 model,
                 credential,
+                authentication,
             }) => (
                 super::providers::ProviderAction::Update {
                     provider_id,
@@ -672,6 +692,7 @@ impl StateStore {
                     base_url,
                     model,
                     credential,
+                    authentication,
                 },
                 "update-provider",
             ),
@@ -727,8 +748,8 @@ impl StateStore {
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
                 let recorded = transaction.query_row(
-                    "SELECT outcome_json FROM action_receipts WHERE target = 'codex' AND action_id = ?1",
-                    [&action_id],
+                    "SELECT outcome_json FROM action_receipts WHERE target = ?1 AND action_id = ?2",
+                    params![target.as_str(), action_id],
                     |row| row.get::<_, String>(0),
                 );
                 match recorded {
@@ -741,13 +762,13 @@ impl StateStore {
                     Err(error) => return Err(StateError::Sqlite(error)),
                 }
                 let current_revision: u64 = transaction.query_row(
-                    "SELECT management_revision FROM target_route_state WHERE target = 'codex'",
-                    [],
+                    "SELECT management_revision FROM target_route_state WHERE target = ?1",
+                    [target.as_str()],
                     |row| row.get(0),
                 )?;
                 let recovery_state: String = transaction.query_row(
-                    "SELECT recovery_state FROM target_route_state WHERE target = 'codex'",
-                    [],
+                    "SELECT recovery_state FROM target_route_state WHERE target = ?1",
+                    [target.as_str()],
                     |row| row.get(0),
                 )?;
                 if recovery_state == "recovery-required" {
@@ -757,11 +778,16 @@ impl StateStore {
                             message: "Managed writes are blocked until recovery is resolved"
                                 .to_owned(),
                         },
-                        authoritative_view: project_target_view(&transaction, &service_epoch)?,
+                        authoritative_view: project_target_view_for(
+                            &transaction,
+                            &service_epoch,
+                            target,
+                        )?,
                     }));
                 }
                 if current_revision != expected_revision {
-                    let authoritative_view = project_target_view(&transaction, &service_epoch)?;
+                    let authoritative_view =
+                        project_target_view_for(&transaction, &service_epoch, target)?;
                     return Ok(ProviderAttempt::Failure(ActionFailure {
                         problem: ControlProblem {
                             code: "stale-revision".to_owned(),
@@ -770,7 +796,8 @@ impl StateStore {
                         authoritative_view,
                     }));
                 }
-                if let Err(error) = super::providers::mutate_provider(&transaction, action) {
+                if let Err(error) = super::providers::mutate_provider(&transaction, target, action)
+                {
                     let (code, message) = match error {
                         super::providers::ProviderMutationError::Invalid => {
                             ("invalid-provider", "Provider declaration is invalid")
@@ -796,17 +823,21 @@ impl StateStore {
                             code: code.to_owned(),
                             message: message.to_owned(),
                         },
-                        authoritative_view: project_target_view(&transaction, &service_epoch)?,
+                        authoritative_view: project_target_view_for(
+                            &transaction,
+                            &service_epoch,
+                            target,
+                        )?,
                     }));
                 }
                 transaction.execute(
                     "UPDATE target_route_state
                      SET management_revision = management_revision + 1,
                          view_sequence = view_sequence + 1
-                     WHERE target = 'codex'",
-                    [],
+                     WHERE target = ?1",
+                    [target.as_str()],
                 )?;
-                let view = project_target_view(&transaction, &service_epoch)?;
+                let view = project_target_view_for(&transaction, &service_epoch, target)?;
                 let outcome = ActionOutcome {
                     status: ActionStatus::Applied,
                     view,
@@ -815,8 +846,9 @@ impl StateStore {
                 transaction.execute(
                     "INSERT INTO action_receipts
                      (target, action_id, action_kind, committed_revision, outcome_json)
-                     VALUES ('codex', ?1, ?2, ?3, ?4)",
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
+                        target.as_str(),
                         action_id,
                         action_kind,
                         outcome.view.management_revision,

@@ -292,6 +292,7 @@ fn provider_declaration_contract_round_trips_the_secret_free_projection_and_acti
         base_url: String::new(),
         model: String::new(),
         credential: CredentialEdit::Remove,
+        authentication: None,
         preset_key: Some("openai-api-responses".into()),
     };
     assert_eq!(

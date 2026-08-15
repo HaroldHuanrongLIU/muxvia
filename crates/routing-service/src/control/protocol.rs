@@ -296,6 +296,8 @@ pub enum TargetAction {
         base_url: String,
         model: String,
         credential: CredentialEdit,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authentication: Option<ProviderAuthentication>,
         preset_key: Option<String>,
     },
     UpdateProvider {
@@ -306,6 +308,8 @@ pub enum TargetAction {
         base_url: String,
         model: String,
         credential: CredentialEdit,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authentication: Option<ProviderAuthentication>,
     },
     ReorderProviders {
         provider_ids: Vec<Uuid>,
@@ -349,6 +353,7 @@ impl fmt::Debug for TargetAction {
                 base_url,
                 model,
                 credential,
+                authentication,
                 preset_key,
             } => formatter
                 .debug_struct("CreateProvider")
@@ -356,6 +361,7 @@ impl fmt::Debug for TargetAction {
                 .field("base_url", base_url)
                 .field("model", model)
                 .field("credential", credential)
+                .field("authentication", authentication)
                 .field("preset_key", preset_key)
                 .finish(),
             Self::UpdateProvider {
@@ -365,6 +371,7 @@ impl fmt::Debug for TargetAction {
                 base_url,
                 model,
                 credential,
+                authentication,
             } => formatter
                 .debug_struct("UpdateProvider")
                 .field("provider_id", provider_id)
@@ -373,6 +380,7 @@ impl fmt::Debug for TargetAction {
                 .field("base_url", base_url)
                 .field("model", model)
                 .field("credential", credential)
+                .field("authentication", authentication)
                 .finish(),
             Self::ReorderProviders { provider_ids } => formatter
                 .debug_struct("ReorderProviders")

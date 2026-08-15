@@ -313,7 +313,7 @@ impl Fixture {
                     "SELECT target,management_revision,view_sequence,current_provider_id,serving_provider_id,takeover_state,route_port,routing_credential,activated_snapshot_id,managed_config_path,recovery_state FROM target_route_state ORDER BY target",
                     "SELECT id,target,provider_id,base_url,model,provider_bearer_token,epoch FROM activated_snapshots ORDER BY id",
                     "SELECT action_id,action_kind,committed_revision,outcome_json FROM action_receipts ORDER BY action_id",
-                    "SELECT id,target,action_id,config_path,file_identity_json,before_owned_json,desired_owned_json,state,created_revision FROM activation_recovery ORDER BY id",
+                    "SELECT id,target,action_id,config_path,file_identity_json,payload_json,state,created_revision FROM activation_recovery ORDER BY id",
                     "SELECT target,code,message FROM target_problems ORDER BY target,code",
                 ];
                 let mut fingerprint = Vec::new();

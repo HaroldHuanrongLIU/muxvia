@@ -191,16 +191,19 @@ impl StoreFixture {
                 transaction.execute(
                     "INSERT INTO providers
                      (id, target, position, provider_revision, name, base_url, model, protocol,
-                      routing_requirement, credential_id, provenance_kind, provenance_key,
-                      generated_owner_id)
+                      authentication, routing_requirement, credential_id, provenance_kind,
+                      provenance_key, generated_owner_id)
                      VALUES (?1, 'codex', 0, 1, 'Fake upstream', ?2, 'gpt-test',
-                             'openai-responses', 'direct-compatible', ?1, NULL, NULL, NULL)",
+                             'openai-responses', 'openai-bearer', 'direct-compatible',
+                             ?1, NULL, NULL, NULL)",
                     (provider_id.to_string(), upstream_base_url.clone()),
                 )?;
                 transaction.execute(
                     "INSERT INTO activated_snapshots
-                     (id, target, provider_id, base_url, model, provider_bearer_token, epoch)
-                     VALUES (?1, 'codex', ?2, ?3, 'gpt-test', ?4, ?5)",
+                     (id, target, provider_id, base_url, model, protocol, authentication,
+                      provider_bearer_token, epoch)
+                     VALUES (?1, 'codex', ?2, ?3, 'gpt-test', 'openai-responses',
+                             'openai-bearer', ?4, ?5)",
                     (
                         snapshot_id.to_string(),
                         provider_id.to_string(),

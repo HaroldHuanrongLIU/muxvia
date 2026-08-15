@@ -19,8 +19,8 @@ use muxvia_routing::{
     control::{
         framing::{read_frame, write_frame},
         protocol::{
-            ActionStatus, ActivationMode, ClaudeHostManagedState, ClaudePreflightContext,
-            ClaudeSelectorState, Target,
+            ActionOutcome, ActionStatus, ActivationMode, ClaudeHostManagedState,
+            ClaudePreflightContext, ClaudeSelectorState, Target,
         },
         server::ControlServer,
     },
@@ -454,6 +454,24 @@ impl Fixture {
             .await
             .unwrap()
     }
+
+    async fn stored_receipt_for(&self, target: Target, action_id: Uuid) -> ActionOutcome {
+        let database = tokio_rusqlite::Connection::open(self.home.database_path())
+            .await
+            .unwrap();
+        let json = database
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT outcome_json FROM action_receipts
+                     WHERE target = ?1 AND action_id = ?2",
+                    (target.as_str(), action_id.to_string()),
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .await
+            .unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
 }
 
 fn command(provider_id: Uuid, revision: u64, action_id: Uuid) -> ActivateProviderCommand {
@@ -834,7 +852,8 @@ async fn claude_publication_failure_keeps_the_commit_and_replay_is_side_effect_f
 }
 
 #[tokio::test]
-async fn claude_post_commit_runtime_handoff_failure_is_explicit_committed_and_control_only() {
+async fn claude_post_commit_runtime_handoff_recovery_updates_applied_receipt_and_replays_coherently()
+ {
     let fixture = Fixture::new().await;
     let (provider_id, revision) = fixture
         .save_claude("Claude", "claude-handoff-test", "provider-secret")
@@ -847,7 +866,7 @@ async fn claude_post_commit_runtime_handoff_failure_is_explicit_committed_and_co
     let mut updates = fixture.store.subscribe_target_views();
     let action_id = Uuid::new_v4();
 
-    let failure = service
+    let initial = service
         .apply_raw_for_with_context(
             Target::Claude,
             action_id,
@@ -856,9 +875,28 @@ async fn claude_post_commit_runtime_handoff_failure_is_explicit_committed_and_co
             Some(&claude_context(&fixture.home)),
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(failure.problem.code, "recovery-required");
+    assert_eq!(initial.status, ActionStatus::Applied);
+    let current = fixture.store.target_view_for(Target::Claude).await.unwrap();
+    assert_eq!(initial.view, current);
+    assert_eq!(current.recovery.state, "recovery-required");
+    assert_eq!(current.managed_configuration.state, "recovery-required");
+    let stored_receipt = fixture.stored_receipt_for(Target::Claude, action_id).await;
+    assert_eq!(stored_receipt.status, ActionStatus::Applied);
+    assert_eq!(stored_receipt.view, current);
+    let replay = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            action_id,
+            0,
+            serde_json::json!({"malformed": true}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status, ActionStatus::Replayed);
+    assert_eq!(replay.view, current);
     let receipt = fixture
         .store
         .receipt_for(Target::Claude, action_id)
@@ -866,6 +904,7 @@ async fn claude_post_commit_runtime_handoff_failure_is_explicit_committed_and_co
         .unwrap()
         .expect("the database commit must remain authoritative");
     assert_eq!(receipt.status, ActionStatus::Replayed);
+    assert_eq!(receipt.view, current);
     assert_eq!(
         receipt.view.current_provider_id,
         Some(provider_id.to_string())
@@ -883,10 +922,6 @@ async fn claude_post_commit_runtime_handoff_failure_is_explicit_committed_and_co
         .trim_start_matches("http://")
         .parse()
         .unwrap();
-    let current = fixture.store.target_view_for(Target::Claude).await.unwrap();
-    assert_eq!(failure.authoritative_view, current);
-    assert_eq!(current.recovery.state, "recovery-required");
-    assert_eq!(current.managed_configuration.state, "recovery-required");
     assert_eq!(current.takeover.endpoint, receipt.view.takeover.endpoint);
     assert_eq!(fixture.count("activated_snapshots").await, 1);
     assert_eq!(

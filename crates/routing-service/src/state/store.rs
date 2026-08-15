@@ -561,6 +561,71 @@ impl StateStore {
         }).await.map_err(map_state_call_error)
     }
 
+    pub(crate) async fn mark_committed_activation_recovery_required(
+        &self,
+        target: Target,
+        recovery_id: Uuid,
+    ) -> Result<ActionOutcome, StateError> {
+        let service_epoch = self.service_epoch.clone();
+        self.connection
+            .call(move |connection| -> Result<ActionOutcome, StateError> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let action_id = transaction
+                    .query_row(
+                        "SELECT action_id FROM activation_recovery
+                         WHERE id = ?1 AND target = ?2 AND state = 'committed'",
+                        params![recovery_id.to_string(), target.as_str()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|error| match error {
+                        tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows => {
+                            StateError::MissingRecoveryIntent
+                        }
+                        error => StateError::Sqlite(error),
+                    })?;
+                let changed = transaction.execute(
+                    "UPDATE activation_recovery SET state = 'recovery-required'
+                     WHERE id = ?1 AND target = ?2 AND state = 'committed'",
+                    params![recovery_id.to_string(), target.as_str()],
+                )?;
+                if changed != 1 {
+                    return Err(StateError::MissingRecoveryIntent);
+                }
+                let changed = transaction.execute(
+                    "UPDATE target_route_state
+                     SET recovery_state = 'recovery-required',
+                         view_sequence = view_sequence + CASE
+                           WHEN recovery_state = 'recovery-required' THEN 0 ELSE 1 END
+                     WHERE target = ?1",
+                    [target.as_str()],
+                )?;
+                if changed != 1 {
+                    return Err(StateError::MissingRecoveryIntent);
+                }
+                let view = project_target_view_for(&transaction, &service_epoch, target)?;
+                let outcome = ActionOutcome {
+                    status: ActionStatus::Applied,
+                    view,
+                };
+                let json = serde_json::to_string(&outcome)?;
+                let changed = transaction.execute(
+                    "UPDATE action_receipts SET outcome_json = ?1
+                     WHERE target = ?2 AND action_id = ?3
+                       AND action_kind = 'activate-provider'",
+                    params![json, target.as_str(), action_id],
+                )?;
+                if changed != 1 {
+                    return Err(StateError::MissingRecoveryIntent);
+                }
+                transaction.commit()?;
+                Ok(outcome)
+            })
+            .await
+            .map_err(map_state_call_error)
+    }
+
     pub(crate) fn publish_target_view(&self, view: TargetView) {
         let _ = self.target_views.send(view);
     }

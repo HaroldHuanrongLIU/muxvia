@@ -726,7 +726,7 @@ impl ActivationService {
                         tokio::task::yield_now().await;
                     }
                     if handle.activate().await.is_err() {
-                        return Err(self.committed_handoff_failure(&intent, Some(handle)).await);
+                        return self.committed_handoff_recovery(&intent, Some(handle)).await;
                     }
                     *self.model_for(target).lock().await = Some(handle);
                 }
@@ -1139,23 +1139,27 @@ impl ActivationService {
         let _ = self.shutdown_model_for(intent.target()).await;
     }
 
-    async fn committed_handoff_failure(
+    async fn committed_handoff_recovery(
         &self,
         intent: &RecoveryIntent,
         candidate: Option<ModelServerHandle>,
-    ) -> ActionFailure {
-        self.mark_required(intent, candidate).await;
-        let failure = self
+    ) -> Result<ActionOutcome, ActionFailure> {
+        self.shutdown_candidate(candidate).await;
+        let _ = self.shutdown_model_for(intent.target()).await;
+        let outcome = match self
             .store
-            .failure_for(
-                intent.target(),
-                "recovery-required",
-                "Committed model runtime requires recovery",
-            )
-            .await;
-        self.store
-            .publish_target_view(failure.authoritative_view.clone());
-        failure
+            .mark_committed_activation_recovery_required(intent.target(), intent.id())
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                return Err(self
+                    .target_failure(intent.target(), "internal-failure")
+                    .await);
+            }
+        };
+        self.store.publish_target_view(outcome.view.clone());
+        Ok(outcome)
     }
 
     async fn shutdown_candidate(&self, candidate: Option<ModelServerHandle>) {

@@ -411,7 +411,7 @@ impl LegacyActionOutcome {
                 mode: self.view.mode,
                 takeover: self.view.takeover,
                 providers,
-                provider_presets: super::providers::provider_presets()
+                provider_presets: super::providers::provider_presets(Target::Codex)
                     .into_iter()
                     .map(|preset| LegacyV3ProviderPresetView {
                         key: preset.key,

@@ -291,6 +291,30 @@ async fn request(stream: &mut UnixStream, request_id: &str, operation: Value) ->
     read_frame(stream).await.unwrap()
 }
 
+#[tokio::test]
+async fn claude_operations_fail_closed_without_touching_codex_state() {
+    let mut fixture = ControlFixture::start().await;
+    let before = fixture.store.target_view().await.unwrap();
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+
+    for (index, operation) in [
+        json!({ "kind": "open-target", "target": "claude" }),
+        json!({ "kind": "act", "target": "claude", "actionId": Uuid::new_v4(), "expectedRevision": 0,
+            "action": { "kind": "create-provider", "name": "must-not-persist", "baseUrl": "https://api.anthropic.com/v1", "model": "claude-test", "credential": { "kind": "replace", "value": "must-not-persist" } } }),
+        json!({ "kind": "discover-models", "target": "claude", "source": { "kind": "draft", "baseUrl": "https://api.anthropic.com/v1", "credentialSource": { "kind": "missing" } } }),
+        json!({ "kind": "check-reachability", "target": "claude", "providerId": Uuid::new_v4(), "providerRevision": 1 }),
+    ].into_iter().enumerate() {
+        let response = request(&mut stream, &format!("claude-{index}"), operation).await;
+        assert_eq!(response["type"], "error");
+        assert_eq!(response["problem"]["code"], "target-unavailable");
+        assert!(response.get("authoritativeView").is_none());
+        assert!(!response.to_string().contains("must-not-persist"));
+    }
+    assert_eq!(fixture.store.target_view().await.unwrap(), before);
+    fixture.shutdown().await;
+}
+
 async fn wait_for_inspections(fixture: &ControlFixture, expected: usize) {
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {

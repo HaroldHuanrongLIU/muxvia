@@ -23,7 +23,7 @@ use crate::{
         framing::{FrameError, read_frame, write_frame},
         protocol::{
             ClientFrame, ControlOperation, ControlProblem, ControlResult, FrameLimit, RpcVersion,
-            ServerFrame, TargetView,
+            ServerFrame, Target, TargetView,
         },
     },
     home::MuxviaHome,
@@ -487,6 +487,18 @@ async fn serve_session(
                     }
                 };
 
+                if operation_target(&operation) == Target::Claude {
+                    if !enqueue_response(&responses, problem_frame(
+                        Some(request_id),
+                        "target-unavailable",
+                        "Target is not available",
+                        None,
+                    )) {
+                        break 'session;
+                    }
+                    continue;
+                }
+
                 match operation {
                     ControlOperation::OpenTarget { .. } => {
                         let Ok(view) = store.target_view().await else {
@@ -591,6 +603,15 @@ async fn serve_session(
     {
         writer_task.abort();
         let _ = writer_task.await;
+    }
+}
+
+fn operation_target(operation: &ControlOperation) -> Target {
+    match operation {
+        ControlOperation::OpenTarget { target }
+        | ControlOperation::Act { target, .. }
+        | ControlOperation::DiscoverModels { target, .. }
+        | ControlOperation::CheckReachability { target, .. } => *target,
     }
 }
 

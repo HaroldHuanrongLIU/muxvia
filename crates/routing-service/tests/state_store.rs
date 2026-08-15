@@ -1,13 +1,14 @@
 use std::{fs, path::PathBuf};
 
 use muxvia_routing::{
+    codex::CodexConfigCodec,
     control::protocol::{
         ActionStatus, ClientFrame, ControlOperation, CredentialEdit, CredentialPresence, Target,
         TargetAction,
     },
     domain::provider::normalize_provider_base_url,
     home::MuxviaHome,
-    state::StateStore,
+    state::{RecoveryIntent, RecoveryPayload, StateStore},
 };
 use uuid::Uuid;
 
@@ -66,6 +67,40 @@ async fn new_database_target_view_matches_the_canonical_protocol_fixture() {
     expected["service"]["epoch"] = serde_json::json!(view.service.epoch);
 
     assert_eq!(serde_json::to_value(view).unwrap(), expected);
+}
+
+#[tokio::test]
+async fn fresh_schema_v4_reopens_with_codex_and_claude_route_rows() {
+    let root = std::env::temp_dir().join(format!("muxvia-v4-reopen-{}", Uuid::new_v4()));
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let first = StateStore::open(&home).await.unwrap();
+    drop(first);
+    let second = StateStore::open(&home).await.unwrap();
+    drop(second);
+
+    let database = tokio_rusqlite::Connection::open(home.database_path())
+        .await
+        .unwrap();
+    let (version, targets): (String, Vec<String>) = database
+        .call(|connection| -> tokio_rusqlite::rusqlite::Result<_> {
+            let version = connection.query_row(
+                "SELECT value FROM metadata WHERE key = 'schema-version'",
+                [],
+                |row| row.get(0),
+            )?;
+            let targets = connection
+                .prepare("SELECT target FROM target_route_state ORDER BY target")?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            Ok((version, targets))
+        })
+        .await
+        .unwrap();
+    assert_eq!(version, "4");
+    assert_eq!(targets, ["claude", "codex"]);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -525,18 +560,40 @@ async fn target_scoped_receipts_and_recovery_action_ids_do_not_cross_targets() {
                     ],
                 )?;
             }
-            connection.execute(
-                "INSERT INTO activation_recovery
-                 (id, target, action_id, config_path, file_identity_json, payload_json, state, created_revision)
-                 VALUES (?1, 'claude', ?2, '/tmp/settings', '{}', ?3, 'pending', 0)",
-                tokio_rusqlite::rusqlite::params![
-                    Uuid::new_v4().to_string(),
-                    action_id.to_string(),
-                    r#"{"target":"claude","before":{},"desired":{}}"#,
-                ],
-            )?;
             Ok(())
         })
+        .await
+        .unwrap();
+
+    let codec = CodexConfigCodec::for_user_home(fixture.home.user_home()).unwrap();
+    fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+    fs::write(codec.config_path(), "approval_policy = \"never\"\n").unwrap();
+    let codex_intent = RecoveryIntent::pending(
+        Uuid::new_v4(),
+        action_id,
+        codec.config_path().to_owned(),
+        codec.inspect().unwrap(),
+        codec.desired_direct("gpt-test", "https://api.openai.com/v1", "openai"),
+        0,
+    );
+    let claude_intent = RecoveryIntent::pending_for_target(
+        Target::Claude,
+        Uuid::new_v4(),
+        action_id,
+        PathBuf::from("/tmp/claude-settings"),
+        RecoveryPayload::Claude {
+            payload: serde_json::json!({ "owned": "claude" }),
+        },
+        0,
+    );
+    fixture
+        .store
+        .insert_recovery_intent(&codex_intent)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .insert_recovery_intent(&claude_intent)
         .await
         .unwrap();
 
@@ -562,6 +619,26 @@ async fn target_scoped_receipts_and_recovery_action_ids_do_not_cross_targets() {
             .target,
         Target::Claude
     );
+    assert_eq!(
+        fixture
+            .store
+            .recovery_intent_for(Target::Codex, action_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        codex_intent.id()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .recovery_intent_for(Target::Claude, action_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .id(),
+        claude_intent.id()
+    );
     let targets = fixture
         .store
         .pending_recovery_intents()
@@ -570,7 +647,7 @@ async fn target_scoped_receipts_and_recovery_action_ids_do_not_cross_targets() {
         .into_iter()
         .map(|intent| intent.target())
         .collect::<Vec<_>>();
-    assert!(targets.contains(&Target::Claude));
+    assert_eq!(targets, vec![Target::Codex, Target::Claude]);
 }
 
 #[test]

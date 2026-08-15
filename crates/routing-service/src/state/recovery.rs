@@ -58,14 +58,13 @@ pub struct RecoveryIntent {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "target", rename_all = "lowercase")]
-enum RecoveryPayload {
+pub enum RecoveryPayload {
     Codex {
         before: Box<ConfigSnapshot>,
         desired: Box<DesiredCodexState>,
     },
     Claude {
-        before: serde_json::Value,
-        desired: serde_json::Value,
+        payload: serde_json::Value,
     },
 }
 
@@ -92,15 +91,33 @@ impl RecoveryIntent {
         desired: DesiredCodexState,
         created_revision: u64,
     ) -> Self {
-        Self {
+        Self::pending_for_target(
+            Target::Codex,
             id,
-            target: Target::Codex,
             action_id,
             config_path,
-            payload: RecoveryPayload::Codex {
+            RecoveryPayload::Codex {
                 before: Box::new(before),
                 desired: Box::new(desired),
             },
+            created_revision,
+        )
+    }
+
+    pub fn pending_for_target(
+        target: Target,
+        id: Uuid,
+        action_id: Uuid,
+        config_path: PathBuf,
+        payload: RecoveryPayload,
+        created_revision: u64,
+    ) -> Self {
+        Self {
+            id,
+            target,
+            action_id,
+            config_path,
+            payload,
             state: RecoveryState::Pending,
             created_revision,
         }
@@ -146,7 +163,12 @@ impl StateStore {
         let intent = intent.clone();
         self.connection
             .call(move |connection| -> Result<(), StateError> {
-                let identity_json = serde_json::to_string(intent.before().identity())?;
+                let identity_json = match &intent.payload {
+                    RecoveryPayload::Codex { before, .. } => {
+                        serde_json::to_string(before.identity())?
+                    }
+                    RecoveryPayload::Claude { .. } => "null".to_owned(),
+                };
                 let payload_json = serde_json::to_string(&intent.payload)?;
                 connection.execute(
                     "INSERT INTO activation_recovery
@@ -190,6 +212,29 @@ impl StateStore {
     pub async fn recovery_intent(&self, id: Uuid) -> Result<Option<RecoveryIntent>, StateError> {
         self.connection
             .call(move |connection| load_intent(connection, &id.to_string()))
+            .await
+            .map_err(super::store::map_state_call_error)
+    }
+
+    pub async fn recovery_intent_for(
+        &self,
+        target: Target,
+        action_id: Uuid,
+    ) -> Result<Option<RecoveryIntent>, StateError> {
+        self.connection
+            .call(move |connection| {
+                let result = connection.query_row(
+                    "SELECT id, target, action_id, config_path, payload_json, state, created_revision
+                     FROM activation_recovery WHERE target = ?1 AND action_id = ?2",
+                    params![target.as_str(), action_id.to_string()],
+                    parse_intent_row,
+                );
+                match result {
+                    Ok(intent) => Ok(Some(intent)),
+                    Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                    Err(error) => Err(StateError::Sqlite(error)),
+                }
+            })
             .await
             .map_err(super::store::map_state_call_error)
     }

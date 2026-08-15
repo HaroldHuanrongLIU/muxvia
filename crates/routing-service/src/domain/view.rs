@@ -226,7 +226,7 @@ pub(crate) fn project_target_view(
             state: "unobserved".to_owned(),
         },
         providers,
-        provider_presets: provider_presets(),
+        provider_presets: provider_presets(Target::Codex),
         current_provider_id,
         serving_provider_id,
         managed_configuration: ManagedConfigurationView {
@@ -277,7 +277,7 @@ pub(crate) fn empty_target_view(service_epoch: &str) -> TargetView {
             state: "unobserved".to_owned(),
         },
         providers: Vec::new(),
-        provider_presets: provider_presets(),
+        provider_presets: provider_presets(Target::Codex),
         current_provider_id: None,
         serving_provider_id: None,
         managed_configuration: ManagedConfigurationView {

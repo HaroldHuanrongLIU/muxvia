@@ -7,18 +7,22 @@ use uuid::Uuid;
 use crate::{
     control::protocol::{
         CredentialEdit, DuplicateCredential, ProviderAuthentication, ProviderPresetView,
-        ProviderProtocol,
+        ProviderProtocol, Target,
     },
     domain::provider::normalize_provider_base_url,
 };
 
 pub const OPENAI_API_RESPONSES_PRESET_KEY: &str = "openai-api-responses";
 pub const OPENAI_API_RESPONSES_BASE_URL: &str = "https://api.openai.com/v1";
+pub const ANTHROPIC_API_MESSAGES_PRESET_KEY: &str = "anthropic-api-messages";
+pub const ANTHROPIC_API_MESSAGES_BASE_URL: &str = "https://api.anthropic.com/v1";
 
 struct SourceDeclaration {
+    target: String,
     position: u32,
     provider_revision: u64,
     protocol: String,
+    authentication: String,
     routing_requirement: String,
     credential_id: Option<String>,
     provenance_kind: Option<String>,
@@ -69,14 +73,25 @@ pub(crate) fn read_provider_for_inspection(
     }))
 }
 
-pub(crate) fn provider_presets() -> Vec<ProviderPresetView> {
-    vec![ProviderPresetView {
+pub(crate) fn provider_presets(target: Target) -> Vec<ProviderPresetView> {
+    let openai = ProviderPresetView {
         key: OPENAI_API_RESPONSES_PRESET_KEY.to_owned(),
         base_url: OPENAI_API_RESPONSES_BASE_URL.to_owned(),
         model: String::new(),
         protocol: ProviderProtocol::OpenaiResponses,
         authentication: ProviderAuthentication::OpenaiBearer,
-    }]
+    };
+    let anthropic = ProviderPresetView {
+        key: ANTHROPIC_API_MESSAGES_PRESET_KEY.to_owned(),
+        base_url: ANTHROPIC_API_MESSAGES_BASE_URL.to_owned(),
+        model: String::new(),
+        protocol: ProviderProtocol::AnthropicMessages,
+        authentication: ProviderAuthentication::AnthropicApiKey,
+    };
+    match target {
+        Target::Codex => vec![openai],
+        Target::Claude => vec![anthropic],
+    }
 }
 
 pub(super) enum ProviderAction {
@@ -362,20 +377,22 @@ fn duplicate_provider(
     let base_url = normalized_base_url(base_url)?;
     let source = transaction
         .query_row(
-            "SELECT position, provider_revision, protocol, routing_requirement, credential_id,
+            "SELECT target, position, provider_revision, protocol, authentication, routing_requirement, credential_id,
                     provenance_kind, provenance_key, generated_owner_id
              FROM providers WHERE id = ?1 AND target = 'codex'",
             [source_provider_id.to_string()],
             |row| {
                 Ok(SourceDeclaration {
-                    position: row.get(0)?,
-                    provider_revision: row.get(1)?,
-                    protocol: row.get(2)?,
-                    routing_requirement: row.get(3)?,
-                    credential_id: row.get(4)?,
-                    provenance_kind: row.get(5)?,
-                    provenance_key: row.get(6)?,
-                    generated_owner_id: row.get(7)?,
+                    target: row.get(0)?,
+                    position: row.get(1)?,
+                    provider_revision: row.get(2)?,
+                    protocol: row.get(3)?,
+                    authentication: row.get(4)?,
+                    routing_requirement: row.get(5)?,
+                    credential_id: row.get(6)?,
+                    provenance_kind: row.get(7)?,
+                    provenance_key: row.get(8)?,
+                    generated_owner_id: row.get(9)?,
                 })
             },
         )
@@ -414,14 +431,16 @@ fn duplicate_provider(
              (id, target, position, provider_revision, name, base_url, model, protocol,
               authentication, routing_requirement, credential_id, provenance_kind, provenance_key,
               generated_owner_id)
-             VALUES (?1, 'codex', ?2, 1, ?3, ?4, ?5, ?6, 'openai-bearer', ?7, ?8, ?9, ?10, NULL)",
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)",
             params![
                 Uuid::new_v4().to_string(),
+                source.target,
                 position,
                 name,
                 base_url,
                 model,
                 source.protocol,
+                source.authentication,
                 source.routing_requirement,
                 credential_id,
                 provenance_kind,

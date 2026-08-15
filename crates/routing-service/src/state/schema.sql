@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS activation_recovery (
   UNIQUE (target, action_id)
 );
 
-INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '3');
+INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '4');
 INSERT OR IGNORE INTO target_route_state (
   target,
   management_revision,

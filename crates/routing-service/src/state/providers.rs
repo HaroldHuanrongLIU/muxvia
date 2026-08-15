@@ -352,11 +352,13 @@ fn create_provider(
 ) -> Result<(), ProviderMutationError> {
     let name = normalized_name(name)?;
     let base_url = normalized_base_url(base_url)?;
-    let provenance = match preset_key {
-        Some(key) if key == preset_key_for(target) => {
-            (Some("preset"), Some(preset_key_for(target)))
-        }
+    let preset_authentication = match preset_key.as_deref() {
+        Some(key) if key == preset_key_for(target) => Some(preset_authentication_for(target)),
         Some(_) => return Err(ProviderMutationError::Invalid),
+        None => None,
+    };
+    let provenance = match preset_authentication {
+        Some(_) => (Some("preset"), Some(preset_key_for(target))),
         None => (None, None),
     };
     let credential_id = match credential {
@@ -364,7 +366,10 @@ fn create_provider(
         CredentialEdit::Remove => None,
         CredentialEdit::Replace { value } => Some(insert_credential(transaction, target, value)?),
     };
-    let authentication = authentication.unwrap_or(ProviderAuthentication::OpenaiBearer);
+    let authentication = authentication
+        .or(preset_authentication)
+        .or_else(|| (target == Target::Codex).then_some(ProviderAuthentication::OpenaiBearer))
+        .ok_or(ProviderMutationError::Invalid)?;
     let protocol = protocol_for(target);
     if !has_valid_provider_declaration(target, protocol, authentication) {
         return Err(ProviderMutationError::Invalid);
@@ -623,6 +628,12 @@ fn preset_key_for(target: Target) -> &'static str {
     match target {
         Target::Codex => OPENAI_API_RESPONSES_PRESET_KEY,
         Target::Claude => ANTHROPIC_API_MESSAGES_PRESET_KEY,
+    }
+}
+fn preset_authentication_for(target: Target) -> ProviderAuthentication {
+    match target {
+        Target::Codex => ProviderAuthentication::OpenaiBearer,
+        Target::Claude => ProviderAuthentication::AnthropicApiKey,
     }
 }
 fn parse_authentication(value: &str) -> ProviderAuthentication {

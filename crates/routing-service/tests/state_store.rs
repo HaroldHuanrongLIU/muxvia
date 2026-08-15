@@ -175,6 +175,70 @@ async fn claude_provider_create_update_and_duplicate_preserve_its_declaration() 
 }
 
 #[tokio::test]
+async fn claude_preset_create_defaults_to_its_api_key_authentication() {
+    let fixture = StoreFixture::new().await;
+    let outcome = fixture
+        .store
+        .apply_provider_action_for(
+            Target::Claude,
+            fixed_uuid(96),
+            0,
+            serde_json::json!({
+                "kind": "create-provider", "name": "Claude preset",
+                "baseUrl": "https://api.anthropic.com/v1", "model": "claude-test",
+                "credential": { "kind": "remove" }, "presetKey": "anthropic-api-messages"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.view.providers[0].authentication.to_string(),
+        "anthropic-api-key"
+    );
+    let manual = fixture
+        .store
+        .apply_provider_action_for(
+            Target::Claude,
+            fixed_uuid(98),
+            1,
+            serde_json::json!({
+                "kind": "create-provider", "name": "Claude manual",
+                "baseUrl": "https://api.example.test/v1", "model": "claude-test",
+                "credential": { "kind": "remove" }
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manual.problem.code, "invalid-provider");
+}
+
+#[tokio::test]
+async fn malformed_claude_action_returns_claude_view_without_mutating_codex() {
+    let fixture = StoreFixture::new().await;
+    let codex_before = fixture.store.target_view().await.unwrap();
+    let failure = fixture
+        .store
+        .apply_provider_action_for(
+            Target::Claude,
+            fixed_uuid(97),
+            0,
+            serde_json::json!({ "kind": "bad" }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.authoritative_view.target, Target::Claude);
+    assert_eq!(
+        fixture
+            .store
+            .target_view()
+            .await
+            .unwrap()
+            .management_revision,
+        codex_before.management_revision
+    );
+}
+
+#[tokio::test]
 async fn reopen_decodes_legacy_v4_claude_recovery_payload() {
     let root = std::env::temp_dir().join(format!("muxvia-legacy-v4-{}", Uuid::new_v4()));
     let home = MuxviaHome::from_user_home(&root);

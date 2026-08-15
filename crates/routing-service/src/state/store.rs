@@ -643,7 +643,7 @@ impl StateStore {
             Ok(None) => {}
             Err(_) => {
                 return Err(self
-                    .failure("state-store-error", "State store operation failed")
+                    .failure_for(target, "state-store-error", "State store operation failed")
                     .await);
             }
         }
@@ -730,12 +730,16 @@ impl StateStore {
             ),
             Ok(_) => {
                 return Err(self
-                    .failure("unsupported-operation", "Provider action is not supported")
+                    .failure_for(
+                        target,
+                        "unsupported-operation",
+                        "Provider action is not supported",
+                    )
                     .await);
             }
             Err(_) => {
                 return Err(self
-                    .failure("invalid-provider", "Provider action is malformed")
+                    .failure_for(target, "invalid-provider", "Provider action is malformed")
                     .await);
             }
         };
@@ -864,7 +868,7 @@ impl StateStore {
             Ok(ProviderAttempt::Applied(outcome)) => Ok(outcome),
             Ok(ProviderAttempt::Failure(failure)) => Err(failure),
             Err(_) => Err(self
-                .failure("state-store-error", "State store operation failed")
+                .failure_for(target, "state-store-error", "State store operation failed")
                 .await),
         }
     }
@@ -900,10 +904,18 @@ impl StateStore {
     }
 
     pub(crate) async fn failure(&self, code: &str, message: &str) -> ActionFailure {
-        let authoritative_view = self
-            .target_view()
-            .await
-            .unwrap_or_else(|_| empty_target_view(&self.service_epoch));
+        self.failure_for(Target::Codex, code, message).await
+    }
+
+    pub(crate) async fn failure_for(
+        &self,
+        target: Target,
+        code: &str,
+        message: &str,
+    ) -> ActionFailure {
+        let authoritative_view = self.target_view_for(target).await.unwrap_or_else(|_| {
+            crate::domain::view::empty_target_view_for(&self.service_epoch, target)
+        });
         ActionFailure {
             problem: ControlProblem {
                 code: code.to_owned(),

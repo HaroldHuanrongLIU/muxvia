@@ -34,6 +34,7 @@ struct SourceDeclaration {
 pub(crate) struct ProviderInspectionSnapshot {
     pub base_url: String,
     pub credential: Option<SecretString>,
+    pub authentication: ProviderAuthentication,
 }
 
 pub(crate) enum ProviderInspectionRead {
@@ -44,25 +45,27 @@ pub(crate) enum ProviderInspectionRead {
 
 pub(crate) fn read_provider_for_inspection(
     connection: &tokio_rusqlite::rusqlite::Connection,
+    target: Target,
     provider_id: Uuid,
     provider_revision: u64,
 ) -> Result<ProviderInspectionRead, tokio_rusqlite::rusqlite::Error> {
     let provider = connection
         .query_row(
-            "SELECT p.base_url, p.provider_revision, c.bearer_token
+            "SELECT p.base_url, p.provider_revision, c.bearer_token, p.authentication
              FROM providers p LEFT JOIN credentials c ON c.id = p.credential_id
-             WHERE p.id = ?1 AND p.target = 'codex'",
-            [provider_id.to_string()],
+             WHERE p.id = ?1 AND p.target = ?2",
+            params![provider_id.to_string(), target.as_str()],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, u64>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()?;
-    let Some((base_url, actual_revision, credential)) = provider else {
+    let Some((base_url, actual_revision, credential, authentication)) = provider else {
         return Ok(ProviderInspectionRead::Missing);
     };
     if actual_revision != provider_revision {
@@ -71,6 +74,7 @@ pub(crate) fn read_provider_for_inspection(
     Ok(ProviderInspectionRead::Found(ProviderInspectionSnapshot {
         base_url,
         credential: credential.map(SecretString::from),
+        authentication: parse_authentication(&authentication),
     }))
 }
 
@@ -212,13 +216,10 @@ pub(super) fn reorder_providers_for(
     target: Target,
     provider_ids: &[Uuid],
 ) -> Result<(), ProviderMutationError> {
-    if target != Target::Codex {
-        return Err(ProviderMutationError::Invalid);
-    }
     let existing = transaction
-        .prepare("SELECT id FROM providers WHERE target = 'codex' ORDER BY position")
+        .prepare("SELECT id FROM providers WHERE target = ?1 ORDER BY position")
         .map_err(|_| ProviderMutationError::Invalid)?
-        .query_map([], |row| row.get::<_, String>(0))
+        .query_map([target.as_str()], |row| row.get::<_, String>(0))
         .map_err(|_| ProviderMutationError::Invalid)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ProviderMutationError::Invalid)?
@@ -239,8 +240,8 @@ pub(super) fn reorder_providers_for(
 
     let temporary_start: u64 = transaction
         .query_row(
-            "SELECT COALESCE(MAX(position) + 1, 0) FROM providers WHERE target = 'codex'",
-            [],
+            "SELECT COALESCE(MAX(position) + 1, 0) FROM providers WHERE target = ?1",
+            [target.as_str()],
             |row| row.get(0),
         )
         .map_err(|_| ProviderMutationError::Invalid)?;
@@ -250,16 +251,16 @@ pub(super) fn reorder_providers_for(
             .ok_or(ProviderMutationError::Invalid)?;
         transaction
             .execute(
-                "UPDATE providers SET position = ?1 WHERE id = ?2 AND target = 'codex'",
-                params![temporary_position, provider_id.to_string()],
+                "UPDATE providers SET position = ?1 WHERE id = ?2 AND target = ?3",
+                params![temporary_position, provider_id.to_string(), target.as_str()],
             )
             .map_err(|_| ProviderMutationError::Invalid)?;
     }
     for (position, provider_id) in provider_ids.iter().enumerate() {
         transaction
             .execute(
-                "UPDATE providers SET position = ?1 WHERE id = ?2 AND target = 'codex'",
-                params![position as u32, provider_id.to_string()],
+                "UPDATE providers SET position = ?1 WHERE id = ?2 AND target = ?3",
+                params![position as u32, provider_id.to_string(), target.as_str()],
             )
             .map_err(|_| ProviderMutationError::Invalid)?;
     }
@@ -272,9 +273,6 @@ pub(super) fn delete_provider_for(
     provider_id: Uuid,
     provider_revision: u64,
 ) -> Result<(), ProviderMutationError> {
-    if target != Target::Codex {
-        return Err(ProviderMutationError::Invalid);
-    }
     let (position, credential_id, revision, generated_owner_id): (
         u32,
         Option<String>,
@@ -283,8 +281,8 @@ pub(super) fn delete_provider_for(
     ) = transaction
         .query_row(
             "SELECT position, credential_id, provider_revision, generated_owner_id
-             FROM providers WHERE id = ?1 AND target = 'codex'",
-            [provider_id.to_string()],
+             FROM providers WHERE id = ?1 AND target = ?2",
+            params![provider_id.to_string(), target.as_str()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
@@ -300,13 +298,13 @@ pub(super) fn delete_provider_for(
         .query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM target_route_state
-                 WHERE target = 'codex' AND current_provider_id = ?1
+                 WHERE target = ?2 AND current_provider_id = ?1
                 UNION ALL
                 SELECT 1 FROM target_route_state r
                  JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
-                 WHERE r.target = 'codex' AND s.provider_id = ?1
+                 WHERE r.target = ?2 AND s.provider_id = ?1
              )",
-            [provider_id.to_string()],
+            params![provider_id.to_string(), target.as_str()],
             |row| row.get(0),
         )
         .map_err(|_| ProviderMutationError::Invalid)?;
@@ -315,15 +313,15 @@ pub(super) fn delete_provider_for(
     }
     transaction
         .execute(
-            "DELETE FROM providers WHERE id = ?1 AND target = 'codex'",
-            [provider_id.to_string()],
+            "DELETE FROM providers WHERE id = ?1 AND target = ?2",
+            params![provider_id.to_string(), target.as_str()],
         )
         .map_err(|_| ProviderMutationError::Invalid)?;
     transaction
         .execute(
             "UPDATE providers SET position = position - 1
-             WHERE target = 'codex' AND position > ?1",
-            [position],
+             WHERE target = ?2 AND position > ?1",
+            params![position, target.as_str()],
         )
         .map_err(|_| ProviderMutationError::Invalid)?;
     if let Some(credential_id) = credential_id {

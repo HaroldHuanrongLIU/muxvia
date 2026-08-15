@@ -6,9 +6,11 @@ import { createTargetSession, type MuxviaControl, type TargetSession } from "./t
 import {
   parseServerFrame,
   type ControlOperation,
+  type ClaudePreflightContext,
   type ControlResult,
   type ServerFrame,
   type TargetView,
+  type Target,
 } from "./types"
 
 type Pending = {
@@ -122,8 +124,8 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     }
   }
 
-  async openTarget(target: "codex"): Promise<TargetSession> {
-    const result = await this.request({ kind: "open-target", target })
+  async openTarget(target: Target, claudeContext?: ClaudePreflightContext): Promise<TargetSession> {
+    const result = await this.request({ kind: "open-target", target, claudeContext })
     if (result.kind !== "target-view") {
       throw new ControlError("invalid-response", "Expected a target view")
     }

@@ -417,7 +417,7 @@ async fn serve_session(
     let (mut reader, writer) = stream.into_split();
     let (responses, response_rx) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
     let mut writer_task = tokio::spawn(write_responses(writer, response_rx));
-    let mut subscribed = false;
+    let mut opened_target = None;
     let mut update_rx = store.subscribe_target_views();
     let mut inspections = JoinSet::<InspectionCompletion>::new();
     let mut inspection_requests = std::collections::HashMap::<String, InspectionRequest>::new();
@@ -487,11 +487,25 @@ async fn serve_session(
                     }
                 };
 
-                if operation_target(&operation) == Target::Claude {
+                let target = operation_target(&operation);
+                if opened_target.is_none() && !matches!(operation, ControlOperation::OpenTarget { .. }) {
                     if !enqueue_response(&responses, problem_frame(
                         Some(request_id),
-                        "target-unavailable",
-                        "Target is not available",
+                        "target-not-open",
+                        "Open a Target before issuing operations",
+                        None,
+                    )) {
+                        break 'session;
+                    }
+                    continue;
+                }
+                if let Some(opened_target) = opened_target
+                    && opened_target != target
+                {
+                    if !enqueue_response(&responses, problem_frame(
+                        Some(request_id),
+                        "target-session-target-mismatch",
+                        "Operation does not match the opened Target",
                         None,
                     )) {
                         break 'session;
@@ -500,24 +514,24 @@ async fn serve_session(
                 }
 
                 match operation {
-                    ControlOperation::OpenTarget { .. } => {
-                        let Ok(view) = store.target_view().await else {
+                    ControlOperation::OpenTarget { target, .. } => {
+                        let Ok(view) = store.target_view_for(target).await else {
                             if !enqueue_response(&responses, problem_frame(Some(request_id), "state-store-error", "State store unavailable", None)) {
                                 break 'session;
                             }
                             continue;
                         };
-                        subscribed = true;
+                        opened_target = Some(target);
                         let response = ServerFrame::Response {
                             request_id,
                             result: ControlResult::TargetView { view },
                         };
                         if !enqueue_response(&responses, response) { break 'session; }
                     }
-                    ControlOperation::Act { action_id, expected_revision, action, .. } => {
+                    ControlOperation::Act { target, action_id, expected_revision, action } => {
                         lifecycle.pending_actions.fetch_add(1, Ordering::AcqRel);
                         let _action = ActionGuard(Arc::clone(&lifecycle));
-                        match activation.apply_raw(action_id, expected_revision, action).await {
+                        match activation.apply_raw_for(target, action_id, expected_revision, action).await {
                             Ok(outcome) => {
                                 let response = ServerFrame::Response {
                                     request_id,
@@ -565,6 +579,7 @@ async fn serve_session(
                         let (cancel, cancelled) = oneshot::channel();
                         let abort = inspections.spawn(inspect_and_queue(
                             task_request_id,
+                            target,
                             operation,
                             inspector,
                             responses,
@@ -578,13 +593,15 @@ async fn serve_session(
                     }
                 }
             }
-            update = update_rx.recv(), if subscribed => {
+            update = update_rx.recv(), if opened_target.is_some() => {
                 match update {
                     Ok(view) => {
+                        if Some(view.target) != opened_target { continue; }
                         if !enqueue_response(&responses, ServerFrame::TargetView { view }) { break 'session; }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let Ok(view) = store.target_view().await else { continue };
+                        let Some(target) = opened_target else { continue; };
+                        let Ok(view) = store.target_view_for(target).await else { continue };
                         if !enqueue_response(&responses, ServerFrame::TargetView { view }) { break 'session; }
                     }
                     Err(broadcast::error::RecvError::Closed) => break 'session,
@@ -608,7 +625,7 @@ async fn serve_session(
 
 fn operation_target(operation: &ControlOperation) -> Target {
     match operation {
-        ControlOperation::OpenTarget { target }
+        ControlOperation::OpenTarget { target, .. }
         | ControlOperation::Act { target, .. }
         | ControlOperation::DiscoverModels { target, .. }
         | ControlOperation::CheckReachability { target, .. } => *target,
@@ -617,6 +634,7 @@ fn operation_target(operation: &ControlOperation) -> Target {
 
 async fn inspect_and_queue(
     request_id: String,
+    target: Target,
     operation: ControlOperation,
     inspector: Arc<ProviderInspector>,
     responses: mpsc::Sender<QueuedResponse>,
@@ -627,7 +645,7 @@ async fn inspect_and_queue(
     let inspection = async {
         match operation {
             ControlOperation::DiscoverModels { source, .. } => ControlResult::ModelDiscovery {
-                result: inspector.discover_models(source).await,
+                result: inspector.discover_models_for(target, source).await,
             },
             ControlOperation::CheckReachability {
                 provider_id,
@@ -635,7 +653,7 @@ async fn inspect_and_queue(
                 ..
             } => ControlResult::Reachability {
                 result: inspector
-                    .check_reachability(provider_id, provider_revision)
+                    .check_reachability_for(target, provider_id, provider_revision)
                     .await,
             },
             _ => unreachable!(),

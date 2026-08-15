@@ -191,6 +191,22 @@ impl ActivationService {
         expected_revision: u64,
         raw_action: serde_json::Value,
     ) -> Result<ActionOutcome, ActionFailure> {
+        self.apply_raw_for(Target::Codex, action_id, expected_revision, raw_action)
+            .await
+    }
+
+    pub async fn apply_raw_for(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        expected_revision: u64,
+        raw_action: serde_json::Value,
+    ) -> Result<ActionOutcome, ActionFailure> {
+        if target == Target::Claude {
+            return self
+                .apply_provider_raw_for(target, action_id, expected_revision, raw_action)
+                .await;
+        }
         if let Some(outcome) = self.receipt_or_failure(action_id).await? {
             return Ok(outcome);
         }
@@ -232,6 +248,45 @@ impl ActivationService {
             Err(_) => Err(self
                 .store
                 .failure("invalid-provider", "Provider action is malformed")
+                .await),
+        }
+    }
+
+    async fn apply_provider_raw_for(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        expected_revision: u64,
+        raw_action: serde_json::Value,
+    ) -> Result<ActionOutcome, ActionFailure> {
+        match serde_json::from_value(raw_action.clone()) {
+            Ok(
+                TargetAction::CreateProvider { .. }
+                | TargetAction::UpdateProvider { .. }
+                | TargetAction::ReorderProviders { .. }
+                | TargetAction::DeleteProvider { .. }
+                | TargetAction::DuplicateProvider { .. },
+            ) => {
+                let outcome = self
+                    .store
+                    .apply_provider_action_for(target, action_id, expected_revision, raw_action)
+                    .await?;
+                if outcome.status == ActionStatus::Applied {
+                    self.store.publish_target_view(outcome.view.clone());
+                }
+                Ok(outcome)
+            }
+            Ok(TargetAction::ActivateProvider { .. }) => Err(self
+                .store
+                .failure_for(
+                    target,
+                    "unsupported-action",
+                    "Target activation is not available",
+                )
+                .await),
+            Err(_) => Err(self
+                .store
+                .failure_for(target, "invalid-provider", "Provider action is malformed")
                 .await),
         }
     }

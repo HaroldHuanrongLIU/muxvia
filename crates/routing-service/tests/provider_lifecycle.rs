@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
 use muxvia_routing::{
-    control::protocol::{ActionStatus, CredentialPresence, ProviderReferenceView},
+    control::protocol::{ActionStatus, CredentialPresence, ProviderReferenceView, Target},
     home::MuxviaHome,
     state::StateStore,
 };
@@ -135,9 +135,9 @@ async fn set_current_and_snapshot(home: &MuxviaHome, current: Uuid, snapshot: Uu
         .call(move |connection| -> Result<()> {
             connection.execute(
                 "INSERT INTO activated_snapshots
-                 (id, target, provider_id, base_url, model, provider_bearer_token, epoch)
+                 (id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch)
                  VALUES (?1, 'codex', ?2, 'https://snapshot.example/v1', 'snapshot-model',
-                         'snapshot-secret', ?3)",
+                         'openai-responses', 'openai-bearer', 'snapshot-secret', ?3)",
                 params![
                     snapshot.to_string(),
                     current.to_string(),
@@ -179,9 +179,9 @@ async fn set_snapshot_only(home: &MuxviaHome, provider_id: Uuid, snapshot: Uuid)
         .call(move |connection| -> Result<()> {
             connection.execute(
                 "INSERT INTO activated_snapshots
-                 (id, target, provider_id, base_url, model, provider_bearer_token, epoch)
+                 (id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch)
                  VALUES (?1, 'codex', ?2, 'https://snapshot.example/v1', 'snapshot-model',
-                         'snapshot-secret', ?3)",
+                         'openai-responses', 'openai-bearer', 'snapshot-secret', ?3)",
                 params![
                     snapshot.to_string(),
                     provider_id.to_string(),
@@ -251,6 +251,74 @@ async fn reorder_projects_the_requested_full_order_without_changing_provider_or_
         outcome.view.managed_configuration,
         before.managed_configuration
     );
+}
+
+#[tokio::test]
+async fn claude_reorder_and_delete_are_target_scoped_provider_lifecycle_operations() {
+    let fixture = StoreFixture::new();
+    let store = fixture.open().await;
+    let first = store
+        .apply_provider_action_for(
+            Target::Claude,
+            action_id(81),
+            0,
+            serde_json::json!({
+                "kind": "create-provider", "name": "Claude A", "baseUrl": "https://a.example/v1",
+                "model": "claude-a", "credential": { "kind": "replace", "value": "claude-a-secret" },
+                "authentication": "anthropic-api-key", "presetKey": null,
+            }),
+        )
+        .await
+        .unwrap()
+        .view
+        .providers[0]
+        .clone();
+    let second = store
+        .apply_provider_action_for(
+            Target::Claude,
+            action_id(82),
+            1,
+            serde_json::json!({
+                "kind": "create-provider", "name": "Claude B", "baseUrl": "https://b.example/v1",
+                "model": "claude-b", "credential": { "kind": "replace", "value": "claude-b-secret" },
+                "authentication": "anthropic-bearer", "presetKey": null,
+            }),
+        )
+        .await
+        .unwrap()
+        .view
+        .providers[1]
+        .clone();
+    let reordered = store
+        .apply_provider_action_for(
+            Target::Claude,
+            action_id(83),
+            2,
+            reorder(&[second.id, first.id]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reordered.view.target, Target::Claude);
+    assert_eq!(reordered.view.providers[0].id, second.id);
+    let deleted = store
+        .apply_provider_action_for(
+            Target::Claude,
+            action_id(84),
+            3,
+            delete(first.id, first.provider_revision),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted
+            .view
+            .providers
+            .iter()
+            .map(|provider| provider.id)
+            .collect::<Vec<_>>(),
+        [second.id]
+    );
+    assert!(store.target_view().await.unwrap().providers.is_empty());
 }
 
 #[tokio::test]

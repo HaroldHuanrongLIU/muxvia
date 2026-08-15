@@ -7,11 +7,12 @@ import type {
   ModelDiscoveryResult,
   ReachabilityResult,
   TargetAction,
+  Target,
   TargetView,
 } from "./types"
 
 export interface MuxviaControl {
-  openTarget(target: "codex"): Promise<TargetSession>
+  openTarget(target: Target): Promise<TargetSession>
 }
 
 export interface TargetSession {
@@ -32,6 +33,7 @@ class TargetSessionImpl implements TargetSession {
   readonly #rpc: RpcTransport
   readonly #listeners = new Set<(next: TargetView) => void>()
   readonly #removePushListener: () => void
+  readonly #target: Target
   #view: TargetView
   #actions: Promise<void> = Promise.resolve()
   #refresh?: Promise<void>
@@ -41,6 +43,7 @@ class TargetSessionImpl implements TargetSession {
   constructor(rpc: RpcTransport, initialView: TargetView) {
     this.#rpc = rpc
     this.#view = initialView
+    this.#target = initialView.target
     this.#lastNotifiedSequence = initialView.viewSequence
     this.#removePushListener = rpc.onTargetView((view) => this.#receivePush(view))
   }
@@ -58,7 +61,7 @@ class TargetSessionImpl implements TargetSession {
       try {
         const response = await this.#rpc.request({
           kind: "act",
-          target: "codex",
+          target: this.#target,
           actionId,
           expectedRevision: this.#view.managementRevision,
           action,
@@ -88,7 +91,7 @@ class TargetSessionImpl implements TargetSession {
     }
     const response = await this.#rpc.request({
       kind: "discover-models",
-      target: "codex",
+      target: this.#target,
       source,
     }, { signal })
     if (response.kind !== "model-discovery") {
@@ -107,7 +110,7 @@ class TargetSessionImpl implements TargetSession {
     }
     const response = await this.#rpc.request({
       kind: "check-reachability",
-      target: "codex",
+      target: this.#target,
       providerId,
       providerRevision,
     }, { signal })
@@ -136,7 +139,7 @@ class TargetSessionImpl implements TargetSession {
   }
 
   #receivePush(view: TargetView): void {
-    if (this.#closed || view.service.epoch !== this.#view.service.epoch) return
+    if (this.#closed || view.target !== this.#target || view.service.epoch !== this.#view.service.epoch) return
     if (view.viewSequence === this.#view.viewSequence) {
       if (view.viewSequence > this.#lastNotifiedSequence) this.#replace(view)
       return
@@ -155,7 +158,7 @@ class TargetSessionImpl implements TargetSession {
 
   async #refreshTarget(): Promise<void> {
     try {
-      const result = await this.#rpc.request({ kind: "open-target", target: "codex" })
+      const result = await this.#rpc.request({ kind: "open-target", target: this.#target })
       if (result.kind === "target-view" && result.view.viewSequence > this.#view.viewSequence) {
         this.#replace(result.view)
       }

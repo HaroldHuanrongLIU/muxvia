@@ -181,6 +181,7 @@ impl StateStore {
 
     pub(crate) async fn provider_for_inspection(
         &self,
+        target: Target,
         provider_id: Uuid,
         provider_revision: u64,
     ) -> Result<super::providers::ProviderInspectionRead, StateError> {
@@ -188,6 +189,7 @@ impl StateStore {
             .call(move |connection| {
                 super::providers::read_provider_for_inspection(
                     connection,
+                    target,
                     provider_id,
                     provider_revision,
                 )

@@ -1,0 +1,25 @@
+{
+  "target": "claude",
+  "managementRevision": 0,
+  "viewSequence": 0,
+  "service": { "epoch": "00000000-0000-4000-8000-000000000001", "state": "running" },
+  "mode": "unmanaged",
+  "takeover": { "state": "inactive", "endpoint": null },
+  "routeHealth": { "state": "unobserved" },
+  "providers": [],
+  "providerPresets": [
+    {
+      "key": "anthropic-api-messages",
+      "baseUrl": "https://api.anthropic.com/v1",
+      "model": "",
+      "protocol": "anthropic-messages",
+      "authentication": "anthropic-api-key"
+    }
+  ],
+  "currentProviderId": null,
+  "servingProviderId": null,
+  "managedConfiguration": { "state": "unmanaged", "path": null, "restartRequired": false },
+  "recovery": { "intentId": null, "state": "clean" },
+  "activatedSnapshot": null,
+  "problems": []
+}

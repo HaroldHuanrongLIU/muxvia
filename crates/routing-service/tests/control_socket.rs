@@ -292,26 +292,115 @@ async fn request(stream: &mut UnixStream, request_id: &str, operation: Value) ->
 }
 
 #[tokio::test]
-async fn claude_operations_fail_closed_without_touching_codex_state() {
+async fn target_isolation_opens_claude_without_touching_codex_state() {
     let mut fixture = ControlFixture::start().await;
     let before = fixture.store.target_view().await.unwrap();
     let mut stream = fixture.connect().await;
     hello(&mut stream).await;
 
-    for (index, operation) in [
+    let unopened = request(
+        &mut stream,
+        "before-open",
+        json!({ "kind": "discover-models", "target": "claude", "source": {
+            "kind": "draft", "baseUrl": "https://api.anthropic.com/v1",
+            "credentialSource": { "kind": "missing" }
+        }}),
+    )
+    .await;
+    assert_eq!(unopened["problem"]["code"], "target-not-open");
+
+    let response = request(
+        &mut stream,
+        "claude-open",
         json!({ "kind": "open-target", "target": "claude" }),
-        json!({ "kind": "act", "target": "claude", "actionId": Uuid::new_v4(), "expectedRevision": 0,
-            "action": { "kind": "create-provider", "name": "must-not-persist", "baseUrl": "https://api.anthropic.com/v1", "model": "claude-test", "credential": { "kind": "replace", "value": "must-not-persist" } } }),
-        json!({ "kind": "discover-models", "target": "claude", "source": { "kind": "draft", "baseUrl": "https://api.anthropic.com/v1", "credentialSource": { "kind": "missing" } } }),
-        json!({ "kind": "check-reachability", "target": "claude", "providerId": Uuid::new_v4(), "providerRevision": 1 }),
-    ].into_iter().enumerate() {
-        let response = request(&mut stream, &format!("claude-{index}"), operation).await;
-        assert_eq!(response["type"], "error");
-        assert_eq!(response["problem"]["code"], "target-unavailable");
-        assert!(response.get("authoritativeView").is_none());
-        assert!(!response.to_string().contains("must-not-persist"));
-    }
+    )
+    .await;
+    assert_eq!(response["type"], "response");
+    assert_eq!(response["result"]["kind"], "target-view");
+    assert_eq!(response["result"]["view"]["target"], "claude");
     assert_eq!(fixture.store.target_view().await.unwrap(), before);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn target_isolation_scopes_pushes_actions_and_receipts_to_the_opened_target() {
+    let mut fixture = ControlFixture::start().await;
+    let mut codex = fixture.connect().await;
+    let mut claude = fixture.connect().await;
+    hello(&mut codex).await;
+    hello(&mut claude).await;
+    request(
+        &mut codex,
+        "open-codex",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    request(
+        &mut claude,
+        "open-claude",
+        json!({ "kind": "open-target", "target": "claude" }),
+    )
+    .await;
+
+    let action_id = Uuid::new_v4();
+    write_frame(&mut claude, &json!({
+        "type": "request", "requestId": "claude-create",
+        "operation": { "kind": "act", "target": "claude", "actionId": action_id, "expectedRevision": 0,
+            "action": { "kind": "create-provider", "name": "Claude", "baseUrl": "https://api.anthropic.com/v1",
+                "model": "claude-test", "credential": { "kind": "replace", "value": "claude-secret" },
+                "authentication": "anthropic-api-key", "presetKey": "anthropic-api-messages" } }
+    })).await.unwrap();
+    let response = read_frame(&mut claude).await.unwrap();
+    let push = read_frame(&mut claude).await.unwrap();
+    assert_eq!(response["result"]["outcome"]["view"]["target"], "claude");
+    assert_eq!(push["view"]["target"], "claude");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut codex))
+            .await
+            .is_err()
+    );
+
+    let codex_response = request(
+        &mut codex,
+        "codex-create",
+        json!({
+            "kind": "act", "target": "codex", "actionId": action_id, "expectedRevision": 0,
+            "action": create_action("Codex", "codex-secret")
+        }),
+    )
+    .await;
+    assert_eq!(codex_response["result"]["outcome"]["status"], "applied");
+    let codex_push = read_frame(&mut codex).await.unwrap();
+    assert_eq!(codex_push["view"]["target"], "codex");
+    assert_eq!(
+        fixture
+            .store
+            .target_view_for(muxvia_routing::control::protocol::Target::Claude)
+            .await
+            .unwrap()
+            .management_revision,
+        1
+    );
+    assert_eq!(
+        fixture
+            .store
+            .target_view()
+            .await
+            .unwrap()
+            .management_revision,
+        1
+    );
+
+    let mismatch = request(
+        &mut claude,
+        "cross-target",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    assert_eq!(
+        mismatch["problem"]["code"],
+        "target-session-target-mismatch"
+    );
     fixture.shutdown().await;
 }
 
@@ -425,6 +514,15 @@ async fn shutdown_is_bounded_when_an_authorized_peer_stops_reading() {
 
     let mut stream = fixture.connect().await;
     hello(&mut stream).await;
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request", "requestId": "open-before-backpressure",
+            "operation": { "kind": "open-target", "target": "codex" }
+        }),
+    )
+    .await
+    .unwrap();
     write_frame(
         &mut stream,
         &json!({
@@ -719,6 +817,12 @@ async fn discovery_is_concurrent_cancellable_and_shutdown_drains_session_work() 
     let mut fixture = ControlFixture::start().await;
     let mut stream = fixture.connect().await;
     hello(&mut stream).await;
+    request(
+        &mut stream,
+        "open-before-inspection",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
     let created = request(
         &mut stream,
         "create-inspected",
@@ -767,17 +871,17 @@ async fn discovery_is_concurrent_cancellable_and_shutdown_drains_session_work() 
     )
     .await
     .unwrap();
-    let opened = tokio::time::timeout(Duration::from_millis(200), read_frame(&mut stream))
+    let queued_push = tokio::time::timeout(Duration::from_millis(200), read_frame(&mut stream))
         .await
         .expect("open-target was blocked behind discovery")
         .unwrap();
-    assert_eq!(opened["requestId"], "open-while-held");
-    assert_eq!(opened["result"]["kind"], "target-view");
-    let queued_push = tokio::time::timeout(Duration::from_millis(200), read_frame(&mut stream))
+    assert_eq!(queued_push["type"], "target-view");
+    let opened = tokio::time::timeout(Duration::from_millis(200), read_frame(&mut stream))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(queued_push["type"], "target-view");
+    assert_eq!(opened["requestId"], "open-while-held");
+    assert_eq!(opened["result"]["kind"], "target-view");
     assert_eq!(fixture.handle.as_ref().unwrap().tracked_inspections(), 1,);
 
     write_frame(
@@ -831,6 +935,13 @@ async fn inspection_admission_is_bounded_and_reaped_capacity_is_reused() {
     let mut fixture = ControlFixture::start().await;
     let mut stream = fixture.connect().await;
     hello(&mut stream).await;
+
+    request(
+        &mut stream,
+        "open-before-admission",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
 
     for index in 0..5 {
         write_frame(
@@ -952,6 +1063,12 @@ async fn completed_and_disconnected_inspections_are_reaped_without_orphans() {
     let mut fixture = ControlFixture::start().await;
     let mut stream = fixture.connect().await;
     hello(&mut stream).await;
+    request(
+        &mut stream,
+        "open-before-completed",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
     let created = request(
         &mut stream,
         "create-completed",
@@ -969,6 +1086,7 @@ async fn completed_and_disconnected_inspections_are_reaped_without_orphans() {
     )
     .await;
     let provider = created["result"]["outcome"]["view"]["providers"][0].clone();
+    read_frame(&mut stream).await.unwrap();
     let completed = request(
         &mut stream,
         "discover-completed",
@@ -1003,6 +1121,7 @@ async fn completed_and_disconnected_inspections_are_reaped_without_orphans() {
     )
     .await;
     let updated_provider = updated["result"]["outcome"]["view"]["providers"][0].clone();
+    read_frame(&mut stream).await.unwrap();
     write_frame(
         &mut stream,
         &json!({

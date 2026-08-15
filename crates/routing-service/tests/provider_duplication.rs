@@ -116,9 +116,9 @@ async fn set_runtime_state(home: &MuxviaHome, provider_id: Uuid, snapshot_id: Uu
         .call(move |connection| -> Result<()> {
             connection.execute(
                 "INSERT INTO activated_snapshots
-                 (id, target, provider_id, base_url, model, provider_bearer_token, epoch)
+                 (id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch)
                  VALUES (?1, 'codex', ?2, 'https://snapshot.example/v1', 'snapshot-model',
-                         'snapshot-secret', ?3)",
+                         'openai-responses', 'openai-bearer', 'snapshot-secret', ?3)",
                 params![
                     snapshot_id.to_string(),
                     provider_id.to_string(),

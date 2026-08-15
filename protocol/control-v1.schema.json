@@ -31,7 +31,7 @@
     },
     "controlOperation": {
       "oneOf": [
-        { "type": "object", "properties": { "kind": { "const": "open-target" }, "target": { "enum": ["codex", "claude"] } }, "required": ["kind", "target"] },
+        { "type": "object", "properties": { "kind": { "const": "open-target" }, "target": { "enum": ["codex", "claude"] }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind", "target"] },
         { "type": "object", "properties": { "kind": { "const": "act" }, "target": { "enum": ["codex", "claude"] }, "actionId": { "type": "string", "format": "uuid" }, "expectedRevision": { "type": "integer", "minimum": 0 }, "action": {} }, "required": ["kind", "target", "actionId", "expectedRevision", "action"] },
         { "type": "object", "properties": { "kind": { "const": "discover-models" }, "target": { "enum": ["codex", "claude"] }, "source": { "$ref": "#/$defs/discoverySource" } }, "required": ["kind", "target", "source"] },
         { "type": "object", "properties": { "kind": { "const": "check-reachability" }, "target": { "enum": ["codex", "claude"] }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "target", "providerId", "providerRevision"] }
@@ -42,6 +42,17 @@
         { "type": "object", "properties": { "kind": { "const": "saved" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"] },
         { "type": "object", "properties": { "kind": { "const": "draft" }, "baseUrl": { "type": "string" }, "credentialSource": { "$ref": "#/$defs/draftCredentialSource" } }, "required": ["kind", "baseUrl", "credentialSource"] }
       ]
+    },
+    "claudePreflightContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "claudeConfigDir": { "type": ["string", "null"] },
+        "selectorState": { "enum": ["unset", "disabled", "enabled", "unknown-nonempty"] },
+        "hostManagedState": { "enum": ["unmanaged", "managed", "unknown"] },
+        "cwd": { "type": "string" }
+      },
+      "required": ["claudeConfigDir", "selectorState", "hostManagedState", "cwd"]
     },
     "draftCredentialSource": {
       "oneOf": [

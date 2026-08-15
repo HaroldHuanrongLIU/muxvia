@@ -8,6 +8,12 @@ const rpcSchema = z.object({
 })
 
 const targetSchema = z.enum(["codex", "claude"])
+const claudePreflightContextSchema = z.object({
+  claudeConfigDir: z.string().nullable(),
+  selectorState: z.enum(["unset", "disabled", "enabled", "unknown-nonempty"]),
+  hostManagedState: z.enum(["unmanaged", "managed", "unknown"]),
+  cwd: z.string(),
+})
 
 const controlProblemSchema = z.object({
   code: z.string(),
@@ -176,6 +182,7 @@ const controlOperationSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("open-target"),
     target: targetSchema,
+    claudeContext: claudePreflightContextSchema.optional(),
   }),
   z.object({
     kind: z.literal("act"),
@@ -298,6 +305,8 @@ const serverFrameSchema = z.discriminatedUnion("type", [
 export type ClientFrame = z.infer<typeof clientFrameSchema>
 export type ServerFrame = z.infer<typeof serverFrameSchema>
 export type TargetView = z.infer<typeof targetViewSchema>
+export type Target = z.infer<typeof targetSchema>
+export type ClaudePreflightContext = z.infer<typeof claudePreflightContextSchema>
 export type TargetAction = z.infer<typeof targetActionSchema>
 export type ActionOutcome = z.infer<typeof actionOutcomeSchema>
 export type ControlProblem = z.infer<typeof controlProblemSchema>

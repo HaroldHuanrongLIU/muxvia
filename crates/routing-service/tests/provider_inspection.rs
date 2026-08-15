@@ -7,7 +7,7 @@ use std::{
 };
 
 use muxvia_routing::{
-    control::protocol::{DiscoverySource, DraftCredentialSource},
+    control::protocol::{DiscoverySource, DraftCredentialSource, Target},
     home::MuxviaHome,
     service::provider_inspector::{
         DiscoveredModel, InspectionCategory, MAX_DISCOVERED_MODELS, MAX_DISCOVERY_BODY_BYTES,
@@ -370,9 +370,150 @@ impl InspectionFixture {
         (provider.id, provider.provider_revision)
     }
 
+    async fn create_claude_provider(
+        &self,
+        base_url: &str,
+        credential: &str,
+        authentication: &str,
+    ) -> (Uuid, u64) {
+        let outcome = self
+            .store
+            .apply_provider_action_for(
+                Target::Claude,
+                Uuid::new_v4(),
+                self.store
+                    .target_view_for(Target::Claude)
+                    .await
+                    .unwrap()
+                    .management_revision,
+                json!({
+                    "kind": "create-provider",
+                    "name": "Claude inspected",
+                    "baseUrl": base_url,
+                    "model": "claude-test",
+                    "credential": { "kind": "replace", "value": credential },
+                    "authentication": authentication,
+                    "presetKey": "anthropic-api-messages",
+                }),
+            )
+            .await
+            .unwrap();
+        let provider = outcome.view.providers.last().unwrap();
+        (provider.id, provider.provider_revision)
+    }
+
     fn database_bytes(&self) -> Vec<u8> {
         fs::read(self.home.database_path()).unwrap()
     }
+}
+
+#[tokio::test]
+async fn claude_discovery_uses_declared_authentication_and_bounded_pagination() {
+    let fixture = InspectionFixture::new().await;
+    let secret = "claude-inspection-secret";
+    let mut server = HttpServer::start(vec![
+        HttpReply::json(
+            200,
+            json!({
+                "data": [{ "id": "claude-z", "display_name": "Z" }],
+                "has_more": true,
+                "last_id": "claude-z"
+            }),
+        ),
+        HttpReply::json(
+            200,
+            json!({
+                "data": [{ "id": "claude-a", "display_name": "A" }],
+                "has_more": false
+            }),
+        ),
+    ])
+    .await;
+    let (provider_id, provider_revision) = fixture
+        .create_claude_provider(
+            &format!("{}/v1", server.base_url),
+            secret,
+            "anthropic-api-key",
+        )
+        .await;
+
+    let result = fixture
+        .inspector()
+        .discover_models_for(
+            Target::Claude,
+            DiscoverySource::Saved {
+                provider_id,
+                provider_revision,
+            },
+        )
+        .await;
+    let ModelDiscoveryResult::Success {
+        models, attempts, ..
+    } = result
+    else {
+        panic!("expected successful Claude discovery")
+    };
+    assert_eq!(attempts, 2);
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        ["claude-a", "claude-z"]
+    );
+    let first = server.next_request().await;
+    let second = server.next_request().await;
+    assert_eq!(first.path, "/v1/models?limit=1000");
+    assert_eq!(second.path, "/v1/models?limit=1000&after_id=claude-z");
+    assert_eq!(
+        first.headers.get("x-api-key").map(String::as_str),
+        Some(secret)
+    );
+    assert_eq!(
+        first.headers.get("anthropic-version").map(String::as_str),
+        Some("2023-06-01")
+    );
+    assert!(!first.headers.contains_key("authorization"));
+}
+
+#[tokio::test]
+async fn claude_bearer_discovery_uses_only_bearer_and_the_anthropic_version() {
+    let fixture = InspectionFixture::new().await;
+    let secret = "claude-bearer-inspection-secret";
+    let mut server = HttpServer::start(vec![HttpReply::json(
+        200,
+        json!({ "data": [{ "id": "claude-bearer" }], "has_more": false }),
+    )])
+    .await;
+    let (provider_id, provider_revision) = fixture
+        .create_claude_provider(
+            &format!("{}/v1", server.base_url),
+            secret,
+            "anthropic-bearer",
+        )
+        .await;
+
+    let result = fixture
+        .inspector()
+        .discover_models_for(
+            Target::Claude,
+            DiscoverySource::Saved {
+                provider_id,
+                provider_revision,
+            },
+        )
+        .await;
+    assert!(matches!(result, ModelDiscoveryResult::Success { .. }));
+    let request = server.next_request().await;
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer claude-bearer-inspection-secret")
+    );
+    assert_eq!(
+        request.headers.get("anthropic-version").map(String::as_str),
+        Some("2023-06-01")
+    );
+    assert!(!request.headers.contains_key("x-api-key"));
 }
 
 impl Drop for InspectionFixture {

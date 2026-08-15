@@ -16,9 +16,9 @@ afterEach(async () => {
 
 const serviceEpoch = "00000000-0000-4000-8000-000000000001"
 
-function viewAtRevision(revision: number, sequence = revision): TargetView {
+function viewAtRevision(revision: number, sequence = revision, target: TargetView["target"] = "codex"): TargetView {
   return {
-    target: "codex",
+    target,
     managementRevision: revision,
     viewSequence: sequence,
     service: { epoch: serviceEpoch, state: "running" },
@@ -32,8 +32,8 @@ function viewAtRevision(revision: number, sequence = revision): TargetView {
       name: `Provider ${revision}`,
       baseUrl: "https://provider.example/v1",
       model: `model-${revision}`,
-      protocol: "openai-responses",
-      authentication: "openai-bearer",
+      protocol: target === "claude" ? "anthropic-messages" : "openai-responses",
+      authentication: target === "claude" ? "anthropic-api-key" : "openai-bearer",
       routingRequirement: "direct-compatible",
       credential: "present",
       completeness: "complete",
@@ -184,12 +184,30 @@ class ScriptedServer {
 async function openScriptedSession(initial: TargetView) {
   const { server, path } = await ScriptedServer.start()
   const client = await RpcClient.connect(path, "control-test")
-  const opening = client.openTarget("codex")
+  const opening = client.openTarget(initial.target)
   await server.waitForRequests(1)
   server.replyOpen(0, initial)
   const session = await opening
   return { session, server }
 }
+
+test("a Claude session captures its target for actions, inspection, and refresh", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(0, 0, "claude"))
+  const action = session.act({
+    kind: "create-provider", name: "Claude", baseUrl: "https://api.anthropic.com/v1", model: "claude-test",
+    credential: { kind: "replace", value: "not-serialized" }, presetKey: "anthropic-api-messages",
+  })
+  await server.waitForRequests(2)
+  expect(server.requests().map((request) => request.operation.target)).toEqual(["claude", "claude"])
+  server.replyApplied(viewAtRevision(1, 1, "claude"))
+  await action
+  server.push(viewAtRevision(3, 3, "claude"))
+  await server.waitForRequests(3)
+  expect(server.requests()[2]!.operation).toMatchObject({ kind: "open-target", target: "claude" })
+  server.replyOpen(2, viewAtRevision(3, 3, "claude"))
+  await session.close()
+  await server.close()
+})
 
 test("a target session serializes actions and replaces stale state", async () => {
   const { session, server } = await openScriptedSession(viewAtRevision(0))

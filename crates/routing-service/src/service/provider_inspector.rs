@@ -13,7 +13,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    control::protocol::{DiscoverySource, DraftCredentialSource},
+    control::protocol::{DiscoverySource, DraftCredentialSource, ProviderAuthentication, Target},
     domain::provider::normalize_provider_base_url,
     state::{StateStore, providers::ProviderInspectionRead},
 };
@@ -24,6 +24,7 @@ pub const MAX_DISCOVERED_MODELS: usize = 2_048;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(8);
 const REACHABILITY_SLOW_THRESHOLD: Duration = Duration::from_secs(6);
+const MAX_ANTHROPIC_DISCOVERY_PAGES: usize = 8;
 
 const COMPATIBILITY_SUFFIXES: [&str; 9] = [
     "/api/claudecode",
@@ -155,15 +156,24 @@ impl ProviderInspector {
     }
 
     pub async fn discover_models(&self, source: DiscoverySource) -> ModelDiscoveryResult {
+        self.discover_models_for(Target::Codex, source).await
+    }
+
+    pub async fn discover_models_for(
+        &self,
+        target: Target,
+        source: DiscoverySource,
+    ) -> ModelDiscoveryResult {
         let started = Instant::now();
-        let (base_url, credential) = match self.resolve_discovery_source(source).await {
-            Ok(resolved) => resolved,
-            Err(category) => {
-                return ModelDiscoveryResult::Failure {
-                    failure: inspection_failure(category, None, 0, started, None),
-                };
-            }
-        };
+        let (base_url, credential, authentication) =
+            match self.resolve_discovery_source(target, source).await {
+                Ok(resolved) => resolved,
+                Err(category) => {
+                    return ModelDiscoveryResult::Failure {
+                        failure: inspection_failure(category, None, 0, started, None),
+                    };
+                }
+            };
         let candidates = match build_models_url_candidates(&base_url, false, None) {
             Ok(candidates) => candidates,
             Err(category) => {
@@ -172,6 +182,12 @@ impl ProviderInspector {
                 };
             }
         };
+
+        if target == Target::Claude {
+            return self
+                .discover_anthropic_models(candidates, credential, authentication, started)
+                .await;
+        }
 
         for (index, candidate) in candidates.iter().enumerate() {
             let attempts = index as u32 + 1;
@@ -190,13 +206,23 @@ impl ProviderInspector {
                 }
             };
             let endpoint_origin = url.origin().ascii_serialization();
-            let response = self
-                .client
-                .get(url)
-                .bearer_auth(credential.expose_secret())
-                .timeout(self.discovery_timeout)
-                .send()
-                .await;
+            let request = self.client.get(url).timeout(self.discovery_timeout);
+            let request = match authentication {
+                ProviderAuthentication::AnthropicApiKey => {
+                    request.header("x-api-key", credential.expose_secret())
+                }
+                ProviderAuthentication::AnthropicBearer | ProviderAuthentication::OpenaiBearer => {
+                    request.bearer_auth(credential.expose_secret())
+                }
+            };
+            let request = match authentication {
+                ProviderAuthentication::AnthropicApiKey
+                | ProviderAuthentication::AnthropicBearer => {
+                    request.header("anthropic-version", "2023-06-01")
+                }
+                ProviderAuthentication::OpenaiBearer => request,
+            };
+            let response = request.send().await;
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
@@ -290,7 +316,7 @@ impl ProviderInspector {
                 }
                 body.extend_from_slice(&chunk);
             }
-            return match parse_models_response(&body) {
+            return match parse_models_response_for(target, &body) {
                 Ok(models) => ModelDiscoveryResult::Success {
                     models,
                     attempts,
@@ -320,15 +346,195 @@ impl ProviderInspector {
         }
     }
 
+    async fn discover_anthropic_models(
+        &self,
+        candidates: Vec<String>,
+        credential: SecretString,
+        authentication: ProviderAuthentication,
+        started: Instant,
+    ) -> ModelDiscoveryResult {
+        let mut attempts = 0;
+        for candidate in candidates {
+            let Ok(base) = Url::parse(&candidate) else {
+                return ModelDiscoveryResult::Failure {
+                    failure: inspection_failure(
+                        InspectionCategory::InvalidEndpoint,
+                        None,
+                        attempts,
+                        started,
+                        None,
+                    ),
+                };
+            };
+            let origin = base.origin().ascii_serialization();
+            let mut after_id: Option<String> = None;
+            let mut cursors = HashSet::new();
+            let mut models = Vec::new();
+            let mut seen = HashSet::new();
+            for page in 0..MAX_ANTHROPIC_DISCOVERY_PAGES {
+                let mut url = base.clone();
+                {
+                    let mut query = url.query_pairs_mut();
+                    query.append_pair("limit", "1000");
+                    if let Some(after_id) = &after_id {
+                        query.append_pair("after_id", after_id);
+                    }
+                }
+                attempts += 1;
+                let request = self.client.get(url).timeout(self.discovery_timeout);
+                let request = match authentication {
+                    ProviderAuthentication::AnthropicApiKey => {
+                        request.header("x-api-key", credential.expose_secret())
+                    }
+                    ProviderAuthentication::AnthropicBearer
+                    | ProviderAuthentication::OpenaiBearer => {
+                        request.bearer_auth(credential.expose_secret())
+                    }
+                }
+                .header("anthropic-version", "2023-06-01");
+                let response = match request.send().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return ModelDiscoveryResult::Failure {
+                            failure: inspection_failure(
+                                classify_reqwest_error(&error),
+                                None,
+                                attempts,
+                                started,
+                                Some(origin),
+                            ),
+                        };
+                    }
+                };
+                let status = response.status();
+                if !status.is_success() {
+                    if page == 0
+                        && matches!(
+                            status,
+                            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+                        )
+                    {
+                        break;
+                    }
+                    return ModelDiscoveryResult::Failure {
+                        failure: inspection_failure(
+                            status_category(status),
+                            Some(status.as_u16()),
+                            attempts,
+                            started,
+                            Some(origin),
+                        ),
+                    };
+                }
+                let body = match bounded_body(response, status, attempts, started, &origin).await {
+                    Ok(body) => body,
+                    Err(failure) => return ModelDiscoveryResult::Failure { failure },
+                };
+                let page = match parse_anthropic_page(&body) {
+                    Ok(page) => page,
+                    Err(category) => {
+                        return ModelDiscoveryResult::Failure {
+                            failure: inspection_failure(
+                                category,
+                                Some(status.as_u16()),
+                                attempts,
+                                started,
+                                Some(origin),
+                            ),
+                        };
+                    }
+                };
+                for model in page.models {
+                    if seen.insert(model.id.clone()) {
+                        models.push(model);
+                        if models.len() > MAX_DISCOVERED_MODELS {
+                            return ModelDiscoveryResult::Failure {
+                                failure: inspection_failure(
+                                    InspectionCategory::TooManyModels,
+                                    Some(status.as_u16()),
+                                    attempts,
+                                    started,
+                                    Some(origin),
+                                ),
+                            };
+                        }
+                    }
+                }
+                if !page.has_more {
+                    models.sort_by(|left, right| left.id.cmp(&right.id));
+                    return ModelDiscoveryResult::Success {
+                        models,
+                        attempts,
+                        elapsed_ms: elapsed_ms(started),
+                        endpoint_origin: origin,
+                    };
+                }
+                let Some(cursor) = page.last_id.filter(|value| !value.trim().is_empty()) else {
+                    return ModelDiscoveryResult::Failure {
+                        failure: inspection_failure(
+                            InspectionCategory::MalformedResponse,
+                            Some(status.as_u16()),
+                            attempts,
+                            started,
+                            Some(origin),
+                        ),
+                    };
+                };
+                if !cursors.insert(cursor.clone()) {
+                    return ModelDiscoveryResult::Failure {
+                        failure: inspection_failure(
+                            InspectionCategory::MalformedResponse,
+                            Some(status.as_u16()),
+                            attempts,
+                            started,
+                            Some(origin),
+                        ),
+                    };
+                }
+                after_id = Some(cursor);
+            }
+            if after_id.is_some() {
+                return ModelDiscoveryResult::Failure {
+                    failure: inspection_failure(
+                        InspectionCategory::TooManyModels,
+                        None,
+                        attempts,
+                        started,
+                        Some(origin),
+                    ),
+                };
+            }
+        }
+        ModelDiscoveryResult::Failure {
+            failure: inspection_failure(
+                InspectionCategory::EndpointUnsupported,
+                None,
+                attempts,
+                started,
+                None,
+            ),
+        }
+    }
+
     pub async fn check_reachability(
         &self,
+        provider_id: Uuid,
+        provider_revision: u64,
+    ) -> ReachabilityResult {
+        self.check_reachability_for(Target::Codex, provider_id, provider_revision)
+            .await
+    }
+
+    pub async fn check_reachability_for(
+        &self,
+        target: Target,
         provider_id: Uuid,
         provider_revision: u64,
     ) -> ReachabilityResult {
         let operation_started = Instant::now();
         let snapshot = match self
             .store
-            .provider_for_inspection(provider_id, provider_revision)
+            .provider_for_inspection(target, provider_id, provider_revision)
             .await
         {
             Ok(ProviderInspectionRead::Found(snapshot)) => snapshot,
@@ -416,31 +622,32 @@ impl ProviderInspector {
 
     async fn resolve_discovery_source(
         &self,
+        target: Target,
         source: DiscoverySource,
-    ) -> Result<(String, SecretString), InspectionCategory> {
+    ) -> Result<(String, SecretString, ProviderAuthentication), InspectionCategory> {
         match source {
             DiscoverySource::Saved {
                 provider_id,
                 provider_revision,
             } => {
                 let snapshot = self
-                    .resolve_saved_provider(provider_id, provider_revision)
+                    .resolve_saved_provider(target, provider_id, provider_revision)
                     .await?;
                 let credential = snapshot
                     .credential
                     .ok_or(InspectionCategory::MissingCredential)?;
-                Ok((snapshot.base_url, credential))
+                Ok((snapshot.base_url, credential, snapshot.authentication))
             }
             DiscoverySource::Draft {
                 base_url,
                 credential_source,
             } => {
-                let credential = match credential_source {
+                let (credential, authentication) = match credential_source {
                     DraftCredentialSource::Missing => {
                         return Err(InspectionCategory::MissingCredential);
                     }
                     DraftCredentialSource::Ephemeral { value } if !value.trim().is_empty() => {
-                        SecretString::from(value)
+                        (SecretString::from(value), default_authentication(target))
                     }
                     DraftCredentialSource::Ephemeral { .. } => {
                         return Err(InspectionCategory::MissingCredential);
@@ -448,25 +655,30 @@ impl ProviderInspector {
                     DraftCredentialSource::Saved {
                         provider_id,
                         provider_revision,
-                    } => self
-                        .resolve_saved_provider(provider_id, provider_revision)
-                        .await?
-                        .credential
-                        .ok_or(InspectionCategory::MissingCredential)?,
+                    } => {
+                        let snapshot = self
+                            .resolve_saved_provider(target, provider_id, provider_revision)
+                            .await?;
+                        let credential = snapshot
+                            .credential
+                            .ok_or(InspectionCategory::MissingCredential)?;
+                        (credential, snapshot.authentication)
+                    }
                 };
-                Ok((base_url, credential))
+                Ok((base_url, credential, authentication))
             }
         }
     }
 
     async fn resolve_saved_provider(
         &self,
+        target: Target,
         provider_id: Uuid,
         provider_revision: u64,
     ) -> Result<crate::state::providers::ProviderInspectionSnapshot, InspectionCategory> {
         match self
             .store
-            .provider_for_inspection(provider_id, provider_revision)
+            .provider_for_inspection(target, provider_id, provider_revision)
             .await
         {
             Ok(ProviderInspectionRead::Found(snapshot)) => Ok(snapshot),
@@ -534,6 +746,27 @@ pub fn build_models_url_candidates(
 }
 
 pub fn parse_models_response(body: &[u8]) -> Result<Vec<DiscoveredModel>, InspectionCategory> {
+    parse_models_response_with_display_name(body, "owned_by")
+}
+
+fn parse_models_response_for(
+    target: Target,
+    body: &[u8],
+) -> Result<Vec<DiscoveredModel>, InspectionCategory> {
+    parse_models_response_with_display_name(
+        body,
+        if target == Target::Claude {
+            "display_name"
+        } else {
+            "owned_by"
+        },
+    )
+}
+
+fn parse_models_response_with_display_name(
+    body: &[u8],
+    display_name_field: &str,
+) -> Result<Vec<DiscoveredModel>, InspectionCategory> {
     if body.len() > MAX_DISCOVERY_BODY_BYTES {
         return Err(InspectionCategory::ResponseTooLarge);
     }
@@ -565,7 +798,7 @@ pub fn parse_models_response(body: &[u8]) -> Result<Vec<DiscoveredModel>, Inspec
             .get("id")
             .and_then(serde_json::Value::as_str)
             .ok_or(InspectionCategory::MalformedResponse)?;
-        let display_name = match entry.get("owned_by") {
+        let display_name = match entry.get(display_name_field) {
             None | Some(serde_json::Value::Null) => None,
             Some(value) => Some(
                 value
@@ -583,6 +816,13 @@ pub fn parse_models_response(body: &[u8]) -> Result<Vec<DiscoveredModel>, Inspec
     }
     models.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(models)
+}
+
+fn default_authentication(target: Target) -> ProviderAuthentication {
+    match target {
+        Target::Codex => ProviderAuthentication::OpenaiBearer,
+        Target::Claude => ProviderAuthentication::AnthropicApiKey,
+    }
 }
 
 fn parse_inspection_url(input: &str, retain_query: bool) -> Result<Url, InspectionCategory> {
@@ -615,6 +855,98 @@ fn push_candidate(candidates: &mut Vec<String>, base: &Url, path: &str) {
     let candidate: String = candidate.into();
     if !candidates.contains(&candidate) {
         candidates.push(candidate);
+    }
+}
+
+struct AnthropicPage {
+    models: Vec<DiscoveredModel>,
+    has_more: bool,
+    last_id: Option<String>,
+}
+
+fn parse_anthropic_page(body: &[u8]) -> Result<AnthropicPage, InspectionCategory> {
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| InspectionCategory::MalformedResponse)?;
+    let object = value
+        .as_object()
+        .ok_or(InspectionCategory::MalformedResponse)?;
+    let entries = object
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(InspectionCategory::MalformedResponse)?;
+    let mut models = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let entry = entry
+            .as_object()
+            .ok_or(InspectionCategory::MalformedResponse)?;
+        let id = entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or(InspectionCategory::MalformedResponse)?;
+        let display_name = match entry.get("display_name") {
+            Some(serde_json::Value::String(value)) => Some(value.clone()),
+            None | Some(serde_json::Value::Null) => None,
+            _ => return Err(InspectionCategory::MalformedResponse),
+        };
+        models.push(DiscoveredModel {
+            id: id.to_owned(),
+            display_name,
+        });
+    }
+    Ok(AnthropicPage {
+        models,
+        has_more: object
+            .get("has_more")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        last_id: object
+            .get("last_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+async fn bounded_body(
+    response: reqwest::Response,
+    status: StatusCode,
+    attempts: u32,
+    started: Instant,
+    endpoint_origin: &str,
+) -> Result<Vec<u8>, InspectionFailure> {
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            inspection_failure(
+                classify_reqwest_error(&error),
+                Some(status.as_u16()),
+                attempts,
+                started,
+                Some(endpoint_origin.to_owned()),
+            )
+        })?;
+        if body.len().saturating_add(chunk.len()) > MAX_DISCOVERY_BODY_BYTES {
+            return Err(inspection_failure(
+                InspectionCategory::ResponseTooLarge,
+                Some(status.as_u16()),
+                attempts,
+                started,
+                Some(endpoint_origin.to_owned()),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn status_category(status: StatusCode) -> InspectionCategory {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            InspectionCategory::AuthenticationRejected
+        }
+        StatusCode::TOO_MANY_REQUESTS => InspectionCategory::RateLimited,
+        _ => InspectionCategory::UpstreamStatus,
     }
 }
 

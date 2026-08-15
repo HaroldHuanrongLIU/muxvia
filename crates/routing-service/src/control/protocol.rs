@@ -148,6 +148,8 @@ pub enum ServerFrame {
 pub enum ControlOperation {
     OpenTarget {
         target: Target,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_context: Option<ClaudePreflightContext>,
     },
     Act {
         target: Target,
@@ -165,6 +167,34 @@ pub enum ControlOperation {
         #[serde(deserialize_with = "deserialize_positive_provider_revision")]
         provider_revision: u64,
     },
+}
+
+/// Secret-free observations supplied while opening the Claude management context.
+/// This is deliberately a closed summary, not a process environment projection.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudePreflightContext {
+    pub claude_config_dir: Option<String>,
+    pub selector_state: ClaudeSelectorState,
+    pub host_managed_state: ClaudeHostManagedState,
+    pub cwd: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaudeSelectorState {
+    Unset,
+    Disabled,
+    Enabled,
+    UnknownNonempty,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClaudeHostManagedState {
+    Unmanaged,
+    Managed,
+    Unknown,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -249,7 +279,7 @@ impl fmt::Debug for DraftCredentialSource {
 impl fmt::Debug for ControlOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::OpenTarget { target } => formatter
+            Self::OpenTarget { target, .. } => formatter
                 .debug_struct("OpenTarget")
                 .field("target", target)
                 .finish(),

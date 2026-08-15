@@ -75,6 +75,42 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, label: strin
   }
 }
 
+type InboundResultExpectation =
+  | { resultKind: "model-discovery" | "reachability" | "action-outcome" }
+  | { errorCode: string }
+type WaitForCondition = (
+  predicate: () => boolean | Promise<boolean>,
+  label: string,
+) => Promise<void>
+
+async function waitForInboundResult(
+  frames: readonly unknown[],
+  start: number,
+  expectation: InboundResultExpectation,
+  label: string,
+  waitForCondition: WaitForCondition = waitFor,
+): Promise<void> {
+  try {
+    await waitForCondition(() => frames.slice(start).some((frame) => {
+      if (typeof frame !== "object" || frame === null) return false
+      const candidate = frame as {
+        type?: unknown
+        requestId?: unknown
+        result?: { kind?: unknown }
+        problem?: { code?: unknown }
+      }
+      if ("errorCode" in expectation) {
+        return candidate.type === "error"
+          && typeof candidate.requestId === "string"
+          && candidate.problem?.code === expectation.errorCode
+      }
+      return candidate.type === "response" && candidate.result?.kind === expectation.resultKind
+    }), `inbound ${label}`)
+  } catch {
+    throw new Error(`inbound-result-wait-failed:${label}`)
+  }
+}
+
 async function waitForSession(
   session: TargetSession,
   predicate: (view: Readonly<TargetView>) => boolean,
@@ -997,6 +1033,31 @@ test("action error diagnostics never retain a secret error or authoritative view
   expect(diagnostic === "secret-scan-failed:controlled-act-error").toBeTrue()
   expect(diagnostic.includes(providerSecret)).toBeFalse()
   expect(diagnostic.includes(controlledError.message)).toBeFalse()
+})
+
+test("inbound action barrier rejects a wrong error with fixed diagnostics", async () => {
+  const wrongError = {
+    type: "error",
+    requestId: "controlled-request",
+    problem: { code: "stale-revision", message: providerSecret },
+  }
+  let diagnostic = ""
+  try {
+    await waitForInboundResult(
+      [wrongError],
+      0,
+      { errorCode: "provider-referenced" },
+      "controlled-active-provider-delete",
+      async (predicate) => {
+        if (!(await predicate())) throw new Error(JSON.stringify(wrongError))
+      },
+    )
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(diagnostic === "inbound-result-wait-failed:controlled-active-provider-delete").toBeTrue()
+  expect(diagnostic.includes(providerSecret)).toBeFalse()
+  expect(diagnostic.includes(JSON.stringify(wrongError))).toBeFalse()
 })
 
 test("Direct tracer fixture enforces file modes under a restrictive umask", async () => {
@@ -1942,29 +2003,6 @@ test("real processes prove the complete Target Provider workflow without leaking
       expect(await readOnlyStateFingerprint(databasePath, configPath)).toEqual(before)
       readOnlyInspections.push(label)
     }
-    const waitForInboundResult = async (
-      start: number,
-      resultKind: "model-discovery" | "reachability" | "action",
-      label: string,
-    ) => {
-      try {
-        await waitFor(() => decodedInboundFrames.slice(start).some((frame) => {
-          if (typeof frame !== "object" || frame === null) return false
-          const candidate = frame as {
-            type?: unknown
-            requestId?: unknown
-            result?: { kind?: unknown }
-          }
-          if (resultKind === "action") {
-            return candidate.type === "response" && candidate.result?.kind === "action-outcome"
-              || candidate.type === "error" && typeof candidate.requestId === "string"
-          }
-          return candidate.type === "response" && candidate.result?.kind === resultKind
-        }), `inbound ${label}`)
-      } catch {
-        throw new Error(`inbound-result-wait-failed:${label}`)
-      }
-    }
     const leader = (key: string) => {
       setup!.mockInput.pressKey("x", { ctrl: true })
       setup!.mockInput.pressKey(key)
@@ -2047,7 +2085,12 @@ test("real processes prove the complete Target Provider workflow without leaking
     setup.mockInput.pressEnter()
     await upstream.waitForCallCount(1)
     expect(requestAudit.projection(0)).toEqual(expectedModelRequestProjection)
-    await waitForInboundResult(automaticInboundStart, "model-discovery", "automatic-model-discovery")
+    await waitForInboundResult(
+      decodedInboundFrames,
+      automaticInboundStart,
+      { resultKind: "model-discovery" },
+      "automatic-model-discovery",
+    )
     const automaticModelsFrame = await setup.waitForFrame((frame) => frame.includes("2 models available"))
     selectedRenderedFrames.push(automaticModelsFrame)
     await assertReadOnlyInspection("complete automatic discovery", savedInspectionBefore)
@@ -2059,7 +2102,12 @@ test("real processes prove the complete Target Provider workflow without leaking
     leader("f")
     await upstream.waitForCallCount(2)
     expect(requestAudit.projection(1)).toEqual(expectedModelRequestProjection)
-    await waitForInboundResult(explicitInboundStart, "model-discovery", "explicit-model-discovery")
+    await waitForInboundResult(
+      decodedInboundFrames,
+      explicitInboundStart,
+      { resultKind: "model-discovery" },
+      "explicit-model-discovery",
+    )
     const explicitModelsFrame = await setup.waitForFrame((frame) => frame.includes("2 models available"))
     selectedRenderedFrames.push(explicitModelsFrame)
     await assertReadOnlyInspection("explicit discovery", explicitInspectionBefore)
@@ -2209,7 +2257,12 @@ test("real processes prove the complete Target Provider workflow without leaking
     setup.mockInput.pressEnter()
     await upstream.waitForCallCount(3)
     expect(requestAudit.projection(2)).toEqual(expectedModelRequestProjection)
-    await waitForInboundResult(activeAutomaticInboundStart, "model-discovery", "active-model-discovery")
+    await waitForInboundResult(
+      decodedInboundFrames,
+      activeAutomaticInboundStart,
+      { resultKind: "model-discovery" },
+      "active-model-discovery",
+    )
     await setup.waitForFrame((frame) => frame.includes("2 models available"))
     await assertReadOnlyInspection("active declaration automatic discovery", activeEditorInspectionBefore)
     setup.mockInput.pressTab()
@@ -2255,7 +2308,12 @@ test("real processes prove the complete Target Provider workflow without leaking
     leader("t")
     await upstream.waitForCallCount(5)
     expect(requestAudit.projection(4)).toEqual(expectedReachabilityRequestProjection)
-    await waitForInboundResult(reachabilityInboundStart, "reachability", "reachability")
+    await waitForInboundResult(
+      decodedInboundFrames,
+      reachabilityInboundStart,
+      { resultKind: "reachability" },
+      "reachability",
+    )
     const reachabilityFrame = await setup.waitForFrame((frame) =>
       frame.includes("Reachable") && frame.includes("HTTP 401")
     )
@@ -2269,7 +2327,12 @@ test("real processes prove the complete Target Provider workflow without leaking
     selectedRenderedFrames.push(activeDeleteConfirmation)
     const activeDeleteInboundStart = decodedInboundFrames.length
     setup.mockInput.pressKey("y")
-    await waitForInboundResult(activeDeleteInboundStart, "action", "active-provider-delete")
+    await waitForInboundResult(
+      decodedInboundFrames,
+      activeDeleteInboundStart,
+      { errorCode: "provider-referenced" },
+      "active-provider-delete",
+    )
     await setup.renderOnce()
     const activeDeleteRejected = captureFrame(setup, selectedRenderedFrames)
     const activeDeleteRenderedFrames = rendererAudit.frames().slice(activeDeleteRenderStart)

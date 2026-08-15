@@ -257,7 +257,7 @@ fn encoded_surface_is_secret_free(encoded: &str, additional: &[&str]) -> Result<
     Ok(())
 }
 
-fn public_surface_is_secret_free<T: fmt::Debug>(
+fn public_surface_is_secret_free<T: fmt::Debug + ?Sized>(
     surface: &T,
     forbidden: &[&str],
 ) -> Result<(), &'static str> {
@@ -265,20 +265,30 @@ fn public_surface_is_secret_free<T: fmt::Debug>(
     encoded_surface_is_secret_free(&encoded, forbidden)
 }
 
-fn action_outcome_is_secret_free(outcome: &ActionOutcome) -> Result<(), &'static str> {
-    public_surface_is_secret_free(outcome, &[])?;
-    let encoded = serde_json::to_string(outcome).map_err(|_| "action outcome did not encode")?;
+fn scan_debug_and_serialized<D, S>(
+    debug_surface: &D,
+    serialized_surface: &S,
+    serialization_error: &'static str,
+) -> Result<(), &'static str>
+where
+    D: fmt::Debug + ?Sized,
+    S: serde::Serialize + ?Sized,
+{
+    public_surface_is_secret_free(debug_surface, &[])?;
+    let encoded = serde_json::to_string(serialized_surface).map_err(|_| serialization_error)?;
     encoded_surface_is_secret_free(&encoded, &[])
 }
 
+fn action_outcome_is_secret_free(outcome: &ActionOutcome) -> Result<(), &'static str> {
+    scan_debug_and_serialized(outcome, outcome, "action outcome did not encode")
+}
+
 fn action_failure_is_secret_free(failure: &ActionFailure) -> Result<(), &'static str> {
-    public_surface_is_secret_free(failure, &[])?;
-    let encoded = serde_json::to_string(&serde_json::json!({
+    let serialized = serde_json::json!({
         "problem": &failure.problem,
         "authoritativeView": &failure.authoritative_view,
-    }))
-    .map_err(|_| "action failure did not encode")?;
-    encoded_surface_is_secret_free(&encoded, &[])
+    });
+    scan_debug_and_serialized(failure, &serialized, "action failure did not encode")
 }
 
 fn take_applied_redacted(
@@ -336,12 +346,8 @@ fn validate_push_redacted(
     actual: TargetView,
     expected: &TargetView,
 ) -> Result<TargetView, &'static str> {
-    public_surface_is_secret_free(&actual, &[])?;
-    public_surface_is_secret_free(expected, &[])?;
-    let actual_json = serde_json::to_string(&actual).map_err(|_| "push did not encode")?;
-    let expected_json = serde_json::to_string(expected).map_err(|_| "push did not encode")?;
-    encoded_surface_is_secret_free(&actual_json, &[])?;
-    encoded_surface_is_secret_free(&expected_json, &[])?;
+    scan_debug_and_serialized(&actual, &actual, "push did not encode")?;
+    scan_debug_and_serialized(expected, expected, "push did not encode")?;
     if actual != *expected {
         return Err("activation push did not match its response view");
     }
@@ -359,6 +365,17 @@ async fn expect_push_redacted(
     match validate_push_redacted(actual, expected) {
         Ok(view) => view,
         Err(diagnostic) => panic!("{diagnostic}"),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SerializedSecretWithSafeDebug<'a> {
+    credential: &'a str,
+}
+
+impl fmt::Debug for SerializedSecretWithSafeDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SerializedSecretWithSafeDebug(<redacted>)")
     }
 }
 
@@ -388,6 +405,25 @@ async fn redacted_test_diagnostics_do_not_echo_secret_values_on_mismatch() {
         Ok(_) => panic!("redacted opposite-branch helper accepted a failure"),
         Err(diagnostic) => diagnostic,
     };
+    assert_eq!(
+        diagnostic,
+        "surface contained a credential or settings value"
+    );
+    assert!(!diagnostic.contains(secret));
+
+    let serialized_only = SerializedSecretWithSafeDebug { credential: secret };
+    assert!(!format!("{serialized_only:?}").contains(secret));
+    assert!(
+        serde_json::to_string(&serialized_only)
+            .unwrap()
+            .contains(secret)
+    );
+    let diagnostic = scan_debug_and_serialized(
+        &serialized_only,
+        &serialized_only,
+        "controlled surface did not encode",
+    )
+    .unwrap_err();
     assert_eq!(
         diagnostic,
         "surface contained a credential or settings value"
@@ -450,6 +486,25 @@ async fn redacted_test_diagnostics_do_not_echo_secret_values_on_mismatch() {
     assert!(format!("{secret_bearing_push:?}").contains(secret));
     let diagnostic = match validate_push_redacted(secret_bearing_push, &view) {
         Ok(_) => panic!("redacted push helper accepted a secret-bearing mismatch"),
+        Err(diagnostic) => diagnostic,
+    };
+    assert_eq!(
+        diagnostic,
+        "surface contained a credential or settings value"
+    );
+    assert!(!diagnostic.contains(secret));
+
+    let mut secret_bearing_expected_push = view.clone();
+    secret_bearing_expected_push.problems.push(ControlProblem {
+        code: "controlled-expected-push-mismatch".to_owned(),
+        message: secret.to_owned(),
+        source: None,
+        selector: None,
+    });
+    assert!(!format!("{view:?}").contains(secret));
+    assert!(format!("{secret_bearing_expected_push:?}").contains(secret));
+    let diagnostic = match validate_push_redacted(view, &secret_bearing_expected_push) {
+        Ok(_) => panic!("redacted push helper accepted a secret-bearing expected push"),
         Err(diagnostic) => diagnostic,
     };
     assert_eq!(

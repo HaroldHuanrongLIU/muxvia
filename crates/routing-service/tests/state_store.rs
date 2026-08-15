@@ -270,6 +270,118 @@ async fn managed_config_version_startup_audit_marks_only_an_invalid_target() {
 }
 
 #[tokio::test]
+async fn managed_config_state_validation_is_identical_at_preparation_and_startup() {
+    for malformed_state in [
+        "legacy-takeover-without-snapshot",
+        "direct-with-route-runtime",
+        "takeover-without-routing-credential",
+        "takeover-with-invalid-route-port",
+    ] {
+        for boundary in ["preparation", "startup"] {
+            let fixture = StoreFixture::new().await;
+            seed_malformed_claude_committed_state(&fixture.home, malformed_state).await;
+
+            let store = if boundary == "startup" {
+                std::sync::Arc::new(StateStore::open(&fixture.home).await.unwrap())
+            } else {
+                std::sync::Arc::clone(&fixture.store)
+            };
+            if boundary == "preparation" {
+                let prepared = store
+                    .prepare_activation_for(Target::Claude, Uuid::new_v4(), 999)
+                    .await
+                    .unwrap();
+                let failure = match prepared {
+                    Ok(_) => panic!("malformed committed state unexpectedly prepared"),
+                    Err(failure) => failure,
+                };
+                assert_eq!(failure.problem.code, "recovery-required");
+            }
+
+            assert_eq!(
+                store
+                    .target_view_for(Target::Claude)
+                    .await
+                    .unwrap()
+                    .recovery
+                    .state,
+                "recovery-required",
+                "malformed committed state did not persist target recovery at {boundary}"
+            );
+            let blocked = store
+                .apply_provider_action_for(Target::Claude, Uuid::new_v4(), 0, serde_json::json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(blocked.problem.code, "recovery-required");
+            assert_eq!(
+                store.target_view().await.unwrap().recovery.state,
+                "clean",
+                "malformed Claude state contaminated the Codex peer at {boundary}"
+            );
+        }
+    }
+}
+
+async fn seed_malformed_claude_committed_state(home: &MuxviaHome, malformed_state: &'static str) {
+    let database = tokio_rusqlite::Connection::open(home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(move |connection| {
+            if malformed_state != "legacy-takeover-without-snapshot" {
+                connection.execute(
+                    "INSERT INTO activated_snapshots
+                     (id, target, provider_id, base_url, model, protocol, authentication,
+                      provider_bearer_token, epoch)
+                     VALUES ('00000000-0000-4000-8000-000000000401', 'claude',
+                             '00000000-0000-4000-8000-000000000402',
+                             'https://api.anthropic.test', 'claude-test',
+                             'anthropic-messages', 'anthropic-bearer', 'snapshot-secret',
+                             '00000000-0000-4000-8000-000000000403')",
+                    [],
+                )?;
+            }
+            match malformed_state {
+                "legacy-takeover-without-snapshot" => connection.execute(
+                    "UPDATE target_route_state SET managed_config_version = 1,
+                       takeover_state = 'active', route_port = 43124,
+                       routing_credential = 'routing-secret', activated_snapshot_id = NULL
+                     WHERE target = 'claude'",
+                    [],
+                )?,
+                "direct-with-route-runtime" => connection.execute(
+                    "UPDATE target_route_state SET managed_config_version = 2,
+                       takeover_state = 'inactive', route_port = 43124,
+                       routing_credential = NULL,
+                       activated_snapshot_id = '00000000-0000-4000-8000-000000000401'
+                     WHERE target = 'claude'",
+                    [],
+                )?,
+                "takeover-without-routing-credential" => connection.execute(
+                    "UPDATE target_route_state SET managed_config_version = 2,
+                       takeover_state = 'active', route_port = 43124,
+                       routing_credential = NULL,
+                       activated_snapshot_id = '00000000-0000-4000-8000-000000000401'
+                     WHERE target = 'claude'",
+                    [],
+                )?,
+                "takeover-with-invalid-route-port" => connection.execute(
+                    "UPDATE target_route_state SET managed_config_version = 2,
+                       takeover_state = 'active', route_port = -1,
+                       routing_credential = 'routing-secret',
+                       activated_snapshot_id = '00000000-0000-4000-8000-000000000401'
+                     WHERE target = 'claude'",
+                    [],
+                )?,
+                _ => unreachable!("test declares every malformed committed state"),
+            };
+            Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn managed_config_version_two_without_a_committed_claude_snapshot_requires_recovery() {
     let fixture = StoreFixture::new().await;
     let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
@@ -402,6 +514,115 @@ async fn managed_config_version_commit_writes_requested_version_atomically_witho
         .await
         .unwrap();
     assert_eq!(persisted, (2, "committed".into(), snapshot_id.to_string()));
+}
+
+#[tokio::test]
+async fn managed_config_version_commit_rejects_payload_ownership_mismatch_before_db_mutation() {
+    for (managed_config_version, legacy_payload) in [(1, false), (2, true)] {
+        let fixture = StoreFixture::new().await;
+        let codec = ClaudeConfigCodec::for_user_home(fixture.home.user_home()).unwrap();
+        let action_id = Uuid::new_v4();
+        let recovery_id = Uuid::new_v4();
+        fixture
+            .store
+            .insert_recovery_intent(&RecoveryIntent::pending_claude(
+                recovery_id,
+                action_id,
+                codec.settings_path().to_owned(),
+                codec.inspect().unwrap(),
+                codec.desired_takeover("claude-test", "http://127.0.0.1:43124", "route-secret"),
+                0,
+            ))
+            .await
+            .unwrap();
+        if legacy_payload {
+            let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+                .await
+                .unwrap();
+            database
+                .call(move |connection| {
+                    connection.execute(
+                        "UPDATE activation_recovery SET payload_json = ?1 WHERE id = ?2",
+                        tokio_rusqlite::rusqlite::params![
+                            include_str!("fixtures/claude-recovery-t05.json"),
+                            recovery_id.to_string()
+                        ],
+                    )?;
+                    Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+                })
+                .await
+                .unwrap();
+        }
+        let mut updates = fixture.store.subscribe_target_views();
+
+        let result = fixture
+            .store
+            .commit_activation_for(
+                Target::Claude,
+                action_id,
+                0,
+                ActivatedSnapshot {
+                    id: Uuid::new_v4(),
+                    target: Target::Claude,
+                    provider_id: Uuid::new_v4(),
+                    base_url: "https://api.anthropic.com/v1".into(),
+                    model: "claude-test".into(),
+                    protocol: ProviderProtocol::AnthropicMessages,
+                    authentication: ProviderAuthentication::AnthropicBearer,
+                    provider_credential: SecretString::from("provider-secret"),
+                    epoch: fixture.store.service_epoch(),
+                },
+                ActivationRuntime::Takeover {
+                    route_port: 43124,
+                    routing_credential: SecretString::from("route-secret"),
+                },
+                managed_config_version,
+                recovery_id,
+                codec.settings_path().to_string_lossy().into_owned(),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(muxvia_routing::state::StateError::InvalidRecoveryPayload)
+            ),
+            "ownership mismatch did not return the fixed recovery payload error"
+        );
+
+        let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+            .await
+            .unwrap();
+        let unchanged = database
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM activated_snapshots WHERE target = 'claude') = 0,
+                       (SELECT COUNT(*) FROM action_receipts
+                        WHERE target = 'claude' AND action_id = ?1) = 0,
+                       (SELECT state = 'pending' FROM activation_recovery WHERE id = ?2),
+                       management_revision = 0 AND view_sequence = 0
+                         AND activated_snapshot_id IS NULL AND recovery_state = 'clean'
+                     FROM target_route_state WHERE target = 'claude'",
+                    tokio_rusqlite::rusqlite::params![
+                        action_id.to_string(),
+                        recovery_id.to_string()
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, bool>(0)?,
+                            row.get::<_, bool>(1)?,
+                            row.get::<_, bool>(2)?,
+                            row.get::<_, bool>(3)?,
+                        ))
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(unchanged, (true, true, true, true));
+        assert!(updates.try_recv().is_err());
+    }
 }
 
 #[tokio::test]

@@ -1175,6 +1175,140 @@ async fn claude_listener_credential_and_snapshot_remain_provisional_until_databa
     assert!(service.model_endpoint_for(Target::Claude).await.is_some());
 }
 
+#[tokio::test]
+async fn claude_payload_ownership_mismatch_rolls_back_without_commit_or_publication() {
+    for current_version in [1_u32, 2_u32] {
+        let fixture = Fixture::new().await;
+        let (provider_id, mut revision) = fixture
+            .save_claude("Claude", "claude-test", "provider-secret")
+            .await;
+        let mut snapshot_count = 0;
+        if current_version == 2 {
+            let setup = fixture.dual_service(
+                ActivationHooks::default(),
+                Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+            );
+            let applied = setup
+                .apply_raw_for_with_context(
+                    Target::Claude,
+                    Uuid::new_v4(),
+                    revision,
+                    takeover_action(provider_id),
+                    Some(&claude_context(&fixture.home)),
+                )
+                .await
+                .unwrap();
+            revision = applied.view.management_revision;
+            snapshot_count = 1;
+            setup.shutdown_models().await.unwrap();
+            let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+                .await
+                .unwrap();
+            database
+                .call(|connection| {
+                    connection.execute(
+                        "UPDATE target_route_state SET managed_config_version = 2
+                         WHERE target = 'claude'",
+                        [],
+                    )?;
+                    Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+                })
+                .await
+                .unwrap();
+        }
+
+        let settings_path = fixture.home.user_home().join(".claude/settings.json");
+        let settings_before = fs::read(&settings_path).ok();
+        let view_before = fixture.store.target_view_for(Target::Claude).await.unwrap();
+        let action_id = Uuid::new_v4();
+        let pause = Arc::new(ActivationPause::default());
+        let service = Arc::new(fixture.dual_service(
+            ActivationHooks::pausing_final_commit(pause.clone()),
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+        ));
+        let mut updates = fixture.store.subscribe_target_views();
+        let context = claude_context(&fixture.home);
+        let activation = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service
+                    .apply_raw_for_with_context(
+                        Target::Claude,
+                        action_id,
+                        revision,
+                        takeover_action(provider_id),
+                        Some(&context),
+                    )
+                    .await
+            })
+        };
+        pause.wait_until_reached().await;
+
+        let mismatched_version = if current_version == 1 { 2 } else { 1 };
+        let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+            .await
+            .unwrap();
+        database
+            .call(move |connection| {
+                let payload_json: String = connection.query_row(
+                    "SELECT payload_json FROM activation_recovery
+                     WHERE target = 'claude' AND action_id = ?1 AND state = 'pending'",
+                    [action_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let mut payload: serde_json::Value = serde_json::from_str(&payload_json)
+                    .map_err(|_| tokio_rusqlite::rusqlite::Error::InvalidQuery)?;
+                payload["ownership_version"] = serde_json::json!(mismatched_version);
+                payload["before"]["ownership_version"] = serde_json::json!(mismatched_version);
+                payload["desired"]["ownership_version"] = serde_json::json!(mismatched_version);
+                for field in ["before", "desired"] {
+                    let owned = payload[field]["owned"]
+                        .as_object_mut()
+                        .ok_or(tokio_rusqlite::rusqlite::Error::InvalidQuery)?;
+                    if mismatched_version == 2 {
+                        owned.insert("api_key".to_owned(), serde_json::Value::Null);
+                    } else {
+                        owned.remove("api_key");
+                    }
+                }
+                connection.execute(
+                    "UPDATE activation_recovery SET payload_json = ?1
+                     WHERE target = 'claude' AND action_id = ?2 AND state = 'pending'",
+                    tokio_rusqlite::rusqlite::params![payload.to_string(), action_id.to_string()],
+                )?;
+                Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        pause.release();
+
+        let failure = activation.await.unwrap().unwrap_err();
+        assert_eq!(failure.problem.code, "internal-failure");
+        assert!(
+            fs::read(&settings_path).ok() == settings_before,
+            "ownership mismatch rollback did not restore exact Claude settings"
+        );
+        let view = fixture.store.target_view_for(Target::Claude).await.unwrap();
+        assert_eq!(view.management_revision, view_before.management_revision);
+        assert_eq!(view.view_sequence, view_before.view_sequence);
+        assert_eq!(view.mode, view_before.mode);
+        assert_eq!(view.current_provider_id, view_before.current_provider_id);
+        assert_eq!(view.activated_snapshot, view_before.activated_snapshot);
+        assert_eq!(view.takeover, view_before.takeover);
+        assert!(fixture.store.receipt(action_id).await.unwrap().is_none());
+        assert_eq!(fixture.count("activated_snapshots").await, snapshot_count);
+        assert_eq!(
+            fixture
+                .recovery_state_for_action(action_id)
+                .await
+                .as_deref(),
+            Some("rolled-back")
+        );
+        assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+        assert!(updates.try_recv().is_err());
+    }
+}
+
 async fn assert_direct_pre_mutation_failure(
     fixture: &Fixture,
     service: &ActivationService,
@@ -1219,6 +1353,48 @@ async fn assert_activation_pre_mutation_failure(
     assert!(updates.try_recv().is_err());
 }
 
+async fn assert_invalid_committed_state_failure(
+    fixture: &Fixture,
+    service: &ActivationService,
+    revision: u64,
+    action: serde_json::Value,
+) {
+    let action_id = Uuid::new_v4();
+    let config_path = fixture.home.user_home().join(".codex/config.toml");
+    let auth_path = fixture.home.user_home().join(".codex/auth.json");
+    let config_before = fs::read(&config_path).ok();
+    let auth_before = fs::read(&auth_path).ok();
+    let view_before = fixture.store.target_view().await.unwrap();
+    let snapshot_count = fixture.count("activated_snapshots").await;
+    let endpoint_before = service.model_endpoint().await;
+    let mut updates = fixture.store.subscribe_target_views();
+
+    let failure = service
+        .apply_raw(action_id, revision, action)
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.problem.code, "recovery-required");
+    assert!(
+        fs::read(&config_path).ok() == config_before,
+        "invalid committed state handling changed Codex configuration"
+    );
+    assert!(
+        fs::read(&auth_path).ok() == auth_before,
+        "invalid committed state handling changed Codex authentication"
+    );
+    let view = fixture.store.target_view().await.unwrap();
+    assert_eq!(view.management_revision, view_before.management_revision);
+    assert_eq!(view.current_provider_id, view_before.current_provider_id);
+    assert_eq!(view.activated_snapshot, view_before.activated_snapshot);
+    assert_eq!(view.recovery.state, "recovery-required");
+    assert_eq!(view.managed_configuration.state, "recovery-required");
+    assert_eq!(service.model_endpoint().await, endpoint_before);
+    assert!(fixture.store.receipt(action_id).await.unwrap().is_none());
+    assert_eq!(fixture.count("activated_snapshots").await, snapshot_count);
+    assert!(updates.try_recv().is_err());
+}
+
 #[tokio::test]
 async fn inactive_dangling_snapshot_pointer_requires_recovery_before_activation() {
     let fixture = Fixture::new().await;
@@ -1230,12 +1406,11 @@ async fn inactive_dangling_snapshot_pointer_requires_recovery_before_activation(
         .await;
     let service = fixture.service(ActivationHooks::default());
 
-    assert_direct_pre_mutation_failure(
+    assert_invalid_committed_state_failure(
         &fixture,
         &service,
-        provider_id,
         revision,
-        "recovery-required",
+        direct_action(provider_id),
     )
     .await;
 }
@@ -1256,12 +1431,11 @@ async fn active_dangling_snapshot_pointer_requires_recovery_before_activation() 
         .await;
     let service = fixture.service(ActivationHooks::default());
 
-    assert_activation_pre_mutation_failure(
+    assert_invalid_committed_state_failure(
         &fixture,
         &service,
         revision,
         takeover_action(provider_id),
-        "recovery-required",
     )
     .await;
 }
@@ -1283,12 +1457,11 @@ async fn incomplete_takeover_runtime_requires_recovery_before_activation() {
         .overwrite_route_state("active", Some(43123), None, Some(snapshot_id))
         .await;
 
-    assert_activation_pre_mutation_failure(
+    assert_invalid_committed_state_failure(
         &fixture,
         &service,
         activated_revision,
         takeover_action(provider_id),
-        "recovery-required",
     )
     .await;
 }
@@ -2664,14 +2837,10 @@ async fn malformed_claude_committed_state_is_target_local_while_codex_and_uds_re
         assert_eq!(second.model_endpoint().await, Some(codex_endpoint));
         assert!(second.model_endpoint_for(Target::Claude).await.is_none());
         let claude_view = second_store.target_view_for(Target::Claude).await.unwrap();
+        assert_eq!(claude_view.recovery.state, "recovery-required");
+        assert_eq!(claude_view.managed_configuration.state, "recovery-required");
         assert_eq!(claude_view.takeover.state, "unavailable");
         assert!(claude_view.takeover.endpoint.is_none());
-        assert!(
-            claude_view
-                .problems
-                .iter()
-                .any(|problem| problem.code == "model-route-unavailable")
-        );
 
         handle.shutdown().await.unwrap();
         second.shutdown_models().await.unwrap();

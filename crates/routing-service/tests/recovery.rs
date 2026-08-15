@@ -13,33 +13,7 @@ use muxvia_routing::{
 use tempfile::TempDir;
 use uuid::Uuid;
 
-const T05_CLAUDE_RECOVERY_PAYLOAD: &str = r#"{
-  "target": "claude",
-  "before": {
-    "identity": {
-      "exists": false,
-      "device": null,
-      "inode": null,
-      "modified_seconds": null,
-      "modified_nanoseconds": null,
-      "length": null,
-      "mode": null
-    },
-    "owned": {
-      "base_url": null,
-      "auth_token": null,
-      "model": null
-    },
-    "unrelated_fingerprint": "4da79b1423d8d61dd7d5c1a339298d75e6c449ec1150c150ea5510d3d6d39f63"
-  },
-  "desired": {
-    "owned": {
-      "base_url": "http://127.0.0.1:43124",
-      "auth_token": "legacy-routing-token-sentinel",
-      "model": "legacy-model"
-    }
-  }
-}"#;
+const T05_CLAUDE_RECOVERY_PAYLOAD: &str = include_str!("fixtures/claude-recovery-t05.json");
 
 struct Fixture {
     _root: TempDir,

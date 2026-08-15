@@ -165,17 +165,7 @@ CREATE TABLE activation_recovery (
 );
 "#;
 
-fn v5_schema() -> String {
-    include_str!("../src/state/schema.sql")
-        .replace(
-            "  managed_config_version INTEGER NOT NULL DEFAULT 1 CHECK (managed_config_version IN (1,2)),\n",
-            "",
-        )
-        .replace(
-            "VALUES ('schema-version', '6')",
-            "VALUES ('schema-version', '5')",
-        )
-}
+const V5_SCHEMA: &str = include_str!("fixtures/state-schema-v5.sql");
 
 struct StoreFixture {
     root: PathBuf,
@@ -257,7 +247,7 @@ async fn schema_v6_migrates_real_v5_claude_states_without_rewriting_persisted_ar
             r#"{"target":"claude","before":{"legacy":"before"},"desired":{"legacy":"desired"}}"#;
         let receipt = r#"{"status":"applied","legacy":"receipt"}"#;
         let connection = Connection::open(fixture.home.database_path()).unwrap();
-        connection.execute_batch(&v5_schema()).unwrap();
+        connection.execute_batch(V5_SCHEMA).unwrap();
         if active {
             connection
                 .execute(
@@ -471,7 +461,7 @@ async fn schema_v6_real_v5_claude_takeover_bootstraps_legacy_and_isolates_invali
     .unwrap();
 
     let connection = Connection::open(fixture.home.database_path()).unwrap();
-    connection.execute_batch(&v5_schema()).unwrap();
+    connection.execute_batch(V5_SCHEMA).unwrap();
     for (target, provider_id, snapshot_id, model, protocol, authentication, secret) in [
         (
             "codex",

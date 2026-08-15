@@ -192,6 +192,18 @@ impl RecoveryPayload {
             Self::Claude { .. } | Self::ClaudeLegacy { .. } => Target::Claude,
         }
     }
+
+    pub(super) fn matches_managed_config_version(&self, target: Target, version: u32) -> bool {
+        match self {
+            Self::Codex { .. } => target == Target::Codex && version == 1,
+            Self::Claude { before, .. } => {
+                target == Target::Claude
+                    && ClaudeConfigOwnership::from_managed_config_version(version)
+                        == Some(before.ownership())
+            }
+            Self::ClaudeLegacy { .. } => false,
+        }
+    }
 }
 
 impl fmt::Debug for RecoveryIntent {

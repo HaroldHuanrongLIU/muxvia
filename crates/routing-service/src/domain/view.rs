@@ -15,7 +15,7 @@ type RouteProjectionRow = (
     Option<String>,
     Option<String>,
     String,
-    Option<u16>,
+    Option<i64>,
     String,
     Option<String>,
     Option<String>,
@@ -149,7 +149,9 @@ pub(crate) fn project_target_view_for(
         })?
         .collect::<Result<Vec<_>>>()?;
 
-    let endpoint = route_port.map(|port| format!("http://127.0.0.1:{port}"));
+    let endpoint = route_port
+        .and_then(|port| u16::try_from(port).ok())
+        .map(|port| format!("http://127.0.0.1:{port}"));
     let mode = match (takeover_state.as_str(), activated_snapshot_id.as_ref()) {
         ("active", _) => "takeover",
         (_, Some(_)) => "direct",
@@ -260,7 +262,11 @@ pub(crate) fn project_target_view_for(
         },
         recovery: RecoveryView {
             intent_id: recovery.0,
-            state: recovery.1,
+            state: if recovery_state == "recovery-required" {
+                recovery_state
+            } else {
+                recovery.1
+            },
         },
         activated_snapshot,
         problems,

@@ -404,6 +404,79 @@ async fn target_isolation_scopes_pushes_actions_and_receipts_to_the_opened_targe
     fixture.shutdown().await;
 }
 
+#[tokio::test]
+async fn claude_receipts_replay_before_malformed_actions_or_duplicate_pushes() {
+    let mut fixture = ControlFixture::start().await;
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    request(
+        &mut stream,
+        "open-claude",
+        json!({ "kind": "open-target", "target": "claude" }),
+    )
+    .await;
+
+    let action_id = Uuid::new_v4();
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request", "requestId": "claude-first",
+            "operation": {
+                "kind": "act", "target": "claude", "actionId": action_id, "expectedRevision": 0,
+                "action": {
+                    "kind": "create-provider", "name": "Claude", "baseUrl": "https://api.anthropic.com/v1",
+                    "model": "claude-test", "credential": { "kind": "replace", "value": "claude-secret" },
+                    "authentication": "anthropic-api-key", "presetKey": "anthropic-api-messages"
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let applied = read_frame(&mut stream).await.unwrap();
+    let push = read_frame(&mut stream).await.unwrap();
+    let before = fixture
+        .store
+        .target_view_for(muxvia_routing::control::protocol::Target::Claude)
+        .await
+        .unwrap();
+
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request", "requestId": "claude-replay",
+            "operation": {
+                "kind": "act", "target": "claude", "actionId": action_id, "expectedRevision": 999,
+                "action": { "kind": "activate-provider", "providerId": "not-a-uuid", "mode": "takeover" }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let replayed = read_frame(&mut stream).await.unwrap();
+    assert_eq!(replayed["result"]["kind"], "action-outcome");
+    assert_eq!(replayed["result"]["outcome"]["status"], "replayed");
+    assert_eq!(
+        replayed["result"]["outcome"]["view"],
+        applied["result"]["outcome"]["view"]
+    );
+    assert_eq!(push["view"], applied["result"]["outcome"]["view"]);
+    assert_eq!(
+        fixture
+            .store
+            .target_view_for(muxvia_routing::control::protocol::Target::Claude)
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut stream))
+            .await
+            .is_err()
+    );
+    fixture.shutdown().await;
+}
+
 async fn wait_for_inspections(fixture: &ControlFixture, expected: usize) {
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {

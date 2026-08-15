@@ -259,6 +259,9 @@ impl ActivationService {
         expected_revision: u64,
         raw_action: serde_json::Value,
     ) -> Result<ActionOutcome, ActionFailure> {
+        if let Some(outcome) = self.receipt_for_or_failure(target, action_id).await? {
+            return Ok(outcome);
+        }
         match serde_json::from_value(raw_action.clone()) {
             Ok(
                 TargetAction::CreateProvider { .. }
@@ -749,6 +752,20 @@ impl ActivationService {
             Ok(outcome) => Ok(outcome),
             Err(_) => Err(self
                 .activation_failure("internal-failure", "Activation failed")
+                .await),
+        }
+    }
+
+    async fn receipt_for_or_failure(
+        &self,
+        target: Target,
+        action_id: Uuid,
+    ) -> Result<Option<ActionOutcome>, ActionFailure> {
+        match self.store.receipt_for(target, action_id).await {
+            Ok(outcome) => Ok(outcome),
+            Err(_) => Err(self
+                .store
+                .failure_for(target, "state-store-error", "State store operation failed")
                 .await),
         }
     }

@@ -476,10 +476,17 @@ impl ManagedFile {
                     .map_err(|_| ManagedFileError::RecoveryRequired)?
                     .exists()
                 {
-                    Err(ManagedFileError::RecoveryRequired)
-                } else {
-                    Ok(())
+                    return Err(ManagedFileError::RecoveryRequired);
                 }
+                self.sync_directory(directory)
+                    .map_err(|_| ManagedFileError::RecoveryRequired)?;
+                if file_identity_at(directory, temporary_name)
+                    .map_err(|_| ManagedFileError::RecoveryRequired)?
+                    .exists()
+                {
+                    return Err(ManagedFileError::RecoveryRequired);
+                }
+                Ok(())
             }
             Err(_) => Err(ManagedFileError::RecoveryRequired),
         }
@@ -579,7 +586,10 @@ fn create_private_parent(parent: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn sync_failing_first(times: usize) -> (DirectorySyncHook, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -617,6 +627,70 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with(".muxvia-"))
             .map(|entry| entry.path())
             .collect()
+    }
+
+    fn remove_temporary_before_cleanup(
+        parent: &Path,
+    ) -> (CleanupHook, Arc<Mutex<Option<PathBuf>>>) {
+        let removed = Arc::new(Mutex::new(None));
+        let removed_for_hook = Arc::clone(&removed);
+        let parent = parent.to_path_buf();
+        let hook = Arc::new(move || {
+            let temporary = fs::read_dir(&parent)?
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name().to_string_lossy().starts_with(".muxvia-"))
+                .ok_or_else(|| io::Error::other("temporary artifact was not present"))?
+                .path();
+            fs::remove_file(&temporary)?;
+            *removed_for_hook.lock().unwrap() = Some(temporary);
+            Ok(())
+        });
+        (hook, removed)
+    }
+
+    fn sync_with_failures_and_recreation(
+        failures: &[usize],
+        recreate_on: Option<usize>,
+        removed: Arc<Mutex<Option<PathBuf>>>,
+    ) -> (DirectorySyncHook, Arc<AtomicUsize>) {
+        let failures = failures.to_vec();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_hook = Arc::clone(&calls);
+        let hook = Arc::new(move || {
+            let call = calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            if failures.contains(&call) {
+                return Err(io::Error::other("injected directory sync failure"));
+            }
+            if recreate_on == Some(call) {
+                let temporary = removed
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| io::Error::other("removed artifact was not recorded"))?;
+                fs::write(temporary, b"attacker-recreated")?;
+            }
+            Ok(())
+        });
+        (hook, calls)
+    }
+
+    fn with_cleanup_hook(
+        home: &Path,
+        directory_sync_hook: DirectorySyncHook,
+        cleanup_hook: CleanupHook,
+    ) -> ManagedFile {
+        ManagedFile::build(
+            home,
+            ".target",
+            "settings",
+            ManagedFileHooks {
+                directory_sync: Some(directory_sync_hook),
+                rollback: Some(Arc::new(|| false)),
+                cleanup: Some(cleanup_hook),
+                ..ManagedFileHooks::default()
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -933,5 +1007,126 @@ mod tests {
             "credential-bearing temporary artifact remained after successful exchange"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn successful_exchange_external_cleanup_removal_is_durably_verified() {
+        let home = tempfile::TempDir::new().unwrap();
+        let plain = ManagedFile::in_configuration_home(home.path(), ".target", "settings").unwrap();
+        fs::create_dir_all(plain.path().parent().unwrap()).unwrap();
+        fs::write(plain.path(), b"operator-original").unwrap();
+        let before = plain.read().unwrap().identity;
+        let (cleanup_hook, removed) =
+            remove_temporary_before_cleanup(plain.path().parent().unwrap());
+        let (sync_hook, calls) = sync_with_failures_and_recreation(&[], None, removed);
+        let managed = with_cleanup_hook(home.path(), sync_hook, cleanup_hook);
+
+        managed
+            .replace(&before, b"routing-secret-sentinel", false)
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(temporary_artifacts(&managed).is_empty());
+    }
+
+    #[test]
+    fn successful_exchange_external_cleanup_removal_sync_failure_requires_recovery() {
+        let home = tempfile::TempDir::new().unwrap();
+        let plain = ManagedFile::in_configuration_home(home.path(), ".target", "settings").unwrap();
+        fs::create_dir_all(plain.path().parent().unwrap()).unwrap();
+        fs::write(plain.path(), b"operator-original").unwrap();
+        let before = plain.read().unwrap().identity;
+        let (cleanup_hook, removed) =
+            remove_temporary_before_cleanup(plain.path().parent().unwrap());
+        let (sync_hook, calls) = sync_with_failures_and_recreation(&[1], None, removed);
+        let managed = with_cleanup_hook(home.path(), sync_hook, cleanup_hook);
+
+        let error = managed
+            .replace(&before, b"routing-secret-sentinel", false)
+            .unwrap_err();
+
+        assert_eq!(error, ManagedFileError::RecoveryRequired);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn successful_exchange_external_cleanup_name_recreation_requires_recovery() {
+        let home = tempfile::TempDir::new().unwrap();
+        let plain = ManagedFile::in_configuration_home(home.path(), ".target", "settings").unwrap();
+        fs::create_dir_all(plain.path().parent().unwrap()).unwrap();
+        fs::write(plain.path(), b"operator-original").unwrap();
+        let before = plain.read().unwrap().identity;
+        let (cleanup_hook, removed) =
+            remove_temporary_before_cleanup(plain.path().parent().unwrap());
+        let (sync_hook, calls) = sync_with_failures_and_recreation(&[], Some(1), removed);
+        let managed = with_cleanup_hook(home.path(), sync_hook, cleanup_hook);
+
+        let error = managed
+            .replace(&before, b"routing-secret-sentinel", false)
+            .unwrap_err();
+
+        assert_eq!(error, ManagedFileError::RecoveryRequired);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn rollback_external_cleanup_removal_is_durably_verified() {
+        let home = tempfile::TempDir::new().unwrap();
+        let plain = ManagedFile::in_configuration_home(home.path(), ".target", "settings").unwrap();
+        fs::create_dir_all(plain.path().parent().unwrap()).unwrap();
+        fs::write(plain.path(), b"operator-original").unwrap();
+        let before = plain.read().unwrap().identity;
+        let (cleanup_hook, removed) =
+            remove_temporary_before_cleanup(plain.path().parent().unwrap());
+        let (sync_hook, calls) = sync_with_failures_and_recreation(&[0], None, removed);
+        let managed = with_cleanup_hook(home.path(), sync_hook, cleanup_hook);
+
+        let error = managed
+            .replace(&before, b"routing-secret-sentinel", false)
+            .unwrap_err();
+
+        assert_eq!(error, ManagedFileError::WriteFailed);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(temporary_artifacts(&managed).is_empty());
+    }
+
+    #[test]
+    fn rollback_external_cleanup_removal_sync_failure_requires_recovery() {
+        let home = tempfile::TempDir::new().unwrap();
+        let plain = ManagedFile::in_configuration_home(home.path(), ".target", "settings").unwrap();
+        fs::create_dir_all(plain.path().parent().unwrap()).unwrap();
+        fs::write(plain.path(), b"operator-original").unwrap();
+        let before = plain.read().unwrap().identity;
+        let (cleanup_hook, removed) =
+            remove_temporary_before_cleanup(plain.path().parent().unwrap());
+        let (sync_hook, calls) = sync_with_failures_and_recreation(&[0, 2], None, removed);
+        let managed = with_cleanup_hook(home.path(), sync_hook, cleanup_hook);
+
+        let error = managed
+            .replace(&before, b"routing-secret-sentinel", false)
+            .unwrap_err();
+
+        assert_eq!(error, ManagedFileError::RecoveryRequired);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn rollback_external_cleanup_name_recreation_requires_recovery() {
+        let home = tempfile::TempDir::new().unwrap();
+        let plain = ManagedFile::in_configuration_home(home.path(), ".target", "settings").unwrap();
+        fs::create_dir_all(plain.path().parent().unwrap()).unwrap();
+        fs::write(plain.path(), b"operator-original").unwrap();
+        let before = plain.read().unwrap().identity;
+        let (cleanup_hook, removed) =
+            remove_temporary_before_cleanup(plain.path().parent().unwrap());
+        let (sync_hook, calls) = sync_with_failures_and_recreation(&[0], Some(2), removed);
+        let managed = with_cleanup_hook(home.path(), sync_hook, cleanup_hook);
+
+        let error = managed
+            .replace(&before, b"routing-secret-sentinel", false)
+            .unwrap_err();
+
+        assert_eq!(error, ManagedFileError::RecoveryRequired);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }

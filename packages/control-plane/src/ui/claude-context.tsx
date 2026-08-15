@@ -2,11 +2,13 @@ import { useTerminalDimensions } from "@opentui/solid"
 import { Show } from "solid-js"
 
 import type { Translator } from "../i18n"
+import type { Target } from "../control/types"
 import { theme } from "../theme"
 import { ActionPrompt } from "./action-prompt"
 import { Logo } from "./logo"
 
 export interface ClaudeContextProps {
+  target: Target
   t: Translator
   notice?: string
   onUnknown: (input: string) => void
@@ -21,8 +23,7 @@ export function ClaudeContext(props: ClaudeContextProps) {
         <scrollbox flexGrow={1} flexShrink={1} paddingTop={Math.max(0, Math.min(1, dimensions().height - 1))}>
           <box flexDirection="column" rowGap={1}>
             <Logo />
-            <text fg={theme.text}>{props.t("target.claude")}</text>
-            <text fg={theme.muted}>{props.t("target.claude.unavailable")}</text>
+            <text fg={theme.text}>{props.t(props.target === "claude" ? "target.claude" : "target.codex")}</text>
             <text fg={theme.muted}>{props.t("target.claude.return")}</text>
             <Show when={props.notice}>
               <text fg={theme.error}>{props.notice}</text>

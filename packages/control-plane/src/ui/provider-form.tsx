@@ -3,7 +3,7 @@ import { useKeyboard, usePaste } from "@opentui/solid"
 import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js"
 
 import { useCommandLayer } from "../commands/keymap"
-import type { DiscoverySource, ModelDiscoveryResult, TargetAction } from "../control/types"
+import type { DiscoverySource, ModelDiscoveryResult, Target, TargetAction } from "../control/types"
 import { inspectionErrorKey, type Translator } from "../i18n"
 import { theme } from "../theme"
 import { useOverlay } from "./overlay-stack"
@@ -16,6 +16,7 @@ export interface ProviderDraft {
   providerId?: string
   providerRevision?: number
   presetKey?: "openai-api-responses" | "anthropic-api-messages" | null
+  authentication?: "openai-bearer" | "anthropic-api-key" | "anthropic-bearer"
 }
 
 export type ProviderFormResult = Extract<TargetAction,
@@ -23,6 +24,7 @@ export type ProviderFormResult = Extract<TargetAction,
 >
 
 export interface ProviderFormProps {
+  target: Target
   mode: "create" | "edit" | "duplicate"
   initialDraft: ProviderDraft
   credentialPresence: "present" | "missing"
@@ -52,6 +54,9 @@ export function ProviderForm(props: ProviderFormProps) {
   const [baseUrl, setBaseUrl] = createSignal(props.initialDraft.baseUrl)
   const [model, setModel] = createSignal(props.initialDraft.model)
   const [credential, setCredential] = createSignal("")
+  const [authentication, setAuthentication] = createSignal(
+    props.initialDraft.authentication ?? (props.target === "claude" ? "anthropic-api-key" : "openai-bearer"),
+  )
   const [credentialIntent, setCredentialIntent] = createSignal<CredentialIntent>(
     props.mode === "create" || props.duplicateCredentialChoice === "without" ? "remove" : "keep",
   )
@@ -151,7 +156,7 @@ export function ProviderForm(props: ProviderFormProps) {
   }
   const submit = async () => {
     if (props.pending) return
-    const fields = { name: name(), baseUrl: baseUrl(), model: model() }
+    const fields = { name: name(), baseUrl: baseUrl(), model: model(), authentication: authentication() }
     const result: ProviderFormResult = props.mode === "create"
       ? { kind: "create-provider", ...fields, credential: credentialEdit(), presetKey: props.initialDraft.presetKey ?? null }
       : props.mode === "edit"
@@ -164,7 +169,9 @@ export function ProviderForm(props: ProviderFormProps) {
         }
         : {
           kind: "duplicate-provider",
-          ...fields,
+          name: fields.name,
+          baseUrl: fields.baseUrl,
+          model: fields.model,
           sourceProviderId: props.initialDraft.providerId!,
           sourceProviderRevision: props.initialDraft.providerRevision!,
           credential: credentialIntent() === "replace"
@@ -233,6 +240,11 @@ export function ProviderForm(props: ProviderFormProps) {
       "provider.credential.remove": removeCredential,
       "provider.models.refresh": refreshModels,
       "provider.models.select": openModelPicker,
+      "provider.authentication.toggle": () => {
+        if (props.target !== "claude") return
+        setAuthentication((current) => current === "anthropic-api-key" ? "anthropic-bearer" : "anthropic-api-key")
+        setDirty(true)
+      },
     },
   })
 
@@ -241,10 +253,12 @@ export function ProviderForm(props: ProviderFormProps) {
     if (key.name === "tab") {
       key.preventDefault()
       key.stopPropagation()
-      setFocus((current) => (current + (key.shift ? 3 : 1)) % 4)
+      const count = props.target === "claude" ? 5 : 4
+      setFocus((current) => (current + (key.shift ? count - 1 : 1)) % count)
       return
     }
-    if (focus() !== 3 || key.ctrl || key.meta || key.super || key.hyper) return
+    const credentialFocus = props.target === "claude" ? 4 : 3
+    if (focus() !== credentialFocus || key.ctrl || key.meta || key.super || key.hyper) return
     if (key.name === "backspace") {
       key.preventDefault()
       key.stopPropagation()
@@ -265,7 +279,8 @@ export function ProviderForm(props: ProviderFormProps) {
   })
 
   usePaste((event) => {
-    if (event.defaultPrevented || overlay.depth > 0 || focus() !== 3) return
+    const credentialFocus = props.target === "claude" ? 4 : 3
+    if (event.defaultPrevented || overlay.depth > 0 || focus() !== credentialFocus) return
     event.preventDefault()
     event.stopPropagation()
     const value = new TextDecoder().decode(event.bytes).replace(/[\r\n]/g, "")
@@ -303,7 +318,15 @@ export function ProviderForm(props: ProviderFormProps) {
         <input ref={(input: InputRenderable) => { inputs[2] = input }} {...inputStyle} focused={focus() === 2} value={model()} onInput={update(model, setModel)} placeholder={props.t("provider.placeholder.model")} />
       </box>
       <box flexDirection="column">
-        <text fg={focus() === 3 ? theme.primary : theme.muted}>{props.t("provider.field.credential")}</text>
+        <Show when={props.target === "claude"}>
+          <box flexDirection="column">
+            <text fg={focus() === 3 ? theme.primary : theme.muted}>{props.t("provider.field.authentication")}</text>
+            <text fg={theme.text} bg={theme.element}>{props.t(authentication() === "anthropic-api-key" ? "provider.authentication.api-key" : "provider.authentication.bearer")}</text>
+          </box>
+        </Show>
+      </box>
+      <box flexDirection="column">
+        <text fg={focus() === (props.target === "claude" ? 4 : 3) ? theme.primary : theme.muted}>{props.t("provider.field.credential")}</text>
         <text fg={theme.text} bg={theme.element}>{credential() ? "•".repeat(credential().length) : credentialPlaceholder()}</text>
       </box>
       <Show when={discovery().status !== "idle"}>

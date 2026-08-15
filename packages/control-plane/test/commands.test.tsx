@@ -263,8 +263,10 @@ test("slash and leader resolve one exact Codex Direct Activation command", async
   }
 })
 
-test("slash commands reject names outside the active scope", () => {
-  expect(resolveSlash("/provider", "claude")).toBeUndefined()
+test("Claude accepts Provider and Takeover commands but rejects Direct", () => {
+  expect(resolveSlash("/provider", "claude")).toBe("provider.create")
+  expect(resolveSlash("/takeover", "claude")).toBe("target.takeover.apply")
+  expect(resolveSlash("/direct", "claude")).toBeUndefined()
 })
 
 test("an overlay layer consumes escape before route and global layers", async () => {

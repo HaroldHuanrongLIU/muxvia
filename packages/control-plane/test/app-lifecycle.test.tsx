@@ -193,12 +193,60 @@ test("an available service connects before rendering and never spawns", async ()
     await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
     setup.mockInput.pressCtrlC()
     await running
-    expect(events).toEqual(["connect", "render"])
+    expect(events).toEqual(["connect", "connect", "render"])
     expect(session.closeCalls).toBe(1)
     expect(destroyCalls()).toBe(1)
     expect(exitSpy).not.toHaveBeenCalled()
   } finally {
     exitSpy.mockRestore()
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("startup opens independent Codex and Claude sessions and closes each exactly once", async () => {
+  const { setup } = await rendererFixture()
+  const codex = new LifecycleSession()
+  const claude = new LifecycleSession()
+  const targets: string[] = []
+  const running = run(options, ports(setup, codex, {
+    connect: async (_socketPath, _release, _signal, target) => {
+      targets.push(target)
+      return target === "codex" ? codex : claude
+    },
+  }))
+  try {
+    await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
+    setup.mockInput.pressCtrlC()
+    await running
+    expect(targets).toEqual(["codex", "claude"])
+    expect(codex.closeCalls).toBe(1)
+    expect(claude.closeCalls).toBe(1)
+  } finally {
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("one unavailable target remains target-local while its peer renders and closes normally", async () => {
+  const { setup } = await rendererFixture()
+  const codex = new LifecycleSession()
+  const running = run(options, ports(setup, codex, {
+    connect: async (_socketPath, _release, _signal, target) => {
+      if (target === "claude") throw Object.assign(new Error("Claude unavailable"), { code: "incompatible-target-cli" })
+      return codex
+    },
+  }))
+  try {
+    await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
+    setup.mockInput.pressKey("2")
+    await setup.waitForFrame((frame) => frame.includes("Claude Code") && frame.includes("incompatible"))
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
+    setup.mockInput.pressKey("1")
+    await setup.waitForFrame((frame) => frame.includes("Mode") && frame.includes("Codex"))
+    setup.mockInput.pressCtrlC()
+    await running
+    expect(codex.closeCalls).toBe(1)
+  } finally {
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()
   }
 })
@@ -222,7 +270,7 @@ test("an unavailable socket directly spawns the absolute sidecar with its Muxvia
     await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
     setup.mockInput.pressCtrlC()
     await running
-    expect(attempts).toHaveLength(2)
+    expect(attempts).toHaveLength(3)
     expect(spawns).toEqual([{
       path: "/opt/muxvia/muxvia-routing",
       args: ["--home", "/tmp/operator-home/.muxvia"],

@@ -192,7 +192,7 @@ test("starts on Home and routes to and from the Codex context", async () => {
       "Codex CLI",
       "Providers, configuration, and routed model access",
       "Claude Code",
-      "Selectable context",
+      "Providers, configuration, and routed model access",
       "Choose a target or enter a command",
       "ctrl+p commands",
     ])
@@ -235,7 +235,7 @@ test("starts on Home and routes to and from the Codex context", async () => {
   }
 })
 
-test("opens the localized Claude context without operating the Codex session", async () => {
+test("renders a localized unavailable Claude target without operating the Codex session", async () => {
   const session = new MemoryTargetSession(view())
   const setup = await testRender(() => <App session={session} locale="zh-CN" />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
   try {
@@ -243,7 +243,7 @@ test("opens the localized Claude context without operating the Codex session", a
     expect(setup.captureCharFrame()).toContain("MUXVIA")
     await setup.mockInput.typeText("/claude")
     setup.mockInput.pressEnter()
-    const claude = await setup.waitForFrame((frame) => frame.includes("此构建中不提供 Claude Code 管理功能"))
+    const claude = await setup.waitForFrame((frame) => frame.includes("路由服务不可用"))
     expect(claude).toContain("使用 Esc 或 /home 返回")
     expect(session.actions).toEqual([])
     expect(session.subscribeCalls).toBe(1)
@@ -253,11 +253,129 @@ test("opens the localized Claude context without operating the Codex session", a
     await setup.waitForFrame((frame) => frame.includes("选择 Target CLI 或输入命令"))
 
     setup.mockInput.pressKey("2")
-    await setup.waitForFrame((frame) => frame.includes("此构建中不提供 Claude Code 管理功能"))
+    await setup.waitForFrame((frame) => frame.includes("路由服务不可用"))
     setup.mockInput.pressEscape()
     await setup.waitForFrame((frame) => frame.includes("选择 Target CLI 或输入命令"))
     expect(session.actions).toEqual([])
     expect(session.subscribeCalls).toBe(1)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Claude uses its independent real Target session and exposes Takeover without Direct", async () => {
+  const codex = new MemoryTargetSession(view())
+  const claudeProvider = provider({
+    id: "00000000-0000-4000-8000-000000000051",
+    name: "Claude Provider",
+    baseUrl: "https://api.anthropic.com/v1",
+    model: "claude-test",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-api-key",
+    routingRequirement: "takeover-required",
+  })
+  const claude = new MemoryTargetSession(view({
+    target: "claude",
+    providers: [claudeProvider],
+    providerPresets: [{
+      key: "anthropic-api-messages",
+      baseUrl: "https://api.anthropic.com/v1",
+      model: "",
+      protocol: "anthropic-messages",
+      authentication: "anthropic-api-key",
+    }],
+  }))
+  const setup = await testRender(
+    () => <App sessions={{ codex, claude }} />,
+    { width: 121, height: 30, useThread: false, kittyKeyboard: true },
+  )
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    const frame = await setup.waitForFrame((next) => next.includes("Claude Provider"))
+    expect(frame).toContain("Claude Code")
+    expect(frame).toContain("Claude · Control Plane")
+    expect(frame).not.toContain("Direct Activation")
+    expect(codex.actions).toEqual([])
+
+    await setup.mockInput.typeText("/takeover")
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => claude.actions.length === 1)
+    expect(claude.actions).toEqual([{
+      kind: "activate-provider",
+      providerId: claudeProvider.id,
+      mode: "takeover",
+    }])
+    expect(codex.actions).toEqual([])
+
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((next) => next.includes("Providers") && next.includes("Claude Provider"))
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("a")
+    await setup.waitFor(() => claude.actions.length === 2)
+    expect(claude.actions[1]).toEqual({
+      kind: "activate-provider",
+      providerId: claudeProvider.id,
+      mode: "takeover",
+    })
+    expect(codex.actions).toEqual([])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("switching targets suppresses stale Claude completion while retaining its target-owned view", async () => {
+  const pending = deferred<ActionOutcome>()
+  const codex = new MemoryTargetSession(view())
+  const claudeProvider = provider({
+    id: "00000000-0000-4000-8000-000000000061",
+    name: "Async Claude Provider",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-bearer",
+    routingRequirement: "takeover-required",
+  })
+  const claudeInitial = view({ target: "claude", providers: [claudeProvider] })
+  const claudeApplied = view({
+    target: "claude",
+    managementRevision: 1,
+    viewSequence: 1,
+    mode: "takeover",
+    takeover: { state: "active", endpoint: "http://127.0.0.1:43123" },
+    providers: [claudeProvider],
+    currentProviderId: claudeProvider.id,
+  })
+  const claude = new MemoryTargetSession(claudeInitial, async () => await pending.promise)
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
+    width: 80,
+    height: 24,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.mockInput.typeText("/takeover")
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => claude.actions.length === 1)
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
+    setup.mockInput.pressKey("1")
+    await setup.waitForFrame((frame) => frame.includes("Codex · Control Plane"))
+
+    pending.resolve({ status: "applied", view: claudeApplied })
+    await flushUi(setup)
+    const codexFrame = setup.captureCharFrame()
+    expect(codexFrame).toContain("Codex · Control Plane")
+    expect(codexFrame).not.toContain("Target Takeover applied")
+    expect(codex.actions).toEqual([])
+
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
+    setup.mockInput.pressKey("2")
+    const claudeFrame = await setup.waitForFrame((frame) => frame.includes("Mode") && frame.includes("Takeover"))
+    expect(claudeFrame).toContain("Async Claude Provider")
+    expect(claudeFrame).not.toContain("Target Takeover applied")
   } finally {
     setup.renderer.destroy()
   }

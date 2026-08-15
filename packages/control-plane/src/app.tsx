@@ -5,6 +5,7 @@ import { dirname, isAbsolute } from "node:path"
 
 import { RpcClient, ControlError } from "./control/rpc-client"
 import type { TargetSession } from "./control/target-session"
+import type { ClaudePreflightContext, Target } from "./control/types"
 import { resolveLocale } from "./i18n"
 import { App } from "./ui/app"
 
@@ -31,7 +32,13 @@ interface SpawnOptions {
 }
 
 export interface RunPorts {
-  connect(socketPath: string, release: string, signal: AbortSignal): Promise<TargetSession>
+  connect(
+    socketPath: string,
+    release: string,
+    signal: AbortSignal,
+    target: Target,
+    claudeContext?: ClaudePreflightContext,
+  ): Promise<TargetSession>
   spawn(path: string, args: string[], options: SpawnOptions): void
   createRenderer(): Promise<CliRenderer>
   render(node: () => JSX.Element, renderer: CliRenderer): Promise<void>
@@ -43,7 +50,7 @@ const readinessTimeoutMs = 2_000
 const retryIntervalMs = 50
 
 interface TargetControl {
-  openTarget(target: "codex"): Promise<TargetSession>
+  openTarget(target: Target, claudeContext?: ClaudePreflightContext): Promise<TargetSession>
   close(): Promise<void>
 }
 
@@ -57,8 +64,12 @@ export async function connectTargetSession(
   socketPath: string,
   release: string,
   signal: AbortSignal,
-  connect: ControlConnector = RpcClient.connect,
+  targetOrConnect: Target | ControlConnector = "codex",
+  connectOverride?: ControlConnector,
+  claudeContext?: ClaudePreflightContext,
 ): Promise<TargetSession> {
+  const target = typeof targetOrConnect === "function" ? "codex" : targetOrConnect
+  const connect = typeof targetOrConnect === "function" ? targetOrConnect : connectOverride ?? RpcClient.connect
   if (signal.aborted) throw new ConnectionDeadlineError()
 
   let control: TargetControl | undefined
@@ -87,7 +98,7 @@ export async function connectTargetSession(
 
   try {
     control = await Promise.race([connected, aborted])
-    const opening = control.openTarget("codex").then(async (session) => {
+    const opening = control.openTarget(target, target === "claude" ? claudeContext : undefined).then(async (session) => {
       if (!signal.aborted) return session
       await closeControl()
       throw new ConnectionDeadlineError()
@@ -110,7 +121,8 @@ export function createProductionRenderer(): Promise<CliRenderer> {
 }
 
 const productionPorts: RunPorts = {
-  connect: connectTargetSession,
+  connect: (socketPath, release, signal, target, claudeContext) =>
+    connectTargetSession(socketPath, release, signal, target, undefined, claudeContext),
   spawn: (path, args) => {
     const child = spawn(path, args, { shell: false, detached: true, stdio: "ignore" })
     child.unref()
@@ -153,6 +165,8 @@ async function connectBeforeDeadline(
   ports: RunPorts,
   deadline: number,
   cancellation: AbortSignal,
+  target: Target,
+  claudeContext?: ClaudePreflightContext,
 ): Promise<TargetSession> {
   if (cancellation.aborted) throw new ConnectionCancelledError()
   const remaining = deadline - ports.clock.now()
@@ -180,7 +194,7 @@ async function connectBeforeDeadline(
     if (cancellation.aborted) onCancel()
   })
   const connection = Promise.resolve()
-    .then(() => ports.connect(options.socketPath, options.release, controller.signal))
+    .then(() => ports.connect(options.socketPath, options.release, controller.signal, target, claudeContext))
     .then(async (session) => {
       if (cancellation.aborted) {
         try {
@@ -213,10 +227,13 @@ async function connectOrStart(
   options: RunOptions,
   ports: RunPorts,
   cancellation: AbortSignal,
+  target: Target,
+  spawnState: { started: boolean },
+  claudeContext?: ClaudePreflightContext,
 ): Promise<TargetSession | undefined> {
   const deadline = ports.clock.now() + readinessTimeoutMs
   try {
-    return await connectBeforeDeadline(options, ports, deadline, cancellation)
+    return await connectBeforeDeadline(options, ports, deadline, cancellation, target, claudeContext)
   } catch (error) {
     if (cancellation.aborted) return undefined
     if (error instanceof ConnectionCancelledError) return undefined
@@ -229,12 +246,15 @@ async function connectOrStart(
   if (!isAbsolute(options.servicePath)) {
     throw new Error("Routing Service path must be absolute")
   }
-  ports.spawn(options.servicePath, ["--home", muxviaHomeForSocket(options.socketPath)], { shell: false })
+  if (!spawnState.started) {
+    spawnState.started = true
+    ports.spawn(options.servicePath, ["--home", muxviaHomeForSocket(options.socketPath)], { shell: false })
+  }
 
   while (ports.clock.now() < deadline) {
     if (cancellation.aborted) return undefined
     try {
-      return await connectBeforeDeadline(options, ports, deadline, cancellation)
+      return await connectBeforeDeadline(options, ports, deadline, cancellation, target, claudeContext)
     } catch (error) {
       if (cancellation.aborted) return undefined
       if (error instanceof ConnectionCancelledError) return undefined
@@ -260,25 +280,81 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
       if (!renderer.isDestroyed) renderer.destroy()
     }),
   )
-  let session: TargetSession | undefined
+  const sessions: Partial<Record<Target, TargetSession>> = {}
+  const unavailable: Partial<Record<Target, string>> = {}
+  const spawnState = { started: false }
+  const claudeContext = claudePreflightContext(process.env)
+  let firstConnectionFailure: unknown
   try {
     if (renderer.isDestroyed) return
-    session = await connectOrStart(options, ports, startup.signal)
-    if (!session || renderer.isDestroyed) return
-    await ports.render(() => <App session={session!} locale={locale} />, renderer)
-    const sessionClosed = session.whenClosed().then(
-      () => { if (!renderer.isDestroyed) renderer.destroy() },
-      () => { if (!renderer.isDestroyed) renderer.destroy() },
-    )
-    await Promise.race([destroyed, sessionClosed])
+    for (const target of ["codex", "claude"] as const) {
+      try {
+        const session = await connectOrStart(
+          options,
+          ports,
+          startup.signal,
+          target,
+          spawnState,
+          target === "claude" ? claudeContext : undefined,
+        )
+        if (session) sessions[target] = session
+      } catch (error) {
+        if (error instanceof ConnectionDeadlineError) throw error
+        firstConnectionFailure ??= error
+        unavailable[target] = typeof error === "object" && error !== null && "code" in error
+          ? String(error.code)
+          : "service-unavailable"
+      }
+    }
+    if (renderer.isDestroyed) return
+    if (Object.keys(sessions).length === 0) throw firstConnectionFailure ?? new ConnectionDeadlineError()
+    await ports.render(() => <App sessions={sessions} unavailable={unavailable} locale={locale} />, renderer)
+    const uniqueSessions = [...new Set(Object.values(sessions))]
+    const allSessionsClosed = Promise.all(uniqueSessions.map((session) => session.whenClosed().catch(() => {})))
+      .then(() => { if (!renderer.isDestroyed) renderer.destroy() })
+    await Promise.race([destroyed, allSessionsClosed])
   } finally {
     for (const stop of stopListening) stop()
     try {
       renderer.setTerminalTitle("")
-      if (session) await session.close()
+      await Promise.all([...new Set(Object.values(sessions))].map((session) => session.close().catch(() => {})))
     } finally {
       if (!renderer.isDestroyed) renderer.destroy()
       await destroyed
     }
   }
+}
+
+function claudePreflightContext(environment: NodeJS.ProcessEnv): ClaudePreflightContext {
+  const selectorNames = [
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+  ] as const
+  const normalized = selectorNames.map((name) => normalizeSelector(environment[name]))
+  const selectorState = normalized.includes("enabled")
+    ? "enabled"
+    : normalized.includes("unknown-nonempty")
+      ? "unknown-nonempty"
+      : normalized.every((state) => state === "unset") ? "unset" : "disabled"
+  return {
+    claudeConfigDir: environment.CLAUDE_CONFIG_DIR ?? null,
+    selectorState,
+    hostManagedState: (() => {
+      const state = normalizeSelector(environment.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST)
+      if (state === "enabled") return "managed"
+      if (state === "unknown-nonempty") return "unknown"
+      return "unmanaged"
+    })(),
+    cwd: process.cwd(),
+  }
+}
+
+function normalizeSelector(value: string | undefined): "unset" | "disabled" | "enabled" | "unknown-nonempty" {
+  if (value === undefined || value === "") return "unset"
+  if (value === "0" || value === "false") return "disabled"
+  if (value === "1" || value === "true") return "enabled"
+  return "unknown-nonempty"
 }

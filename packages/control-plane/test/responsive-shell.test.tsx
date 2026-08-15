@@ -132,7 +132,7 @@ test("Claude renders the exact extreme-size matrix without excluded application 
   try {
     await setup.renderOnce()
     setup.mockInput.pressKey("2")
-    await setup.waitForFrame((frame) => frame.includes("Claude Code management is not available"))
+    await setup.waitForFrame((frame) => frame.includes("Routing Service is unavailable"))
     await expectSizeMatrix(setup)
   } finally {
     setup.renderer.destroy()

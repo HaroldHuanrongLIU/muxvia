@@ -2,7 +2,7 @@ import type { InputRenderable, KeyEvent } from "@opentui/core"
 import { createEffect, createSignal, For, onMount, Show, type Accessor } from "solid-js"
 
 import { useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
-import type { ReachabilityResult, TargetView } from "../control/types"
+import type { ReachabilityResult, Target, TargetView } from "../control/types"
 import { inspectionErrorKey, type Translator } from "../i18n"
 import { theme } from "../theme"
 import { useOverlay } from "./overlay-stack"
@@ -10,14 +10,17 @@ import { useOverlay } from "./overlay-stack"
 type Provider = TargetView["providers"][number]
 
 export interface ProviderPickerProps {
+  target: Target
   providers: Accessor<readonly Provider[]>
   selectedId: Accessor<string | undefined>
   t: Translator
   pending: Accessor<boolean>
   activationMode: Accessor<"direct" | "takeover" | undefined>
+  allowDirect: Accessor<boolean>
   onSelectedIdChange: (id: string | undefined) => void
   onEdit: () => void
   onActivateDirect: () => void
+  onActivateTakeover: () => void
   onDuplicate: () => void
   reachability: Accessor<{
     pending: boolean
@@ -52,12 +55,13 @@ export function ProviderPicker(props: ProviderPickerProps) {
   })
 
   useCommandLayer({
-    scope: "provider-picker",
+    scope: props.target === "claude" ? "provider-picker-claude" : "provider-picker",
     priority: 300,
     enabled: () => overlay.depth === 1 && !props.pending(),
     handlers: {
       "provider.edit": props.onEdit,
-      "provider.activate.direct": props.onActivateDirect,
+      ...(props.allowDirect() ? { "provider.activate.direct": props.onActivateDirect } : {}),
+      ...(props.target === "claude" ? { "provider.activate.takeover": props.onActivateTakeover } : {}),
       "provider.duplicate": props.onDuplicate,
       "provider.reachability.check": props.onCheckReachability,
       "provider.move-up": () => props.onMove(-1),

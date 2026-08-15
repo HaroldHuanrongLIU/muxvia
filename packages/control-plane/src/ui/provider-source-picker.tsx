@@ -58,7 +58,9 @@ export function ProviderSourcePicker(props: {
   }
   const label = (source: ProviderSource) => source.kind === "blank"
     ? props.t("provider.source.blank")
-    : props.t("provider.preset.openai-api-responses")
+    : props.t(source.preset.key === "anthropic-api-messages"
+      ? "provider.preset.anthropic-api-messages"
+      : "provider.preset.openai-api-responses")
 
   return <box flexDirection="column" padding={1} rowGap={1} backgroundColor={theme.panel}>
     <text fg={theme.text}>{props.t("provider.source.title")}</text>

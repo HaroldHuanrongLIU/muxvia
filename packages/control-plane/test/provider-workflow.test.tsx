@@ -373,6 +373,7 @@ test("a failed explicit credential removal retries an edit with Remove", async (
   function Harness() {
     keymap = useMuxviaKeymap()
     return <ProviderForm
+      target="codex"
       mode="edit"
       initialDraft={{
         name: "First Provider",
@@ -561,9 +562,75 @@ test("Preset source selection copies an ordinary draft without discovery and sav
       name: "Official Copy",
       baseUrl: "https://api.openai.com/v1",
       model: "",
+      authentication: "openai-bearer",
       credential: { kind: "remove" },
       presetKey: "openai-api-responses",
     }])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Claude Provider editor selects Bearer authentication and dispatches only its Target session", async () => {
+  const codex = new MemoryTargetSession(view())
+  const claudeInitial = view({
+    target: "claude",
+    providerPresets: [{
+      key: "anthropic-api-messages",
+      baseUrl: "https://api.anthropic.com/v1",
+      model: "",
+      protocol: "anthropic-messages",
+      authentication: "anthropic-api-key",
+    }],
+  })
+  const claude = new MemoryTargetSession(claudeInitial, async () => ({ status: "applied", view: claudeInitial }))
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
+    width: 80,
+    height: 24,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.mockInput.typeText("/provider")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Anthropic API (Messages)"))
+    setup.mockInput.pressKey("down")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Anthropic API key"))
+    await setup.renderOnce()
+
+    await setup.mockInput.typeText("Claude Bearer")
+    setup.mockInput.pressTab()
+    await setup.renderOnce()
+    setup.mockInput.pressTab()
+    await setup.renderOnce()
+    await setup.mockInput.typeText("claude-test")
+    setup.mockInput.pressTab()
+    await setup.renderOnce()
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("h")
+    setup.mockInput.pressTab()
+    await setup.renderOnce()
+    await setup.mockInput.typeText(credentialSecret)
+
+    const safeFrame = setup.captureCharFrame()
+    expect(safeFrame).not.toContain(credentialSecret)
+    expect(safeFrame).toContain("Anthropic Bearer token")
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => claude.actions.length === 1)
+    expect(claude.actions).toEqual([{
+      kind: "create-provider",
+      name: "Claude Bearer",
+      baseUrl: "https://api.anthropic.com/v1",
+      model: "claude-test",
+      authentication: "anthropic-bearer",
+      credential: { kind: "replace", valuePresent: true },
+      presetKey: "anthropic-api-messages",
+    }])
+    expect(codex.actions).toEqual([])
+    expect(JSON.stringify(claude.actions)).not.toContain(credentialSecret)
   } finally {
     setup.renderer.destroy()
   }

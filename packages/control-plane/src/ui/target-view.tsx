@@ -50,7 +50,7 @@ export function TargetView(props: TargetViewProps) {
   return (
     <box flexDirection="column" rowGap={1}>
       <text fg={theme.primary}>MUXVIA</text>
-      <text fg={theme.text}>{props.t("target.codex")}</text>
+      <text fg={theme.text}>{props.t(props.view.target === "claude" ? "target.claude" : "target.codex")}</text>
       <box flexDirection="column">
         <text fg={theme.text}>{status("status.mode", labelTargetState(props.t, props.view.mode))}</text>
         <text fg={theme.text}>{status("status.current", providerName(props.view, props.view.currentProviderId, props.t))}</text>
@@ -69,7 +69,7 @@ export function TargetView(props: TargetViewProps) {
       )}</For>
 
       <Show when={props.view.managedConfiguration.restartRequired}>
-        <text fg={theme.warning}>{props.t("activity.restart")}</text>
+        <text fg={theme.warning}>{props.t(props.view.target === "claude" ? "activity.restart.claude" : "activity.restart")}</text>
       </Show>
       <For each={props.view.problems}>{(problem) => (
         <text fg={theme.error}>{problemText(problem.code)}</text>

@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use muxvia_routing::{
     claude::{
         ClaudeCapability, ClaudeConfigCodec, ClaudeProbe, ClaudeRuntimeShadow, CommandClaudeProbe,
+        DesiredClaudeState,
     },
     control::protocol::{
         ClaudeBlockingSelector, ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState,
@@ -38,32 +39,47 @@ fn fixture(source: &str) -> (TempDir, ClaudeConfigCodec) {
     (home, codec)
 }
 
+fn secret_json_string_matches(
+    value: &serde_json::Value,
+    expected: &str,
+) -> Result<(), &'static str> {
+    if value.as_str() == Some(expected) {
+        Ok(())
+    } else {
+        Err("secret JSON value mismatch")
+    }
+}
+
 #[test]
-fn absent_file_apply_owns_only_three_env_members_and_restore_removes_it() {
+fn direct_absent_file_apply_owns_four_fields_and_restore_removes_it() {
     let home = TempDir::new().unwrap();
     let codec = ClaudeConfigCodec::for_user_home(home.path()).unwrap();
     let before = codec.inspect().unwrap();
-    let desired = codec.desired_takeover(
-        "claude-sonnet-test",
-        "http://127.0.0.1:43124",
-        "routing-secret",
-    );
+    let desired: DesiredClaudeState = serde_json::from_value(serde_json::json!({
+        "ownership_version": 2,
+        "mode": "direct",
+        "owned": {
+            "base_url": "https://provider.example",
+            "auth_token": "provider-secret",
+            "model": "claude-sonnet-test",
+            "api_key": null
+        }
+    }))
+    .unwrap();
 
     codec.atomic_apply(&before, &desired).unwrap();
 
+    let applied: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(codec.settings_path()).unwrap()).unwrap();
+    let env = applied["env"].as_object().unwrap();
+    secret_json_string_matches(&applied["env"]["ANTHROPIC_AUTH_TOKEN"], "provider-secret").unwrap();
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(
-            &fs::read_to_string(codec.settings_path()).unwrap()
-        )
-        .unwrap(),
-        serde_json::json!({
-            "env": {
-                "ANTHROPIC_BASE_URL": "http://127.0.0.1:43124",
-                "ANTHROPIC_AUTH_TOKEN": "routing-secret",
-                "ANTHROPIC_MODEL": "claude-sonnet-test"
-            }
-        })
+        applied["env"]["ANTHROPIC_BASE_URL"],
+        "https://provider.example"
     );
+    assert_eq!(applied["env"]["ANTHROPIC_MODEL"], "claude-sonnet-test");
+    assert!(!env.contains_key("ANTHROPIC_API_KEY"));
+    assert_eq!(env.len(), 3);
     codec.restore(&before, &desired).unwrap();
     assert!(!codec.settings_path().exists());
 }

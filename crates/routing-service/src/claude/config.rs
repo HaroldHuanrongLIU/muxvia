@@ -13,7 +13,7 @@ use crate::{
     config::managed_file::{FileIdentity, ManagedFile, ManagedFileError, PreRenameHook},
     control::protocol::{
         ClaudeBlockingSelector, ClaudeHostManagedState, ClaudePreflightContext,
-        ClaudeSelectorState, Target,
+        ClaudeSelectorState, ProviderAuthentication, Target,
     },
     state::{RecoveryIntent, RecoveryState, StateStore},
 };
@@ -81,6 +81,21 @@ fn legacy_ownership() -> ClaudeConfigOwnership {
     ClaudeConfigOwnership::LegacyThree
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ManagedClaudeMode {
+    Direct,
+    Takeover,
+}
+
+fn takeover_mode() -> ManagedClaudeMode {
+    ManagedClaudeMode::Takeover
+}
+
+fn is_takeover_mode(mode: &ManagedClaudeMode) -> bool {
+    *mode == ManagedClaudeMode::Takeover
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct OwnedClaudeState {
     base_url: Option<Value>,
@@ -106,6 +121,8 @@ impl fmt::Debug for OwnedClaudeState {
 pub struct DesiredClaudeState {
     #[serde(default = "legacy_ownership")]
     ownership_version: ClaudeConfigOwnership,
+    #[serde(default = "takeover_mode", skip_serializing_if = "is_takeover_mode")]
+    mode: ManagedClaudeMode,
     owned: OwnedClaudeState,
 }
 
@@ -119,6 +136,15 @@ impl DesiredClaudeState {
     pub(crate) fn ownership(&self) -> ClaudeConfigOwnership {
         self.ownership_version
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+// Landed before the activation transaction consumes typed Claude state.
+#[allow(dead_code)]
+pub(crate) enum ManagedClaudeState {
+    Unmanaged { snapshot: ClaudeConfigSnapshot },
+    Direct { snapshot: ClaudeConfigSnapshot },
+    Takeover { snapshot: ClaudeConfigSnapshot },
 }
 
 #[derive(Clone, Serialize)]
@@ -281,6 +307,47 @@ impl ClaudeConfigCodec {
         base_url: &str,
         routing_credential: &str,
     ) -> DesiredClaudeState {
+        self.desired_takeover_v2(model, base_url, routing_credential)
+    }
+
+    // Landed before Claude Direct is enabled at the activation boundary.
+    #[allow(dead_code)]
+    pub(crate) fn desired_direct(
+        &self,
+        model: &str,
+        base_url: &str,
+        authentication: ProviderAuthentication,
+        provider_credential: &str,
+    ) -> Result<DesiredClaudeState, ClaudeProblem> {
+        let (auth_token, api_key) = match authentication {
+            ProviderAuthentication::AnthropicBearer => {
+                (Some(Value::String(provider_credential.to_owned())), None)
+            }
+            ProviderAuthentication::AnthropicApiKey => {
+                (None, Some(Value::String(provider_credential.to_owned())))
+            }
+            ProviderAuthentication::OpenaiBearer => {
+                return Err(ClaudeProblem::new("invalid-provider", None));
+            }
+        };
+        Ok(DesiredClaudeState {
+            ownership_version: ClaudeConfigOwnership::FourField,
+            mode: ManagedClaudeMode::Direct,
+            owned: OwnedClaudeState {
+                base_url: Some(Value::String(base_url.to_owned())),
+                auth_token,
+                model: Some(Value::String(model.to_owned())),
+                api_key,
+            },
+        })
+    }
+
+    pub(crate) fn desired_takeover_v2(
+        &self,
+        model: &str,
+        base_url: &str,
+        routing_credential: &str,
+    ) -> DesiredClaudeState {
         self.desired_takeover_with_ownership(
             model,
             base_url,
@@ -298,6 +365,7 @@ impl ClaudeConfigCodec {
     ) -> DesiredClaudeState {
         DesiredClaudeState {
             ownership_version: ownership,
+            mode: ManagedClaudeMode::Takeover,
             owned: OwnedClaudeState {
                 base_url: Some(Value::String(base_url.to_owned())),
                 auth_token: Some(Value::String(routing_credential.to_owned())),
@@ -352,6 +420,36 @@ impl ClaudeConfigCodec {
                 Some(self.settings_path()),
             ))
         }
+    }
+
+    /// The expectation and its before snapshot must come from one authoritative committed
+    /// Recovery Intent. Matching user-authored values without that expectation remain unmanaged.
+    // Landed before the activation transaction supplies committed intent state.
+    #[allow(dead_code)]
+    pub(crate) fn inspect_managed_state(
+        &self,
+        committed: Option<(&DesiredClaudeState, &ClaudeConfigSnapshot)>,
+    ) -> Result<ManagedClaudeState, ClaudeProblem> {
+        let ownership = committed
+            .map(|(expected, _)| expected.ownership_version)
+            .unwrap_or(ClaudeConfigOwnership::FourField);
+        let current = self.inspect_with_ownership(ownership)?;
+        let Some((expected, committed_before)) = committed else {
+            return Ok(ManagedClaudeState::Unmanaged { snapshot: current });
+        };
+        if committed_before.ownership_version != ownership
+            || current.owned != expected.owned
+            || current.unrelated_fingerprint != committed_before.unrelated_fingerprint
+        {
+            return Err(ClaudeProblem::new(
+                "configuration-collision",
+                Some(self.settings_path()),
+            ));
+        }
+        Ok(match expected.mode {
+            ManagedClaudeMode::Direct => ManagedClaudeState::Direct { snapshot: current },
+            ManagedClaudeMode::Takeover => ManagedClaudeState::Takeover { snapshot: current },
+        })
     }
 
     pub fn restore(
@@ -815,4 +913,438 @@ fn map_file_error(error: ManagedFileError, path: Option<&Path>) -> ClaudeProblem
         ManagedFileError::RecoveryRequired => "recovery-required",
     };
     ClaudeProblem::new(code, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, sync::Mutex};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::control::protocol::ProviderAuthentication;
+
+    fn fixture(source: &str) -> (TempDir, ClaudeConfigCodec) {
+        let home = TempDir::new().expect("temporary home");
+        let codec = ClaudeConfigCodec::for_user_home(home.path()).expect("Claude codec");
+        fs::create_dir_all(codec.settings_path().parent().expect("settings parent"))
+            .expect("create Claude home");
+        fs::write(codec.settings_path(), source).expect("write settings fixture");
+        (home, codec)
+    }
+
+    fn read_settings(codec: &ClaudeConfigCodec) -> Value {
+        serde_json::from_slice(&fs::read(codec.settings_path()).expect("read settings"))
+            .expect("parse settings")
+    }
+
+    fn secret_json_string_matches(value: &Value, expected: &str) -> Result<(), &'static str> {
+        if value.as_str() == Some(expected) {
+            Ok(())
+        } else {
+            Err("secret JSON value mismatch")
+        }
+    }
+
+    #[test]
+    fn direct_bearer_sets_auth_token_removes_api_key_and_preserves_unrelated_semantics() {
+        let source = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://prior.example",
+                "ANTHROPIC_MODEL": "prior-model",
+                "ANTHROPIC_AUTH_TOKEN": "prior-auth-secret",
+                "ANTHROPIC_API_KEY": "prior-api-secret",
+                "OPERATOR_FLAG": {"nested": [1, true, null]}
+            },
+            "model": "operator-top-level-model",
+            "permissions": {"allow": ["Read"]}
+        });
+        let (_home, codec) = fixture(&source.to_string());
+        #[cfg(unix)]
+        fs::set_permissions(codec.settings_path(), fs::Permissions::from_mode(0o640))
+            .expect("set fixture mode");
+        let before = codec.inspect().expect("inspect settings");
+        let desired = codec
+            .desired_direct(
+                "claude-direct-model",
+                "https://direct.example",
+                ProviderAuthentication::AnthropicBearer,
+                "direct-bearer-secret",
+            )
+            .expect("valid bearer Direct state");
+
+        codec
+            .atomic_apply(&before, &desired)
+            .expect("apply bearer Direct state");
+
+        let after = read_settings(&codec);
+        assert_eq!(after["env"][BASE_URL_KEY], "https://direct.example");
+        assert_eq!(after["env"][MODEL_KEY], "claude-direct-model");
+        secret_json_string_matches(&after["env"][AUTH_TOKEN_KEY], "direct-bearer-secret").unwrap();
+        assert!(after["env"].get(API_KEY).is_none());
+        assert_eq!(
+            after["env"]["OPERATOR_FLAG"],
+            source["env"]["OPERATOR_FLAG"]
+        );
+        assert_eq!(after["model"], source["model"]);
+        assert_eq!(after["permissions"], source["permissions"]);
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(codec.settings_path())
+                .expect("settings metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn direct_api_key_restores_both_prior_credentials_and_preserves_later_unrelated_edits() {
+        let source = serde_json::json!({
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "prior-auth-secret",
+                "ANTHROPIC_API_KEY": "prior-api-secret",
+                "OPERATOR_FLAG": "keep"
+            }
+        });
+        let (_home, codec) = fixture(&source.to_string());
+        let before = codec.inspect().expect("inspect settings");
+        let desired = codec
+            .desired_direct(
+                "claude-api-model",
+                "https://api.example",
+                ProviderAuthentication::AnthropicApiKey,
+                "direct-api-secret",
+            )
+            .expect("valid API-key Direct state");
+
+        codec
+            .atomic_apply(&before, &desired)
+            .expect("apply API-key Direct state");
+        let mut live = read_settings(&codec);
+        assert!(live["env"].get(AUTH_TOKEN_KEY).is_none());
+        secret_json_string_matches(&live["env"][API_KEY], "direct-api-secret").unwrap();
+        live["operatorAfterApply"] = serde_json::json!({"keep": [1, 2, 3]});
+        fs::write(
+            codec.settings_path(),
+            serde_json::to_vec_pretty(&live).expect("serialize settings"),
+        )
+        .expect("write unrelated edit");
+
+        codec
+            .restore(&before, &desired)
+            .expect("restore prior state");
+
+        let restored = read_settings(&codec);
+        secret_json_string_matches(&restored["env"][AUTH_TOKEN_KEY], "prior-auth-secret").unwrap();
+        secret_json_string_matches(&restored["env"][API_KEY], "prior-api-secret").unwrap();
+        assert_eq!(restored["env"]["OPERATOR_FLAG"], "keep");
+        assert_eq!(
+            restored["operatorAfterApply"],
+            serde_json::json!({"keep": [1, 2, 3]})
+        );
+    }
+
+    #[test]
+    fn direct_diagnostics_are_fixed_and_secret_free() {
+        let (_home, codec) = fixture(r#"{"env":{"ANTHROPIC_API_KEY":"prior-92031"}}"#);
+        let before = codec.inspect().expect("inspect settings");
+        let desired = codec
+            .desired_direct(
+                "model-83017",
+                "https://base-64109.example",
+                ProviderAuthentication::AnthropicBearer,
+                "credential-75193",
+            )
+            .expect("valid Direct state");
+        codec
+            .atomic_apply(&before, &desired)
+            .expect("apply Direct state");
+        fs::write(
+            codec.settings_path(),
+            r#"{"env":{"ANTHROPIC_MODEL":48127}}"#,
+        )
+        .expect("write drifted settings");
+
+        let error = codec
+            .restore(&before, &desired)
+            .expect_err("owned drift must block restore");
+        let diagnostics = format!("{error:?}\n{error}\n{desired:?}\n{before:?}");
+        for forbidden in [
+            "prior-92031",
+            "model-83017",
+            "base-64109",
+            "credential-75193",
+            "48127",
+            "112, 114, 105, 111, 114",
+        ] {
+            assert!(
+                !diagnostics.contains(forbidden),
+                "Claude diagnostic exposed controlled secret material"
+            );
+        }
+        assert_eq!(error.code(), "recovery-required");
+    }
+
+    #[test]
+    fn direct_rejects_non_claude_authentication_without_writing() {
+        let (_home, codec) = fixture(r#"{"operator":"keep"}"#);
+        let error = codec
+            .desired_direct(
+                "model",
+                "https://base.example",
+                ProviderAuthentication::OpenaiBearer,
+                "credential-secret",
+            )
+            .expect_err("Codex authentication must be rejected");
+
+        let diagnostic = format!("{error:?}\n{error}");
+        assert!(!diagnostic.contains("credential-secret"));
+        assert_eq!(error.code(), "invalid-provider");
+        assert_eq!(read_settings(&codec)["operator"], "keep");
+    }
+
+    #[test]
+    fn managed_state_requires_a_caller_supplied_committed_expectation() {
+        let (_home, codec) = fixture(r#"{"env":{"OPERATOR_FLAG":"keep"}}"#);
+        let committed_before = codec.inspect().expect("inspect unmanaged settings");
+        let desired = codec
+            .desired_direct(
+                "model",
+                "https://base.example",
+                ProviderAuthentication::AnthropicBearer,
+                "credential-secret",
+            )
+            .expect("valid Direct state");
+        codec
+            .atomic_apply(&committed_before, &desired)
+            .expect("apply Direct state");
+
+        assert!(matches!(
+            codec
+                .inspect_managed_state(None)
+                .expect("inspect without ownership"),
+            ManagedClaudeState::Unmanaged { .. }
+        ));
+        assert!(matches!(
+            codec
+                .inspect_managed_state(Some((&desired, &committed_before)))
+                .expect("inspect committed Direct"),
+            ManagedClaudeState::Direct { .. }
+        ));
+    }
+
+    #[test]
+    fn managed_state_reports_owned_or_unrelated_committed_drift_as_collision() {
+        for mutate in [
+            |document: &mut Value| document["env"][MODEL_KEY] = Value::String("drift".into()),
+            |document: &mut Value| document["operator"] = Value::String("drift".into()),
+        ] {
+            let (_home, codec) = fixture(r#"{"operator":"keep"}"#);
+            let committed_before = codec.inspect().expect("inspect unmanaged settings");
+            let desired =
+                codec.desired_takeover_v2("model", "http://127.0.0.1:9", "routing-secret");
+            codec
+                .atomic_apply(&committed_before, &desired)
+                .expect("apply Takeover state");
+            assert!(matches!(
+                codec
+                    .inspect_managed_state(Some((&desired, &committed_before)))
+                    .expect("inspect committed Takeover"),
+                ManagedClaudeState::Takeover { .. }
+            ));
+            let mut live = read_settings(&codec);
+            mutate(&mut live);
+            fs::write(
+                codec.settings_path(),
+                serde_json::to_vec_pretty(&live).expect("serialize drift"),
+            )
+            .expect("write drift");
+
+            let error = codec
+                .inspect_managed_state(Some((&desired, &committed_before)))
+                .expect_err("committed drift must collide");
+            assert_eq!(error.code(), "configuration-collision");
+        }
+    }
+
+    #[test]
+    fn direct_profile_transitions_and_takeover_change_only_four_approved_fields() {
+        let source = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://prior.example",
+                "ANTHROPIC_MODEL": "prior-model",
+                "ANTHROPIC_AUTH_TOKEN": "prior-auth",
+                "ANTHROPIC_API_KEY": "prior-api",
+                "OPERATOR_FLAG": {"keep": true}
+            },
+            "permissions": {"deny": ["Write"]},
+            "model": "top-level-model"
+        });
+        let (_home, codec) = fixture(&source.to_string());
+        let original = codec.inspect().expect("capture original state");
+        let bearer = codec
+            .desired_direct(
+                "bearer-model",
+                "https://bearer.example",
+                ProviderAuthentication::AnthropicBearer,
+                "bearer-secret",
+            )
+            .expect("valid bearer Direct state");
+        codec
+            .atomic_apply(&original, &bearer)
+            .expect("apply bearer Direct state");
+        let bearer_before = codec.inspect().expect("capture bearer Direct state");
+        let api_key = codec
+            .desired_direct(
+                "api-model",
+                "https://api.example",
+                ProviderAuthentication::AnthropicApiKey,
+                "api-secret",
+            )
+            .expect("valid API-key Direct state");
+        codec
+            .atomic_apply(&bearer_before, &api_key)
+            .expect("apply API-key Direct state");
+        let api_before = codec.inspect().expect("capture API-key Direct state");
+        let takeover =
+            codec.desired_takeover_v2("takeover-model", "http://127.0.0.1:43124", "routing-secret");
+        codec
+            .atomic_apply(&api_before, &takeover)
+            .expect("apply Takeover state");
+
+        let active = read_settings(&codec);
+        assert_eq!(active["env"][BASE_URL_KEY], "http://127.0.0.1:43124");
+        assert_eq!(active["env"][MODEL_KEY], "takeover-model");
+        secret_json_string_matches(&active["env"][AUTH_TOKEN_KEY], "routing-secret").unwrap();
+        assert!(active["env"].get(API_KEY).is_none());
+        assert_eq!(
+            active["env"]["OPERATOR_FLAG"],
+            source["env"]["OPERATOR_FLAG"]
+        );
+        assert_eq!(active["permissions"], source["permissions"]);
+        assert_eq!(active["model"], source["model"]);
+
+        codec
+            .restore(&api_before, &takeover)
+            .expect("restore API-key Direct state");
+        codec
+            .restore(&bearer_before, &api_key)
+            .expect("restore bearer Direct state");
+        codec
+            .restore(&original, &bearer)
+            .expect("restore original state");
+        let restored = read_settings(&codec);
+        secret_json_string_matches(&restored["env"][AUTH_TOKEN_KEY], "prior-auth").unwrap();
+        secret_json_string_matches(&restored["env"][API_KEY], "prior-api").unwrap();
+        assert_eq!(
+            restored["env"]["OPERATOR_FLAG"],
+            source["env"]["OPERATOR_FLAG"]
+        );
+        assert_eq!(restored["permissions"], source["permissions"]);
+        assert_eq!(restored["model"], source["model"]);
+    }
+
+    #[test]
+    fn legacy_takeover_keeps_api_key_unrelated_and_v2_transition_can_restore_it() {
+        let (_home, codec) =
+            fixture(r#"{"env":{"ANTHROPIC_API_KEY":"legacy-api","OPERATOR_FLAG":"keep"}}"#);
+        let legacy_before = codec
+            .inspect_with_ownership(ClaudeConfigOwnership::LegacyThree)
+            .expect("capture legacy state");
+        let legacy_takeover = codec.desired_takeover_with_ownership(
+            "legacy-model",
+            "http://127.0.0.1:43124",
+            "legacy-routing-secret",
+            ClaudeConfigOwnership::LegacyThree,
+        );
+        codec
+            .atomic_apply(&legacy_before, &legacy_takeover)
+            .expect("apply legacy Takeover");
+        secret_json_string_matches(&read_settings(&codec)["env"][API_KEY], "legacy-api").unwrap();
+        assert!(matches!(
+            codec
+                .inspect_managed_state(Some((&legacy_takeover, &legacy_before)))
+                .expect("validate committed legacy Takeover"),
+            ManagedClaudeState::Takeover { .. }
+        ));
+
+        let v2_before = codec
+            .inspect()
+            .expect("capture four-field transition state");
+        let v2_takeover = codec.desired_takeover_v2(
+            "current-model",
+            "http://127.0.0.1:43125",
+            "current-routing-secret",
+        );
+        codec
+            .atomic_apply(&v2_before, &v2_takeover)
+            .expect("apply four-field Takeover");
+        assert!(read_settings(&codec)["env"].get(API_KEY).is_none());
+
+        codec
+            .restore(&v2_before, &v2_takeover)
+            .expect("restore legacy API key after failed upgrade");
+        secret_json_string_matches(&read_settings(&codec)["env"][API_KEY], "legacy-api").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_absent_file_is_private_under_restrictive_umask() {
+        let home = TempDir::new().expect("temporary home");
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("claude::config::tests::direct_umask_subprocess_helper")
+            .env("MUXVIA_DIRECT_UMASK_TEST_HOME", home.path())
+            .status()
+            .expect("run umask helper");
+
+        assert!(status.success());
+        assert_eq!(
+            fs::metadata(home.path().join(".claude/settings.json"))
+                .expect("settings metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "invoked in an isolated subprocess by the Direct umask regression test"]
+    fn direct_umask_subprocess_helper() {
+        static UMASK_LOCK: Mutex<()> = Mutex::new(());
+        struct RestoreUmask(libc::mode_t);
+        impl Drop for RestoreUmask {
+            fn drop(&mut self) {
+                unsafe { libc::umask(self.0) };
+            }
+        }
+
+        let _guard = UMASK_LOCK.lock().expect("umask lock");
+        let home =
+            Path::new(&std::env::var_os("MUXVIA_DIRECT_UMASK_TEST_HOME").expect("helper home"))
+                .to_owned();
+        let codec = ClaudeConfigCodec::for_user_home(&home).expect("Claude codec");
+        let before = codec.inspect().expect("inspect absent settings");
+        let desired = codec
+            .desired_direct(
+                "model",
+                "https://base.example",
+                ProviderAuthentication::AnthropicBearer,
+                "credential",
+            )
+            .expect("valid Direct state");
+        let previous = unsafe { libc::umask(0o077) };
+        let _restore = RestoreUmask(previous);
+        codec
+            .atomic_apply(&before, &desired)
+            .expect("apply Direct state");
+    }
 }

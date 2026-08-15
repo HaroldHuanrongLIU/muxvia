@@ -4,7 +4,7 @@ use std::{fs, path::Path};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use muxvia_routing::{
-    claude::ClaudeConfigCodec,
+    claude::{ClaudeConfigCodec, DesiredClaudeState},
     codex::CodexConfigCodec,
     control::protocol::Target,
     home::MuxviaHome,
@@ -211,6 +211,45 @@ fn direct_and_legacy_takeover_desired_payloads_remain_mode_free_and_round_trip()
         let decoded = serde_json::from_value(encoded).unwrap();
         assert_eq!(desired, decoded);
     }
+}
+
+#[test]
+fn claude_direct_mode_round_trips_while_legacy_takeover_defaults_without_rewrite() {
+    let direct: DesiredClaudeState = serde_json::from_value(serde_json::json!({
+        "ownership_version": 2,
+        "mode": "direct",
+        "owned": {
+            "base_url": "https://direct.example",
+            "auth_token": "diagnostic-direct-secret",
+            "model": "claude-direct",
+            "api_key": null
+        }
+    }))
+    .unwrap();
+    let direct_encoded = serde_json::to_value(&direct).unwrap();
+    let direct_diagnostic = format!("{direct:?}");
+    assert!(!direct_diagnostic.contains("diagnostic-direct-secret"));
+    assert_eq!(
+        direct_encoded.get("mode").and_then(|value| value.as_str()),
+        Some("direct")
+    );
+    let direct_decoded: DesiredClaudeState = serde_json::from_value(direct_encoded).unwrap();
+    assert_eq!(direct, direct_decoded);
+
+    let legacy: DesiredClaudeState = serde_json::from_value(serde_json::json!({
+        "owned": {
+            "base_url": "http://127.0.0.1:43124",
+            "auth_token": "diagnostic-legacy-secret",
+            "model": "claude-legacy"
+        }
+    }))
+    .unwrap();
+    let legacy_encoded = serde_json::to_value(&legacy).unwrap();
+    let legacy_diagnostic = format!("{legacy:?}");
+    assert!(!legacy_diagnostic.contains("diagnostic-legacy-secret"));
+    assert!(legacy_encoded.get("mode").is_none());
+    let legacy_decoded: DesiredClaudeState = serde_json::from_value(legacy_encoded).unwrap();
+    assert_eq!(legacy, legacy_decoded);
 }
 
 #[cfg(unix)]

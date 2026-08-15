@@ -4,12 +4,21 @@ import { testRender } from "@opentui/solid"
 import { App } from "../src/ui/app"
 import type { TargetSession } from "../src/control/target-session"
 import type { ActionOutcome, TargetAction, TargetView } from "../src/control/types"
+import {
+  assertControlledSecretSource,
+  assertSecretFreeStructured,
+  auditSecretFreeActions,
+  waitForSecretFreeCondition,
+  waitForSecretFreeFrame,
+} from "./secret-audit"
 
 const serviceEpoch = "00000000-0000-4000-8000-000000000001"
 const snapshotId = "00000000-0000-4000-8000-000000000002"
 const snapshotEpoch = "00000000-0000-4000-8000-000000000003"
 const credentialSentinel = "provider-secret-must-not-render"
 const problemMessageSentinel = "backend-problem-secret-must-not-render"
+const settingsSentinel = "claude-settings-secret-must-not-render"
+const claudeDirectSecrets = [credentialSentinel, problemMessageSentinel, settingsSentinel] as const
 
 type CreateProviderAction = Extract<TargetAction, { kind: "create-provider" }>
 type RecordedAction =
@@ -135,6 +144,47 @@ class MemoryTargetSession implements TargetSession {
 function expectSecretFree(setup: Awaited<ReturnType<typeof testRender>>, session: MemoryTargetSession): void {
   expect(setup.captureCharFrame()).not.toContain(credentialSentinel)
   expect(JSON.stringify(session.actions)).not.toContain(credentialSentinel)
+}
+
+function controlledClaudeDirectSources(): unknown {
+  return {
+    credential: credentialSentinel,
+    backend: new Error(problemMessageSentinel),
+    settings: { raw: settingsSentinel },
+  }
+}
+
+async function waitForClaudeDirectFrame(
+  setup: Awaited<ReturnType<typeof testRender>>,
+  predicate: (frame: string) => boolean,
+  label: string,
+): Promise<string> {
+  return await waitForSecretFreeFrame(setup, predicate, claudeDirectSecrets, label)
+}
+
+async function waitForClaudeDirectActions(
+  setup: Awaited<ReturnType<typeof testRender>>,
+  session: MemoryTargetSession,
+  count: number,
+  label: string,
+): Promise<void> {
+  await waitForSecretFreeCondition(
+    setup,
+    () => session.actions.length === count,
+    () => auditSecretFreeActions(session.actions, claudeDirectSecrets, label),
+    `secret-scan-failed:${label}-action`,
+    label,
+  )
+}
+
+function assertClaudeDirectActions(
+  session: MemoryTargetSession,
+  expected: RecordedAction[],
+  label: string,
+): void {
+  assertSecretFreeStructured("action", session.actions, claudeDirectSecrets, label, (safeActions) => {
+    expect(safeActions).toEqual(expected)
+  })
 }
 
 async function flushUi(setup: Awaited<ReturnType<typeof testRender>>): Promise<void> {
@@ -426,6 +476,8 @@ test("renders a localized unavailable Claude target without operating the Codex 
 })
 
 test("Claude slash leader and palette dispatch the existing Direct command identity", async () => {
+  const controlledSources = controlledClaudeDirectSources()
+  assertControlledSecretSource(controlledSources, claudeDirectSecrets, "claude-direct-command-source")
   const codex = new MemoryTargetSession(view())
   const claudeProvider = provider({
     id: "00000000-0000-4000-8000-000000000051",
@@ -436,7 +488,7 @@ test("Claude slash leader and palette dispatch the existing Direct command ident
     authentication: "anthropic-api-key",
     routingRequirement: "direct-compatible",
   })
-  const claude = new MemoryTargetSession(view({
+  const initial = view({
     target: "claude",
     providers: [claudeProvider],
     providerPresets: [{
@@ -446,7 +498,11 @@ test("Claude slash leader and palette dispatch the existing Direct command ident
       protocol: "anthropic-messages",
       authentication: "anthropic-api-key",
     }],
-  }))
+  })
+  const claude = new MemoryTargetSession(initial, async () => {
+    assertControlledSecretSource(controlledSources, claudeDirectSecrets, "claude-direct-command-session")
+    return { status: "applied", view: initial }
+  })
   const setup = await testRender(
     () => <App sessions={{ codex, claude }} />,
     { width: 121, height: 30, useThread: false, kittyKeyboard: true },
@@ -454,43 +510,43 @@ test("Claude slash leader and palette dispatch the existing Direct command ident
   try {
     await setup.renderOnce()
     setup.mockInput.pressKey("2")
-    const frame = await setup.waitForFrame((next) => next.includes("Claude Provider"))
+    const frame = await waitForClaudeDirectFrame(setup, (next) => next.includes("Claude Provider"), "claude-direct-command-route")
     expect(frame).toContain("Claude Code")
     expect(frame).toContain("Claude · Control Plane")
     expect(codex.actions).toEqual([])
 
     await setup.mockInput.typeText("/direct")
     setup.mockInput.pressEnter()
-    await setup.waitFor(() => claude.actions.length === 1)
-    expect(claude.actions).toEqual([{
+    await waitForClaudeDirectActions(setup, claude, 1, "claude-direct-command-slash")
+    assertClaudeDirectActions(claude, [{
       kind: "activate-provider",
       providerId: claudeProvider.id,
       mode: "direct",
-    }])
+    }], "claude-direct-command-slash")
     expect(codex.actions).toEqual([])
 
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("d")
-    await setup.waitFor(() => claude.actions.length === 2)
-    expect(claude.actions[1]).toEqual({
-      kind: "activate-provider",
-      providerId: claudeProvider.id,
-      mode: "direct",
-    })
+    await waitForClaudeDirectActions(setup, claude, 2, "claude-direct-command-leader")
+    assertClaudeDirectActions(claude, [
+      { kind: "activate-provider", providerId: claudeProvider.id, mode: "direct" },
+      { kind: "activate-provider", providerId: claudeProvider.id, mode: "direct" },
+    ], "claude-direct-command-leader")
 
     setup.mockInput.pressKey("p", { ctrl: true })
-    await setup.waitForFrame((next) => next.includes("Search commands"))
+    await waitForClaudeDirectFrame(setup, (next) => next.includes("Search commands"), "claude-direct-command-palette")
     await setup.mockInput.typeText("Apply Direct Activation")
     setup.mockInput.pressEnter()
-    await setup.waitFor(() => claude.actions.length === 3)
-    expect(claude.actions[2]).toEqual({
-      kind: "activate-provider",
-      providerId: claudeProvider.id,
-      mode: "direct",
+    await waitForClaudeDirectActions(setup, claude, 3, "claude-direct-command-palette-action")
+    assertClaudeDirectActions(claude, [
+      { kind: "activate-provider", providerId: claudeProvider.id, mode: "direct" },
+      { kind: "activate-provider", providerId: claudeProvider.id, mode: "direct" },
+      { kind: "activate-provider", providerId: claudeProvider.id, mode: "direct" },
+    ], "claude-direct-command-palette-action")
+    assertSecretFreeStructured("view", claude.get(), claudeDirectSecrets, "claude-direct-command-view", (safeView) => {
+      expect(safeView.target).toBe("claude")
     })
-    expect(claude.actions).toHaveLength(3)
     expect(codex.actions).toEqual([])
-    expectSecretFree(setup, claude)
   } finally {
     setup.renderer.destroy()
   }
@@ -524,9 +580,14 @@ test("Claude Direct chooses Current then first fallback and rejects Incomplete l
     { providers: [first, current], currentProviderId: null, expectedId: first.id, expectedActions: 1 },
     { providers: [incomplete], currentProviderId: incomplete.id, expectedId: incomplete.id, expectedActions: 0 },
   ] as const) {
+    const controlledSources = controlledClaudeDirectSources()
+    assertControlledSecretSource(controlledSources, claudeDirectSecrets, "claude-direct-default-source")
     const codex = new MemoryTargetSession(view())
     const initial = view({ target: "claude", providers: [...testCase.providers], currentProviderId: testCase.currentProviderId })
-    const claude = new MemoryTargetSession(initial, async () => ({ status: "applied", view: initial }))
+    const claude = new MemoryTargetSession(initial, async () => {
+      assertControlledSecretSource(controlledSources, claudeDirectSecrets, "claude-direct-default-session")
+      return { status: "applied", view: initial }
+    })
     const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
       width: 80,
       height: 24,
@@ -539,83 +600,124 @@ test("Claude Direct chooses Current then first fallback and rejects Incomplete l
       await setup.mockInput.typeText("/direct")
       setup.mockInput.pressEnter()
       if (testCase.expectedActions === 0) {
-        const frame = await setup.waitForFrame((value) => value.includes("Complete the required Provider fields and retry."))
+        const frame = await waitForClaudeDirectFrame(
+          setup,
+          (value) => value.includes("Complete the required Provider fields and retry."),
+          "claude-direct-incomplete",
+        )
         expect(frame).not.toContain(problemMessageSentinel)
       } else {
-        await setup.waitFor(() => claude.actions.length === 1)
-        expect(claude.actions).toEqual([{
+        await waitForClaudeDirectActions(setup, claude, 1, "claude-direct-default-action")
+        assertClaudeDirectActions(claude, [{
           kind: "activate-provider",
           providerId: testCase.expectedId,
           mode: "direct",
-        }])
+        }], "claude-direct-default-action")
       }
-      expect(claude.actions).toHaveLength(testCase.expectedActions)
+      assertSecretFreeStructured("action", claude.actions, claudeDirectSecrets, "claude-direct-default-count", (safeActions) => {
+        expect(safeActions).toHaveLength(testCase.expectedActions)
+      })
+      assertSecretFreeStructured("view", claude.get(), claudeDirectSecrets, "claude-direct-default-view", (safeView) => {
+        expect(safeView.target).toBe("claude")
+      })
       expect(codex.actions).toEqual([])
-      expectSecretFree(setup, claude)
     } finally {
       setup.renderer.destroy()
     }
   }
 })
 
-test("switching targets suppresses stale Claude Direct completion while retaining its target-owned view", async () => {
-  const pending = deferred<ActionOutcome>()
-  const codex = new MemoryTargetSession(view())
-  const claudeProvider = provider({
-    id: "00000000-0000-4000-8000-000000000061",
-    name: "Async Claude Provider",
-    protocol: "anthropic-messages",
-    authentication: "anthropic-bearer",
-    routingRequirement: "direct-compatible",
-  })
-  const claudeInitial = view({ target: "claude", providers: [claudeProvider] })
-  const claudeApplied = view({
-    target: "claude",
-    managementRevision: 1,
-    viewSequence: 1,
-    mode: "direct",
-    takeover: { state: "inactive", endpoint: null },
-    providers: [claudeProvider],
-    currentProviderId: claudeProvider.id,
-    managedConfiguration: { state: "managed", path: "/tmp/home/.claude/settings.json", restartRequired: true },
-  })
-  const claude = new MemoryTargetSession(claudeInitial, async () => await pending.promise)
-  const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
-    width: 80,
-    height: 24,
-    useThread: false,
-    kittyKeyboard: true,
-  })
-  try {
-    await setup.renderOnce()
-    setup.mockInput.pressKey("2")
-    await setup.mockInput.typeText("/direct")
-    setup.mockInput.pressEnter()
-    await setup.waitFor(() => claude.actions.length === 1)
-    setup.mockInput.pressEscape()
-    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
-    setup.mockInput.pressKey("1")
-    await setup.waitForFrame((frame) => frame.includes("Codex · Control Plane"))
+test("switching targets isolates stale Claude Direct and Takeover completions and installs each view once", async () => {
+  for (const mode of ["direct", "takeover"] as const) {
+    const controlledSources = controlledClaudeDirectSources()
+    assertControlledSecretSource(controlledSources, claudeDirectSecrets, `claude-${mode}-isolation-source`)
+    const pending = deferred<ActionOutcome>()
+    const codex = new MemoryTargetSession(view())
+    const claudeProvider = provider({
+      id: `00000000-0000-4000-8000-00000000006${mode === "direct" ? "1" : "2"}`,
+      name: `Async Claude ${mode === "direct" ? "Direct" : "Takeover"} Provider`,
+      protocol: "anthropic-messages",
+      authentication: "anthropic-bearer",
+      routingRequirement: mode === "direct" ? "direct-compatible" : "takeover-required",
+    })
+    const claudeInitial = view({ target: "claude", providers: [claudeProvider] })
+    const claudeApplied = view({
+      target: "claude",
+      managementRevision: 1,
+      viewSequence: 1,
+      mode,
+      takeover: mode === "direct"
+        ? { state: "inactive", endpoint: null }
+        : { state: "active", endpoint: "http://127.0.0.1:43123" },
+      providers: [claudeProvider],
+      currentProviderId: claudeProvider.id,
+      managedConfiguration: mode === "direct"
+        ? { state: "managed", path: "/tmp/home/.claude/settings.json", restartRequired: true }
+        : { state: "managed", path: "/tmp/home/.claude/settings.json", restartRequired: false },
+    })
+    const claude = new MemoryTargetSession(claudeInitial, async () => {
+      assertControlledSecretSource(controlledSources, claudeDirectSecrets, `claude-${mode}-isolation-session`)
+      return await pending.promise
+    })
+    const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
+      width: 80,
+      height: 24,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("2")
+      await setup.mockInput.typeText(`/${mode}`)
+      setup.mockInput.pressEnter()
+      await waitForClaudeDirectActions(setup, claude, 1, `claude-${mode}-isolation-action`)
+      setup.mockInput.pressEscape()
+      await waitForClaudeDirectFrame(setup, (frame) => frame.includes("Choose a target"), `claude-${mode}-isolation-home`)
+      setup.mockInput.pressKey("1")
+      await waitForClaudeDirectFrame(setup, (frame) => frame.includes("Codex · Control Plane"), `claude-${mode}-isolation-codex`)
 
-    pending.resolve({ status: "applied", view: claudeApplied })
-    await flushUi(setup)
-    const codexFrame = setup.captureCharFrame()
-    expect(codexFrame).toContain("Codex · Control Plane")
-    expect(codexFrame).not.toContain("Direct Activation applied")
-    expect(codexFrame).not.toContain("Restart Claude Code")
-    expect(codexFrame).not.toContain("Async Claude Provider")
-    expect(codex.actions).toEqual([])
+      pending.resolve({ status: "applied", view: claudeApplied })
+      await flushUi(setup)
+      const codexFrame = await waitForClaudeDirectFrame(
+        setup,
+        (frame) => frame.includes("Codex · Control Plane"),
+        `claude-${mode}-isolation-hidden-completion`,
+      )
+      expect(codexFrame).not.toContain(mode === "direct" ? "Direct Activation applied" : "Target Takeover applied")
+      expect(codexFrame).not.toContain("Restart Claude Code")
+      expect(codexFrame).not.toContain(claudeProvider.name)
+      expect(codex.actions).toEqual([])
 
-    setup.mockInput.pressEscape()
-    await setup.waitForFrame((frame) => frame.includes("Choose a target"))
-    setup.mockInput.pressKey("2")
-    const claudeFrame = await setup.waitForFrame((frame) => frame.includes("Mode") && frame.includes("Direct"))
-    expect(claudeFrame).toContain("Async Claude Provider")
-    expect(claudeFrame).toContain("Restart Claude Code to use the managed configuration.")
-    expect(claudeFrame.match(/Direct Activation applied/g) ?? []).toHaveLength(0)
-    expectSecretFree(setup, claude)
-  } finally {
-    setup.renderer.destroy()
+      setup.mockInput.pressEscape()
+      await waitForClaudeDirectFrame(setup, (frame) => frame.includes("Choose a target"), `claude-${mode}-isolation-return-home`)
+      setup.mockInput.pressKey("2")
+      const expectedMode = mode === "direct" ? "Direct" : "Takeover"
+      const claudeFrame = await waitForClaudeDirectFrame(
+        setup,
+        (frame) => frame.includes("Mode") && frame.includes(expectedMode),
+        `claude-${mode}-isolation-return`,
+      )
+      expect(claudeFrame).toContain(claudeProvider.name)
+      if (mode === "direct") {
+        expect(claudeFrame).toContain("Restart Claude Code to use the managed configuration.")
+      }
+      const activityLines = meaningfulLines(claudeFrame).filter((line) => line.includes("applied:"))
+      assertSecretFreeStructured("activity", activityLines, claudeDirectSecrets, `claude-${mode}-isolation-activity`, (safeActivities) => {
+        expect(safeActivities).toHaveLength(0)
+      })
+      assertSecretFreeStructured("view", claude.get(), claudeDirectSecrets, `claude-${mode}-isolation-view`, (safeView) => {
+        expect(safeView.mode).toBe(mode)
+        expect(safeView.currentProviderId).toBe(claudeProvider.id)
+      })
+      assertClaudeDirectActions(claude, [{
+        kind: "activate-provider",
+        providerId: claudeProvider.id,
+        mode,
+      }], `claude-${mode}-isolation-final-action`)
+    } finally {
+      pending.resolve({ status: "applied", view: claudeApplied })
+      setup.renderer.destroy()
+    }
   }
 })
 

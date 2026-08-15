@@ -9,9 +9,19 @@ import { createTranslator } from "../src/i18n"
 import { App } from "../src/ui/app"
 import { OverlayProvider } from "../src/ui/overlay-stack"
 import { ProviderForm, type ProviderFormResult } from "../src/ui/provider-form"
+import {
+  assertControlledSecretSource,
+  assertSecretFreeStructured,
+  auditSecretFreeActions,
+  waitForSecretFreeCondition,
+  waitForSecretFreeFrame,
+} from "./secret-audit"
 
 const credentialSecret = "provider-secret-must-not-render"
 const credentialUuid = "00000000-0000-4000-8000-000000000099"
+const backendSecret = "backend-claude-direct-secret-must-not-render"
+const settingsSecret = "settings-claude-direct-secret-must-not-render"
+const claudeDirectSecrets = [credentialSecret, backendSecret, settingsSecret] as const
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -85,6 +95,7 @@ function projectAction(action: TargetAction): RecordedTargetAction {
 
 class MemoryTargetSession implements TargetSession {
   readonly actions: RecordedTargetAction[] = []
+  lastError: unknown
   readonly #listeners = new Set<(next: TargetView) => void>()
   #view: TargetView
   #handler: (action: TargetAction) => Promise<ActionOutcome>
@@ -100,9 +111,14 @@ class MemoryTargetSession implements TargetSession {
   get(): Readonly<TargetView> { return this.#view }
   async act(action: TargetAction): Promise<ActionOutcome> {
     this.actions.push(projectAction(action))
-    const outcome = await this.#handler(action)
-    this.#view = outcome.view
-    return outcome
+    try {
+      const outcome = await this.#handler(action)
+      this.#view = outcome.view
+      return outcome
+    } catch (error) {
+      this.lastError = error
+      throw error
+    }
   }
   setView(next: TargetView): void { this.#view = next }
   pushView(next: TargetView): void {
@@ -117,6 +133,47 @@ class MemoryTargetSession implements TargetSession {
   }
   async whenClosed(): Promise<void> { return await new Promise(() => {}) }
   async close(): Promise<void> {}
+}
+
+function controlledClaudeDirectSources(): unknown {
+  return {
+    credential: credentialSecret,
+    backend: new Error(backendSecret),
+    settings: { raw: settingsSecret },
+  }
+}
+
+async function waitForClaudeDirectFrame(
+  setup: Awaited<ReturnType<typeof testRender>>,
+  predicate: (frame: string) => boolean,
+  label: string,
+): Promise<string> {
+  return await waitForSecretFreeFrame(setup, predicate, claudeDirectSecrets, label)
+}
+
+async function waitForClaudeDirectActions(
+  setup: Awaited<ReturnType<typeof testRender>>,
+  session: MemoryTargetSession,
+  count: number,
+  label: string,
+): Promise<void> {
+  await waitForSecretFreeCondition(
+    setup,
+    () => session.actions.length === count,
+    () => auditSecretFreeActions(session.actions, claudeDirectSecrets, label),
+    `secret-scan-failed:${label}-action`,
+    label,
+  )
+}
+
+function assertClaudeDirectActions(
+  session: MemoryTargetSession,
+  expected: RecordedTargetAction[],
+  label: string,
+): void {
+  assertSecretFreeStructured("action", session.actions, claudeDirectSecrets, label, (safeActions) => {
+    expect(safeActions).toEqual(expected)
+  })
 }
 
 function expectInOrder(frame: string, names: readonly string[]): void {
@@ -931,6 +988,8 @@ test("Provider Direct Activation defaults to Current and dispatches the selected
 })
 
 test("Claude picker binds Direct to leader a and Takeover to leader o without duplicate dispatch", async () => {
+  const controlledSources = controlledClaudeDirectSources()
+  assertControlledSecretSource(controlledSources, claudeDirectSecrets, "claude-picker-binding-source")
   const first = provider({
     id: "00000000-0000-4000-8000-000000000071",
     name: "Claude First Provider",
@@ -946,7 +1005,10 @@ test("Claude picker binds Direct to leader a and Takeover to leader o without du
   })
   const initial = view({ target: "claude", providers: [first, selected], currentProviderId: first.id })
   const codex = new MemoryTargetSession(view())
-  const claude = new MemoryTargetSession(initial, async () => ({ status: "applied", view: initial }))
+  const claude = new MemoryTargetSession(initial, async () => {
+    assertControlledSecretSource(controlledSources, claudeDirectSecrets, "claude-picker-binding-session")
+    return { status: "applied", view: initial }
+  })
   const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
     width: 80,
     height: 24,
@@ -958,38 +1020,76 @@ test("Claude picker binds Direct to leader a and Takeover to leader o without du
     setup.mockInput.pressKey("2")
     await setup.mockInput.typeText("/providers")
     setup.mockInput.pressEnter()
-    const picker = await setup.waitForFrame((frame) => frame.includes("Claude Selected Provider"))
+    const picker = await waitForClaudeDirectFrame(setup, (frame) => frame.includes("Claude Selected Provider"), "claude-picker-binding-direct")
     expect(picker).toContain("ctrl+x a direct")
     expect(picker).toContain("ctrl+x o takeover")
     setup.mockInput.pressKey("down")
 
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("a")
-    await setup.waitFor(() => claude.actions.length === 1)
-    expect(claude.actions).toEqual([{
+    await waitForClaudeDirectActions(setup, claude, 1, "claude-picker-binding-direct-action")
+    assertClaudeDirectActions(claude, [{
       kind: "activate-provider",
       providerId: selected.id,
       mode: "direct",
-    }])
+    }], "claude-picker-binding-direct-action")
 
     await setup.mockInput.typeText("/providers")
     setup.mockInput.pressEnter()
-    await setup.waitForFrame((frame) => frame.includes("Claude Selected Provider"))
+    await waitForClaudeDirectFrame(setup, (frame) => frame.includes("Claude Selected Provider"), "claude-picker-binding-takeover")
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("o")
-    await setup.waitFor(() => claude.actions.length === 2)
-    expect(claude.actions).toEqual([
+    await waitForClaudeDirectActions(setup, claude, 2, "claude-picker-binding-takeover-action")
+    assertClaudeDirectActions(claude, [
       { kind: "activate-provider", providerId: selected.id, mode: "direct" },
       { kind: "activate-provider", providerId: selected.id, mode: "takeover" },
-    ])
+    ], "claude-picker-binding-takeover-action")
     expect(codex.actions).toEqual([])
-    expect(JSON.stringify(claude.actions)).not.toContain(credentialSecret)
   } finally {
     setup.renderer.destroy()
   }
 })
 
+test("Claude picker renders the exact Direct and Takeover bindings in English and Chinese", async () => {
+  const claudeProvider = provider({
+    id: "00000000-0000-4000-8000-000000000077",
+    name: "Localized Claude Provider",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-api-key",
+  })
+  for (const testCase of [
+    { locale: "en" as const, direct: "ctrl+x a direct", takeover: "ctrl+x o takeover" },
+    { locale: "zh-CN" as const, direct: "ctrl+x a 直接激活", takeover: "ctrl+x o Takeover" },
+  ]) {
+    const codex = new MemoryTargetSession(view())
+    const claude = new MemoryTargetSession(view({ target: "claude", providers: [claudeProvider] }))
+    const setup = await testRender(() => <App sessions={{ codex, claude }} locale={testCase.locale} />, {
+      width: 121,
+      height: 30,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("2")
+      await setup.mockInput.typeText("/providers")
+      setup.mockInput.pressEnter()
+      const picker = await waitForClaudeDirectFrame(
+        setup,
+        (frame) => frame.includes("Localized Claude Provider"),
+        `claude-picker-help-${testCase.locale}`,
+      )
+      expect(picker).toContain(testCase.direct)
+      expect(picker).toContain(testCase.takeover)
+    } finally {
+      setup.renderer.destroy()
+    }
+  }
+})
+
 test("Claude Direct uses the same projected and authoritative Takeover-required confirmation", async () => {
+  const controlledSources = controlledClaudeDirectSources()
+  assertControlledSecretSource(controlledSources, claudeDirectSecrets, "claude-takeover-confirm-source")
   const selected = provider({
     id: "00000000-0000-4000-8000-000000000073",
     name: "Claude Bridge Provider",
@@ -1012,9 +1112,15 @@ test("Claude Direct uses the same projected and authoritative Takeover-required 
   const codex = new MemoryTargetSession(view())
   let claude!: MemoryTargetSession
   claude = new MemoryTargetSession(projected, async (action) => {
+    assertControlledSecretSource(controlledSources, claudeDirectSecrets, "claude-takeover-confirm-session")
     if (action.kind === "activate-provider" && action.mode === "direct") {
       claude.setView(authoritative)
-      throw { code: "takeover-required", message: "authoritative-secret-must-not-render" }
+      throw {
+        code: "takeover-required",
+        message: backendSecret,
+        credential: credentialSecret,
+        settings: settingsSecret,
+      }
     }
     return { status: "applied", view: authoritative }
   })
@@ -1029,16 +1135,20 @@ test("Claude Direct uses the same projected and authoritative Takeover-required 
     setup.mockInput.pressKey("2")
     await setup.mockInput.typeText("/providers")
     setup.mockInput.pressEnter()
-    await setup.waitForFrame((frame) => frame.includes(selected.name))
+    await waitForClaudeDirectFrame(setup, (frame) => frame.includes(selected.name), "claude-takeover-confirm-picker")
     const pickerFocus = setup.renderer.currentFocusedRenderable as InputRenderable
 
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("a")
-    const projectedConfirm = await setup.waitForFrame((frame) => frame.includes("Enable Target Takeover?"))
+    const projectedConfirm = await waitForClaudeDirectFrame(
+      setup,
+      (frame) => frame.includes("Enable Target Takeover?"),
+      "claude-takeover-confirm-projected",
+    )
     expect(projectedConfirm).toContain("Enable Takeover")
     expect(projectedConfirm).toContain("Cancel")
     expect(projectedConfirm).not.toContain("Direct Activation applied")
-    expect(claude.actions).toEqual([])
+    assertClaudeDirectActions(claude, [], "claude-takeover-confirm-projected-action")
     setup.mockInput.pressEscape()
     for (let pass = 0; pass < 4; pass++) await Promise.resolve()
     expect(setup.renderer.currentFocusedRenderable).toBe(pickerFocus)
@@ -1046,25 +1156,28 @@ test("Claude Direct uses the same projected and authoritative Takeover-required 
     claude.pushView(directCompatible)
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("a")
-    await setup.waitFor(() => claude.actions.length === 1)
-    const authoritativeConfirm = await setup.waitForFrame((frame) => frame.includes("Enable Target Takeover?"))
-    expect(authoritativeConfirm).not.toContain("authoritative-secret-must-not-render")
+    await waitForClaudeDirectActions(setup, claude, 1, "claude-takeover-confirm-authoritative-action")
+    assertControlledSecretSource(claude.lastError, claudeDirectSecrets, "claude-takeover-confirm-error-source")
+    const authoritativeConfirm = await waitForClaudeDirectFrame(
+      setup,
+      (frame) => frame.includes("Enable Target Takeover?"),
+      "claude-takeover-confirm-authoritative",
+    )
+    expect(authoritativeConfirm).not.toContain(backendSecret)
     expect(authoritativeConfirm).not.toContain(credentialSecret)
-    expect(claude.actions).toEqual([{
+    assertClaudeDirectActions(claude, [{
       kind: "activate-provider",
       providerId: selected.id,
       mode: "direct",
-    }])
+    }], "claude-takeover-confirm-authoritative-action")
 
     setup.mockInput.pressEnter()
     setup.mockInput.pressEnter()
-    await setup.waitFor(() => claude.actions.length === 2)
-    expect(claude.actions[1]).toEqual({
-      kind: "activate-provider",
-      providerId: selected.id,
-      mode: "takeover",
-    })
-    expect(claude.actions).toHaveLength(2)
+    await waitForClaudeDirectActions(setup, claude, 2, "claude-takeover-confirm-takeover-action")
+    assertClaudeDirectActions(claude, [
+      { kind: "activate-provider", providerId: selected.id, mode: "direct" },
+      { kind: "activate-provider", providerId: selected.id, mode: "takeover" },
+    ], "claude-takeover-confirm-takeover-action")
     expect(codex.actions).toEqual([])
   } finally {
     setup.renderer.destroy()
@@ -1072,6 +1185,8 @@ test("Claude Direct uses the same projected and authoritative Takeover-required 
 })
 
 test("Claude picker Direct gates duplicate input and installs one restart-guided success", async () => {
+  const controlledSources = controlledClaudeDirectSources()
+  assertControlledSecretSource(controlledSources, claudeDirectSecrets, "claude-picker-pending-source")
   const selected = provider({
     id: "00000000-0000-4000-8000-000000000074",
     name: "Pending Claude Direct",
@@ -1097,7 +1212,10 @@ test("Claude picker Direct gates duplicate input and installs one restart-guided
   })
   const pending = deferred<ActionOutcome>()
   const codex = new MemoryTargetSession(view())
-  const claude = new MemoryTargetSession(initial, async () => await pending.promise)
+  const claude = new MemoryTargetSession(initial, async () => {
+    assertControlledSecretSource(controlledSources, claudeDirectSecrets, "claude-picker-pending-session")
+    return await pending.promise
+  })
   const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
     width: 80,
     height: 24,
@@ -1109,36 +1227,58 @@ test("Claude picker Direct gates duplicate input and installs one restart-guided
     setup.mockInput.pressKey("2")
     await setup.mockInput.typeText("/providers")
     setup.mockInput.pressEnter()
-    await setup.waitForFrame((frame) => frame.includes(selected.name))
+    await waitForClaudeDirectFrame(setup, (frame) => frame.includes(selected.name), "claude-picker-pending-open")
 
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("a")
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("a")
-    await setup.waitFor(() => claude.actions.length === 1)
-    const pendingFrame = await setup.waitForFrame((frame) => frame.includes("Applying Direct Activation…"))
+    await waitForClaudeDirectActions(setup, claude, 1, "claude-picker-pending-action")
+    const pendingFrame = await waitForClaudeDirectFrame(
+      setup,
+      (frame) => frame.includes("Applying Direct Activation…"),
+      "claude-picker-pending-frame",
+    )
     expect(pendingFrame).toContain("Providers")
     expect(pendingFrame).not.toContain(credentialSecret)
 
     setup.mockInput.pressKey("p", { ctrl: true })
     setup.mockInput.pressEnter()
     await setup.renderOnce()
-    expect(claude.actions).toHaveLength(1)
-    expect(setup.captureCharFrame()).not.toContain("Search commands")
+    assertSecretFreeStructured("action", claude.actions, claudeDirectSecrets, "claude-picker-pending-gated", (safeActions) => {
+      expect(safeActions).toHaveLength(1)
+    })
+    const guardedFrame = await waitForClaudeDirectFrame(
+      setup,
+      (frame) => frame.includes("Applying Direct Activation…") && !frame.includes("Search commands"),
+      "claude-picker-pending-gated-frame",
+    )
+    expect(guardedFrame).not.toContain("Search commands")
 
     pending.resolve({ status: "applied", view: applied })
-    const completed = await setup.waitForFrame((frame) =>
-      frame.includes("Direct Activation applied: Pending Claude Direct")
-      && frame.includes("Restart Claude Code to use the managed configuration."))
+    const completed = await waitForClaudeDirectFrame(
+      setup,
+      (frame) => frame.includes("Direct Activation applied: Pending Claude Direct")
+        && frame.includes("Restart Claude Code to use the managed configuration."),
+      "claude-picker-pending-complete",
+    )
     expect(completed).toContain("Mode       Direct")
     expect(completed.match(/Direct Activation applied:/g)).toHaveLength(1)
     expect(completed).not.toContain("Providers")
     expect(completed).not.toContain(credentialSecret)
-    expect(claude.actions).toEqual([{
+    assertClaudeDirectActions(claude, [{
       kind: "activate-provider",
       providerId: selected.id,
       mode: "direct",
-    }])
+    }], "claude-picker-pending-final-action")
+    const activityLines = completed.split("\n").filter((line) => line.includes("Direct Activation applied:"))
+    assertSecretFreeStructured("activity", activityLines, claudeDirectSecrets, "claude-picker-pending-activity", (safeActivities) => {
+      expect(safeActivities).toHaveLength(1)
+    })
+    assertSecretFreeStructured("view", claude.get(), claudeDirectSecrets, "claude-picker-pending-view", (safeView) => {
+      expect(safeView.mode).toBe("direct")
+      expect(safeView.currentProviderId).toBe(selected.id)
+    })
     expect(codex.actions).toEqual([])
   } finally {
     pending.resolve({ status: "applied", view: applied })

@@ -14,6 +14,7 @@ T06 adds Direct Activation to the real Claude Target context delivered by T05. I
 
 - Claude Direct desired-state construction for `anthropic-api-key` and `anthropic-bearer` Providers;
 - typed recognition of committed Claude `Unmanaged`, `Direct`, and `Takeover` states;
+- an internal managed-configuration ownership version that preserves T05 recovery and Takeover compatibility;
 - the existing receipt-first, recovery-intent, atomic-write, reread-verification, final-revision, immutable-snapshot, rollback, and publication contract;
 - exact replacement and restoration of the approved Claude settings while preserving unrelated JSON and file mode;
 - named Direct commands and Provider-picker behavior in the Claude Control Plane context; and
@@ -55,6 +56,24 @@ Takeover continues to set `ANTHROPIC_AUTH_TOKEN` to the Routing Credential and n
 Muxvia never owns the complete `env` object, top-level `model`, Provider selectors, unrelated settings, `~/.claude.json`, Claude application authorization state, or OS credential stores. JSON formatting is not preserved, but unrelated JSON semantics, current file mode, and the exact prior approved-field values or absence are preserved.
 
 The existing Managed File seam continues to canonicalize a Configuration Home directory symlink and reject a symlinked `settings.json`, unsafe file-identity changes, non-regular targets, and non-durable replacement or rollback states.
+
+## T05 compatibility and ownership upgrade
+
+T05 persisted Claude Takeovers and Recovery Intents under a three-field ownership contract in which `ANTHROPIC_API_KEY` was unrelated configuration. Their snapshots contain only the three owned values plus an unrelated semantic fingerprint; they cannot reconstruct or restore the API-key value if it is retroactively treated as owned.
+
+Schema v6 therefore adds an internal managed-configuration ownership version to Target Route State:
+
+- version 1 means the T05 Claude three-field contract;
+- version 2 means the T06 Claude four-field contract; and
+- Codex remains on its existing ownership contract and does not change behavior.
+
+The v5-to-v6 migration assigns version 1 to every existing row and does not rewrite files, receipts, snapshots, or recovery payloads. A new Claude activation commits version 2 in the same final transaction as Current, Snapshot, runtime, receipt, and recovery state.
+
+Startup and activation validate an existing version-1 committed Takeover with the original three-field interpretation, leaving `ANTHROPIC_API_KEY` inside the unrelated fingerprint. A subsequent authorized Takeover switch may upgrade it to version 2: it first validates the committed version-1 state, then captures a new four-field before snapshot, removes `ANTHROPIC_API_KEY`, and commits version 2 only after the normal verified write. Failure restores the captured API-key value or absence exactly.
+
+Persisted version-1 pending Recovery Intents retain their original three-field interpretation. Deserialization distinguishes legacy payloads from new version-2 payloads; reconciliation compares and restores only the fields that the intent originally owned, so the historical `ANTHROPIC_API_KEY` remains untouched and covered by the stored unrelated fingerprint. New Recovery Intents record version 2 explicitly and contain all four prior approved-field values or absence.
+
+An unknown ownership version or an inconsistent ownership-version/runtime combination fails closed as Recovery Required. The ownership version is internal persistence metadata and is not added to Target Views or the control protocol.
 
 ## Typed managed state and ownership
 
@@ -140,7 +159,7 @@ Pending state, outcome installation, activities, restart guidance, notices, sele
 Successful Direct projects:
 
 - `managedConfiguration.state: applied`;
-- `managedConfiguration.mode: direct`;
+- top-level `mode: direct`;
 - the canonical `settings.json` path;
 - `restartRequired: true`;
 - the committed Current Provider and Activated Snapshot; and

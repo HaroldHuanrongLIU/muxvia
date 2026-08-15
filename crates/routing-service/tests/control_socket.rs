@@ -429,6 +429,123 @@ async fn claude_gap_reopen_preserves_context_for_takeover_and_publishes_only_cla
 }
 
 #[tokio::test]
+async fn claude_direct_responds_before_one_push_replays_without_push_and_isolates_codex() {
+    let root = short_temp_root("mx-claude-direct");
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    let activation = Arc::new(
+        ActivationService::new(
+            Arc::clone(&store),
+            home.clone(),
+            Arc::new(ControlCodexProbe),
+            "/usr/bin/codex".into(),
+            Arc::new(ControlNoopUpstream),
+        )
+        .with_claude_runtime(Arc::new(ControlClaudeProbe), "/usr/bin/claude".into()),
+    );
+    let handle =
+        ControlServer::bind_with_activation(&home, Arc::clone(&store), "routing-test", activation)
+            .await
+            .unwrap();
+    let mut claude = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut claude).await;
+    let opened = request(
+        &mut claude,
+        "open-claude",
+        json!({
+            "kind": "open-target", "target": "claude",
+            "claudeContext": {
+                "claudeConfigDir": null,
+                "selectorState": "unset",
+                "hostManagedState": "unmanaged",
+                "cwd": user_home
+            }
+        }),
+    )
+    .await;
+    let mut codex = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut codex).await;
+    let codex_opened = request(
+        &mut codex,
+        "open-codex",
+        json!({"kind": "open-target", "target": "codex"}),
+    )
+    .await;
+    let saved = request(
+        &mut claude,
+        "save",
+        json!({
+            "kind": "act", "target": "claude", "actionId": Uuid::new_v4(),
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-provider", "name": "Claude Direct",
+                "baseUrl": "https://api.anthropic.test", "model": "claude-test",
+                "credential": {"kind": "replace", "value": "provider-secret-must-not-escape"},
+                "authentication": "anthropic-bearer", "presetKey": null
+            }
+        }),
+    )
+    .await;
+    let _save_push = read_frame(&mut claude).await.unwrap();
+    let provider_id = saved["result"]["outcome"]["view"]["providers"][0]["id"]
+        .as_str()
+        .unwrap();
+    let action_id = Uuid::new_v4();
+
+    let applied = request(
+        &mut claude,
+        "direct",
+        json!({
+            "kind": "act", "target": "claude", "actionId": action_id,
+            "expectedRevision": 1,
+            "action": {"kind": "activate-provider", "providerId": provider_id, "mode": "direct"}
+        }),
+    )
+    .await;
+    assert_eq!(applied["result"]["outcome"]["status"], "applied");
+    assert_eq!(applied["result"]["outcome"]["view"]["mode"], "direct");
+    let push = read_frame(&mut claude).await.unwrap();
+    assert_eq!(push["view"], applied["result"]["outcome"]["view"]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut codex))
+            .await
+            .is_err()
+    );
+
+    let replay = request(
+        &mut claude,
+        "replay",
+        json!({
+            "kind": "act", "target": "claude", "actionId": action_id,
+            "expectedRevision": 0,
+            "action": {"malformed": true, "credential": "wire-secret-must-not-escape"}
+        }),
+    )
+    .await;
+    assert_eq!(replay["result"]["outcome"]["status"], "replayed");
+    assert_eq!(replay["result"]["outcome"]["view"], push["view"]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut claude))
+            .await
+            .is_err()
+    );
+    assert_eq!(store.target_view().await.unwrap().management_revision, 0);
+    let wire = format!("{opened}{codex_opened}{saved}{applied}{push}{replay}");
+    for forbidden in [
+        "provider-secret-must-not-escape",
+        "wire-secret-must-not-escape",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    ] {
+        assert!(!wire.contains(forbidden));
+    }
+    handle.shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn target_isolation_opens_claude_without_touching_codex_state() {
     let mut fixture = ControlFixture::start().await;
     let before = fixture.store.target_view().await.unwrap();

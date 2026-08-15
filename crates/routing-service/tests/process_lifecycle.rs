@@ -281,6 +281,110 @@ async fn inactive_service_exits_after_its_last_accepted_session() {
 }
 
 #[tokio::test]
+async fn clean_claude_direct_is_control_only_across_restart_and_exits_after_last_session() {
+    let root = TempDir::new().unwrap();
+    let user_home = root.path().join("home");
+    let home = user_home.join(".muxvia");
+    fs::create_dir_all(&user_home).unwrap();
+    let claude = fake_cli(root.path(), "fake-claude-direct", "2.1.37 (Claude Code)");
+
+    let first_shutdown = root.path().join("first-shutdown");
+    let mut first = command(&home, &first_shutdown)
+        .arg("--test-claude-executable")
+        .arg(&claude)
+        .spawn()
+        .unwrap();
+    let socket = home.join("run/control.sock");
+    wait_for_socket(&socket).await;
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+    hello(&mut stream).await;
+    request(
+        &mut stream,
+        "open-claude",
+        json!({
+            "kind": "open-target", "target": "claude",
+            "claudeContext": {
+                "claudeConfigDir": null, "selectorState": "unset",
+                "hostManagedState": "unmanaged", "cwd": user_home
+            }
+        }),
+    )
+    .await;
+    let saved = request(
+        &mut stream,
+        "save-claude",
+        json!({
+            "kind": "act", "target": "claude", "actionId": Uuid::new_v4(),
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-provider", "name": "Claude Direct",
+                "baseUrl": "https://api.anthropic.test", "model": "claude-direct",
+                "credential": {"kind": "replace", "value": "provider-secret"},
+                "authentication": "anthropic-api-key", "presetKey": null
+            }
+        }),
+    )
+    .await;
+    read_frame(&mut stream).await.unwrap();
+    let provider_id = saved["result"]["outcome"]["view"]["providers"][0]["id"].clone();
+    let applied = request(
+        &mut stream,
+        "activate-direct",
+        json!({
+            "kind": "act", "target": "claude", "actionId": Uuid::new_v4(),
+            "expectedRevision": 1,
+            "action": {"kind": "activate-provider", "providerId": provider_id, "mode": "direct"}
+        }),
+    )
+    .await;
+    read_frame(&mut stream).await.unwrap();
+    let applied_view = &applied["result"]["outcome"]["view"];
+    assert_eq!(applied_view["mode"], "direct");
+    assert!(applied_view["takeover"]["endpoint"].is_null());
+    let snapshot_id = applied_view["activatedSnapshot"]["id"].clone();
+    drop(stream);
+    assert!(
+        timeout(PROCESS_TIMEOUT, first.wait())
+            .await
+            .expect("Claude Direct retained the first service epoch")
+            .unwrap()
+            .success()
+    );
+    assert!(!socket.exists());
+
+    let second_shutdown = root.path().join("second-shutdown");
+    let mut second = command(&home, &second_shutdown)
+        .arg("--test-claude-executable")
+        .arg(&claude)
+        .spawn()
+        .unwrap();
+    wait_for_socket(&socket).await;
+    let mut reopened = UnixStream::connect(&socket).await.unwrap();
+    hello(&mut reopened).await;
+    let reopened_view = request(
+        &mut reopened,
+        "reopen-claude",
+        json!({"kind": "open-target", "target": "claude"}),
+    )
+    .await;
+    assert_eq!(reopened_view["result"]["view"]["mode"], "direct");
+    assert_eq!(
+        reopened_view["result"]["view"]["activatedSnapshot"]["id"],
+        snapshot_id
+    );
+    assert!(reopened_view["result"]["view"]["takeover"]["endpoint"].is_null());
+    drop(reopened);
+    assert!(
+        timeout(PROCESS_TIMEOUT, second.wait())
+            .await
+            .expect("Claude Direct retained the restarted service epoch")
+            .unwrap()
+            .success()
+    );
+    assert!(!socket.exists());
+}
+
+#[tokio::test]
 async fn unresolved_claude_recovery_or_drift_keeps_control_only_process_alive() {
     for state in ["recovery-required", "configuration-drift"] {
         let root = TempDir::new().unwrap();

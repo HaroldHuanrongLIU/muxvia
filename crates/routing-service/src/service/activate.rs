@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     claude::{
         ClaudeCapability, ClaudeConfigCodec, ClaudeConfigOwnership, ClaudeConfigSnapshot,
-        ClaudeProbe, CommandClaudeProbe, DesiredClaudeState,
+        ClaudeProbe, CommandClaudeProbe, DesiredClaudeState, ManagedClaudeState,
     },
     codex::config::ManagedCodexState,
 };
@@ -28,7 +28,7 @@ use crate::{
     },
     state::{
         ActionFailure, ActivationCommit, ActivationPreparation, ActivationRuntime,
-        ManagedWriteStatus, RecoveryIntent, RecoveryState, StateError, StateStore,
+        ManagedWriteStatus, RecoveryIntent, RecoveryPayload, RecoveryState, StateError, StateStore,
     },
 };
 
@@ -401,16 +401,6 @@ impl ActivationService {
                 Ok(outcome)
             }
             Ok(TargetAction::ActivateProvider { provider_id, mode }) => {
-                if target == Target::Claude && mode == ActivationMode::Direct {
-                    return Err(self
-                        .store
-                        .failure_for(
-                            target,
-                            "unsupported-activation-mode",
-                            "Claude Direct Activation is not available",
-                        )
-                        .await);
-                }
                 let provider_id = match Uuid::parse_str(&provider_id) {
                     Ok(provider_id) => provider_id,
                     Err(_) => {
@@ -577,27 +567,46 @@ impl ActivationService {
         };
 
         let (runtime, configuration, mut candidate) = match command.mode {
-            ActivationMode::Direct => {
-                let ConfigurationPreflight::Codex { codec, before } = configuration else {
-                    return Err(self
-                        .target_failure(target, "unsupported-activation-mode")
-                        .await);
-                };
-                let desired = codec.desired_direct(
-                    &preparation.model,
-                    &preparation.base_url,
-                    preparation.provider_credential.expose_secret(),
-                );
-                (
-                    ActivationRuntime::Direct,
-                    ActivationConfiguration::Codex {
-                        codec,
-                        before,
-                        desired,
-                    },
-                    None,
-                )
-            }
+            ActivationMode::Direct => match configuration {
+                ConfigurationPreflight::Codex { codec, before } => {
+                    let desired = codec.desired_direct(
+                        &preparation.model,
+                        &preparation.base_url,
+                        preparation.provider_credential.expose_secret(),
+                    );
+                    (
+                        ActivationRuntime::Direct,
+                        ActivationConfiguration::Codex {
+                            codec,
+                            before,
+                            desired,
+                        },
+                        None,
+                    )
+                }
+                ConfigurationPreflight::Claude { codec, before } => {
+                    let desired = match codec.desired_direct(
+                        &preparation.model,
+                        &preparation.base_url,
+                        preparation.authentication,
+                        preparation.provider_credential.expose_secret(),
+                    ) {
+                        Ok(desired) => desired,
+                        Err(problem) => {
+                            return Err(self.target_failure(target, problem.code()).await);
+                        }
+                    };
+                    (
+                        ActivationRuntime::Direct,
+                        ActivationConfiguration::Claude {
+                            codec,
+                            before: *before,
+                            desired,
+                        },
+                        None,
+                    )
+                }
+            },
             ActivationMode::Takeover => {
                 let persisted_port = preparation.preferred_route_port;
                 let model_slot = self.model_for(target).lock().await;
@@ -731,7 +740,10 @@ impl ActivationService {
                     command.expected_revision,
                     snapshot,
                     runtime,
-                    preparation.managed_config_version,
+                    match target {
+                        Target::Codex => 1,
+                        Target::Claude => 2,
+                    },
                     recovery_id,
                     configuration.config_path().to_string_lossy().into_owned(),
                     capability_problem,
@@ -1054,26 +1066,46 @@ impl ActivationService {
                     .ok_or_else(|| PreflightFailure::new("preflight-context-required"))?;
                 let codec = ClaudeConfigCodec::for_user_home(self.home.user_home())
                     .map_err(|problem| PreflightFailure::new(problem.code()))?;
-                let ownership = ClaudeConfigOwnership::from_managed_config_version(
+                let committed_ownership = ClaudeConfigOwnership::from_managed_config_version(
                     preparation.managed_config_version,
                 )
                 .ok_or_else(|| PreflightFailure::new("recovery-required"))?;
-                let expected = match (
+                let (expected, ownership) = match (
                     &preparation.prior_snapshot,
                     &preparation.prior_route_runtime,
                 ) {
-                    (Some(snapshot), Some(runtime)) => Some(codec.desired_takeover_with_ownership(
-                        &snapshot.model,
-                        &format!("http://127.0.0.1:{}", runtime.route_port),
-                        runtime.routing_credential.expose_secret(),
-                        ownership,
-                    )),
-                    (None, None) => None,
+                    (Some(snapshot), Some(runtime)) => (
+                        Some(codec.desired_takeover_with_ownership(
+                            &snapshot.model,
+                            &format!("http://127.0.0.1:{}", runtime.route_port),
+                            runtime.routing_credential.expose_secret(),
+                            committed_ownership,
+                        )),
+                        committed_ownership,
+                    ),
+                    (Some(snapshot), None)
+                        if committed_ownership == ClaudeConfigOwnership::FourField =>
+                    {
+                        (
+                            Some(
+                                codec
+                                    .desired_direct(
+                                        &snapshot.model,
+                                        &snapshot.base_url,
+                                        snapshot.authentication,
+                                        snapshot.provider_credential.expose_secret(),
+                                    )
+                                    .map_err(|problem| PreflightFailure::new(problem.code()))?,
+                            ),
+                            committed_ownership,
+                        )
+                    }
+                    (None, None) => (None, ClaudeConfigOwnership::FourField),
                     (Some(_), None) | (None, Some(_)) => {
                         return Err(PreflightFailure::new("recovery-required"));
                     }
                 };
-                let (_, before) = codec
+                let (_, committed_before) = codec
                     .preflight_snapshot_with_ownership(context, expected.as_ref(), ownership)
                     .map_err(|problem| {
                         let code = match problem.code() {
@@ -1086,6 +1118,60 @@ impl ActivationService {
                             selector: problem.selector(),
                         }
                     })?;
+                let committed_expectation = match (
+                    expected.as_ref(),
+                    preparation.prior_recovery_payload.as_ref(),
+                ) {
+                    (None, None) => None,
+                    (Some(expected), Some(RecoveryPayload::Claude { before, desired }))
+                        if desired.as_ref() == expected && before.ownership() == ownership =>
+                    {
+                        Some((expected, before.as_ref()))
+                    }
+                    _ => return Err(PreflightFailure::new("recovery-required")),
+                };
+                let managed =
+                    codec
+                        .inspect_managed_state(committed_expectation)
+                        .map_err(|problem| PreflightFailure {
+                            code: match problem.code() {
+                                "configuration-collision" if expected.is_some() => {
+                                    "recovery-required"
+                                }
+                                code => code,
+                            },
+                            source: problem.source().map(str::to_owned),
+                            selector: problem.selector(),
+                        })?;
+                let managed_shape_is_valid = matches!(
+                    (
+                        managed,
+                        &preparation.prior_snapshot,
+                        &preparation.prior_route_runtime
+                    ),
+                    (ManagedClaudeState::Unmanaged { .. }, None, None)
+                        | (ManagedClaudeState::Direct { .. }, Some(_), None)
+                        | (ManagedClaudeState::Takeover { .. }, Some(_), Some(_))
+                );
+                if !managed_shape_is_valid {
+                    return Err(PreflightFailure::new("recovery-required"));
+                }
+                let before = if ownership == ClaudeConfigOwnership::LegacyThree {
+                    codec
+                        .preflight_snapshot_with_ownership(
+                            context,
+                            None,
+                            ClaudeConfigOwnership::FourField,
+                        )
+                        .map_err(|problem| PreflightFailure {
+                            code: problem.code(),
+                            source: problem.source().map(str::to_owned),
+                            selector: problem.selector(),
+                        })?
+                        .1
+                } else {
+                    committed_before
+                };
                 let capability_problem = match self.claude_probe.probe(&self.claude_executable) {
                     Ok(ClaudeCapability::Tested { .. }) => None,
                     Ok(ClaudeCapability::UnknownCompatible { warning, .. }) => {

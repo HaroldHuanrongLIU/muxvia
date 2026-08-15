@@ -34,7 +34,7 @@ use muxvia_routing::{
 };
 use tempfile::TempDir;
 use tokio::sync::Notify;
-use tokio_rusqlite::rusqlite::OptionalExtension;
+use tokio_rusqlite::rusqlite::{Connection as SqliteConnection, OptionalExtension};
 use toml_edit::DocumentMut;
 use uuid::Uuid;
 
@@ -151,6 +151,33 @@ struct Fixture {
     probe: Arc<GoodProbe>,
 }
 
+struct ActivationCommitAbort {
+    connection: SqliteConnection,
+}
+
+impl ActivationCommitAbort {
+    fn install(home: &MuxviaHome) -> Self {
+        let connection = SqliteConnection::open(home.database_path()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER abort_claude_activation_commit
+                 BEFORE UPDATE OF current_provider_id ON target_route_state
+                 WHEN NEW.target = 'claude'
+                 BEGIN SELECT RAISE(ABORT, 'test-claude-activation-commit-abort'); END;",
+            )
+            .unwrap();
+        Self { connection }
+    }
+}
+
+impl Drop for ActivationCommitAbort {
+    fn drop(&mut self) {
+        let _ = self
+            .connection
+            .execute_batch("DROP TRIGGER IF EXISTS abort_claude_activation_commit;");
+    }
+}
+
 #[derive(PartialEq, Eq)]
 struct MutationFingerprint {
     sqlite: Vec<u8>,
@@ -219,6 +246,17 @@ impl Fixture {
     }
 
     async fn save_claude(&self, name: &str, model: &str, secret: &str) -> (Uuid, u64) {
+        self.save_claude_with_auth(name, model, secret, "anthropic-api-key")
+            .await
+    }
+
+    async fn save_claude_with_auth(
+        &self,
+        name: &str,
+        model: &str,
+        secret: &str,
+        authentication: &str,
+    ) -> (Uuid, u64) {
         let result = self
             .store
             .apply_provider_action_for(
@@ -233,7 +271,7 @@ impl Fixture {
                     "kind": "create-provider", "name": name,
                     "baseUrl": "https://api.anthropic.test", "model": model,
                     "credential": { "kind": "replace", "value": secret },
-                    "authentication": "anthropic-api-key",
+                    "authentication": authentication,
                     "presetKey": null,
                 }),
             )
@@ -243,6 +281,79 @@ impl Fixture {
             result.view.providers.last().unwrap().id,
             result.view.management_revision,
         )
+    }
+
+    async fn managed_config_version_for(&self, target: Target) -> u32 {
+        let database = tokio_rusqlite::Connection::open(self.home.database_path())
+            .await
+            .unwrap();
+        database
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT managed_config_version FROM target_route_state WHERE target = ?1",
+                    [target.as_str()],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn downgrade_latest_claude_takeover_to_v1(&self, legacy_api_key: &str) {
+        let settings_path = self.home.user_home().join(".claude/settings.json");
+        let mut settings: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        settings["env"]["ANTHROPIC_API_KEY"] = serde_json::json!(legacy_api_key);
+        fs::write(
+            &settings_path,
+            serde_json::to_vec_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        let database = tokio_rusqlite::Connection::open(self.home.database_path())
+            .await
+            .unwrap();
+        let legacy_api_key = legacy_api_key.to_owned();
+        database
+            .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                let (id, payload_json): (String, String) = connection.query_row(
+                    "SELECT id, payload_json FROM activation_recovery
+                     WHERE target = 'claude' AND state = 'committed'
+                     ORDER BY rowid DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let mut payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+                let object = payload.as_object_mut().unwrap();
+                object.remove("ownership_version");
+                let before = object["before"].as_object_mut().unwrap();
+                before.remove("ownership_version");
+                before.remove("unrelated_fingerprint");
+                before.insert(
+                    "unrelated".to_owned(),
+                    serde_json::json!({
+                        "env": {"ANTHROPIC_API_KEY": legacy_api_key},
+                        "permissions": {"allow": ["Read"]}
+                    }),
+                );
+                before["owned"].as_object_mut().unwrap().remove("api_key");
+                let desired = object["desired"].as_object_mut().unwrap();
+                desired.remove("ownership_version");
+                desired.remove("mode");
+                desired["owned"].as_object_mut().unwrap().remove("api_key");
+                connection.execute(
+                    "UPDATE activation_recovery SET payload_json = ?1 WHERE id = ?2",
+                    (serde_json::to_string(&payload).unwrap(), id),
+                )?;
+                connection.execute(
+                    "UPDATE target_route_state SET managed_config_version = 1
+                     WHERE target = 'claude'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     async fn mutate_provider(&self, provider_id: Uuid, base_url: &str, model: &str) {
@@ -593,32 +704,803 @@ async fn claude_takeover_commits_one_target_native_snapshot_and_leaves_codex_unc
 }
 
 #[tokio::test]
-async fn claude_direct_is_receipt_first_but_rejected_before_probe_file_or_runtime_work() {
+async fn claude_direct_commits_both_authentication_profiles_without_model_runtime() {
+    for (authentication, active_key, inactive_key) in [
+        (
+            "anthropic-api-key",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+        ),
+        (
+            "anthropic-bearer",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ),
+    ] {
+        let fixture = Fixture::new().await;
+        let settings = fixture.home.user_home().join(".claude/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(
+            &settings,
+            br#"{"env":{"ANTHROPIC_AUTH_TOKEN":"prior-token","ANTHROPIC_API_KEY":"prior-key"},"permissions":{"allow":["Read"]}}"#,
+        )
+        .unwrap();
+        let (provider_id, revision) = fixture
+            .save_claude_with_auth(
+                "Claude Direct",
+                "claude-sonnet-test",
+                "provider-secret",
+                authentication,
+            )
+            .await;
+        let probe = Arc::new(GoodClaudeProbe(AtomicUsize::new(0)));
+        let steps = Arc::new(Steps::default());
+        let service = fixture.dual_service(ActivationHooks::observed(steps.clone()), probe.clone());
+        let codex_endpoint_before = service.model_endpoint().await;
+        let claude_endpoint_before = service.model_endpoint_for(Target::Claude).await;
+        let action_id = Uuid::new_v4();
+        let mut updates = fixture.store.subscribe_target_views();
+
+        let outcome = service
+            .apply_raw_for_with_context(
+                Target::Claude,
+                action_id,
+                revision,
+                direct_action(provider_id),
+                Some(&claude_context(&fixture.home)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, ActionStatus::Applied);
+        assert_eq!(outcome.view.target, Target::Claude);
+        assert_eq!(outcome.view.mode, "direct");
+        assert_eq!(outcome.view.management_revision, revision + 1);
+        assert_eq!(outcome.view.view_sequence, revision + 1);
+        assert_eq!(
+            outcome.view.current_provider_id,
+            Some(provider_id.to_string())
+        );
+        assert!(outcome.view.serving_provider_id.is_none());
+        let snapshot = outcome.view.activated_snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.provider_id, provider_id);
+        assert_eq!(snapshot.model, "claude-sonnet-test");
+        assert_eq!(snapshot.authentication.to_string(), authentication);
+        assert_eq!(outcome.view.managed_configuration.state, "applied");
+        assert_eq!(
+            outcome.view.managed_configuration.path.as_deref(),
+            settings.to_str()
+        );
+        assert!(outcome.view.managed_configuration.restart_required);
+        assert_eq!(outcome.view.takeover.state, "inactive");
+        assert!(outcome.view.takeover.endpoint.is_none());
+        assert_eq!(fixture.managed_config_version_for(Target::Claude).await, 2);
+        assert_eq!(fixture.count("activated_snapshots").await, 1);
+        assert_eq!(fixture.count("activation_recovery").await, 1);
+        assert_eq!(fixture.count("action_receipts").await, 2);
+        assert_eq!(
+            fixture
+                .recovery_state_for_action(action_id)
+                .await
+                .as_deref(),
+            Some("committed")
+        );
+        assert!(
+            fixture
+                .store
+                .routing_credential_for(Target::Claude)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(service.model_endpoint().await, codex_endpoint_before);
+        assert_eq!(
+            service.model_endpoint_for(Target::Claude).await,
+            claude_endpoint_before
+        );
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+        let env = document["env"].as_object().unwrap();
+        assert_eq!(
+            document["env"]["ANTHROPIC_BASE_URL"],
+            "https://api.anthropic.test/"
+        );
+        assert_eq!(document["env"]["ANTHROPIC_MODEL"], "claude-sonnet-test");
+        assert_eq!(document["env"][active_key], "provider-secret");
+        assert!(!env.contains_key(inactive_key));
+        assert_eq!(document["permissions"]["allow"][0], "Read");
+        assert_eq!(updates.recv().await.unwrap(), outcome.view);
+        assert!(updates.try_recv().is_err());
+        let reached = steps.0.lock().unwrap().clone();
+        assert!(!reached.contains(&ActivationStep::BindListener));
+        assert!(!reached.contains(&ActivationStep::PersistRoutingCredential));
+        assert!(!reached.contains(&ActivationStep::RuntimeHandoff));
+
+        let replay = service
+            .apply_raw_for_with_context(
+                Target::Claude,
+                action_id,
+                0,
+                serde_json::json!({"malformed": true}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status, ActionStatus::Replayed);
+        assert_eq!(replay.view, outcome.view);
+        assert_eq!(probe.0.load(Ordering::SeqCst), 1);
+        assert!(updates.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn claude_direct_switches_authentication_profiles_against_the_immutable_snapshot() {
     let fixture = Fixture::new().await;
-    let (provider_id, revision) = fixture
-        .save_claude("Claude", "claude-sonnet-test", "provider-secret")
-        .await;
-    let probe = Arc::new(GoodClaudeProbe(AtomicUsize::new(0)));
-    let service = fixture.dual_service(ActivationHooks::default(), probe.clone());
-    let before = fixture.mutation_fingerprint().await;
     let settings = fixture.home.user_home().join(".claude/settings.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(
+        &settings,
+        br#"{"env":{"ANTHROPIC_AUTH_TOKEN":"operator-token","ANTHROPIC_API_KEY":"operator-key"},"permissions":{"deny":["Bash"]}}"#,
+    )
+    .unwrap();
+    let (api_provider, _) = fixture
+        .save_claude_with_auth(
+            "API Direct",
+            "claude-api",
+            "api-provider-secret",
+            "anthropic-api-key",
+        )
+        .await;
+    let (bearer_provider, revision) = fixture
+        .save_claude_with_auth(
+            "Bearer Direct",
+            "claude-bearer",
+            "bearer-provider-secret",
+            "anthropic-bearer",
+        )
+        .await;
+    let service = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+
+    let first = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            revision,
+            direct_action(api_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    fixture
+        .mutate_provider(
+            api_provider,
+            "https://edited-after-activation.invalid",
+            "edited-model",
+        )
+        .await;
+    fixture
+        .mutate_provider_credential(api_provider, "edited-provider-secret")
+        .await;
+    let second = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            first.view.management_revision,
+            direct_action(bearer_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    let after_bearer: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(after_bearer["env"]["ANTHROPIC_MODEL"], "claude-bearer");
+    assert_eq!(
+        after_bearer["env"]["ANTHROPIC_AUTH_TOKEN"],
+        "bearer-provider-secret"
+    );
+    assert!(
+        !after_bearer["env"]
+            .as_object()
+            .unwrap()
+            .contains_key("ANTHROPIC_API_KEY")
+    );
+    assert_eq!(after_bearer["permissions"]["deny"][0], "Bash");
+
+    let third = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            second.view.management_revision,
+            direct_action(api_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    let after_api: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(after_api["env"]["ANTHROPIC_MODEL"], "edited-model");
+    assert_eq!(
+        after_api["env"]["ANTHROPIC_API_KEY"],
+        "edited-provider-secret"
+    );
+    assert!(
+        !after_api["env"]
+            .as_object()
+            .unwrap()
+            .contains_key("ANTHROPIC_AUTH_TOKEN")
+    );
+    assert_eq!(third.view.mode, "direct");
+    assert_eq!(
+        third.view.current_provider_id,
+        Some(api_provider.to_string())
+    );
+    assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+}
+
+#[tokio::test]
+async fn claude_corrupt_committed_expectation_fails_closed_as_recovery_required() {
+    let fixture = Fixture::new().await;
+    let (first_provider, revision) = fixture
+        .save_claude_with_auth("First", "claude-first", "first-secret", "anthropic-api-key")
+        .await;
+    let service = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let first = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            revision,
+            direct_action(first_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    let (second_provider, second_revision) = fixture
+        .save_claude_with_auth(
+            "Second",
+            "claude-second",
+            "second-secret",
+            "anthropic-bearer",
+        )
+        .await;
+    assert!(second_revision > first.view.management_revision);
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
+            connection.execute(
+                "UPDATE activation_recovery SET payload_json = '{\"corrupt\":true}'
+                 WHERE rowid = (
+                   SELECT rowid FROM activation_recovery
+                   WHERE target = 'claude' AND state = 'committed'
+                   ORDER BY rowid DESC LIMIT 1
+                 )",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let settings = fixture.home.user_home().join(".claude/settings.json");
+    let file_before = fs::read(&settings).unwrap();
 
     let failure = service
         .apply_raw_for_with_context(
             Target::Claude,
             Uuid::new_v4(),
-            revision,
-            direct_action(provider_id),
+            second_revision,
+            direct_action(second_provider),
             Some(&claude_context(&fixture.home)),
         )
         .await
         .unwrap_err();
 
-    assert_eq!(failure.problem.code, "unsupported-activation-mode");
-    assert_eq!(probe.0.load(Ordering::SeqCst), 0);
-    assert_eq!(fixture.mutation_fingerprint().await, before);
-    assert!(!settings.exists());
+    assert_eq!(failure.problem.code, "recovery-required");
+    assert_eq!(
+        failure.authoritative_view.recovery.state,
+        "recovery-required"
+    );
+    assert_eq!(
+        failure.authoritative_view.managed_configuration.state,
+        "recovery-required"
+    );
+    assert_eq!(fs::read(&settings).unwrap(), file_before);
     assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+}
+
+#[tokio::test]
+async fn claude_direct_to_takeover_uses_v2_and_takeover_to_direct_fails_before_intent() {
+    let fixture = Fixture::new().await;
+    let settings = fixture.home.user_home().join(".claude/settings.json");
+    let (direct_provider, _) = fixture
+        .save_claude_with_auth(
+            "API Direct",
+            "claude-direct",
+            "direct-api-secret",
+            "anthropic-api-key",
+        )
+        .await;
+    let (takeover_provider, revision) = fixture
+        .save_claude_with_auth(
+            "Takeover",
+            "claude-route",
+            "upstream-secret",
+            "anthropic-bearer",
+        )
+        .await;
+    let service = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let direct = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            revision,
+            direct_action(direct_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+
+    let takeover = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            direct.view.management_revision,
+            takeover_action(takeover_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(takeover.view.mode, "takeover");
+    assert_eq!(fixture.managed_config_version_for(Target::Claude).await, 2);
+    assert!(takeover.view.takeover.endpoint.is_some());
+    assert!(service.model_endpoint_for(Target::Claude).await.is_some());
+    let applied: serde_json::Value = serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(applied["env"]["ANTHROPIC_MODEL"], "claude-route");
+    assert!(applied["env"]["ANTHROPIC_AUTH_TOKEN"].is_string());
+    assert!(
+        !applied["env"]
+            .as_object()
+            .unwrap()
+            .contains_key("ANTHROPIC_API_KEY")
+    );
+    let intent_count = fixture.count("activation_recovery").await;
+    let file_before = fs::read(&settings).unwrap();
+    let failure = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            takeover.view.management_revision,
+            direct_action(direct_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.problem.code, "takeover-active");
+    assert_eq!(fixture.count("activation_recovery").await, intent_count);
+    assert_eq!(fs::read(&settings).unwrap(), file_before);
+    service.shutdown_model_for(Target::Claude).await.unwrap();
+}
+
+#[tokio::test]
+async fn claude_direct_post_intent_failpoints_restore_exact_state_without_runtime_or_publication() {
+    for failpoint in [
+        ActivationFailpoint::RecoveryIntent,
+        ActivationFailpoint::AtomicConfigWrite,
+        ActivationFailpoint::ConfigVerify,
+        ActivationFailpoint::FinalCommit,
+    ] {
+        let fixture = Fixture::new().await;
+        let settings = fixture.home.user_home().join(".claude/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let before = br#"{"env":{"ANTHROPIC_AUTH_TOKEN":"prior-token","ANTHROPIC_API_KEY":"prior-key"},"permissions":{"allow":["Read"]}}"#;
+        fs::write(&settings, before).unwrap();
+        let before_value: serde_json::Value = serde_json::from_slice(before).unwrap();
+        let (provider_id, revision) = fixture
+            .save_claude_with_auth(
+                "Claude Direct",
+                "claude-direct",
+                "provider-secret",
+                "anthropic-bearer",
+            )
+            .await;
+        let service = fixture.dual_service(
+            ActivationHooks::failing(failpoint),
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+        );
+        let mut updates = fixture.store.subscribe_target_views();
+        let action_id = Uuid::new_v4();
+
+        let failure = service
+            .apply_raw_for_with_context(
+                Target::Claude,
+                action_id,
+                revision,
+                direct_action(provider_id),
+                Some(&claude_context(&fixture.home)),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            failure.problem.code.as_str(),
+            "configuration-write-failed" | "internal-failure"
+        ));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&settings).unwrap()).unwrap(),
+            before_value,
+            "{failpoint:?}"
+        );
+        assert_eq!(
+            fixture
+                .recovery_state_for_action(action_id)
+                .await
+                .as_deref(),
+            Some("rolled-back"),
+            "{failpoint:?}"
+        );
+        assert!(
+            fixture
+                .store
+                .activated_snapshot_for(Target::Claude)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .routing_credential_for(Target::Claude)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+        assert!(updates.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn claude_real_sqlite_commit_failure_restores_first_and_direct_to_direct_configuration() {
+    for prior_direct in [false, true] {
+        let fixture = Fixture::new().await;
+        let settings = fixture.home.user_home().join(".claude/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(
+            &settings,
+            br#"{"env":{"ANTHROPIC_AUTH_TOKEN":"operator-token","ANTHROPIC_API_KEY":"operator-key"},"permissions":{"allow":["Read"]}}"#,
+        )
+        .unwrap();
+        let (first_provider, first_revision) = fixture
+            .save_claude_with_auth("First", "claude-first", "first-secret", "anthropic-bearer")
+            .await;
+        let service = fixture.dual_service(
+            ActivationHooks::default(),
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+        );
+        let (provider_id, revision) = if prior_direct {
+            let first = service
+                .apply_raw_for_with_context(
+                    Target::Claude,
+                    Uuid::new_v4(),
+                    first_revision,
+                    direct_action(first_provider),
+                    Some(&claude_context(&fixture.home)),
+                )
+                .await
+                .unwrap();
+            let (second_provider, second_revision) = fixture
+                .save_claude_with_auth(
+                    "Second",
+                    "claude-second",
+                    "second-secret",
+                    "anthropic-api-key",
+                )
+                .await;
+            assert!(second_revision > first.view.management_revision);
+            (second_provider, second_revision)
+        } else {
+            (first_provider, first_revision)
+        };
+        let view_before = fixture.store.target_view_for(Target::Claude).await.unwrap();
+        let file_before: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+        let snapshot_count = fixture.count("activated_snapshots").await;
+        let receipt_count = fixture.count("action_receipts").await;
+        let action_id = Uuid::new_v4();
+        let abort = ActivationCommitAbort::install(&fixture.home);
+
+        let failure = service
+            .apply_raw_for_with_context(
+                Target::Claude,
+                action_id,
+                revision,
+                direct_action(provider_id),
+                Some(&claude_context(&fixture.home)),
+            )
+            .await
+            .unwrap_err();
+        drop(abort);
+
+        assert_eq!(failure.problem.code, "internal-failure");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&settings).unwrap()).unwrap(),
+            file_before
+        );
+        let view_after = fixture.store.target_view_for(Target::Claude).await.unwrap();
+        assert_eq!(
+            view_after.management_revision,
+            view_before.management_revision
+        );
+        assert_eq!(
+            view_after.current_provider_id,
+            view_before.current_provider_id
+        );
+        assert_eq!(
+            view_after.activated_snapshot,
+            view_before.activated_snapshot
+        );
+        assert_eq!(fixture.count("activated_snapshots").await, snapshot_count);
+        assert_eq!(fixture.count("action_receipts").await, receipt_count);
+        assert_eq!(
+            fixture
+                .recovery_state_for_action(action_id)
+                .await
+                .as_deref(),
+            Some("rolled-back")
+        );
+        assert!(
+            fixture
+                .store
+                .routing_credential_for(Target::Claude)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn claude_real_sqlite_commit_failure_cleans_direct_to_takeover_candidate() {
+    let fixture = Fixture::new().await;
+    let (direct_provider, direct_revision) = fixture
+        .save_claude_with_auth(
+            "Direct",
+            "claude-direct",
+            "direct-secret",
+            "anthropic-api-key",
+        )
+        .await;
+    let service = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let direct = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            direct_revision,
+            direct_action(direct_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    let (takeover_provider, revision) = fixture
+        .save_claude_with_auth(
+            "Takeover",
+            "claude-route",
+            "upstream-secret",
+            "anthropic-bearer",
+        )
+        .await;
+    assert!(revision > direct.view.management_revision);
+    let settings = fixture.home.user_home().join(".claude/settings.json");
+    let file_before: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    let view_before = fixture.store.target_view_for(Target::Claude).await.unwrap();
+    let action_id = Uuid::new_v4();
+    let abort = ActivationCommitAbort::install(&fixture.home);
+
+    let failure = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            action_id,
+            revision,
+            takeover_action(takeover_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap_err();
+    drop(abort);
+
+    assert_eq!(failure.problem.code, "internal-failure");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&settings).unwrap()).unwrap(),
+        file_before
+    );
+    let view_after = fixture.store.target_view_for(Target::Claude).await.unwrap();
+    assert_eq!(
+        view_after.management_revision,
+        view_before.management_revision
+    );
+    assert_eq!(
+        view_after.current_provider_id,
+        view_before.current_provider_id
+    );
+    assert_eq!(
+        view_after.activated_snapshot,
+        view_before.activated_snapshot
+    );
+    assert!(
+        fixture
+            .store
+            .routing_credential_for(Target::Claude)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+    assert_eq!(
+        fixture
+            .recovery_state_for_action(action_id)
+            .await
+            .as_deref(),
+        Some("rolled-back")
+    );
+}
+
+#[tokio::test]
+async fn claude_v1_takeover_sqlite_failure_restores_legacy_api_key_and_retry_upgrades_to_v2() {
+    let fixture = Fixture::new().await;
+    let settings = fixture.home.user_home().join(".claude/settings.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(
+        &settings,
+        br#"{"env":{"ANTHROPIC_API_KEY":"legacy-api-key"},"permissions":{"allow":["Read"]}}"#,
+    )
+    .unwrap();
+    let (first_provider, first_revision) = fixture
+        .save_claude_with_auth(
+            "Legacy",
+            "claude-legacy",
+            "legacy-upstream-secret",
+            "anthropic-api-key",
+        )
+        .await;
+    let first_service = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let first = first_service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            first_revision,
+            takeover_action(first_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    let endpoint = first_service
+        .model_endpoint_for(Target::Claude)
+        .await
+        .unwrap();
+    fixture
+        .downgrade_latest_claude_takeover_to_v1("legacy-api-key")
+        .await;
+    assert_eq!(fixture.managed_config_version_for(Target::Claude).await, 1);
+    first_service
+        .shutdown_model_for(Target::Claude)
+        .await
+        .unwrap();
+    let restarted_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+    let service = ActivationService::new(
+        Arc::clone(&restarted_store),
+        fixture.home.clone(),
+        fixture.probe.clone(),
+        "/usr/bin/codex".into(),
+        Arc::new(NoopUpstream),
+    )
+    .with_claude_runtime(
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+        "/usr/bin/claude".into(),
+    );
+    service
+        .bootstrap_committed_takeover_for(Target::Claude)
+        .await
+        .unwrap();
+    assert_eq!(
+        service.model_endpoint_for(Target::Claude).await,
+        Some(endpoint)
+    );
+    let restarted_settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(
+        restarted_settings["env"]["ANTHROPIC_API_KEY"],
+        "legacy-api-key"
+    );
+    let (second_provider, revision) = fixture
+        .save_claude_with_auth(
+            "Upgraded",
+            "claude-upgraded",
+            "upgraded-upstream-secret",
+            "anthropic-bearer",
+        )
+        .await;
+    assert!(revision > first.view.management_revision);
+    let action_id = Uuid::new_v4();
+    let abort = ActivationCommitAbort::install(&fixture.home);
+
+    let failure = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            action_id,
+            revision,
+            takeover_action(second_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap_err();
+    drop(abort);
+
+    assert_eq!(failure.problem.code, "internal-failure");
+    assert_eq!(fixture.managed_config_version_for(Target::Claude).await, 1);
+    let restored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(restored["env"]["ANTHROPIC_API_KEY"], "legacy-api-key");
+    assert_eq!(restored["env"]["ANTHROPIC_MODEL"], "claude-legacy");
+    assert_eq!(
+        service.model_endpoint_for(Target::Claude).await,
+        Some(endpoint)
+    );
+    assert!(tokio::net::TcpStream::connect(endpoint).await.is_ok());
+    assert_eq!(
+        fixture
+            .recovery_state_for_action(action_id)
+            .await
+            .as_deref(),
+        Some("rolled-back")
+    );
+
+    let upgraded = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            action_id,
+            revision,
+            takeover_action(second_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upgraded.status, ActionStatus::Applied);
+    assert_eq!(fixture.managed_config_version_for(Target::Claude).await, 2);
+    let upgraded_settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
+    assert!(
+        !upgraded_settings["env"]
+            .as_object()
+            .unwrap()
+            .contains_key("ANTHROPIC_API_KEY")
+    );
+    assert_eq!(
+        upgraded_settings["env"]["ANTHROPIC_MODEL"],
+        "claude-upgraded"
+    );
+    assert_eq!(
+        service.model_endpoint_for(Target::Claude).await,
+        Some(endpoint)
+    );
+    service.shutdown_model_for(Target::Claude).await.unwrap();
 }
 
 #[tokio::test]
@@ -1244,7 +2126,9 @@ async fn claude_payload_ownership_mismatch_rolls_back_without_commit_or_publicat
         };
         pause.wait_until_reached().await;
 
-        let mismatched_version = if current_version == 1 { 2 } else { 1 };
+        // Every newly authorized Claude activation writes the T06 four-field contract,
+        // including an unmanaged row that still carries the migrated v1 marker.
+        let mismatched_version = 1;
         let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
             .await
             .unwrap();

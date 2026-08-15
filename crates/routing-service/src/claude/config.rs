@@ -139,8 +139,6 @@ impl DesiredClaudeState {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-// Landed before the activation transaction consumes typed Claude state.
-#[allow(dead_code)]
 pub(crate) enum ManagedClaudeState {
     Unmanaged { snapshot: ClaudeConfigSnapshot },
     Direct { snapshot: ClaudeConfigSnapshot },
@@ -310,8 +308,6 @@ impl ClaudeConfigCodec {
         self.desired_takeover_v2(model, base_url, routing_credential)
     }
 
-    // Landed before Claude Direct is enabled at the activation boundary.
-    #[allow(dead_code)]
     pub(crate) fn desired_direct(
         &self,
         model: &str,
@@ -424,8 +420,6 @@ impl ClaudeConfigCodec {
 
     /// The expectation and its before snapshot must come from one authoritative committed
     /// Recovery Intent. Matching user-authored values without that expectation remain unmanaged.
-    // Landed before the activation transaction supplies committed intent state.
-    #[allow(dead_code)]
     pub(crate) fn inspect_managed_state(
         &self,
         committed: Option<(&DesiredClaudeState, &ClaudeConfigSnapshot)>,

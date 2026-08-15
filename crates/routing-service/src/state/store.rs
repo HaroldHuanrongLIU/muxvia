@@ -64,6 +64,7 @@ type ActivationPreparationRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 pub struct ActivationPreparation {
@@ -77,12 +78,14 @@ pub struct ActivationPreparation {
     pub routing_requirement: ProviderRoutingRequirement,
     pub prior_snapshot: Option<CommittedActivationSnapshot>,
     pub prior_route_runtime: Option<CommittedRouteRuntime>,
+    pub prior_recovery_payload: Option<RecoveryPayload>,
     pub preferred_route_port: Option<u16>,
 }
 
 pub struct CommittedActivationSnapshot {
     pub base_url: String,
     pub model: String,
+    pub authentication: ProviderAuthentication,
     pub provider_credential: SecretString,
 }
 
@@ -313,12 +316,13 @@ impl StateStore {
             .call(move |connection| -> Result<Result<ActivationPreparation, ActionFailure>, StateError> {
                 let (revision, managed_config_version, recovery_state, takeover_state, route_port, routing_credential,
                     raw_snapshot_id, joined_snapshot_id, prior_base_url, prior_model,
-                    prior_provider_credential):
+                    prior_authentication, prior_provider_credential):
                     ActivationPreparationRow = connection.query_row(
                         "SELECT r.management_revision, r.managed_config_version,
                                 r.recovery_state, r.takeover_state,
                                 r.route_port, r.routing_credential, r.activated_snapshot_id,
-                                s.id, s.base_url, s.model, s.provider_bearer_token
+                                s.id, s.base_url, s.model, s.authentication,
+                                s.provider_bearer_token
                          FROM target_route_state r
                          LEFT JOIN activated_snapshots s
                            ON s.id = r.activated_snapshot_id AND s.target = r.target
@@ -326,9 +330,12 @@ impl StateStore {
                         [target.as_str()],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
                             row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?,
-                            row.get(9)?, row.get(10)?)),
+                            row.get(9)?, row.get(10)?, row.get(11)?)),
                     )?;
-                let failure = |code: &str, message: &str| -> ActionFailure {
+                let failure = |connection: &tokio_rusqlite::rusqlite::Connection,
+                               code: &str,
+                               message: &str|
+                 -> ActionFailure {
                     ActionFailure {
                         problem: ControlProblem {
                             code: code.to_owned(), message: message.to_owned(),
@@ -339,7 +346,7 @@ impl StateStore {
                     }
                 };
                 if recovery_state == "recovery-required" {
-                    return Ok(Err(failure("recovery-required", "Managed writes are blocked until recovery is resolved")));
+                    return Ok(Err(failure(connection, "recovery-required", "Managed writes are blocked until recovery is resolved")));
                 }
                 if !valid_committed_managed_configuration(
                     target,
@@ -351,7 +358,7 @@ impl StateStore {
                     routing_credential.as_deref(),
                 ) {
                     mark_invalid_managed_configurations(connection, Some(target))?;
-                    return Ok(Err(failure(
+                    return Ok(Err(failure(connection,
                         "recovery-required",
                         "Managed configuration requires recovery",
                     )));
@@ -363,13 +370,13 @@ impl StateStore {
                     |row| row.get(0),
                 )?;
                 if drifted {
-                    return Ok(Err(failure(
+                    return Ok(Err(failure(connection,
                         "configuration-drift",
                         "Managed configuration drift must be reconciled",
                     )));
                 }
                 if revision != expected_revision {
-                    return Ok(Err(failure("stale-revision", "Target state changed; refresh and retry")));
+                    return Ok(Err(failure(connection, "stale-revision", "Target state changed; refresh and retry")));
                 }
                 let route_port = route_port.map(|route_port| {
                     u16::try_from(route_port).expect("validated route port")
@@ -379,25 +386,29 @@ impl StateStore {
                     joined_snapshot_id,
                     prior_base_url,
                     prior_model,
+                    prior_authentication,
                     prior_provider_credential,
                     route_port,
                     routing_credential,
                 ) {
-                    ("inactive", None, None, None, None, None, None) => (None, None),
-                    ("inactive", None, None, None, None, Some(_), None) => (None, None),
-                    ("inactive", Some(_), Some(base_url), Some(model), Some(credential), None, None) => (
+                    ("inactive", None, None, None, None, None, None, None) => (None, None),
+                    ("inactive", None, None, None, None, None, Some(_), None) => (None, None),
+                    ("inactive", Some(_), Some(base_url), Some(model), Some(authentication),
+                        Some(credential), None, None) => (
                         Some(CommittedActivationSnapshot {
                             base_url,
                             model,
+                            authentication: parse_provider_authentication(&authentication)?,
                             provider_credential: SecretString::from(credential),
                         }),
                         None,
                     ),
-                    ("active", Some(_), Some(base_url), Some(model), Some(provider_credential),
-                        Some(route_port), Some(routing_credential)) => (
+                    ("active", Some(_), Some(base_url), Some(model), Some(authentication),
+                        Some(provider_credential), Some(route_port), Some(routing_credential)) => (
                             Some(CommittedActivationSnapshot {
                                 base_url,
                                 model,
+                                authentication: parse_provider_authentication(&authentication)?,
                                 provider_credential: SecretString::from(provider_credential),
                             }),
                             Some(CommittedRouteRuntime {
@@ -406,6 +417,34 @@ impl StateStore {
                             }),
                         ),
                     _ => unreachable!("validated committed managed configuration shape"),
+                };
+                let prior_recovery_payload = if target == Target::Claude && prior_snapshot.is_some() {
+                    let payload_json = match connection.query_row(
+                            "SELECT payload_json FROM activation_recovery
+                             WHERE target = ?1 AND state = 'committed'
+                             ORDER BY rowid DESC LIMIT 1",
+                            [target.as_str()],
+                            |row| row.get::<_, String>(0),
+                        ) {
+                            Ok(payload) => Some(payload),
+                            Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => None,
+                            Err(error) => return Err(StateError::Sqlite(error)),
+                        };
+                    let version = u32::try_from(managed_config_version)
+                        .expect("validated managed configuration version");
+                    let payload = payload_json
+                        .and_then(|payload| serde_json::from_str::<RecoveryPayload>(&payload).ok())
+                        .filter(|payload| payload.matches_managed_config_version(target, version));
+                    let Some(payload) = payload else {
+                        mark_invalid_committed_recovery_payload(connection, target)?;
+                        return Ok(Err(failure(connection,
+                            "recovery-required",
+                            "Managed configuration requires recovery",
+                        )));
+                    };
+                    Some(payload)
+                } else {
+                    None
                 };
                 let provider = connection.query_row(
                     "SELECT p.base_url, p.model, c.bearer_token, p.protocol, p.authentication, p.routing_requirement
@@ -419,12 +458,12 @@ impl StateStore {
                 let (base_url, model, credential, protocol, authentication, routing_requirement) = match provider {
                     Ok(values) => values,
                     Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => {
-                        return Ok(Err(failure("incomplete-provider", "Provider is missing or incomplete")));
+                        return Ok(Err(failure(connection, "incomplete-provider", "Provider is missing or incomplete")));
                     }
                     Err(error) => return Err(StateError::Sqlite(error)),
                 };
                 if base_url.is_empty() || model.is_empty() || credential.is_none() {
-                    return Ok(Err(failure("incomplete-provider", "Provider is missing or incomplete")));
+                    return Ok(Err(failure(connection, "incomplete-provider", "Provider is missing or incomplete")));
                 }
                 let credential = credential.expect("credential is present after completeness check");
                 let routing_requirement = match routing_requirement.as_str() {
@@ -444,7 +483,7 @@ impl StateStore {
                     _ => return Err(StateError::InvalidActivatedSnapshot),
                 };
                 if !has_valid_provider_declaration(target, protocol, authentication) {
-                    return Ok(Err(failure(
+                    return Ok(Err(failure(connection,
                         "incomplete-provider",
                         "Provider is missing or incomplete",
                     )));
@@ -461,6 +500,7 @@ impl StateStore {
                     routing_requirement,
                     prior_snapshot,
                     prior_route_runtime,
+                    prior_recovery_payload,
                     preferred_route_port: route_port,
                 }))
             })
@@ -1352,6 +1392,17 @@ fn valid_committed_managed_configuration(
     )
 }
 
+fn parse_provider_authentication(
+    authentication: &str,
+) -> Result<ProviderAuthentication, StateError> {
+    match authentication {
+        "openai-bearer" => Ok(ProviderAuthentication::OpenaiBearer),
+        "anthropic-api-key" => Ok(ProviderAuthentication::AnthropicApiKey),
+        "anthropic-bearer" => Ok(ProviderAuthentication::AnthropicBearer),
+        _ => Err(StateError::InvalidActivatedSnapshot),
+    }
+}
+
 fn valid_commit_managed_config_version(target: Target, version: u32, takeover_state: &str) -> bool {
     matches!(
         (target, version, takeover_state),
@@ -1359,6 +1410,32 @@ fn valid_commit_managed_config_version(target: Target, version: u32, takeover_st
             | (Target::Claude, 1, "active")
             | (Target::Claude, 2, "inactive" | "active")
     )
+}
+
+fn mark_invalid_committed_recovery_payload(
+    connection: &mut tokio_rusqlite::rusqlite::Connection,
+    target: Target,
+) -> tokio_rusqlite::rusqlite::Result<()> {
+    let transaction = connection
+        .transaction_with_behavior(tokio_rusqlite::rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "UPDATE activation_recovery SET state = 'recovery-required'
+         WHERE rowid = (
+           SELECT rowid FROM activation_recovery
+           WHERE target = ?1 AND state = 'committed'
+           ORDER BY rowid DESC LIMIT 1
+         )",
+        [target.as_str()],
+    )?;
+    transaction.execute(
+        "UPDATE target_route_state
+         SET recovery_state = 'recovery-required',
+             view_sequence = view_sequence + CASE
+               WHEN recovery_state = 'recovery-required' THEN 0 ELSE 1 END
+         WHERE target = ?1",
+        [target.as_str()],
+    )?;
+    transaction.commit()
 }
 
 fn mark_invalid_managed_configurations(

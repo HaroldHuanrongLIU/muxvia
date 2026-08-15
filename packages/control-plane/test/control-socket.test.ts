@@ -320,6 +320,7 @@ test("aborting a request sends one cancel frame, rejects locally, and ignores a 
     source: {
       kind: "draft",
       baseUrl: "https://draft.example/v1",
+      authentication: "openai-bearer",
       credentialSource: { kind: "ephemeral", value: "ephemeral-test-value" },
     },
   }, { signal: controller.signal })

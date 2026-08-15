@@ -206,12 +206,20 @@ pub(crate) fn project_target_view_for(
             Ok(ControlProblem {
                 code: row.get(0)?,
                 message: row.get(1)?,
+                source: None,
+                selector: None,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
     let configuration_drift = problems
         .iter()
         .any(|problem| problem.code == "configuration-drift");
+    let startup_unavailable = problems.iter().any(|problem| {
+        matches!(
+            problem.code.as_str(),
+            "startup-reconciliation-failed" | "model-route-unavailable"
+        )
+    });
 
     Ok(TargetView {
         target,
@@ -223,8 +231,12 @@ pub(crate) fn project_target_view_for(
         },
         mode: mode.to_owned(),
         takeover: TakeoverView {
-            state: takeover_state.clone(),
-            endpoint,
+            state: if startup_unavailable {
+                "unavailable".to_owned()
+            } else {
+                takeover_state.clone()
+            },
+            endpoint: (!startup_unavailable).then_some(endpoint).flatten(),
         },
         route_health: RouteHealthView {
             state: "unobserved".to_owned(),

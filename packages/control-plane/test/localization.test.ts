@@ -38,6 +38,14 @@ test("stable backend codes map to localized copy without backend messages", () =
   expect(t(messageKeyForProblem("stale-revision"))).toContain("状态")
   expect(t(messageKeyForProblem("takeover-required"))).toBe("此 Provider 需要 Target Takeover。")
   expect(t(messageKeyForProblem("takeover-active"))).toBe("使用直接激活前，请先停用 Target Takeover。")
+  expect(t(messageKeyForProblem("provider-mode-active"), {
+    selector: "CLAUDE_CODE_USE_VERTEX",
+    source: "control-plane-context",
+  })).toContain("CLAUDE_CODE_USE_VERTEX")
+  expect(t(messageKeyForProblem("shadowing-configuration"), {
+    source: "shared-project-settings",
+  })).toContain("shared-project-settings")
+  expect(t(messageKeyForProblem("configuration-drift"))).toContain("协调")
   expect(messageKeyForProblem("unrecognized-code")).toBe("error.generic")
 })
 

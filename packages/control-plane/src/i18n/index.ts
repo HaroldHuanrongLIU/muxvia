@@ -42,6 +42,11 @@ const problemMessageKeys = new Map<string, MessageKey>([
   ["unsupported-configuration-home", "error.unsupported-configuration-home"],
   ["configuration-collision", "error.configuration-collision"],
   ["configuration-write-failed", "error.configuration-write-failed"],
+  ["configuration-drift", "error.configuration-drift"],
+  ["provider-mode-active", "error.provider-mode-active"],
+  ["shadowing-configuration", "error.shadowing-configuration"],
+  ["startup-reconciliation-failed", "error.startup-reconciliation-failed"],
+  ["model-route-unavailable", "error.model-route-unavailable"],
   ["takeover-required", "error.takeover-required"],
   ["takeover-active", "error.takeover-active"],
   ["internal-failure", "error.internal-failure"],
@@ -66,6 +71,7 @@ export function labelTargetState(t: Translator, value: string): string {
     case "ready": return t("state.ready")
     case "inactive": return t("state.inactive")
     case "active": return t("state.active")
+    case "unavailable": return t("state.unavailable")
     case "applied": return t("state.applied")
     case "required":
     case "recovery-required": return t("state.recovery-required")

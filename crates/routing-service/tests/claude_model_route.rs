@@ -30,7 +30,7 @@ use muxvia_routing::{
 };
 use tempfile::TempDir;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{Mutex, oneshot},
     time::{Duration, sleep, timeout},
@@ -771,13 +771,6 @@ async fn body_policy_returns_fixed_local_errors_without_an_upstream_call() {
         .send()
         .await
         .unwrap();
-    let too_large = route_client()
-        .post(format!("http://{}/v1/messages", server.endpoint()))
-        .header(claude_authorization().0, claude_authorization().1)
-        .body(vec![b' '; MAX_BODY_BYTES + 1])
-        .send()
-        .await
-        .unwrap();
     let streamed_too_large = route_client()
         .post(format!("http://{}/v1/messages", server.endpoint()))
         .header(claude_authorization().0, claude_authorization().1)
@@ -817,8 +810,6 @@ async fn body_policy_returns_fixed_local_errors_without_an_upstream_call() {
     assert_eq!(malformed.bytes().await.unwrap(), "invalid request body");
     assert_eq!(invalid_gzip.status(), StatusCode::BAD_REQUEST);
     assert_eq!(invalid_gzip.bytes().await.unwrap(), "invalid request body");
-    assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(too_large.bytes().await.unwrap(), "request body too large");
     assert_eq!(streamed_too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(
         streamed_too_large.bytes().await.unwrap(),
@@ -831,6 +822,60 @@ async fn body_policy_returns_fixed_local_errors_without_an_upstream_call() {
     );
     assert!(upstream.requests.lock().await.is_empty());
 
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn authentication_and_declared_body_limit_reject_before_reading_a_withheld_body() {
+    let fixture = StoreFixture::new().await;
+    fixture
+        .seed_claude_snapshot(
+            "https://unused.example/v1",
+            ProviderAuthentication::AnthropicApiKey,
+            "claude-body-model",
+        )
+        .await;
+    let upstream = Arc::new(CountingUpstream {
+        calls: AtomicUsize::new(0),
+    });
+    let server = start_model(&fixture, Target::Claude, Arc::clone(&upstream)).await;
+
+    for (authorization, content_length, expected_status, expected_body) in [
+        (
+            "Bearer wrong-routing-credential",
+            1024_u64,
+            "401 Unauthorized",
+            "request rejected",
+        ),
+        (
+            concat!(
+                "Bearer ",
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+            ),
+            (MAX_BODY_BYTES + 1) as u64,
+            "413 Payload Too Large",
+            "request body too large",
+        ),
+    ] {
+        let mut socket = TcpStream::connect(server.endpoint()).await.unwrap();
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: {}\r\nAuthorization: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            server.endpoint(),
+            authorization,
+            content_length,
+        );
+        socket.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(1), socket.read_to_end(&mut response))
+            .await
+            .expect("server waited for the declared request body")
+            .unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with(&format!("HTTP/1.1 {expected_status}")));
+        assert!(response.ends_with(expected_body));
+    }
+
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 0);
     server.shutdown().await.unwrap();
 }
 

@@ -191,8 +191,19 @@ async function openScriptedSession(initial: TargetView) {
   return { session, server }
 }
 
-test("a Claude session captures its target for actions, inspection, and refresh", async () => {
-  const { session, server } = await openScriptedSession(viewAtRevision(0, 0, "claude"))
+test("a Claude session captures its target and preflight context for gap refresh", async () => {
+  const { server, path } = await ScriptedServer.start()
+  const client = await RpcClient.connect(path, "control-test")
+  const claudeContext = {
+    claudeConfigDir: null,
+    selectorState: "disabled" as const,
+    hostManagedState: "unmanaged" as const,
+    cwd: "/tmp/project",
+  }
+  const opening = client.openTarget("claude", claudeContext)
+  await server.waitForRequests(1)
+  server.replyOpen(0, viewAtRevision(0, 0, "claude"))
+  const session = await opening
   const action = session.act({
     kind: "create-provider", name: "Claude", baseUrl: "https://api.anthropic.com/v1", model: "claude-test",
     credential: { kind: "replace", value: "not-serialized" }, presetKey: "anthropic-api-messages",
@@ -203,7 +214,11 @@ test("a Claude session captures its target for actions, inspection, and refresh"
   await action
   server.push(viewAtRevision(3, 3, "claude"))
   await server.waitForRequests(3)
-  expect(server.requests()[2]!.operation).toMatchObject({ kind: "open-target", target: "claude" })
+  expect(server.requests()[2]!.operation).toEqual({
+    kind: "open-target",
+    target: "claude",
+    claudeContext,
+  })
   server.replyOpen(2, viewAtRevision(3, 3, "claude"))
   await session.close()
   await server.close()
@@ -301,6 +316,7 @@ test("aborted discovery sends one cancel, ignores a late result, and preserves a
   const discovery = session.discoverModels({
     kind: "draft",
     baseUrl: "https://draft.example/v1",
+    authentication: "openai-bearer",
     credentialSource: { kind: "ephemeral", value: "ephemeral-test-value" },
   }, controller.signal)
   await server.waitForRequests(2)
@@ -327,11 +343,13 @@ test("explicit refresh accepts unsaved Blank and Preset drafts without Provider 
   const blank = session.discoverModels({
     kind: "draft",
     baseUrl: "",
+    authentication: "openai-bearer",
     credentialSource: { kind: "missing" },
   })
   const preset = session.discoverModels({
     kind: "draft",
     baseUrl: "https://api.openai.com/v1",
+    authentication: "openai-bearer",
     credentialSource: { kind: "ephemeral", value: "preset-test-value" },
   })
   await server.waitForRequests(3)
@@ -344,6 +362,7 @@ test("explicit refresh accepts unsaved Blank and Preset drafts without Provider 
       source: {
         kind: "draft",
         baseUrl: "",
+        authentication: "openai-bearer",
         credentialSource: { kind: "missing" },
       },
     },
@@ -353,6 +372,7 @@ test("explicit refresh accepts unsaved Blank and Preset drafts without Provider 
       source: {
         kind: "draft",
         baseUrl: "https://api.openai.com/v1",
+        authentication: "openai-bearer",
         credentialSource: { kind: "ephemeral", value: "preset-test-value" },
       },
     },

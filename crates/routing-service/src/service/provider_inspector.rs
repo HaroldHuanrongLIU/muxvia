@@ -640,14 +640,15 @@ impl ProviderInspector {
             }
             DiscoverySource::Draft {
                 base_url,
+                authentication,
                 credential_source,
             } => {
-                let (credential, authentication) = match credential_source {
+                let credential = match credential_source {
                     DraftCredentialSource::Missing => {
                         return Err(InspectionCategory::MissingCredential);
                     }
                     DraftCredentialSource::Ephemeral { value } if !value.trim().is_empty() => {
-                        (SecretString::from(value), default_authentication(target))
+                        SecretString::from(value)
                     }
                     DraftCredentialSource::Ephemeral { .. } => {
                         return Err(InspectionCategory::MissingCredential);
@@ -659,10 +660,9 @@ impl ProviderInspector {
                         let snapshot = self
                             .resolve_saved_provider(target, provider_id, provider_revision)
                             .await?;
-                        let credential = snapshot
+                        snapshot
                             .credential
-                            .ok_or(InspectionCategory::MissingCredential)?;
-                        (credential, snapshot.authentication)
+                            .ok_or(InspectionCategory::MissingCredential)?
                     }
                 };
                 Ok((base_url, credential, authentication))
@@ -816,13 +816,6 @@ fn parse_models_response_with_display_name(
     }
     models.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(models)
-}
-
-fn default_authentication(target: Target) -> ProviderAuthentication {
-    match target {
-        Target::Codex => ProviderAuthentication::OpenaiBearer,
-        Target::Claude => ProviderAuthentication::AnthropicApiKey,
-    }
 }
 
 fn parse_inspection_url(input: &str, retain_query: bool) -> Result<Url, InspectionCategory> {

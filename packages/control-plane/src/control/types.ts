@@ -11,6 +11,10 @@ const targetSchema = z.enum(["codex", "claude"])
 const claudePreflightContextSchema = z.object({
   claudeConfigDir: z.string().nullable(),
   selectorState: z.enum(["unset", "disabled", "enabled", "unknown-nonempty"]),
+  blockingSelector: z.enum([
+    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+  ]).nullable().optional(),
   hostManagedState: z.enum(["unmanaged", "managed", "unknown"]),
   cwd: z.string(),
 })
@@ -18,6 +22,8 @@ const claudePreflightContextSchema = z.object({
 const controlProblemSchema = z.object({
   code: z.string(),
   message: z.string(),
+  source: z.enum(["control-plane-context", "user-settings", "managed-settings", "shared-project-settings", "local-project-settings"]).optional(),
+  selector: z.string().optional(),
 })
 
 const providerViewSchema = z.object({
@@ -129,6 +135,7 @@ const discoverySourceSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("draft"),
     baseUrl: z.string(),
+    authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]),
     credentialSource: draftCredentialSourceSchema,
   }),
 ])

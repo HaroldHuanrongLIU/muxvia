@@ -70,8 +70,8 @@ async fn new_database_target_view_matches_the_canonical_protocol_fixture() {
 }
 
 #[tokio::test]
-async fn fresh_schema_v4_reopens_with_codex_and_claude_route_rows() {
-    let root = std::env::temp_dir().join(format!("muxvia-v4-reopen-{}", Uuid::new_v4()));
+async fn fresh_schema_v5_reopens_with_codex_and_claude_route_rows() {
+    let root = std::env::temp_dir().join(format!("muxvia-v5-reopen-{}", Uuid::new_v4()));
     let user_home = root.join("home");
     fs::create_dir_all(&user_home).unwrap();
     let home = MuxviaHome::from_user_home(&user_home);
@@ -98,8 +98,44 @@ async fn fresh_schema_v4_reopens_with_codex_and_claude_route_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, "4");
+    assert_eq!(version, "5");
     assert_eq!(targets, ["claude", "codex"]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn credential_reference_foreign_key_rejects_cross_target_corruption() {
+    let root = std::env::temp_dir().join(format!("muxvia-v5-target-fk-{}", Uuid::new_v4()));
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    drop(StateStore::open(&home).await.unwrap());
+
+    let database = tokio_rusqlite::Connection::open(home.database_path())
+        .await
+        .unwrap();
+    let rejected = database
+        .call(|connection| -> tokio_rusqlite::rusqlite::Result<bool> {
+            connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+            connection.execute(
+                "INSERT INTO credentials (id, target, bearer_token)
+                 VALUES ('cross-target-credential', 'codex', 'secret')",
+                [],
+            )?;
+            let result = connection.execute(
+                "INSERT INTO providers
+                 (id, target, position, provider_revision, name, base_url, model, protocol,
+                  authentication, credential_id, routing_requirement)
+                 VALUES ('cross-target-provider', 'claude', 0, 1, 'Claude',
+                         'https://api.anthropic.com/v1', 'claude-test', 'anthropic-messages',
+                         'anthropic-api-key', 'cross-target-credential', 'direct-compatible')",
+                [],
+            );
+            Ok(result.is_err())
+        })
+        .await
+        .unwrap();
+    assert!(rejected);
     let _ = fs::remove_dir_all(root);
 }
 

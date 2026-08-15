@@ -33,13 +33,23 @@ export class ControlError extends Error {
   readonly code: string
   readonly retryable: boolean
   readonly authoritativeView?: TargetView
+  readonly source?: string
+  readonly selector?: string
 
-  constructor(code: string, message: string, authoritativeView?: TargetView) {
+  constructor(
+    code: string,
+    message: string,
+    authoritativeView?: TargetView,
+    source?: string,
+    selector?: string,
+  ) {
     super(message)
     this.name = "ControlError"
     this.code = code
     this.retryable = code === "stale-revision"
     this.authoritativeView = authoritativeView
+    this.source = source
+    this.selector = selector
   }
 }
 
@@ -129,7 +139,7 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     if (result.kind !== "target-view") {
       throw new ControlError("invalid-response", "Expected a target view")
     }
-    return createTargetSession(this, result.view)
+    return createTargetSession(this, result.view, claudeContext)
   }
 
   request(operation: InspectionOperation, options?: RequestOptions): Promise<ControlResult>
@@ -203,7 +213,10 @@ export class RpcClient implements RpcTransport, MuxviaControl {
       if (frame.type === "hello-ack") {
         handshake.resolve()
       } else if (frame.type === "error") {
-        handshake.reject(new ControlError(frame.problem.code, frame.problem.message, frame.authoritativeView))
+        handshake.reject(new ControlError(
+          frame.problem.code, frame.problem.message, frame.authoritativeView,
+          frame.problem.source, frame.problem.selector,
+        ))
       } else {
         handshake.reject(new ControlError("invalid-response", "Expected hello acknowledgement"))
       }
@@ -224,7 +237,10 @@ export class RpcClient implements RpcTransport, MuxviaControl {
       return
     }
     if (frame.type === "error") {
-      const failure = new ControlError(frame.problem.code, frame.problem.message, frame.authoritativeView)
+      const failure = new ControlError(
+        frame.problem.code, frame.problem.message, frame.authoritativeView,
+        frame.problem.source, frame.problem.selector,
+      )
       if (frame.requestId === null) {
         this.#socket.destroy()
         this.#fail(failure)

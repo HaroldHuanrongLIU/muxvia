@@ -502,12 +502,22 @@ impl ActivationService {
                 context.host_managed_state,
                 ClaudeHostManagedState::Managed | ClaudeHostManagedState::Unknown
             ) {
+                let selector = context
+                    .blocking_selector
+                    .map(|selector| selector.as_str().to_owned())
+                    .or_else(|| {
+                        matches!(
+                            context.host_managed_state,
+                            ClaudeHostManagedState::Managed | ClaudeHostManagedState::Unknown
+                        )
+                        .then(|| "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST".to_owned())
+                    });
                 return Err(self
-                    .store
-                    .failure_for(
+                    .target_failure_with_projection(
                         target,
                         "provider-mode-active",
-                        "Claude provider mode prevents Target Takeover",
+                        Some("control-plane-context".to_owned()),
+                        selector,
                     )
                     .await);
             }
@@ -552,7 +562,16 @@ impl ActivationService {
             .await
         {
             Ok(result) => result,
-            Err(code) => return Err(self.target_failure(target, code).await),
+            Err(problem) => {
+                return Err(self
+                    .target_failure_with_projection(
+                        target,
+                        problem.code,
+                        problem.source,
+                        problem.selector,
+                    )
+                    .await);
+            }
         };
 
         let (runtime, configuration, mut candidate) = match command.mode {
@@ -745,6 +764,8 @@ impl ActivationService {
                     problem: crate::control::protocol::ControlProblem {
                         code: "stale-revision".into(),
                         message: "Target state changed; refresh and retry".into(),
+                        source: None,
+                        selector: None,
                     },
                     authoritative_view: view,
                 })
@@ -755,6 +776,8 @@ impl ActivationService {
                     problem: crate::control::protocol::ControlProblem {
                         code: "recovery-required".into(),
                         message: "Managed writes are blocked until recovery is resolved".into(),
+                        source: None,
+                        selector: None,
                     },
                     authoritative_view: view,
                 })
@@ -784,10 +807,36 @@ impl ActivationService {
 
     pub async fn bootstrap_committed_takeovers(&self) -> Result<(), ModelServerError> {
         for target in [Target::Codex, Target::Claude] {
-            if let Err(error) = self.bootstrap_committed_takeover_for(target).await {
-                let _ = self.shutdown_models().await;
-                return Err(error);
+            let view = self
+                .store
+                .target_view_for(target)
+                .await
+                .map_err(|_| ModelServerError::State)?;
+            if view
+                .problems
+                .iter()
+                .any(|problem| problem.code == "startup-reconciliation-failed")
+            {
+                continue;
             }
+            if let Err(error) = self.bootstrap_committed_takeover_for(target).await {
+                if matches!(error, ModelServerError::State) {
+                    return Err(error);
+                }
+                self.store
+                    .record_startup_problem_for(
+                        target,
+                        "model-route-unavailable",
+                        "The committed model route could not be resumed",
+                    )
+                    .await
+                    .map_err(|_| ModelServerError::State)?;
+                continue;
+            }
+            self.store
+                .clear_startup_problems_for(target)
+                .await
+                .map_err(|_| ModelServerError::State)?;
         }
         Ok(())
     }
@@ -954,7 +1003,7 @@ impl ActivationService {
         target: Target,
         preparation: &ActivationPreparation,
         claude_context: Option<&ClaudePreflightContext>,
-    ) -> Result<(ConfigurationPreflight, Option<ControlProblem>), &'static str> {
+    ) -> Result<(ConfigurationPreflight, Option<ControlProblem>), PreflightFailure> {
         match target {
             Target::Codex => {
                 let capability_problem = match self.codex_probe.probe(&self.codex_executable) {
@@ -963,13 +1012,17 @@ impl ActivationService {
                         Some(ControlProblem {
                             code: "untested-target-cli".into(),
                             message: warning,
+                            source: None,
+                            selector: None,
                         })
                     }
-                    Err(_) => return Err("incompatible-target-cli"),
+                    Err(_) => return Err(PreflightFailure::new("incompatible-target-cli")),
                 };
                 let codec = CodexConfigCodec::for_user_home(self.home.user_home())
-                    .map_err(|problem| problem.code())?;
-                let before = self.inspect_config(&codec, preparation)?;
+                    .map_err(|problem| PreflightFailure::new(problem.code()))?;
+                let before = self
+                    .inspect_config(&codec, preparation)
+                    .map_err(PreflightFailure::new)?;
                 Ok((
                     ConfigurationPreflight::Codex {
                         codec,
@@ -979,9 +1032,10 @@ impl ActivationService {
                 ))
             }
             Target::Claude => {
-                let context = claude_context.ok_or("preflight-context-required")?;
+                let context = claude_context
+                    .ok_or_else(|| PreflightFailure::new("preflight-context-required"))?;
                 let codec = ClaudeConfigCodec::for_user_home(self.home.user_home())
-                    .map_err(|problem| problem.code())?;
+                    .map_err(|problem| PreflightFailure::new(problem.code()))?;
                 let expected = match (
                     &preparation.prior_snapshot,
                     &preparation.prior_route_runtime,
@@ -992,13 +1046,22 @@ impl ActivationService {
                         runtime.routing_credential.expose_secret(),
                     )),
                     (None, None) => None,
-                    (Some(_), None) | (None, Some(_)) => return Err("recovery-required"),
+                    (Some(_), None) | (None, Some(_)) => {
+                        return Err(PreflightFailure::new("recovery-required"));
+                    }
                 };
                 let (_, before) = codec
                     .preflight_snapshot(context, expected.as_ref())
-                    .map_err(|problem| match problem.code() {
-                        "configuration-collision" if expected.is_some() => "recovery-required",
-                        code => code,
+                    .map_err(|problem| {
+                        let code = match problem.code() {
+                            "configuration-collision" if expected.is_some() => "recovery-required",
+                            code => code,
+                        };
+                        PreflightFailure {
+                            code,
+                            source: problem.source().map(str::to_owned),
+                            selector: problem.selector().map(str::to_owned),
+                        }
                     })?;
                 let capability_problem = match self.claude_probe.probe(&self.claude_executable) {
                     Ok(ClaudeCapability::Tested { .. }) => None,
@@ -1006,9 +1069,11 @@ impl ActivationService {
                         Some(ControlProblem {
                             code: "untested-target-cli".into(),
                             message: warning,
+                            source: None,
+                            selector: None,
                         })
                     }
-                    Err(_) => return Err("incompatible-target-cli"),
+                    Err(_) => return Err(PreflightFailure::new("incompatible-target-cli")),
                 };
                 Ok((
                     ConfigurationPreflight::Claude {
@@ -1183,6 +1248,17 @@ impl ActivationService {
     }
 
     async fn target_failure(&self, target: Target, code: &str) -> ActionFailure {
+        self.target_failure_with_projection(target, code, None, None)
+            .await
+    }
+
+    async fn target_failure_with_projection(
+        &self,
+        target: Target,
+        code: &str,
+        source: Option<String>,
+        selector: Option<String>,
+    ) -> ActionFailure {
         let stable = match code {
             "stale-revision"
             | "incomplete-provider"
@@ -1205,9 +1281,29 @@ impl ActivationService {
             let message = format!("Activation failed (correlation {})", Uuid::new_v4());
             self.store.failure_for(target, stable, &message).await
         } else {
-            self.store
+            let mut failure = self
+                .store
                 .failure_for(target, stable, "Activation failed")
-                .await
+                .await;
+            failure.problem.source = source;
+            failure.problem.selector = selector;
+            failure
+        }
+    }
+}
+
+struct PreflightFailure {
+    code: &'static str,
+    source: Option<String>,
+    selector: Option<String>,
+}
+
+impl PreflightFailure {
+    fn new(code: &'static str) -> Self {
+        Self {
+            code,
+            source: None,
+            selector: None,
         }
     }
 }

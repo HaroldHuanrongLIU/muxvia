@@ -4,6 +4,7 @@ import { ControlError, type RpcTransport } from "./rpc-client"
 import type {
   ActionOutcome,
   DiscoverySource,
+  ClaudePreflightContext,
   ModelDiscoveryResult,
   ReachabilityResult,
   TargetAction,
@@ -34,16 +35,22 @@ class TargetSessionImpl implements TargetSession {
   readonly #listeners = new Set<(next: TargetView) => void>()
   readonly #removePushListener: () => void
   readonly #target: Target
+  readonly #claudeContext?: ClaudePreflightContext
   #view: TargetView
   #actions: Promise<void> = Promise.resolve()
   #refresh?: Promise<void>
   #lastNotifiedSequence: number
   #closed = false
 
-  constructor(rpc: RpcTransport, initialView: TargetView) {
+  constructor(
+    rpc: RpcTransport,
+    initialView: TargetView,
+    claudeContext?: ClaudePreflightContext,
+  ) {
     this.#rpc = rpc
     this.#view = initialView
     this.#target = initialView.target
+    this.#claudeContext = claudeContext
     this.#lastNotifiedSequence = initialView.viewSequence
     this.#removePushListener = rpc.onTargetView((view) => this.#receivePush(view))
   }
@@ -158,7 +165,11 @@ class TargetSessionImpl implements TargetSession {
 
   async #refreshTarget(): Promise<void> {
     try {
-      const result = await this.#rpc.request({ kind: "open-target", target: this.#target })
+      const result = await this.#rpc.request({
+        kind: "open-target",
+        target: this.#target,
+        claudeContext: this.#claudeContext,
+      })
       if (result.kind === "target-view" && result.view.viewSequence > this.#view.viewSequence) {
         this.#replace(result.view)
       }
@@ -174,6 +185,10 @@ class TargetSessionImpl implements TargetSession {
   }
 }
 
-export function createTargetSession(rpc: RpcTransport, initialView: TargetView): TargetSession {
-  return new TargetSessionImpl(rpc, initialView)
+export function createTargetSession(
+  rpc: RpcTransport,
+  initialView: TargetView,
+  claudeContext?: ClaudePreflightContext,
+): TargetSession {
+  return new TargetSessionImpl(rpc, initialView, claudeContext)
 }

@@ -7,7 +7,7 @@ use std::{
 };
 
 use muxvia_routing::{
-    control::protocol::{DiscoverySource, DraftCredentialSource, Target},
+    control::protocol::{DiscoverySource, DraftCredentialSource, ProviderAuthentication, Target},
     home::MuxviaHome,
     service::provider_inspector::{
         DiscoveredModel, InspectionCategory, MAX_DISCOVERED_MODELS, MAX_DISCOVERY_BODY_BYTES,
@@ -516,6 +516,61 @@ async fn claude_bearer_discovery_uses_only_bearer_and_the_anthropic_version() {
     assert!(!request.headers.contains_key("x-api-key"));
 }
 
+#[tokio::test]
+async fn claude_draft_discovery_uses_the_explicit_authentication_profile() {
+    for (authentication, expected_header, unexpected_header) in [
+        (
+            ProviderAuthentication::AnthropicApiKey,
+            "x-api-key",
+            "authorization",
+        ),
+        (
+            ProviderAuthentication::AnthropicBearer,
+            "authorization",
+            "x-api-key",
+        ),
+    ] {
+        let fixture = InspectionFixture::new().await;
+        let secret = "claude-draft-auth-secret";
+        let mut server = HttpServer::start(vec![HttpReply::json(
+            200,
+            json!({ "data": [{ "id": "claude-draft" }], "has_more": false }),
+        )])
+        .await;
+
+        let result = fixture
+            .inspector()
+            .discover_models_for(
+                Target::Claude,
+                DiscoverySource::Draft {
+                    base_url: format!("{}/v1", server.base_url),
+                    authentication,
+                    credential_source: DraftCredentialSource::Ephemeral {
+                        value: secret.into(),
+                    },
+                },
+            )
+            .await;
+
+        assert!(matches!(result, ModelDiscoveryResult::Success { .. }));
+        let request = server.next_request().await;
+        let expected = if expected_header == "authorization" {
+            "Bearer claude-draft-auth-secret"
+        } else {
+            secret
+        };
+        assert_eq!(
+            request.headers.get(expected_header).map(String::as_str),
+            Some(expected)
+        );
+        assert!(!request.headers.contains_key(unexpected_header));
+        assert_eq!(
+            request.headers.get("anthropic-version").map(String::as_str),
+            Some("2023-06-01")
+        );
+    }
+}
+
 impl Drop for InspectionFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
@@ -525,6 +580,7 @@ impl Drop for InspectionFixture {
 fn ephemeral_source(base_url: String, secret: &str) -> DiscoverySource {
     DiscoverySource::Draft {
         base_url,
+        authentication: ProviderAuthentication::OpenaiBearer,
         credential_source: DraftCredentialSource::Ephemeral {
             value: secret.to_owned(),
         },
@@ -740,6 +796,7 @@ async fn draft_discovery_can_reuse_a_saved_credential_without_using_the_saved_en
         .inspector()
         .discover_models(DiscoverySource::Draft {
             base_url: format!("{}/v1", draft_server.base_url),
+            authentication: ProviderAuthentication::OpenaiBearer,
             credential_source: DraftCredentialSource::Saved {
                 provider_id,
                 provider_revision,
@@ -764,6 +821,7 @@ async fn draft_discovery_can_reuse_a_saved_credential_without_using_the_saved_en
         .inspector()
         .discover_models(DiscoverySource::Draft {
             base_url: String::new(),
+            authentication: ProviderAuthentication::OpenaiBearer,
             credential_source: DraftCredentialSource::Missing,
         })
         .await;

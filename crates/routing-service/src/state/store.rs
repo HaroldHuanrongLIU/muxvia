@@ -300,7 +300,10 @@ impl StateStore {
                     )?;
                 let failure = |code: &str, message: &str| -> ActionFailure {
                     ActionFailure {
-                        problem: ControlProblem { code: code.to_owned(), message: message.to_owned() },
+                        problem: ControlProblem {
+                            code: code.to_owned(), message: message.to_owned(),
+                            source: None, selector: None,
+                        },
                         authoritative_view: project_target_view_for(connection, &service_epoch, target)
                             .unwrap_or_else(|_| crate::domain::view::empty_target_view_for(&service_epoch, target)),
                     }
@@ -644,6 +647,58 @@ impl StateStore {
                     transaction.execute(
                         "UPDATE target_route_state
                          SET view_sequence = view_sequence + 1 WHERE target = ?1",
+                        [target.as_str()],
+                    )?;
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    pub async fn record_startup_problem_for(
+        &self,
+        target: Target,
+        code: &'static str,
+        message: &'static str,
+    ) -> Result<(), StateError> {
+        self.connection
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                let changed = transaction.execute(
+                    "INSERT INTO target_problems (target, code, message) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(target, code) DO UPDATE SET message = excluded.message",
+                    params![target.as_str(), code, message],
+                )?;
+                if changed == 1 {
+                    transaction.execute(
+                        "UPDATE target_route_state SET view_sequence = view_sequence + 1
+                         WHERE target = ?1",
+                        [target.as_str()],
+                    )?;
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    pub async fn clear_startup_problems_for(&self, target: Target) -> Result<(), StateError> {
+        self.connection
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                let changed = transaction.execute(
+                    "DELETE FROM target_problems
+                     WHERE target = ?1 AND code IN
+                       ('startup-reconciliation-failed', 'model-route-unavailable')",
+                    [target.as_str()],
+                )?;
+                if changed > 0 {
+                    transaction.execute(
+                        "UPDATE target_route_state SET view_sequence = view_sequence + 1
+                         WHERE target = ?1",
                         [target.as_str()],
                     )?;
                 }
@@ -1021,6 +1076,8 @@ impl StateStore {
                             code: "recovery-required".to_owned(),
                             message: "Managed writes are blocked until recovery is resolved"
                                 .to_owned(),
+                            source: None,
+                            selector: None,
                         },
                         authoritative_view: project_target_view_for(
                             &transaction,
@@ -1036,6 +1093,8 @@ impl StateStore {
                         problem: ControlProblem {
                             code: "stale-revision".to_owned(),
                             message: "Target state changed; refresh and retry".to_owned(),
+                            source: None,
+                            selector: None,
                         },
                         authoritative_view,
                     }));
@@ -1066,6 +1125,8 @@ impl StateStore {
                         problem: ControlProblem {
                             code: code.to_owned(),
                             message: message.to_owned(),
+                            source: None,
+                            selector: None,
                         },
                         authoritative_view: project_target_view_for(
                             &transaction,
@@ -1156,6 +1217,8 @@ impl StateStore {
             problem: ControlProblem {
                 code: code.to_owned(),
                 message: message.to_owned(),
+                source: None,
+                selector: None,
             },
             authoritative_view,
         }

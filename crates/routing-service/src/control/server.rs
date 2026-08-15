@@ -177,9 +177,23 @@ impl ControlServer {
                 .await
                 .map_err(|_| ControlServerError::State)?
             {
-                ManagedWriteStatus::Allowed if reconciled => {}
+                ManagedWriteStatus::Allowed if reconciled => {
+                    store
+                        .clear_startup_problems_for(target)
+                        .await
+                        .map_err(|_| ControlServerError::State)?;
+                }
                 ManagedWriteStatus::RecoveryRequired | ManagedWriteStatus::ConfigurationDrift => {}
-                ManagedWriteStatus::Allowed => return Err(ControlServerError::State),
+                ManagedWriteStatus::Allowed => {
+                    store
+                        .record_startup_problem_for(
+                            target,
+                            "startup-reconciliation-failed",
+                            "Managed configuration recovery could not be reconciled",
+                        )
+                        .await
+                        .map_err(|_| ControlServerError::State)?;
+                }
             }
         }
         activation
@@ -536,7 +550,7 @@ async fn serve_session(
                         };
                         opened_target = Some(target);
                         opened_claude_context = if target == Target::Claude {
-                            claude_context
+                            claude_context.or(opened_claude_context)
                         } else {
                             None
                         };
@@ -567,12 +581,11 @@ async fn serve_session(
                                 if !enqueue_response(&responses, response) { break 'session; }
                             }
                             Err(failure) => {
-                                if !enqueue_response(&responses, problem_frame(
-                                    Some(request_id),
-                                    &failure.problem.code,
-                                    &failure.problem.message,
-                                    Some(failure.authoritative_view),
-                                )) { break 'session; }
+                                if !enqueue_response(&responses, ServerFrame::Error {
+                                    request_id: Some(request_id),
+                                    problem: failure.problem,
+                                    authoritative_view: Some(failure.authoritative_view),
+                                }) { break 'session; }
                             }
                         }
                     }
@@ -758,6 +771,8 @@ fn problem_frame(
         problem: ControlProblem {
             code: code.to_owned(),
             message: message.to_owned(),
+            source: None,
+            selector: None,
         },
         authoritative_view,
     }
@@ -816,6 +831,8 @@ async fn write_problem(
             problem: ControlProblem {
                 code: code.to_owned(),
                 message: message.to_owned(),
+                source: None,
+                selector: None,
             },
             authoritative_view,
         },

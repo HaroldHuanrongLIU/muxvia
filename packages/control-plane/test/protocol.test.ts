@@ -52,6 +52,7 @@ test("round-trips draft discovery sources and view-free inspection results", () 
         source: {
           kind: "draft",
           baseUrl: "https://draft.example/v1",
+          authentication: "openai-bearer",
           credentialSource,
         },
       },

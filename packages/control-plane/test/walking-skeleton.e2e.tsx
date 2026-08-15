@@ -1533,6 +1533,7 @@ test("outbound operation audit catches a preset-phase discovery without retainin
       source: {
         kind: "draft",
         baseUrl,
+        authentication: "anthropic-api-key",
         credentialSource: { kind: "ephemeral", value: credential },
       },
     },

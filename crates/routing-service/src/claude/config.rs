@@ -319,7 +319,7 @@ impl ClaudeConfigCodec {
     ) -> Result<(ClaudePreflightReport, ClaudeConfigSnapshot), ClaudeProblem> {
         self.validate_context(context)?;
         let (snapshot, document) = self.read_snapshot()?;
-        validate_provider_modes(&document, self.settings_path())?;
+        validate_provider_modes(&document, self.settings_path(), "user-settings")?;
         if expected_takeover.is_some_and(|expected| snapshot.owned != expected.owned) {
             return Err(ClaudeProblem::new(
                 "configuration-collision",
@@ -336,10 +336,18 @@ impl ClaudeConfigCodec {
                 continue;
             }
             let source = fs_read_json(&path)?;
+            let source_kind = if path.ends_with(".claude/settings.local.json") {
+                "local-project-settings"
+            } else if path.ends_with(".claude/settings.json") && path.starts_with(&cwd) {
+                "shared-project-settings"
+            } else {
+                "managed-settings"
+            };
             if has_owned_shadow(&source) {
-                return Err(ClaudeProblem::new("shadowing-configuration", Some(&path)));
+                return Err(ClaudeProblem::new("shadowing-configuration", Some(&path))
+                    .with_source(source_kind));
             }
-            validate_provider_modes(&source, &path)?;
+            validate_provider_modes(&source, &path, source_kind)?;
         }
         Ok((
             ClaudePreflightReport {
@@ -378,10 +386,15 @@ impl ClaudeConfigCodec {
             context.host_managed_state,
             ClaudeHostManagedState::Managed | ClaudeHostManagedState::Unknown
         ) {
-            return Err(ClaudeProblem::new(
-                "provider-mode-active",
-                Some(self.settings_path()),
-            ));
+            let selector = context
+                .blocking_selector
+                .map(|selector| selector.as_str().to_owned())
+                .unwrap_or_else(|| "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST".to_owned());
+            return Err(
+                ClaudeProblem::new("provider-mode-active", Some(self.settings_path()))
+                    .with_source("control-plane-context")
+                    .with_selector(selector),
+            );
         }
         Ok(())
     }
@@ -589,7 +602,11 @@ fn apply_owned(document: &mut Value, owned: &OwnedClaudeState) {
     }
 }
 
-fn validate_provider_modes(document: &Value, path: &Path) -> Result<(), ClaudeProblem> {
+fn validate_provider_modes(
+    document: &Value,
+    path: &Path,
+    source: &'static str,
+) -> Result<(), ClaudeProblem> {
     let Some(env) = document.get("env").and_then(Value::as_object) else {
         return Ok(());
     };
@@ -598,7 +615,9 @@ fn validate_provider_modes(document: &Value, path: &Path) -> Result<(), ClaudePr
         .chain(["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"])
     {
         if env.get(key).is_some_and(selector_blocks) {
-            return Err(ClaudeProblem::new("provider-mode-active", Some(path)));
+            return Err(ClaudeProblem::new("provider-mode-active", Some(path))
+                .with_source(source)
+                .with_selector(key));
         }
     }
     Ok(())

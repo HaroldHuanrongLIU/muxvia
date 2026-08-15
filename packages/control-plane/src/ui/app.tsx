@@ -84,10 +84,16 @@ function actionProblem(error: unknown): ActivityDraft {
     ? String(error.code)
     : "internal-failure"
   const messageKey = messageKeyForProblem(code)
+  const source = typeof error === "object" && error !== null && "source" in error
+    ? String(error.source)
+    : undefined
+  const selector = typeof error === "object" && error !== null && "selector" in error
+    ? String(error.selector)
+    : undefined
   return {
     kind: "error",
     messageKey,
-    values: messageKey === "error.generic" ? { code } : undefined,
+    values: messageKey === "error.generic" ? { code } : { source: source ?? "unknown", selector: selector ?? "unknown" },
   }
 }
 

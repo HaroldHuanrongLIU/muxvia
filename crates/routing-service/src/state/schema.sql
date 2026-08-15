@@ -6,7 +6,8 @@ CREATE TABLE IF NOT EXISTS metadata (
 CREATE TABLE IF NOT EXISTS credentials (
   id TEXT PRIMARY KEY,
   target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
-  bearer_token TEXT NOT NULL
+  bearer_token TEXT NOT NULL,
+  UNIQUE (target, id)
 );
 
 CREATE TABLE IF NOT EXISTS providers (
@@ -19,7 +20,7 @@ CREATE TABLE IF NOT EXISTS providers (
   model TEXT NOT NULL,
   protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
   authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
-  credential_id TEXT REFERENCES credentials(id) ON DELETE SET NULL,
+  credential_id TEXT,
   provenance_kind TEXT,
   provenance_key TEXT,
   generated_owner_id TEXT,
@@ -28,7 +29,8 @@ CREATE TABLE IF NOT EXISTS providers (
   CHECK (
     (target = 'codex' AND protocol = 'openai-responses' AND authentication = 'openai-bearer')
     OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer'))
-  )
+  ),
+  FOREIGN KEY (target, credential_id) REFERENCES credentials(target, id)
 );
 
 CREATE TABLE IF NOT EXISTS target_route_state (
@@ -89,7 +91,7 @@ CREATE TABLE IF NOT EXISTS activation_recovery (
   UNIQUE (target, action_id)
 );
 
-INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '4');
+INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '5');
 INSERT OR IGNORE INTO target_route_state (
   target,
   management_revision,

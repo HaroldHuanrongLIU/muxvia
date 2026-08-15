@@ -68,16 +68,19 @@ fn inspection_protocol_round_trips_all_sources_cancellation_and_view_free_result
         saved,
         DiscoverySource::Draft {
             base_url: "https://draft.example/v1".into(),
+            authentication: ProviderAuthentication::OpenaiBearer,
             credential_source: DraftCredentialSource::Missing,
         },
         DiscoverySource::Draft {
             base_url: "https://draft.example/v1?token=endpoint-query-must-not-escape".into(),
+            authentication: ProviderAuthentication::AnthropicBearer,
             credential_source: DraftCredentialSource::Ephemeral {
                 value: "ephemeral-secret-must-not-escape".into(),
             },
         },
         DiscoverySource::Draft {
             base_url: "https://draft.example/v1".into(),
+            authentication: ProviderAuthentication::AnthropicApiKey,
             credential_source: DraftCredentialSource::Saved {
                 provider_id: "00000000-0000-4000-8000-000000000101".parse().unwrap(),
                 provider_revision: 7,
@@ -575,6 +578,23 @@ fn protocol_literals_and_identifiers_are_validated() {
         }
     });
     assert!(serde_json::from_value::<ClientFrame>(invalid_action_id).is_err());
+
+    let arbitrary_claude_selector = serde_json::json!({
+        "type": "request",
+        "requestId": "request-2",
+        "operation": {
+            "kind": "open-target",
+            "target": "claude",
+            "claudeContext": {
+                "claudeConfigDir": null,
+                "selectorState": "enabled",
+                "blockingSelector": "CREDENTIAL_BEARING_ARBITRARY_VALUE",
+                "hostManagedState": "unmanaged",
+                "cwd": "/safe/project"
+            }
+        }
+    });
+    assert!(serde_json::from_value::<ClientFrame>(arbitrary_claude_selector).is_err());
 
     let hello_ack = serde_json::json!({
         "type": "hello-ack",

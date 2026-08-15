@@ -75,6 +75,7 @@ type DiscoveryProjection =
   | {
     kind: "draft"
     baseUrl: string
+    authentication: "openai-bearer" | "anthropic-api-key" | "anthropic-bearer"
     credentialSource: "missing" | "ephemeral" | "saved"
     savedProviderId?: string
     savedProviderRevision?: number
@@ -116,6 +117,7 @@ function projectDiscovery(source: DiscoverySource): DiscoveryProjection {
   return {
     kind: "draft",
     baseUrl: redactEndpoint(source.baseUrl),
+    authentication: source.authentication,
     credentialSource: source.credentialSource.kind,
     savedProviderId: source.credentialSource.kind === "saved" ? source.credentialSource.providerId : undefined,
     savedProviderRevision: source.credentialSource.kind === "saved" ? source.credentialSource.providerRevision : undefined,
@@ -241,6 +243,7 @@ test("saved discovery mounts once, refresh uses the current draft, aborts the ol
     expect(session.discoveries[1]).toEqual({
       kind: "draft",
       baseUrl: "https://inspection.example/v1/draft",
+      authentication: "openai-bearer",
       credentialSource: "ephemeral",
       savedProviderId: undefined,
       savedProviderRevision: undefined,
@@ -531,6 +534,7 @@ test("Claude owns automatic and explicit Discovery plus neutral Reachability", a
     expect(claude.discoveries[1]).toEqual({
       kind: "draft",
       baseUrl: selected.baseUrl,
+      authentication: "anthropic-api-key",
       credentialSource: "saved",
       savedProviderId: selected.id,
       savedProviderRevision: selected.providerRevision,
@@ -556,6 +560,51 @@ test("Claude owns automatic and explicit Discovery plus neutral Reachability", a
     expect(codex.reachabilityCalls).toEqual([])
     expect(codex.actions).toEqual([])
     expect(claude.actions).toEqual([])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Claude draft Discovery follows the editor authentication toggle", async () => {
+  const selected = provider({
+    name: "Claude Draft Auth",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-api-key",
+    routingRequirement: "takeover-required",
+  })
+  const claude = new InspectionTargetSession({
+    initial: view({ target: "claude", providers: [selected] }),
+    discover: async () => ({
+      status: "success",
+      models: [],
+      attempts: 1,
+      elapsedMs: 1,
+      endpointOrigin: "https://inspection.example",
+    }),
+  })
+  const codex = new InspectionTargetSession({ initial: view() })
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
+    width: 80, height: 24, useThread: false, kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Enter edit ·"))
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => claude.discoveries.length === 1)
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("h")
+    await setup.waitForFrame((frame) => frame.includes("Anthropic Bearer token"))
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("f")
+    await setup.waitFor(() => claude.discoveries.length === 2)
+    expect(claude.discoveries[1]).toMatchObject({
+      kind: "draft",
+      authentication: "anthropic-bearer",
+      credentialSource: "saved",
+    })
   } finally {
     setup.renderer.destroy()
   }

@@ -340,7 +340,7 @@ async fn request(stream: &mut UnixStream, request_id: &str, operation: Value) ->
 }
 
 #[tokio::test]
-async fn claude_open_context_is_used_by_takeover_and_publishes_only_the_claude_session() {
+async fn claude_gap_reopen_preserves_context_for_takeover_and_publishes_only_claude() {
     let root = short_temp_root("mx-claude-act");
     let user_home = root.join("home");
     fs::create_dir_all(&user_home).unwrap();
@@ -400,6 +400,13 @@ async fn claude_open_context_is_used_by_takeover_and_publishes_only_the_claude_s
         read_frame(&mut stream).await.unwrap()["view"]["target"],
         "claude"
     );
+    let refreshed = request(
+        &mut stream,
+        "gap-refresh",
+        json!({ "kind": "open-target", "target": "claude" }),
+    )
+    .await;
+    assert_eq!(refreshed["result"]["view"]["target"], "claude");
 
     let applied = request(
         &mut stream,
@@ -416,7 +423,7 @@ async fn claude_open_context_is_used_by_takeover_and_publishes_only_the_claude_s
     let push = read_frame(&mut stream).await.unwrap();
     assert_eq!(push["view"], applied["result"]["outcome"]["view"]);
     assert_eq!(store.target_view().await.unwrap().management_revision, 0);
-    assert!(!format!("{opened}{saved}{applied}{push}").contains("provider-secret"));
+    assert!(!format!("{opened}{saved}{refreshed}{applied}{push}").contains("provider-secret"));
     handle.shutdown().await.unwrap();
     let _ = fs::remove_dir_all(root);
 }
@@ -433,6 +440,7 @@ async fn target_isolation_opens_claude_without_touching_codex_state() {
         "before-open",
         json!({ "kind": "discover-models", "target": "claude", "source": {
             "kind": "draft", "baseUrl": "https://api.anthropic.com/v1",
+            "authentication": "anthropic-api-key",
             "credentialSource": { "kind": "missing" }
         }}),
     )
@@ -737,6 +745,7 @@ async fn shutdown_is_bounded_when_an_authorized_peer_stops_reading() {
                 "source": {
                     "kind": "draft",
                     "baseUrl": upstream.base_url,
+                    "authentication": "openai-bearer",
                     "credentialSource": {
                         "kind": "ephemeral",
                         "value": "backpressure-secret-must-not-escape"
@@ -1158,6 +1167,7 @@ async fn inspection_admission_is_bounded_and_reaped_capacity_is_reused() {
                     "source": {
                         "kind": "draft",
                         "baseUrl": upstream.base_url,
+                        "authentication": "openai-bearer",
                         "credentialSource": {
                             "kind": "ephemeral",
                             "value": "admission-secret-must-not-escape"
@@ -1206,6 +1216,7 @@ async fn inspection_admission_is_bounded_and_reaped_capacity_is_reused() {
                 "source": {
                     "kind": "draft",
                     "baseUrl": upstream.base_url,
+                    "authentication": "openai-bearer",
                     "credentialSource": {
                         "kind": "ephemeral",
                         "value": "replacement-secret-must-not-escape"
@@ -1243,6 +1254,7 @@ async fn inspection_admission_is_bounded_and_reaped_capacity_is_reused() {
                 "source": {
                     "kind": "draft",
                     "baseUrl": upstream.base_url,
+                    "authentication": "openai-bearer",
                     "credentialSource": {
                         "kind": "ephemeral",
                         "value": "shutdown-secret-must-not-escape"
@@ -1391,6 +1403,7 @@ async fn duplicate_inspection_id_closes_before_queued_frames_can_cross_correlate
                 "source": {
                     "kind": "draft",
                     "baseUrl": upstream.base_url,
+                    "authentication": "openai-bearer",
                     "credentialSource": {
                         "kind": "ephemeral",
                         "value": "queued-result-secret-must-not-escape"
@@ -1420,6 +1433,7 @@ async fn duplicate_inspection_id_closes_before_queued_frames_can_cross_correlate
                 "source": {
                     "kind": "draft",
                     "baseUrl": upstream.base_url,
+                    "authentication": "openai-bearer",
                     "credentialSource": {
                         "kind": "ephemeral",
                         "value": "second-secret-must-not-escape"
@@ -1952,6 +1966,7 @@ async fn claude_unknown_nonempty_session_opens_read_only_but_takeover_has_no_sid
             "claudeContext": {
                 "claudeConfigDir": null,
                 "selectorState": "unknown-nonempty",
+                "blockingSelector": "CLAUDE_CODE_USE_VERTEX",
                 "hostManagedState": "unmanaged",
                 "cwd": user_home
             }
@@ -1979,6 +1994,8 @@ async fn claude_unknown_nonempty_session_opens_read_only_but_takeover_has_no_sid
     .await;
 
     assert_eq!(blocked["problem"]["code"], "provider-mode-active");
+    assert_eq!(blocked["problem"]["source"], "control-plane-context");
+    assert_eq!(blocked["problem"]["selector"], "CLAUDE_CODE_USE_VERTEX");
     assert_eq!(
         blocked["authoritativeView"],
         serde_json::to_value(&before).unwrap()

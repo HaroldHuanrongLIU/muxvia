@@ -503,6 +503,7 @@ fn claude_context(home: &MuxviaHome) -> ClaudePreflightContext {
     ClaudePreflightContext {
         claude_config_dir: None,
         selector_state: ClaudeSelectorState::Unset,
+        blocking_selector: None,
         host_managed_state: ClaudeHostManagedState::Unmanaged,
         cwd: home.user_home().to_string_lossy().into_owned(),
     }
@@ -2418,7 +2419,7 @@ async fn committed_takeover_bootstraps_exact_endpoint_in_a_new_service_epoch_wit
 }
 
 #[tokio::test]
-async fn occupied_committed_port_blocks_production_bootstrap_before_control_socket_opens() {
+async fn occupied_committed_port_leaves_target_control_only_and_opens_control_socket() {
     let fixture = Fixture::new().await;
     let (provider_id, revision) = fixture.save("First", "gpt", "secret").await;
     let first = fixture.service(ActivationHooks::default());
@@ -2445,17 +2446,31 @@ async fn occupied_committed_port_blocks_production_bootstrap_before_control_sock
         Arc::new(NoopUpstream),
     ));
 
+    let handle = ControlServer::bind_with_activation(
+        &fixture.home,
+        Arc::clone(&second_store),
+        "test",
+        Arc::clone(&second),
+    )
+    .await
+    .unwrap();
+    assert!(fixture.home.root().join("run/control.sock").exists());
+    assert!(second.model_endpoint().await.is_none());
+    let view = second_store.target_view().await.unwrap();
+    assert_eq!(view.takeover.state, "unavailable");
+    assert!(view.takeover.endpoint.is_none());
     assert!(
-        ControlServer::bind_with_activation(&fixture.home, second_store, "test", second,)
-            .await
-            .is_err()
+        view.problems
+            .iter()
+            .any(|problem| problem.code == "model-route-unavailable")
     );
-    assert!(!fixture.home.root().join("run/control.sock").exists());
+    handle.shutdown().await.unwrap();
+    second.shutdown_models().await.unwrap();
     drop(occupied);
 }
 
 #[tokio::test]
-async fn occupied_claude_port_closes_dual_bootstrap_before_control_socket_and_drains_codex() {
+async fn occupied_claude_port_isolates_claude_while_codex_resumes_and_drains() {
     let fixture = Fixture::new().await;
     let (codex_provider, codex_revision) = fixture.save("Codex", "gpt-test", "secret").await;
     let (claude_provider, claude_revision) =
@@ -2513,12 +2528,28 @@ async fn occupied_claude_port_closes_dual_bootstrap_before_control_socket_and_dr
         ),
     );
 
+    let handle = ControlServer::bind_with_activation(
+        &fixture.home,
+        Arc::clone(&second_store),
+        "test",
+        Arc::clone(&second),
+    )
+    .await
+    .unwrap();
+    assert!(fixture.home.root().join("run/control.sock").exists());
+    assert_eq!(second.model_endpoint().await, Some(codex_endpoint));
+    assert!(second.model_endpoint_for(Target::Claude).await.is_none());
+    let claude_view = second_store.target_view_for(Target::Claude).await.unwrap();
+    assert_eq!(claude_view.takeover.state, "unavailable");
+    assert!(claude_view.takeover.endpoint.is_none());
     assert!(
-        ControlServer::bind_with_activation(&fixture.home, second_store, "test", second)
-            .await
-            .is_err()
+        claude_view
+            .problems
+            .iter()
+            .any(|problem| problem.code == "model-route-unavailable")
     );
-    assert!(!fixture.home.root().join("run/control.sock").exists());
+    handle.shutdown().await.unwrap();
+    second.shutdown_models().await.unwrap();
     let rebound_codex = tokio::net::TcpListener::bind(codex_endpoint).await.unwrap();
     drop(rebound_codex);
     drop(occupied);

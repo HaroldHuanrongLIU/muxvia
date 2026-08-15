@@ -40,7 +40,7 @@
     "discoverySource": {
       "oneOf": [
         { "type": "object", "properties": { "kind": { "const": "saved" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"] },
-        { "type": "object", "properties": { "kind": { "const": "draft" }, "baseUrl": { "type": "string" }, "credentialSource": { "$ref": "#/$defs/draftCredentialSource" } }, "required": ["kind", "baseUrl", "credentialSource"] }
+        { "type": "object", "properties": { "kind": { "const": "draft" }, "baseUrl": { "type": "string" }, "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer"] }, "credentialSource": { "$ref": "#/$defs/draftCredentialSource" } }, "required": ["kind", "baseUrl", "authentication", "credentialSource"] }
       ]
     },
     "claudePreflightContext": {
@@ -49,6 +49,7 @@
       "properties": {
         "claudeConfigDir": { "type": ["string", "null"] },
         "selectorState": { "enum": ["unset", "disabled", "enabled", "unknown-nonempty"] },
+        "blockingSelector": { "type": ["string", "null"] },
         "hostManagedState": { "enum": ["unmanaged", "managed", "unknown"] },
         "cwd": { "type": "string" }
       },
@@ -168,7 +169,12 @@
     },
     "controlProblem": {
       "type": "object",
-      "properties": { "code": { "type": "string" }, "message": { "type": "string" } },
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "source": { "enum": ["control-plane-context", "user-settings", "managed-settings", "shared-project-settings", "local-project-settings"] },
+        "selector": { "type": "string" }
+      },
       "required": ["code", "message"]
     },
     "activatedSnapshot": {

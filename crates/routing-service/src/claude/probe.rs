@@ -18,6 +18,8 @@ pub enum ClaudeCapability {
 pub struct ClaudeProblem {
     code: &'static str,
     path: Option<std::path::PathBuf>,
+    source: Option<&'static str>,
+    selector: Option<String>,
     correlation_id: Uuid,
 }
 
@@ -26,6 +28,8 @@ impl ClaudeProblem {
         Self {
             code,
             path: path.map(Path::to_path_buf),
+            source: None,
+            selector: None,
             correlation_id: Uuid::new_v4(),
         }
     }
@@ -37,6 +41,24 @@ impl ClaudeProblem {
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
+
+    pub(crate) fn with_source(mut self, source: &'static str) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    pub(crate) fn with_selector(mut self, selector: impl Into<String>) -> Self {
+        self.selector = Some(selector.into());
+        self
+    }
+
+    pub(crate) fn source(&self) -> Option<&'static str> {
+        self.source
+    }
+
+    pub(crate) fn selector(&self) -> Option<&str> {
+        self.selector.as_deref()
+    }
 }
 
 impl fmt::Debug for ClaudeProblem {
@@ -45,6 +67,8 @@ impl fmt::Debug for ClaudeProblem {
             .debug_struct("ClaudeProblem")
             .field("code", &self.code)
             .field("path", &self.path)
+            .field("source", &self.source)
+            .field("selector", &self.selector)
             .field("correlation_id", &self.correlation_id)
             .finish()
     }

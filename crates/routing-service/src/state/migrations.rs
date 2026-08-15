@@ -14,7 +14,7 @@ use crate::control::protocol::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -43,16 +43,67 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v1(connection)?;
             migrate_v2(connection)?;
             migrate_v3(connection)?;
+            migrate_v4(connection)?;
         }
         Some(2) => {
             migrate_v2(connection)?;
             migrate_v3(connection)?;
+            migrate_v4(connection)?;
         }
-        Some(3) => migrate_v3(connection)?,
+        Some(3) => {
+            migrate_v3(connection)?;
+            migrate_v4(connection)?;
+        }
+        Some(4) => migrate_v4(connection)?,
         Some(_) => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v4(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE credentials_v5 (
+           id TEXT PRIMARY KEY,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           bearer_token TEXT NOT NULL,
+           UNIQUE (target, id)
+         );
+         CREATE TABLE providers_v5 (
+           id TEXT PRIMARY KEY,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           position INTEGER NOT NULL CHECK (position >= 0),
+           provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
+           name TEXT NOT NULL,
+           base_url TEXT NOT NULL,
+           model TEXT NOT NULL,
+           protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
+           authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
+           credential_id TEXT,
+           provenance_kind TEXT,
+           provenance_key TEXT,
+           generated_owner_id TEXT,
+           routing_requirement TEXT NOT NULL DEFAULT 'direct-compatible'
+             CHECK (routing_requirement IN ('direct-compatible', 'takeover-required')),
+           CHECK ((target = 'codex' AND protocol = 'openai-responses' AND authentication = 'openai-bearer')
+             OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer'))),
+           FOREIGN KEY (target, credential_id) REFERENCES credentials_v5(target, id)
+         );
+         INSERT INTO credentials_v5 SELECT id, target, bearer_token FROM credentials;
+         INSERT INTO providers_v5 SELECT * FROM providers;
+         DROP TABLE providers;
+         DROP TABLE credentials;
+         ALTER TABLE credentials_v5 RENAME TO credentials;
+         ALTER TABLE providers_v5 RENAME TO providers;
+         UPDATE metadata SET value = '5' WHERE key = 'schema-version';",
+    )?;
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.commit()
 }
 
 fn migrate_v3(connection: &mut Connection) -> Result<()> {

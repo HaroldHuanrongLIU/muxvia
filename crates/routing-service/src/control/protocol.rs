@@ -176,6 +176,8 @@ pub enum ControlOperation {
 pub struct ClaudePreflightContext {
     pub claude_config_dir: Option<String>,
     pub selector_state: ClaudeSelectorState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_selector: Option<ClaudeBlockingSelector>,
     pub host_managed_state: ClaudeHostManagedState,
     pub cwd: String,
 }
@@ -187,6 +189,32 @@ pub enum ClaudeSelectorState {
     Disabled,
     Enabled,
     UnknownNonempty,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub enum ClaudeBlockingSelector {
+    #[serde(rename = "CLAUDE_CODE_USE_BEDROCK")]
+    Bedrock,
+    #[serde(rename = "CLAUDE_CODE_USE_VERTEX")]
+    Vertex,
+    #[serde(rename = "CLAUDE_CODE_USE_FOUNDRY")]
+    Foundry,
+    #[serde(rename = "CLAUDE_CODE_USE_MANTLE")]
+    Mantle,
+    #[serde(rename = "CLAUDE_CODE_USE_ANTHROPIC_AWS")]
+    AnthropicAws,
+}
+
+impl ClaudeBlockingSelector {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bedrock => "CLAUDE_CODE_USE_BEDROCK",
+            Self::Vertex => "CLAUDE_CODE_USE_VERTEX",
+            Self::Foundry => "CLAUDE_CODE_USE_FOUNDRY",
+            Self::Mantle => "CLAUDE_CODE_USE_MANTLE",
+            Self::AnthropicAws => "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -211,6 +239,7 @@ pub enum DiscoverySource {
     },
     Draft {
         base_url: String,
+        authentication: ProviderAuthentication,
         credential_source: DraftCredentialSource,
     },
 }
@@ -228,10 +257,12 @@ impl fmt::Debug for DiscoverySource {
                 .finish(),
             Self::Draft {
                 base_url: _,
+                authentication,
                 credential_source,
             } => formatter
                 .debug_struct("Draft")
                 .field("base_url", &Redacted)
+                .field("authentication", authentication)
                 .field("credential_source", credential_source)
                 .finish(),
         }
@@ -745,4 +776,8 @@ pub struct ActivatedSnapshotView {
 pub struct ControlProblem {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
 }

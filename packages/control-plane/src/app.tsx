@@ -372,6 +372,9 @@ function claudePreflightContext(environment: NodeJS.ProcessEnv): ClaudePreflight
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
   ] as const
   const normalized = selectorNames.map((name) => normalizeSelector(environment[name]))
+  const blockingSelector = selectorNames.find((_, index) => (
+    normalized[index] === "enabled" || normalized[index] === "unknown-nonempty"
+  )) ?? null
   const selectorState = normalized.includes("enabled")
     ? "enabled"
     : normalized.includes("unknown-nonempty")
@@ -380,6 +383,7 @@ function claudePreflightContext(environment: NodeJS.ProcessEnv): ClaudePreflight
   return {
     claudeConfigDir: environment.CLAUDE_CONFIG_DIR ?? null,
     selectorState,
+    blockingSelector,
     hostManagedState: (() => {
       const state = normalizeSelector(environment.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST)
       if (state === "enabled") return "managed"

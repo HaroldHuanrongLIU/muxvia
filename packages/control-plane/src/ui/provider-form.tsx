@@ -213,7 +213,12 @@ export function ProviderForm(props: ProviderFormProps) {
           providerRevision: props.visibleProviderRevision ?? props.initialDraft.providerRevision,
         }
         : { kind: "missing" }
-    void runDiscovery({ kind: "draft", baseUrl: baseUrl(), credentialSource })
+    void runDiscovery({
+      kind: "draft",
+      baseUrl: baseUrl(),
+      authentication: authentication(),
+      credentialSource,
+    })
   }
   const openModelPicker = () => {
     const current = discovery()

@@ -22,6 +22,7 @@ fn context(cwd: &Path) -> ClaudePreflightContext {
     ClaudePreflightContext {
         claude_config_dir: None,
         selector_state: ClaudeSelectorState::Unset,
+        blocking_selector: None,
         host_managed_state: ClaudeHostManagedState::Unmanaged,
         cwd: cwd.to_string_lossy().into_owned(),
     }

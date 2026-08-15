@@ -31,6 +31,16 @@ use uuid::Uuid;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(8);
 
+fn assert_claude_direct_process_surface_is_secret_free(value: &Value) {
+    let encoded = value.to_string();
+    assert!(
+        !encoded.contains("provider-secret")
+            && !encoded.contains("ANTHROPIC_API_KEY")
+            && !encoded.contains("ANTHROPIC_AUTH_TOKEN"),
+        "Claude Direct process surface exposed a credential or setting"
+    );
+}
+
 struct ProcessFixture {
     _root: TempDir,
     home: PathBuf,
@@ -298,7 +308,7 @@ async fn clean_claude_direct_is_control_only_across_restart_and_exits_after_last
     wait_for_socket(&socket).await;
     let mut stream = UnixStream::connect(&socket).await.unwrap();
     hello(&mut stream).await;
-    request(
+    let opened = request(
         &mut stream,
         "open-claude",
         json!({
@@ -310,6 +320,7 @@ async fn clean_claude_direct_is_control_only_across_restart_and_exits_after_last
         }),
     )
     .await;
+    assert_claude_direct_process_surface_is_secret_free(&opened);
     let saved = request(
         &mut stream,
         "save-claude",
@@ -325,7 +336,9 @@ async fn clean_claude_direct_is_control_only_across_restart_and_exits_after_last
         }),
     )
     .await;
-    read_frame(&mut stream).await.unwrap();
+    assert_claude_direct_process_surface_is_secret_free(&saved);
+    let save_push = read_frame(&mut stream).await.unwrap();
+    assert_claude_direct_process_surface_is_secret_free(&save_push);
     let provider_id = saved["result"]["outcome"]["view"]["providers"][0]["id"].clone();
     let applied = request(
         &mut stream,
@@ -337,7 +350,9 @@ async fn clean_claude_direct_is_control_only_across_restart_and_exits_after_last
         }),
     )
     .await;
-    read_frame(&mut stream).await.unwrap();
+    assert_claude_direct_process_surface_is_secret_free(&applied);
+    let activation_push = read_frame(&mut stream).await.unwrap();
+    assert_claude_direct_process_surface_is_secret_free(&activation_push);
     let applied_view = &applied["result"]["outcome"]["view"];
     assert_eq!(applied_view["mode"], "direct");
     assert!(applied_view["takeover"]["endpoint"].is_null());
@@ -367,6 +382,7 @@ async fn clean_claude_direct_is_control_only_across_restart_and_exits_after_last
         json!({"kind": "open-target", "target": "claude"}),
     )
     .await;
+    assert_claude_direct_process_surface_is_secret_free(&reopened_view);
     assert_eq!(reopened_view["result"]["view"]["mode"], "direct");
     assert_eq!(
         reopened_view["result"]["view"]["activatedSnapshot"]["id"],

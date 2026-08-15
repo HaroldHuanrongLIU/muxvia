@@ -73,8 +73,8 @@ async fn new_database_target_view_matches_the_canonical_protocol_fixture() {
 }
 
 #[tokio::test]
-async fn fresh_schema_v6_reopens_with_codex_and_claude_route_rows() {
-    let root = std::env::temp_dir().join(format!("muxvia-v6-reopen-{}", Uuid::new_v4()));
+async fn fresh_schema_v7_reopens_with_codex_and_claude_route_rows() {
+    let root = std::env::temp_dir().join(format!("muxvia-v7-reopen-{}", Uuid::new_v4()));
     let user_home = root.join("home");
     fs::create_dir_all(&user_home).unwrap();
     let home = MuxviaHome::from_user_home(&user_home);
@@ -101,7 +101,7 @@ async fn fresh_schema_v6_reopens_with_codex_and_claude_route_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, "6");
+    assert_eq!(version, "7");
     assert_eq!(targets, ["claude", "codex"]);
     let _ = fs::remove_dir_all(root);
 }
@@ -497,7 +497,8 @@ async fn managed_config_version_commit_writes_requested_version_atomically_witho
     let persisted = database
         .call(move |connection| {
             connection.query_row(
-                "SELECT r.managed_config_version, a.state, r.activated_snapshot_id
+                "SELECT r.managed_config_version, a.state, r.activated_snapshot_id,
+                        r.recovery_intent_id = ?1
                  FROM target_route_state r JOIN activation_recovery a
                    ON a.target = r.target AND a.id = ?1
                  WHERE r.target = 'claude'",
@@ -507,13 +508,17 @@ async fn managed_config_version_commit_writes_requested_version_atomically_witho
                         row.get::<_, u32>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, bool>(3)?,
                     ))
                 },
             )
         })
         .await
         .unwrap();
-    assert_eq!(persisted, (2, "committed".into(), snapshot_id.to_string()));
+    assert_eq!(
+        persisted,
+        (2, "committed".into(), snapshot_id.to_string(), true)
+    );
 }
 
 #[tokio::test]

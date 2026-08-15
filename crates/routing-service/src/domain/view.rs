@@ -19,6 +19,7 @@ type RouteProjectionRow = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 pub(crate) fn project_target_view_for(
@@ -37,10 +38,11 @@ pub(crate) fn project_target_view_for(
         recovery_state,
         managed_config_path,
         activated_snapshot_id,
+        recovery_intent_id,
     ): RouteProjectionRow = connection.query_row(
         "SELECT management_revision, view_sequence, current_provider_id, serving_provider_id,
                 takeover_state, route_port, recovery_state, managed_config_path,
-                activated_snapshot_id
+                activated_snapshot_id, recovery_intent_id
          FROM target_route_state WHERE target = ?1",
         [target_name],
         |row| {
@@ -54,6 +56,7 @@ pub(crate) fn project_target_view_for(
                 row.get(6)?,
                 row.get(7)?,
                 row.get(8)?,
+                row.get(9)?,
             ))
         },
     )?;
@@ -159,8 +162,9 @@ pub(crate) fn project_target_view_for(
     };
     let recovery = connection
         .query_row(
-            "SELECT id, state FROM activation_recovery WHERE target = ?1 ORDER BY rowid DESC LIMIT 1",
-            [target_name],
+            "SELECT id, state FROM activation_recovery
+             WHERE target = ?1 AND id = ?2",
+            [target_name, recovery_intent_id.as_deref().unwrap_or("")],
             |row| Ok((Some(row.get::<_, String>(0)?), row.get::<_, String>(1)?)),
         )
         .unwrap_or((None, recovery_state.clone()));

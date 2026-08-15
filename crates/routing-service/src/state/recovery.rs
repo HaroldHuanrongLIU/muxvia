@@ -459,10 +459,11 @@ impl StateStore {
                     transaction.execute(
                         "UPDATE target_route_state
                          SET recovery_state = 'recovery-required',
+                             recovery_intent_id = ?1,
                              view_sequence = view_sequence + CASE
                                WHEN recovery_state = 'recovery-required' THEN 0 ELSE 1 END
-                         WHERE target = ?1",
-                        [target],
+                         WHERE target = ?2",
+                        [id.to_string(), target],
                     )?;
                 }
                 transaction.commit()?;

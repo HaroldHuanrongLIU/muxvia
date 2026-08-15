@@ -191,6 +191,36 @@ impl fmt::Debug for MutationFingerprint {
     }
 }
 
+fn redacted_match<T: PartialEq>(actual: &T, expected: &T) -> Result<(), &'static str> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err("redacted values differed")
+    }
+}
+
+fn public_surface_is_secret_free<T: fmt::Debug>(
+    surface: &T,
+    forbidden: &[&str],
+) -> Result<(), &'static str> {
+    let encoded = format!("{surface:?}");
+    if forbidden.iter().any(|secret| encoded.contains(secret)) {
+        Err("public surface contained a credential")
+    } else {
+        Ok(())
+    }
+}
+
+#[test]
+fn redacted_test_diagnostics_do_not_echo_secret_values_on_mismatch() {
+    let secret = "controlled-secret-sentinel";
+    let actual = serde_json::json!({"credential": secret});
+    let expected = serde_json::json!({"credential": "mutated"});
+    let diagnostic = redacted_match(&actual, &expected).unwrap_err();
+    assert_eq!(diagnostic, "redacted values differed");
+    assert!(!diagnostic.contains(secret));
+}
+
 impl Fixture {
     async fn new() -> Self {
         let temp = TempDir::new().unwrap();
@@ -219,6 +249,10 @@ impl Fixture {
             )
             .await
             .unwrap();
+        assert!(
+            public_surface_is_secret_free(&result, &[secret]).is_ok(),
+            "provider save outcome exposed a credential"
+        );
         (
             result.view.providers.last().unwrap().id,
             result.view.management_revision,
@@ -277,6 +311,10 @@ impl Fixture {
             )
             .await
             .unwrap();
+        assert!(
+            public_surface_is_secret_free(&result, &[secret]).is_ok(),
+            "Claude provider save outcome exposed a credential"
+        );
         (
             result.view.providers.last().unwrap().id,
             result.view.management_revision,
@@ -317,9 +355,10 @@ impl Fixture {
         database
             .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
                 let (id, payload_json): (String, String) = connection.query_row(
-                    "SELECT id, payload_json FROM activation_recovery
-                     WHERE target = 'claude' AND state = 'committed'
-                     ORDER BY rowid DESC LIMIT 1",
+                    "SELECT a.id, a.payload_json FROM target_route_state r
+                     JOIN activation_recovery a
+                       ON a.id = r.recovery_intent_id AND a.target = r.target
+                     WHERE r.target = 'claude' AND a.state = 'committed'",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
@@ -534,7 +573,7 @@ impl Fixture {
                 let queries = [
                     "SELECT id,target,position,provider_revision,name,base_url,model,protocol,credential_id,provenance_kind,provenance_key,generated_owner_id,routing_requirement FROM providers ORDER BY id",
                     "SELECT id,target,bearer_token FROM credentials ORDER BY id",
-                    "SELECT target,management_revision,view_sequence,current_provider_id,serving_provider_id,takeover_state,route_port,routing_credential,activated_snapshot_id,managed_config_path,recovery_state FROM target_route_state ORDER BY target",
+                    "SELECT target,management_revision,view_sequence,current_provider_id,serving_provider_id,takeover_state,route_port,routing_credential,activated_snapshot_id,managed_config_path,managed_config_version,recovery_intent_id,recovery_state FROM target_route_state ORDER BY target",
                     "SELECT id,target,provider_id,base_url,model,provider_bearer_token,epoch FROM activated_snapshots ORDER BY id",
                     "SELECT action_id,action_kind,committed_revision,outcome_json FROM action_receipts ORDER BY action_id",
                     "SELECT id,target,action_id,config_path,file_identity_json,payload_json,state,created_revision FROM activation_recovery ORDER BY id",
@@ -752,6 +791,14 @@ async fn claude_direct_commits_both_authentication_profiles_without_model_runtim
             .await
             .unwrap();
 
+        assert!(
+            public_surface_is_secret_free(
+                &outcome,
+                &["provider-secret", "prior-token", "prior-key"]
+            )
+            .is_ok(),
+            "Claude Direct outcome exposed a credential"
+        );
         assert_eq!(outcome.status, ActionStatus::Applied);
         assert_eq!(outcome.view.target, Target::Claude);
         assert_eq!(outcome.view.mode, "direct");
@@ -806,7 +853,14 @@ async fn claude_direct_commits_both_authentication_profiles_without_model_runtim
             "https://api.anthropic.test/"
         );
         assert_eq!(document["env"]["ANTHROPIC_MODEL"], "claude-sonnet-test");
-        assert_eq!(document["env"][active_key], "provider-secret");
+        assert!(
+            redacted_match(
+                &document["env"][active_key],
+                &serde_json::json!("provider-secret")
+            )
+            .is_ok(),
+            "Claude Direct credential did not match"
+        );
         assert!(!env.contains_key(inactive_key));
         assert_eq!(document["permissions"]["allow"][0], "Read");
         assert_eq!(updates.recv().await.unwrap(), outcome.view);
@@ -826,6 +880,14 @@ async fn claude_direct_commits_both_authentication_profiles_without_model_runtim
             )
             .await
             .unwrap();
+        assert!(
+            public_surface_is_secret_free(
+                &replay,
+                &["provider-secret", "prior-token", "prior-key"]
+            )
+            .is_ok(),
+            "Claude Direct replay exposed a credential"
+        );
         assert_eq!(replay.status, ActionStatus::Replayed);
         assert_eq!(replay.view, outcome.view);
         assert_eq!(probe.0.load(Ordering::SeqCst), 1);
@@ -874,6 +936,11 @@ async fn claude_direct_switches_authentication_profiles_against_the_immutable_sn
         )
         .await
         .unwrap();
+    assert!(
+        public_surface_is_secret_free(&first, &["api-provider-secret", "bearer-provider-secret"])
+            .is_ok(),
+        "Claude Direct outcome exposed a credential"
+    );
     fixture
         .mutate_provider(
             api_provider,
@@ -894,12 +961,28 @@ async fn claude_direct_switches_authentication_profiles_against_the_immutable_sn
         )
         .await
         .unwrap();
+    assert!(
+        public_surface_is_secret_free(
+            &second,
+            &[
+                "api-provider-secret",
+                "bearer-provider-secret",
+                "edited-provider-secret"
+            ]
+        )
+        .is_ok(),
+        "Claude Direct transition exposed a credential"
+    );
     let after_bearer: serde_json::Value =
         serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
     assert_eq!(after_bearer["env"]["ANTHROPIC_MODEL"], "claude-bearer");
-    assert_eq!(
-        after_bearer["env"]["ANTHROPIC_AUTH_TOKEN"],
-        "bearer-provider-secret"
+    assert!(
+        redacted_match(
+            &after_bearer["env"]["ANTHROPIC_AUTH_TOKEN"],
+            &serde_json::json!("bearer-provider-secret")
+        )
+        .is_ok(),
+        "Claude bearer credential did not match"
     );
     assert!(
         !after_bearer["env"]
@@ -919,12 +1002,28 @@ async fn claude_direct_switches_authentication_profiles_against_the_immutable_sn
         )
         .await
         .unwrap();
+    assert!(
+        public_surface_is_secret_free(
+            &third,
+            &[
+                "api-provider-secret",
+                "bearer-provider-secret",
+                "edited-provider-secret"
+            ]
+        )
+        .is_ok(),
+        "Claude Direct transition exposed a credential"
+    );
     let after_api: serde_json::Value =
         serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
     assert_eq!(after_api["env"]["ANTHROPIC_MODEL"], "edited-model");
-    assert_eq!(
-        after_api["env"]["ANTHROPIC_API_KEY"],
-        "edited-provider-secret"
+    assert!(
+        redacted_match(
+            &after_api["env"]["ANTHROPIC_API_KEY"],
+            &serde_json::json!("edited-provider-secret")
+        )
+        .is_ok(),
+        "Claude API credential did not match"
     );
     assert!(
         !after_api["env"]
@@ -976,11 +1075,8 @@ async fn claude_corrupt_committed_expectation_fails_closed_as_recovery_required(
         .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
             connection.execute(
                 "UPDATE activation_recovery SET payload_json = '{\"corrupt\":true}'
-                 WHERE rowid = (
-                   SELECT rowid FROM activation_recovery
-                   WHERE target = 'claude' AND state = 'committed'
-                   ORDER BY rowid DESC LIMIT 1
-                 )",
+                 WHERE id = (SELECT recovery_intent_id FROM target_route_state
+                             WHERE target = 'claude')",
                 [],
             )?;
             Ok(())
@@ -1001,6 +1097,10 @@ async fn claude_corrupt_committed_expectation_fails_closed_as_recovery_required(
         .await
         .unwrap_err();
 
+    assert!(
+        public_surface_is_secret_free(&failure, &["first-secret", "second-secret"]).is_ok(),
+        "corrupt-expectation failure exposed a credential"
+    );
     assert_eq!(failure.problem.code, "recovery-required");
     assert_eq!(
         failure.authoritative_view.recovery.state,
@@ -1010,8 +1110,314 @@ async fn claude_corrupt_committed_expectation_fails_closed_as_recovery_required(
         failure.authoritative_view.managed_configuration.state,
         "recovery-required"
     );
-    assert_eq!(fs::read(&settings).unwrap(), file_before);
+    assert!(
+        redacted_match(&fs::read(&settings).unwrap(), &file_before).is_ok(),
+        "corrupt-expectation failure changed Claude settings"
+    );
     assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+}
+
+#[tokio::test]
+async fn claude_retried_rolled_back_action_rebinds_the_current_recovery_expectation() {
+    let fixture = Fixture::new().await;
+    let (provider_a, _) = fixture
+        .save_claude_with_auth("A", "claude-a", "secret-a", "anthropic-api-key")
+        .await;
+    let (provider_b, _) = fixture
+        .save_claude_with_auth("B", "claude-b", "secret-b", "anthropic-bearer")
+        .await;
+    let (provider_c, revision) = fixture
+        .save_claude_with_auth("C", "claude-c", "secret-c", "anthropic-api-key")
+        .await;
+    let action_a = Uuid::new_v4();
+
+    let failed = fixture.dual_service(
+        ActivationHooks::failing(ActivationFailpoint::FinalCommit),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let first_a = failed
+        .apply_raw_for_with_context(
+            Target::Claude,
+            action_a,
+            revision,
+            direct_action(provider_a),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        public_surface_is_secret_free(&first_a, &["secret-a", "secret-b", "secret-c"]).is_ok(),
+        "failed Claude activation exposed a credential"
+    );
+    assert_eq!(first_a.problem.code, "internal-failure");
+    assert_eq!(
+        fixture.recovery_state_for_action(action_a).await.as_deref(),
+        Some("rolled-back")
+    );
+
+    let service = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let b = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            revision,
+            direct_action(provider_b),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    assert!(
+        public_surface_is_secret_free(&b, &["secret-a", "secret-b", "secret-c"]).is_ok(),
+        "Claude activation outcome exposed a credential"
+    );
+    let retried_a = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            action_a,
+            b.view.management_revision,
+            direct_action(provider_a),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    assert!(
+        public_surface_is_secret_free(&retried_a, &["secret-a", "secret-b", "secret-c"]).is_ok(),
+        "retried Claude outcome exposed a credential"
+    );
+    assert_eq!(retried_a.status, ActionStatus::Applied);
+    assert_eq!(
+        retried_a.view.current_provider_id,
+        Some(provider_a.to_string())
+    );
+
+    let c = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            retried_a.view.management_revision,
+            direct_action(provider_c),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    assert!(
+        public_surface_is_secret_free(&c, &["secret-a", "secret-b", "secret-c"]).is_ok(),
+        "Claude activation outcome exposed a credential"
+    );
+    assert_eq!(c.status, ActionStatus::Applied);
+    assert_eq!(c.view.current_provider_id, Some(provider_c.to_string()));
+    assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+}
+
+#[tokio::test]
+async fn claude_legal_committed_payload_mismatch_persists_recovery_required_and_blocks_writes() {
+    let fixture = Fixture::new().await;
+    let (provider_a, revision) = fixture
+        .save_claude_with_auth("A", "claude-a", "secret-a", "anthropic-api-key")
+        .await;
+    let service = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let action_a = Uuid::new_v4();
+    let a = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            action_a,
+            revision,
+            direct_action(provider_a),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    let (provider_b, next_revision) = fixture
+        .save_claude_with_auth("B", "claude-b", "secret-b", "anthropic-bearer")
+        .await;
+    assert!(next_revision > a.view.management_revision);
+
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+            let payload_json: String = connection.query_row(
+                "SELECT payload_json FROM activation_recovery
+                 WHERE target = 'claude' AND action_id = ?1 AND state = 'committed'",
+                [action_a.to_string()],
+                |row| row.get(0),
+            )?;
+            let mut payload: serde_json::Value = serde_json::from_str(&payload_json)
+                .map_err(|_| tokio_rusqlite::rusqlite::Error::InvalidQuery)?;
+            payload["desired"]["owned"]["model"] = serde_json::json!("mismatched-model");
+            payload["before"]["unrelated_fingerprint"] =
+                serde_json::json!("mismatched-fingerprint");
+            connection.execute(
+                "UPDATE activation_recovery SET payload_json = ?1
+                 WHERE target = 'claude' AND action_id = ?2 AND state = 'committed'",
+                tokio_rusqlite::rusqlite::params![payload.to_string(), action_a.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let mut updates = fixture.store.subscribe_target_views();
+
+    let failure = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            next_revision,
+            direct_action(provider_b),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        public_surface_is_secret_free(&failure, &["secret-a", "secret-b"]).is_ok(),
+        "recovery-required failure exposed a credential"
+    );
+    assert_eq!(failure.problem.code, "recovery-required");
+    assert_eq!(
+        failure.authoritative_view.recovery.state,
+        "recovery-required"
+    );
+    assert_eq!(
+        fixture.recovery_state_for_action(action_a).await.as_deref(),
+        Some("recovery-required")
+    );
+    assert_eq!(
+        fixture
+            .store
+            .target_view_for(Target::Claude)
+            .await
+            .unwrap()
+            .recovery
+            .state,
+        "recovery-required"
+    );
+    let blocked = fixture
+        .store
+        .apply_provider_action_for(
+            Target::Claude,
+            Uuid::new_v4(),
+            next_revision,
+            serde_json::json!({"kind": "delete-provider", "providerId": provider_b}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        public_surface_is_secret_free(&blocked, &["secret-a", "secret-b"]).is_ok(),
+        "blocked managed write exposed a credential"
+    );
+    assert_eq!(blocked.problem.code, "recovery-required");
+    assert_eq!(
+        fixture.store.target_view().await.unwrap().recovery.state,
+        "clean"
+    );
+    assert!(updates.try_recv().is_err());
+    assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+}
+
+#[tokio::test]
+async fn claude_direct_final_revision_race_restores_auth_profile_and_same_action_retries() {
+    let fixture = Fixture::new().await;
+    let (provider_a, revision) = fixture
+        .save_claude_with_auth("A", "claude-a", "secret-a", "anthropic-api-key")
+        .await;
+    let setup = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let a = setup
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            revision,
+            direct_action(provider_a),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    assert!(
+        public_surface_is_secret_free(&a, &["secret-a"]).is_ok(),
+        "Claude Direct setup outcome exposed a credential"
+    );
+    let settings_path = fixture.home.user_home().join(".claude/settings.json");
+    let settings_before = fs::read(&settings_path).unwrap();
+    let snapshot_before = a.view.activated_snapshot.clone();
+    let (provider_b, revision_b) = fixture
+        .save_claude_with_auth("B", "claude-b", "secret-b", "anthropic-bearer")
+        .await;
+    let action_b = Uuid::new_v4();
+    let pause = Arc::new(ActivationPause::default());
+    let paused = Arc::new(fixture.dual_service(
+        ActivationHooks::pausing_final_commit(pause.clone()),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    ));
+    let context = claude_context(&fixture.home);
+    let activation = {
+        let paused = Arc::clone(&paused);
+        tokio::spawn(async move {
+            paused
+                .apply_raw_for_with_context(
+                    Target::Claude,
+                    action_b,
+                    revision_b,
+                    direct_action(provider_b),
+                    Some(&context),
+                )
+                .await
+        })
+    };
+    pause.wait_until_reached().await;
+    let (_, concurrent_revision) = fixture
+        .save_claude_with_auth("Concurrent", "claude-c", "secret-c", "anthropic-api-key")
+        .await;
+    let mut updates = fixture.store.subscribe_target_views();
+    pause.release();
+
+    let failure = activation.await.unwrap().unwrap_err();
+    assert!(
+        public_surface_is_secret_free(&failure, &["secret-a", "secret-b", "secret-c"]).is_ok(),
+        "stale Claude activation exposed a credential"
+    );
+    assert_eq!(failure.problem.code, "stale-revision");
+    assert!(
+        redacted_match(&fs::read(&settings_path).unwrap(), &settings_before).is_ok(),
+        "stale Claude activation did not restore the prior auth profile"
+    );
+    let current = fixture.store.target_view_for(Target::Claude).await.unwrap();
+    assert_eq!(current.management_revision, concurrent_revision);
+    assert_eq!(current.current_provider_id, Some(provider_a.to_string()));
+    assert_eq!(current.activated_snapshot, snapshot_before);
+    assert!(fixture.store.receipt(action_b).await.unwrap().is_none());
+    assert_eq!(
+        fixture.recovery_state_for_action(action_b).await.as_deref(),
+        Some("rolled-back")
+    );
+    assert!(updates.try_recv().is_err());
+    assert!(paused.model_endpoint_for(Target::Claude).await.is_none());
+
+    let retry = setup
+        .apply_raw_for_with_context(
+            Target::Claude,
+            action_b,
+            concurrent_revision,
+            direct_action(provider_b),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    assert!(
+        public_surface_is_secret_free(&retry, &["secret-a", "secret-b", "secret-c"]).is_ok(),
+        "retried Claude outcome exposed a credential"
+    );
+    assert_eq!(retry.status, ActionStatus::Applied);
+    assert_eq!(retry.view.current_provider_id, Some(provider_b.to_string()));
+    assert!(setup.model_endpoint_for(Target::Claude).await.is_none());
 }
 
 #[tokio::test]
@@ -1048,6 +1454,10 @@ async fn claude_direct_to_takeover_uses_v2_and_takeover_to_direct_fails_before_i
         )
         .await
         .unwrap();
+    assert!(
+        public_surface_is_secret_free(&direct, &["direct-api-secret", "upstream-secret"]).is_ok(),
+        "Claude Direct outcome exposed a credential"
+    );
 
     let takeover = service
         .apply_raw_for_with_context(
@@ -1059,6 +1469,10 @@ async fn claude_direct_to_takeover_uses_v2_and_takeover_to_direct_fails_before_i
         )
         .await
         .unwrap();
+    assert!(
+        public_surface_is_secret_free(&takeover, &["direct-api-secret", "upstream-secret"]).is_ok(),
+        "Claude Takeover outcome exposed a credential"
+    );
 
     assert_eq!(takeover.view.mode, "takeover");
     assert_eq!(fixture.managed_config_version_for(Target::Claude).await, 2);
@@ -1085,9 +1499,16 @@ async fn claude_direct_to_takeover_uses_v2_and_takeover_to_direct_fails_before_i
         )
         .await
         .unwrap_err();
+    assert!(
+        public_surface_is_secret_free(&failure, &["direct-api-secret", "upstream-secret"]).is_ok(),
+        "takeover-active failure exposed a credential"
+    );
     assert_eq!(failure.problem.code, "takeover-active");
     assert_eq!(fixture.count("activation_recovery").await, intent_count);
-    assert_eq!(fs::read(&settings).unwrap(), file_before);
+    assert!(
+        redacted_match(&fs::read(&settings).unwrap(), &file_before).is_ok(),
+        "takeover-active failure changed Claude settings"
+    );
     service.shutdown_model_for(Target::Claude).await.unwrap();
 }
 
@@ -1131,14 +1552,26 @@ async fn claude_direct_post_intent_failpoints_restore_exact_state_without_runtim
             .await
             .unwrap_err();
 
+        assert!(
+            public_surface_is_secret_free(
+                &failure,
+                &["provider-secret", "prior-token", "prior-key"]
+            )
+            .is_ok(),
+            "Claude failpoint failure exposed a credential"
+        );
         assert!(matches!(
             failure.problem.code.as_str(),
             "configuration-write-failed" | "internal-failure"
         ));
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&fs::read(&settings).unwrap()).unwrap(),
-            before_value,
-            "{failpoint:?}"
+        assert!(
+            redacted_match(
+                &serde_json::from_slice::<serde_json::Value>(&fs::read(&settings).unwrap())
+                    .unwrap(),
+                &before_value
+            )
+            .is_ok(),
+            "Claude failpoint did not restore settings at {failpoint:?}"
         );
         assert_eq!(
             fixture
@@ -1231,10 +1664,19 @@ async fn claude_real_sqlite_commit_failure_restores_first_and_direct_to_direct_c
             .unwrap_err();
         drop(abort);
 
+        assert!(
+            public_surface_is_secret_free(&failure, &["first-secret", "second-secret"]).is_ok(),
+            "SQLite commit failure exposed a credential"
+        );
         assert_eq!(failure.problem.code, "internal-failure");
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&fs::read(&settings).unwrap()).unwrap(),
-            file_before
+        assert!(
+            redacted_match(
+                &serde_json::from_slice::<serde_json::Value>(&fs::read(&settings).unwrap())
+                    .unwrap(),
+                &file_before
+            )
+            .is_ok(),
+            "SQLite commit failure did not restore Claude settings"
         );
         let view_after = fixture.store.target_view_for(Target::Claude).await.unwrap();
         assert_eq!(
@@ -1323,10 +1765,18 @@ async fn claude_real_sqlite_commit_failure_cleans_direct_to_takeover_candidate()
         .unwrap_err();
     drop(abort);
 
+    assert!(
+        public_surface_is_secret_free(&failure, &["direct-secret", "upstream-secret"]).is_ok(),
+        "SQLite transition failure exposed a credential"
+    );
     assert_eq!(failure.problem.code, "internal-failure");
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&fs::read(&settings).unwrap()).unwrap(),
-        file_before
+    assert!(
+        redacted_match(
+            &serde_json::from_slice::<serde_json::Value>(&fs::read(&settings).unwrap()).unwrap(),
+            &file_before
+        )
+        .is_ok(),
+        "SQLite transition failure did not restore Claude settings"
     );
     let view_after = fixture.store.target_view_for(Target::Claude).await.unwrap();
     assert_eq!(
@@ -1391,6 +1841,11 @@ async fn claude_v1_takeover_sqlite_failure_restores_legacy_api_key_and_retry_upg
         )
         .await
         .unwrap();
+    assert!(
+        public_surface_is_secret_free(&first, &["legacy-upstream-secret", "legacy-api-key"])
+            .is_ok(),
+        "legacy Claude activation exposed a credential"
+    );
     let endpoint = first_service
         .model_endpoint_for(Target::Claude)
         .await
@@ -1425,9 +1880,13 @@ async fn claude_v1_takeover_sqlite_failure_restores_legacy_api_key_and_retry_upg
     );
     let restarted_settings: serde_json::Value =
         serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
-    assert_eq!(
-        restarted_settings["env"]["ANTHROPIC_API_KEY"],
-        "legacy-api-key"
+    assert!(
+        redacted_match(
+            &restarted_settings["env"]["ANTHROPIC_API_KEY"],
+            &serde_json::json!("legacy-api-key")
+        )
+        .is_ok(),
+        "legacy Claude API key changed during bootstrap"
     );
     let (second_provider, revision) = fixture
         .save_claude_with_auth(
@@ -1453,11 +1912,30 @@ async fn claude_v1_takeover_sqlite_failure_restores_legacy_api_key_and_retry_upg
         .unwrap_err();
     drop(abort);
 
+    assert!(
+        public_surface_is_secret_free(
+            &failure,
+            &[
+                "legacy-upstream-secret",
+                "upgraded-upstream-secret",
+                "legacy-api-key"
+            ]
+        )
+        .is_ok(),
+        "legacy Claude failure exposed a credential"
+    );
     assert_eq!(failure.problem.code, "internal-failure");
     assert_eq!(fixture.managed_config_version_for(Target::Claude).await, 1);
     let restored: serde_json::Value =
         serde_json::from_slice(&fs::read(&settings).unwrap()).unwrap();
-    assert_eq!(restored["env"]["ANTHROPIC_API_KEY"], "legacy-api-key");
+    assert!(
+        redacted_match(
+            &restored["env"]["ANTHROPIC_API_KEY"],
+            &serde_json::json!("legacy-api-key")
+        )
+        .is_ok(),
+        "legacy Claude API key was not restored"
+    );
     assert_eq!(restored["env"]["ANTHROPIC_MODEL"], "claude-legacy");
     assert_eq!(
         service.model_endpoint_for(Target::Claude).await,
@@ -1482,6 +1960,18 @@ async fn claude_v1_takeover_sqlite_failure_restores_legacy_api_key_and_retry_upg
         )
         .await
         .unwrap();
+    assert!(
+        public_surface_is_secret_free(
+            &upgraded,
+            &[
+                "legacy-upstream-secret",
+                "upgraded-upstream-secret",
+                "legacy-api-key"
+            ]
+        )
+        .is_ok(),
+        "upgraded Claude activation exposed a credential"
+    );
     assert_eq!(upgraded.status, ActionStatus::Applied);
     assert_eq!(fixture.managed_config_version_for(Target::Claude).await, 2);
     let upgraded_settings: serde_json::Value =
@@ -1572,15 +2062,22 @@ async fn claude_provisional_and_post_intent_faults_release_runtime_and_restore_e
             .await
             .unwrap_err();
 
+        assert!(
+            public_surface_is_secret_free(&failure, &["provider-secret"]).is_ok(),
+            "Claude takeover failpoint exposed a credential"
+        );
         assert!(matches!(
             failure.problem.code.as_str(),
             "configuration-write-failed" | "internal-failure"
         ));
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&fs::read(&settings_path).unwrap())
-                .unwrap(),
-            before_value,
-            "{failpoint:?}"
+        assert!(
+            redacted_match(
+                &serde_json::from_slice::<serde_json::Value>(&fs::read(&settings_path).unwrap())
+                    .unwrap(),
+                &before_value
+            )
+            .is_ok(),
+            "Claude takeover failpoint did not restore settings at {failpoint:?}"
         );
         assert!(service.model_endpoint_for(Target::Claude).await.is_none());
         assert!(
@@ -2167,9 +2664,13 @@ async fn claude_payload_ownership_mismatch_rolls_back_without_commit_or_publicat
         pause.release();
 
         let failure = activation.await.unwrap().unwrap_err();
+        assert!(
+            public_surface_is_secret_free(&failure, &["provider-secret"]).is_ok(),
+            "ownership mismatch failure exposed a credential"
+        );
         assert_eq!(failure.problem.code, "internal-failure");
         assert!(
-            fs::read(&settings_path).ok() == settings_before,
+            redacted_match(&fs::read(&settings_path).ok(), &settings_before).is_ok(),
             "ownership mismatch rollback did not restore exact Claude settings"
         );
         let view = fixture.store.target_view_for(Target::Claude).await.unwrap();
@@ -3914,7 +4415,10 @@ async fn startup_marks_only_claude_configuration_drift_and_resumes_clean_codex()
             .state,
         "configuration-drift"
     );
-    assert_eq!(fs::read(&settings_path).unwrap(), drifted_before);
+    assert!(
+        redacted_match(&fs::read(&settings_path).unwrap(), &drifted_before).is_ok(),
+        "startup drift handling changed Claude settings"
+    );
     let unbound = tokio::net::TcpListener::bind(claude_endpoint)
         .await
         .unwrap();

@@ -186,56 +186,71 @@ impl StoreFixture {
 }
 
 #[tokio::test]
-async fn schema_v6_fresh_database_has_checked_non_null_default_ownership_version() {
+async fn schema_v7_fresh_database_has_ownership_version_and_recovery_binding() {
     let fixture = StoreFixture::new();
     drop(fixture.open().await);
 
     let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
         .await
         .unwrap();
-    let (version, not_null, default_value, table_sql, route_versions) = database
-        .call(|connection| -> tokio_rusqlite::rusqlite::Result<_> {
-            let version = connection.query_row(
-                "SELECT value FROM metadata WHERE key = 'schema-version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )?;
-            let (not_null, default_value) = connection.query_row(
-                "SELECT \"notnull\", dflt_value
+    let (version, not_null, default_value, table_sql, route_versions, recovery_binding_is_nullable) =
+        database
+            .call(|connection| -> tokio_rusqlite::rusqlite::Result<_> {
+                let version = connection.query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema-version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let (not_null, default_value) = connection.query_row(
+                    "SELECT \"notnull\", dflt_value
                  FROM pragma_table_info('target_route_state')
                  WHERE name = 'managed_config_version'",
-                [],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
-            )?;
-            let table_sql = connection.query_row(
-                "SELECT sql FROM sqlite_schema
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+                )?;
+                let table_sql = connection.query_row(
+                    "SELECT sql FROM sqlite_schema
                  WHERE type = 'table' AND name = 'target_route_state'",
-                [],
-                |row| row.get::<_, String>(0),
-            )?;
-            let route_versions = connection
-                .prepare(
-                    "SELECT target, managed_config_version
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let route_versions = connection
+                    .prepare(
+                        "SELECT target, managed_config_version
                      FROM target_route_state ORDER BY target",
-                )?
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((version, not_null, default_value, table_sql, route_versions))
-        })
-        .await
-        .unwrap();
+                    )?
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let recovery_binding_is_nullable: bool = connection.query_row(
+                    "SELECT \"notnull\" = 0 FROM pragma_table_info('target_route_state')
+                 WHERE name = 'recovery_intent_id'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((
+                    version,
+                    not_null,
+                    default_value,
+                    table_sql,
+                    route_versions,
+                    recovery_binding_is_nullable,
+                ))
+            })
+            .await
+            .unwrap();
 
-    assert_eq!(version, "6");
+    assert_eq!(version, "7");
     assert_eq!(not_null, 1);
     assert_eq!(default_value.as_deref(), Some("1"));
     assert!(table_sql.contains("CHECK (managed_config_version IN (1,2))"));
     assert_eq!(route_versions, [("claude".into(), 1), ("codex".into(), 1)]);
+    assert!(recovery_binding_is_nullable);
 }
 
 #[tokio::test]
-async fn schema_v6_migrates_real_v5_claude_states_without_rewriting_persisted_artifacts() {
+async fn schema_v7_migrates_real_v5_claude_states_and_binds_the_unique_committed_intent() {
     for active in [false, true] {
         let fixture = StoreFixture::new();
         fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
@@ -318,13 +333,21 @@ async fn schema_v6_migrates_real_v5_claude_states_without_rewriting_persisted_ar
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "6"
+            "7"
         );
-        let route: (i64, String, Option<i64>, bool, Option<String>, i64) = database
+        let route: (
+            i64,
+            String,
+            Option<i64>,
+            bool,
+            Option<String>,
+            i64,
+            Option<String>,
+        ) = database
             .query_row(
                 "SELECT management_revision, takeover_state, route_port,
                         routing_credential IS 'route-secret',
-                        activated_snapshot_id, managed_config_version
+                        activated_snapshot_id, managed_config_version, recovery_intent_id
                  FROM target_route_state WHERE target = 'claude'",
                 [],
                 |row| {
@@ -335,6 +358,7 @@ async fn schema_v6_migrates_real_v5_claude_states_without_rewriting_persisted_ar
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
@@ -351,6 +375,7 @@ async fn schema_v6_migrates_real_v5_claude_states_without_rewriting_persisted_ar
                     Some(snapshot_id.to_owned())
                 )
             );
+            assert_eq!(route.6.as_deref(), Some(recovery_id));
             assert!(
                 database
                     .query_row(
@@ -404,14 +429,78 @@ async fn schema_v6_migrates_real_v5_claude_states_without_rewriting_persisted_ar
                 "v5 migration rewrote the Recovery Intent payload"
             );
         } else {
-            assert_eq!(route, (0, "inactive".to_owned(), None, false, None, 1));
+            assert_eq!(
+                route,
+                (0, "inactive".to_owned(), None, false, None, 1, None)
+            );
         }
     }
 }
 
+#[tokio::test]
+async fn schema_v7_does_not_guess_between_multiple_legacy_committed_intents() {
+    let fixture = StoreFixture::new();
+    fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    connection.execute_batch(V5_SCHEMA).unwrap();
+    connection
+        .execute(
+            "INSERT INTO activated_snapshots
+             (id, target, provider_id, base_url, model, protocol, authentication,
+              provider_bearer_token, epoch)
+             VALUES ('00000000-0000-4000-8000-000000000211', 'claude',
+                     '00000000-0000-4000-8000-000000000212', 'https://provider.test',
+                     'claude-test', 'anthropic-messages', 'anthropic-bearer',
+                     'provider-secret', '00000000-0000-4000-8000-000000000213')",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE target_route_state SET takeover_state = 'active', route_port = 43124,
+               routing_credential = 'route-secret',
+               activated_snapshot_id = '00000000-0000-4000-8000-000000000211'
+             WHERE target = 'claude'",
+            [],
+        )
+        .unwrap();
+    for suffix in ["221", "222"] {
+        connection
+            .execute(
+                "INSERT INTO activation_recovery
+                 (id, target, action_id, config_path, file_identity_json, payload_json,
+                  state, created_revision)
+                 VALUES (?1, 'claude', ?2, '/tmp/settings.json', 'null', '{}',
+                         'committed', 0)",
+                params![
+                    format!("00000000-0000-4000-8000-000000000{suffix}"),
+                    format!("10000000-0000-4000-8000-000000000{suffix}")
+                ],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    drop(fixture.open().await);
+    let database = Connection::open(fixture.home.database_path()).unwrap();
+    let migrated: (String, Option<String>, String) = database
+        .query_row(
+            "SELECT (SELECT value FROM metadata WHERE key = 'schema-version'),
+                    recovery_intent_id, recovery_state
+             FROM target_route_state WHERE target = 'claude'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        migrated,
+        ("7".to_owned(), None, "recovery-required".to_owned())
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
-async fn schema_v6_real_v5_claude_takeover_bootstraps_legacy_and_isolates_invalid_restart() {
+async fn schema_v7_real_v5_claude_takeover_bootstraps_legacy_and_isolates_invalid_restart() {
     let root = PathBuf::from("/tmp").join(format!("mv-{}", Uuid::new_v4()));
     let user_home = root.join("home");
     fs::create_dir_all(&user_home).unwrap();
@@ -918,7 +1007,7 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "6");
+    assert_eq!(schema_version, "7");
     assert_eq!(
         view.providers[0].id,
         Uuid::parse_str(existing_provider_id).unwrap()
@@ -1148,7 +1237,7 @@ async fn schema_v4_migrates_v2_routing_requirement_and_historical_receipts() {
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "6");
+    assert_eq!(schema_version, "7");
     assert_eq!(
         store.target_view().await.unwrap().providers[0].routing_requirement,
         ProviderRoutingRequirement::DirectCompatible

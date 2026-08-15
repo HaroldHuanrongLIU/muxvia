@@ -14,7 +14,7 @@ use crate::control::protocol::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -45,27 +45,58 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v3(connection)?;
             migrate_v4(connection)?;
             migrate_v5(connection)?;
+            migrate_v6(connection)?;
         }
         Some(2) => {
             migrate_v2(connection)?;
             migrate_v3(connection)?;
             migrate_v4(connection)?;
             migrate_v5(connection)?;
+            migrate_v6(connection)?;
         }
         Some(3) => {
             migrate_v3(connection)?;
             migrate_v4(connection)?;
             migrate_v5(connection)?;
+            migrate_v6(connection)?;
         }
         Some(4) => {
             migrate_v4(connection)?;
             migrate_v5(connection)?;
+            migrate_v6(connection)?;
         }
-        Some(5) => migrate_v5(connection)?,
+        Some(5) => {
+            migrate_v5(connection)?;
+            migrate_v6(connection)?;
+        }
+        Some(6) => migrate_v6(connection)?,
         Some(_) => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v6(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "ALTER TABLE target_route_state ADD COLUMN recovery_intent_id TEXT;
+         UPDATE target_route_state
+         SET recovery_intent_id = (
+           SELECT id FROM activation_recovery a
+           WHERE a.target = target_route_state.target AND a.state = 'committed'
+         )
+         WHERE activated_snapshot_id IS NOT NULL
+           AND (SELECT COUNT(*) FROM activation_recovery a
+                WHERE a.target = target_route_state.target AND a.state = 'committed') = 1;
+         UPDATE target_route_state
+         SET recovery_state = 'recovery-required'
+         WHERE target = 'claude' AND activated_snapshot_id IS NOT NULL
+           AND recovery_intent_id IS NULL
+           AND (SELECT COUNT(*) FROM activation_recovery a
+                WHERE a.target = target_route_state.target AND a.state = 'committed') > 1;
+         UPDATE metadata SET value = '7' WHERE key = 'schema-version';",
+    )?;
+    transaction.commit()
 }
 
 fn migrate_v5(connection: &mut Connection) -> Result<()> {

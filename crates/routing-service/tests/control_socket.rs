@@ -66,6 +66,21 @@ impl ClaudeProbe for CountingClaudeProbe {
 
 struct ControlNoopUpstream;
 
+fn assert_claude_direct_wire_is_secret_free(value: &Value) {
+    let wire = value.to_string();
+    for forbidden in [
+        "provider-secret-must-not-escape",
+        "wire-secret-must-not-escape",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+    ] {
+        assert!(
+            !wire.contains(forbidden),
+            "Claude Direct wire surface exposed a credential or setting"
+        );
+    }
+}
+
 #[async_trait]
 impl UpstreamTransport for ControlNoopUpstream {
     async fn send(&self, _: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
@@ -465,6 +480,7 @@ async fn claude_direct_responds_before_one_push_replays_without_push_and_isolate
         }),
     )
     .await;
+    assert_claude_direct_wire_is_secret_free(&opened);
     let mut codex = UnixStream::connect(handle.socket_path()).await.unwrap();
     hello(&mut codex).await;
     let codex_opened = request(
@@ -473,6 +489,7 @@ async fn claude_direct_responds_before_one_push_replays_without_push_and_isolate
         json!({"kind": "open-target", "target": "codex"}),
     )
     .await;
+    assert_claude_direct_wire_is_secret_free(&codex_opened);
     let saved = request(
         &mut claude,
         "save",
@@ -488,7 +505,9 @@ async fn claude_direct_responds_before_one_push_replays_without_push_and_isolate
         }),
     )
     .await;
-    let _save_push = read_frame(&mut claude).await.unwrap();
+    assert_claude_direct_wire_is_secret_free(&saved);
+    let save_push = read_frame(&mut claude).await.unwrap();
+    assert_claude_direct_wire_is_secret_free(&save_push);
     let provider_id = saved["result"]["outcome"]["view"]["providers"][0]["id"]
         .as_str()
         .unwrap();
@@ -504,9 +523,11 @@ async fn claude_direct_responds_before_one_push_replays_without_push_and_isolate
         }),
     )
     .await;
+    assert_claude_direct_wire_is_secret_free(&applied);
     assert_eq!(applied["result"]["outcome"]["status"], "applied");
     assert_eq!(applied["result"]["outcome"]["view"]["mode"], "direct");
     let push = read_frame(&mut claude).await.unwrap();
+    assert_claude_direct_wire_is_secret_free(&push);
     assert_eq!(push["view"], applied["result"]["outcome"]["view"]);
     assert!(
         tokio::time::timeout(Duration::from_millis(80), read_frame(&mut codex))
@@ -524,6 +545,7 @@ async fn claude_direct_responds_before_one_push_replays_without_push_and_isolate
         }),
     )
     .await;
+    assert_claude_direct_wire_is_secret_free(&replay);
     assert_eq!(replay["result"]["outcome"]["status"], "replayed");
     assert_eq!(replay["result"]["outcome"]["view"], push["view"]);
     assert!(
@@ -532,15 +554,6 @@ async fn claude_direct_responds_before_one_push_replays_without_push_and_isolate
             .is_err()
     );
     assert_eq!(store.target_view().await.unwrap().management_revision, 0);
-    let wire = format!("{opened}{codex_opened}{saved}{applied}{push}{replay}");
-    for forbidden in [
-        "provider-secret-must-not-escape",
-        "wire-secret-must-not-escape",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_API_KEY",
-    ] {
-        assert!(!wire.contains(forbidden));
-    }
     handle.shutdown().await.unwrap();
     let _ = fs::remove_dir_all(root);
 }

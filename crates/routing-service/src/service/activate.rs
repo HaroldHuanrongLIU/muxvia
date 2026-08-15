@@ -555,6 +555,30 @@ impl ActivationService {
         {
             Ok(result) => result,
             Err(problem) => {
+                if target == Target::Claude
+                    && problem.code == "recovery-required"
+                    && let Some(recovery_id) = preparation.prior_recovery_id
+                {
+                    let view = match self
+                        .store
+                        .mark_current_activation_recovery_required(target, recovery_id)
+                        .await
+                    {
+                        Ok(view) => view,
+                        Err(_) => {
+                            return Err(self.target_failure(target, "internal-failure").await);
+                        }
+                    };
+                    return Err(ActionFailure {
+                        problem: ControlProblem {
+                            code: "recovery-required".to_owned(),
+                            message: "Managed configuration requires recovery".to_owned(),
+                            source: problem.source,
+                            selector: problem.selector,
+                        },
+                        authoritative_view: view,
+                    });
+                }
                 return Err(self
                     .target_failure_with_projection(
                         target,
@@ -1127,6 +1151,9 @@ impl ActivationService {
                         if desired.as_ref() == expected && before.ownership() == ownership =>
                     {
                         Some((expected, before.as_ref()))
+                    }
+                    (Some(expected), None) if ownership == ClaudeConfigOwnership::LegacyThree => {
+                        Some((expected, &committed_before))
                     }
                     _ => return Err(PreflightFailure::new("recovery-required")),
                 };

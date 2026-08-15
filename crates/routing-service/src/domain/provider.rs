@@ -27,6 +27,17 @@ pub fn has_valid_provider_declaration(
     )
 }
 
+pub fn has_valid_provider_authentication(
+    target: Target,
+    authentication: ProviderAuthentication,
+) -> bool {
+    let protocol = match target {
+        Target::Codex => ProviderProtocol::OpenaiResponses,
+        Target::Claude => ProviderProtocol::AnthropicMessages,
+    };
+    has_valid_provider_declaration(target, protocol, authentication)
+}
+
 pub fn normalize_provider_base_url(input: &str) -> Result<String, InvalidProvider> {
     let mut url = Url::parse(input).map_err(|_| InvalidProvider)?;
 

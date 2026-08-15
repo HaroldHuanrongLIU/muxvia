@@ -11,7 +11,9 @@ use muxvia_routing::{
     claude::{
         ClaudeCapability, ClaudeConfigCodec, ClaudeProbe, ClaudeRuntimeShadow, CommandClaudeProbe,
     },
-    control::protocol::{ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState},
+    control::protocol::{
+        ClaudeBlockingSelector, ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState,
+    },
 };
 use tempfile::TempDir;
 
@@ -342,6 +344,7 @@ fn normalized_context_blocks_nondefault_home_active_or_unknown_provider_modes() 
     ] {
         let mut active = context(home.path());
         active.selector_state = selector_state;
+        active.blocking_selector = Some(ClaudeBlockingSelector::Vertex);
         cases.push((active, "provider-mode-active"));
     }
     for host_managed_state in [
@@ -350,10 +353,32 @@ fn normalized_context_blocks_nondefault_home_active_or_unknown_provider_modes() 
     ] {
         let mut active = context(home.path());
         active.host_managed_state = host_managed_state;
+        active.blocking_selector = Some(ClaudeBlockingSelector::HostManaged);
         cases.push((active, "provider-mode-active"));
     }
     for (context, expected) in cases {
         assert_eq!(codec.preflight(&context).unwrap_err().code(), expected);
+        assert!(!codec.settings_path().exists());
+    }
+}
+
+#[test]
+fn inconsistent_normalized_context_is_rejected_without_configuration_access() {
+    let home = TempDir::new().unwrap();
+    let codec = ClaudeConfigCodec::for_user_home(home.path()).unwrap();
+    for (selector_state, blocking_selector) in [
+        (ClaudeSelectorState::Enabled, None),
+        (ClaudeSelectorState::UnknownNonempty, None),
+        (
+            ClaudeSelectorState::Unset,
+            Some(ClaudeBlockingSelector::Vertex),
+        ),
+    ] {
+        let mut invalid = context(home.path());
+        invalid.selector_state = selector_state;
+        invalid.blocking_selector = blocking_selector;
+        let error = codec.preflight(&invalid).unwrap_err();
+        assert_eq!(error.code(), "preflight-context-required");
         assert!(!codec.settings_path().exists());
     }
 }

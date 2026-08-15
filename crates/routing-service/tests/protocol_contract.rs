@@ -596,6 +596,42 @@ fn protocol_literals_and_identifiers_are_validated() {
     });
     assert!(serde_json::from_value::<ClientFrame>(arbitrary_claude_selector).is_err());
 
+    for (selector_state, host_managed_state, blocking_selector) in [
+        ("enabled", "unmanaged", None),
+        ("unknown-nonempty", "unmanaged", None),
+        ("unset", "managed", None),
+        ("unset", "unmanaged", Some("CLAUDE_CODE_USE_VERTEX")),
+    ] {
+        let invalid_context = serde_json::json!({
+            "type": "request",
+            "requestId": "request-context",
+            "operation": {
+                "kind": "open-target",
+                "target": "claude",
+                "claudeContext": {
+                    "claudeConfigDir": null,
+                    "selectorState": selector_state,
+                    "blockingSelector": blocking_selector,
+                    "hostManagedState": host_managed_state,
+                    "cwd": "/safe/project"
+                }
+            }
+        });
+        assert!(serde_json::from_value::<ClientFrame>(invalid_context).is_err());
+    }
+
+    let arbitrary_problem_selector = serde_json::json!({
+        "type": "error",
+        "requestId": "request-3",
+        "problem": {
+            "code": "provider-mode-active",
+            "message": "fixed",
+            "source": "control-plane-context",
+            "selector": "ARBITRARY_SECRET_BEARING_SELECTOR"
+        }
+    });
+    assert!(serde_json::from_value::<ServerFrame>(arbitrary_problem_selector).is_err());
+
     let hello_ack = serde_json::json!({
         "type": "hello-ack",
         "rpc": { "major": 1, "minor": 0 },

@@ -2,6 +2,8 @@ use std::{fmt, path::Path, process::Command};
 
 use uuid::Uuid;
 
+use crate::control::protocol::ClaudeBlockingSelector;
+
 const TESTED_CLAUDE_VERSION: &str = "2.1.37 (Claude Code)";
 
 pub trait ClaudeProbe: Send + Sync {
@@ -19,7 +21,7 @@ pub struct ClaudeProblem {
     code: &'static str,
     path: Option<std::path::PathBuf>,
     source: Option<&'static str>,
-    selector: Option<String>,
+    selector: Option<ClaudeBlockingSelector>,
     correlation_id: Uuid,
 }
 
@@ -47,8 +49,8 @@ impl ClaudeProblem {
         self
     }
 
-    pub(crate) fn with_selector(mut self, selector: impl Into<String>) -> Self {
-        self.selector = Some(selector.into());
+    pub(crate) fn with_selector(mut self, selector: ClaudeBlockingSelector) -> Self {
+        self.selector = Some(selector);
         self
     }
 
@@ -56,8 +58,8 @@ impl ClaudeProblem {
         self.source
     }
 
-    pub(crate) fn selector(&self) -> Option<&str> {
-        self.selector.as_deref()
+    pub(crate) fn selector(&self) -> Option<ClaudeBlockingSelector> {
+        self.selector
     }
 }
 

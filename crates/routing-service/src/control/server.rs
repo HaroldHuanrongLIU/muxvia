@@ -23,10 +23,11 @@ use crate::{
     control::{
         framing::{FrameError, read_frame, write_frame},
         protocol::{
-            ClientFrame, ControlOperation, ControlProblem, ControlResult, FrameLimit, RpcVersion,
-            ServerFrame, Target, TargetView,
+            ClientFrame, ControlOperation, ControlProblem, ControlResult, DiscoverySource,
+            FrameLimit, RpcVersion, ServerFrame, Target, TargetView,
         },
     },
+    domain::provider::has_valid_provider_authentication,
     home::MuxviaHome,
     model::ReqwestUpstream,
     service::{activate::ActivationService, provider_inspector::ProviderInspector},
@@ -160,18 +161,31 @@ impl ControlServer {
         let inspector = Arc::new(
             ProviderInspector::new(Arc::clone(&store)).map_err(|_| ControlServerError::State)?,
         );
-        let codec = CodexConfigCodec::for_user_home(home.user_home())
-            .map_err(|_| ControlServerError::State)?;
-        let claude_codec = ClaudeConfigCodec::for_user_home(home.user_home())
-            .map_err(|_| ControlServerError::State)?;
-        let reconciliations = [
-            (Target::Codex, codec.reconcile_pending(&store).await.is_ok()),
-            (
-                Target::Claude,
-                claude_codec.reconcile_pending(&store).await.is_ok(),
-            ),
-        ];
-        for (target, reconciled) in reconciliations {
+        for target in [Target::Codex, Target::Claude] {
+            let reconciled = match target {
+                Target::Codex => match CodexConfigCodec::for_user_home(home.user_home()) {
+                    Ok(codec) => Some(codec.reconcile_pending(&store).await.is_ok()),
+                    Err(_) => None,
+                },
+                Target::Claude => match ClaudeConfigCodec::for_user_home(home.user_home()) {
+                    Ok(codec) => Some(codec.reconcile_pending(&store).await.is_ok()),
+                    Err(_) => None,
+                },
+            };
+            let reconciled = match reconciled {
+                Some(reconciled) => reconciled,
+                None => {
+                    store
+                        .record_startup_problem_for(
+                            target,
+                            "model-route-unavailable",
+                            "The committed model route could not be resumed",
+                        )
+                        .await
+                        .map_err(|_| ControlServerError::State)?;
+                    continue;
+                }
+            };
             match store
                 .managed_write_status_for(target)
                 .await
@@ -591,6 +605,22 @@ async fn serve_session(
                     }
                     operation @ (ControlOperation::DiscoverModels { .. }
                     | ControlOperation::CheckReachability { .. }) => {
+                        if let ControlOperation::DiscoverModels {
+                            source: DiscoverySource::Draft { authentication, .. },
+                            ..
+                        } = &operation
+                            && !has_valid_provider_authentication(target, *authentication)
+                        {
+                            if !enqueue_response(&responses, problem_frame(
+                                Some(request_id),
+                                "invalid-provider-authentication",
+                                "Draft authentication does not match Target",
+                                None,
+                            )) {
+                                break 'session;
+                            }
+                            continue;
+                        }
                         if inspection_requests.contains_key(&request_id) {
                             let _ = enqueue_response(&responses, problem_frame(
                                 Some(request_id),

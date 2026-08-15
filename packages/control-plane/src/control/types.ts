@@ -8,22 +8,37 @@ const rpcSchema = z.object({
 })
 
 const targetSchema = z.enum(["codex", "claude"])
+const claudeBlockingSelectorSchema = z.enum([
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+  "CLAUDE_CODE_USE_MANTLE",
+  "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+  "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+])
 const claudePreflightContextSchema = z.object({
   claudeConfigDir: z.string().nullable(),
   selectorState: z.enum(["unset", "disabled", "enabled", "unknown-nonempty"]),
-  blockingSelector: z.enum([
-    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-  ]).nullable().optional(),
+  blockingSelector: claudeBlockingSelectorSchema.nullable().optional(),
   hostManagedState: z.enum(["unmanaged", "managed", "unknown"]),
   cwd: z.string(),
+}).superRefine((context, validation) => {
+  const environmentActive = context.selectorState === "enabled" || context.selectorState === "unknown-nonempty"
+  const hostActive = context.hostManagedState === "managed" || context.hostManagedState === "unknown"
+  const selector = context.blockingSelector ?? undefined
+  const valid = environmentActive
+    ? selector !== undefined && selector !== "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"
+    : hostActive
+      ? selector === "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"
+      : selector === undefined
+  if (!valid) validation.addIssue({ code: "custom", message: "invalid-claude-blocking-selector", path: ["blockingSelector"] })
 })
 
 const controlProblemSchema = z.object({
   code: z.string(),
   message: z.string(),
   source: z.enum(["control-plane-context", "user-settings", "managed-settings", "shared-project-settings", "local-project-settings"]).optional(),
-  selector: z.string().optional(),
+  selector: claudeBlockingSelectorSchema.optional(),
 })
 
 const providerViewSchema = z.object({
@@ -314,6 +329,7 @@ export type ServerFrame = z.infer<typeof serverFrameSchema>
 export type TargetView = z.infer<typeof targetViewSchema>
 export type Target = z.infer<typeof targetSchema>
 export type ClaudePreflightContext = z.infer<typeof claudePreflightContextSchema>
+export type ClaudeBlockingSelector = z.infer<typeof claudeBlockingSelectorSchema>
 export type TargetAction = z.infer<typeof targetActionSchema>
 export type ActionOutcome = z.infer<typeof actionOutcomeSchema>
 export type ControlProblem = z.infer<typeof controlProblemSchema>

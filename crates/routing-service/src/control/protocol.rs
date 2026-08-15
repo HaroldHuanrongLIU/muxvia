@@ -171,8 +171,8 @@ pub enum ControlOperation {
 
 /// Secret-free observations supplied while opening the Claude management context.
 /// This is deliberately a closed summary, not a process environment projection.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClaudePreflightContext {
     pub claude_config_dir: Option<String>,
     pub selector_state: ClaudeSelectorState,
@@ -180,6 +180,56 @@ pub struct ClaudePreflightContext {
     pub blocking_selector: Option<ClaudeBlockingSelector>,
     pub host_managed_state: ClaudeHostManagedState,
     pub cwd: String,
+}
+
+impl ClaudePreflightContext {
+    pub(crate) fn has_valid_blocking_selector(&self) -> bool {
+        let environment_active = matches!(
+            self.selector_state,
+            ClaudeSelectorState::Enabled | ClaudeSelectorState::UnknownNonempty
+        );
+        let host_active = matches!(
+            self.host_managed_state,
+            ClaudeHostManagedState::Managed | ClaudeHostManagedState::Unknown
+        );
+        match (environment_active, host_active, self.blocking_selector) {
+            (true, _, Some(selector)) => selector != ClaudeBlockingSelector::HostManaged,
+            (false, true, Some(selector)) => selector == ClaudeBlockingSelector::HostManaged,
+            (false, false, None) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClaudePreflightContextWire {
+    claude_config_dir: Option<String>,
+    selector_state: ClaudeSelectorState,
+    #[serde(default)]
+    blocking_selector: Option<ClaudeBlockingSelector>,
+    host_managed_state: ClaudeHostManagedState,
+    cwd: String,
+}
+
+impl<'de> Deserialize<'de> for ClaudePreflightContext {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ClaudePreflightContextWire::deserialize(deserializer)?;
+        let context = Self {
+            claude_config_dir: wire.claude_config_dir,
+            selector_state: wire.selector_state,
+            blocking_selector: wire.blocking_selector,
+            host_managed_state: wire.host_managed_state,
+            cwd: wire.cwd,
+        };
+        if !context.has_valid_blocking_selector() {
+            return Err(D::Error::custom("invalid-claude-blocking-selector"));
+        }
+        Ok(context)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -203,6 +253,8 @@ pub enum ClaudeBlockingSelector {
     Mantle,
     #[serde(rename = "CLAUDE_CODE_USE_ANTHROPIC_AWS")]
     AnthropicAws,
+    #[serde(rename = "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST")]
+    HostManaged,
 }
 
 impl ClaudeBlockingSelector {
@@ -213,6 +265,7 @@ impl ClaudeBlockingSelector {
             Self::Foundry => "CLAUDE_CODE_USE_FOUNDRY",
             Self::Mantle => "CLAUDE_CODE_USE_MANTLE",
             Self::AnthropicAws => "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+            Self::HostManaged => "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
         }
     }
 }
@@ -779,5 +832,5 @@ pub struct ControlProblem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selector: Option<String>,
+    pub selector: Option<ClaudeBlockingSelector>,
 }

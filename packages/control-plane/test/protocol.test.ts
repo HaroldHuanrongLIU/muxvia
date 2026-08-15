@@ -344,6 +344,49 @@ test("rejects an action identifier that is not a UUID", () => {
   })).toThrow()
 })
 
+test("rejects incomplete or arbitrary Claude blocking selector projections", () => {
+  for (const claudeContext of [
+    { claudeConfigDir: null, selectorState: "enabled", hostManagedState: "unmanaged", cwd: "/safe" },
+    { claudeConfigDir: null, selectorState: "unknown-nonempty", hostManagedState: "unmanaged", cwd: "/safe" },
+    { claudeConfigDir: null, selectorState: "unset", hostManagedState: "managed", cwd: "/safe" },
+    { claudeConfigDir: null, selectorState: "unset", blockingSelector: "CLAUDE_CODE_USE_VERTEX", hostManagedState: "unmanaged", cwd: "/safe" },
+  ]) {
+    expect(() => parseClientFrame({
+      type: "request",
+      requestId: "open-claude",
+      operation: { kind: "open-target", target: "claude", claudeContext },
+    })).toThrow()
+  }
+
+  expect(() => parseServerFrame({
+    type: "error",
+    requestId: "activate",
+    problem: {
+      code: "provider-mode-active",
+      message: "fixed",
+      source: "control-plane-context",
+      selector: "ARBITRARY_SECRET_BEARING_SELECTOR",
+    },
+  })).toThrow()
+})
+
+test("JSON schema shares the exact closed Claude blocking selector enum", async () => {
+  const schema = JSON.parse(await readFile(fileURLToPath(new URL("../../../protocol/control-v1.schema.json", import.meta.url)), "utf8"))
+  expect(schema.$defs.claudeBlockingSelector.enum).toEqual([
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+  ])
+  expect(schema.$defs.claudePreflightContext.properties.blockingSelector).toEqual({
+    oneOf: [{ $ref: "#/$defs/claudeBlockingSelector" }, { type: "null" }],
+  })
+  expect(schema.$defs.controlProblem.properties.selector).toEqual({ $ref: "#/$defs/claudeBlockingSelector" })
+  expect(schema.$defs.claudePreflightContext.allOf).toHaveLength(3)
+})
+
 test("rejects a hello acknowledgement outside RPC 1.0 or the fixed frame limit", () => {
   const helloAck = {
     type: "hello-ack",

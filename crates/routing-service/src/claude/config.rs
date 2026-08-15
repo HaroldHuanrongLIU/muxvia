@@ -12,7 +12,8 @@ use super::ClaudeProblem;
 use crate::{
     config::managed_file::{FileIdentity, ManagedFile, ManagedFileError, PreRenameHook},
     control::protocol::{
-        ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState, Target,
+        ClaudeBlockingSelector, ClaudeHostManagedState, ClaudePreflightContext,
+        ClaudeSelectorState, Target,
     },
     state::{RecoveryIntent, RecoveryState, StateStore},
 };
@@ -23,12 +24,12 @@ const OWNED_KEYS: [&str; 3] = [
     "ANTHROPIC_MODEL",
 ];
 
-const PROVIDER_SELECTORS: [&str; 5] = [
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_USE_MANTLE",
-    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+const PROVIDER_SELECTORS: [ClaudeBlockingSelector; 5] = [
+    ClaudeBlockingSelector::Bedrock,
+    ClaudeBlockingSelector::Vertex,
+    ClaudeBlockingSelector::Foundry,
+    ClaudeBlockingSelector::Mantle,
+    ClaudeBlockingSelector::AnthropicAws,
 ];
 
 type ClaudePreRenameHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
@@ -365,6 +366,12 @@ impl ClaudeConfigCodec {
     }
 
     fn validate_context(&self, context: &ClaudePreflightContext) -> Result<(), ClaudeProblem> {
+        if !context.has_valid_blocking_selector() {
+            return Err(ClaudeProblem::new(
+                "preflight-context-required",
+                Some(self.settings_path()),
+            ));
+        }
         if let Some(observed) = &context.claude_config_dir {
             let observed = PathBuf::from(observed);
             let resolved = std::fs::canonicalize(&observed).unwrap_or(observed);
@@ -388,8 +395,7 @@ impl ClaudeConfigCodec {
         ) {
             let selector = context
                 .blocking_selector
-                .map(|selector| selector.as_str().to_owned())
-                .unwrap_or_else(|| "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST".to_owned());
+                .expect("validated Claude context has an exact blocking selector");
             return Err(
                 ClaudeProblem::new("provider-mode-active", Some(self.settings_path()))
                     .with_source("control-plane-context")
@@ -610,14 +616,14 @@ fn validate_provider_modes(
     let Some(env) = document.get("env").and_then(Value::as_object) else {
         return Ok(());
     };
-    for key in PROVIDER_SELECTORS
+    for selector in PROVIDER_SELECTORS
         .into_iter()
-        .chain(["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"])
+        .chain([ClaudeBlockingSelector::HostManaged])
     {
-        if env.get(key).is_some_and(selector_blocks) {
+        if env.get(selector.as_str()).is_some_and(selector_blocks) {
             return Err(ClaudeProblem::new("provider-mode-active", Some(path))
                 .with_source(source)
-                .with_selector(key));
+                .with_selector(selector));
         }
     }
     Ok(())

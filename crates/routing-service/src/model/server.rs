@@ -37,6 +37,10 @@ pub enum ModelServerError {
     Task,
     #[error("model server state is unavailable")]
     State,
+    #[error("target committed route state is inconsistent")]
+    TargetState,
+    #[error("target configuration home is unavailable")]
+    TargetConfiguration,
 }
 
 pub struct ReservedListener {

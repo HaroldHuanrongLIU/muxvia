@@ -22,7 +22,7 @@ use muxvia_routing::{
             ActionOutcome, ActionStatus, ActivationMode, ClaudeHostManagedState,
             ClaudePreflightContext, ClaudeSelectorState, Target,
         },
-        server::ControlServer,
+        server::{ControlServer, ControlServerError},
     },
     home::MuxviaHome,
     model::{UpstreamError, UpstreamRequest, UpstreamResponse, UpstreamTransport},
@@ -387,6 +387,33 @@ impl Fixture {
             .unwrap();
     }
 
+    async fn corrupt_committed_target(&self, target: Target, missing: &'static str) {
+        let database = tokio_rusqlite::Connection::open(self.home.database_path())
+            .await
+            .unwrap();
+        database
+            .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                match missing {
+                    "snapshot" => {
+                        connection.execute(
+                            "DELETE FROM activated_snapshots WHERE target = ?1",
+                            [target.as_str()],
+                        )?;
+                    }
+                    "routing-credential" => {
+                        connection.execute(
+                            "UPDATE target_route_state SET routing_credential = NULL WHERE target = ?1",
+                            [target.as_str()],
+                        )?;
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
     async fn mutation_fingerprint(&self) -> MutationFingerprint {
         let database = tokio_rusqlite::Connection::open(self.home.database_path())
             .await
@@ -591,6 +618,36 @@ async fn claude_direct_is_receipt_first_but_rejected_before_probe_file_or_runtim
     assert_eq!(probe.0.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.mutation_fingerprint().await, before);
     assert!(!settings.exists());
+    assert!(service.model_endpoint_for(Target::Claude).await.is_none());
+}
+
+#[tokio::test]
+async fn inconsistent_claude_context_never_projects_provider_mode_without_a_selector() {
+    let fixture = Fixture::new().await;
+    let (provider_id, revision) = fixture
+        .save_claude("Claude", "claude-test", "provider-secret")
+        .await;
+    let probe = Arc::new(GoodClaudeProbe(AtomicUsize::new(0)));
+    let service = fixture
+        .service(ActivationHooks::default())
+        .with_claude_runtime(probe.clone(), "/usr/bin/claude".into());
+    let mut invalid = claude_context(&fixture.home);
+    invalid.selector_state = ClaudeSelectorState::Enabled;
+
+    let failure = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            revision,
+            takeover_action(provider_id),
+            Some(&invalid),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.problem.code, "preflight-context-required");
+    assert!(failure.problem.selector.is_none());
+    assert_eq!(probe.0.load(Ordering::SeqCst), 0);
     assert!(service.model_endpoint_for(Target::Claude).await.is_none());
 }
 
@@ -2419,7 +2476,7 @@ async fn committed_takeover_bootstraps_exact_endpoint_in_a_new_service_epoch_wit
 }
 
 #[tokio::test]
-async fn occupied_committed_port_leaves_target_control_only_and_opens_control_socket() {
+async fn occupied_committed_port_fails_before_opening_the_control_socket() {
     let fixture = Fixture::new().await;
     let (provider_id, revision) = fixture.save("First", "gpt", "secret").await;
     let first = fixture.service(ActivationHooks::default());
@@ -2446,31 +2503,24 @@ async fn occupied_committed_port_leaves_target_control_only_and_opens_control_so
         Arc::new(NoopUpstream),
     ));
 
-    let handle = ControlServer::bind_with_activation(
+    let error = ControlServer::bind_with_activation(
         &fixture.home,
         Arc::clone(&second_store),
         "test",
         Arc::clone(&second),
     )
     .await
+    .err()
     .unwrap();
-    assert!(fixture.home.root().join("run/control.sock").exists());
+    assert!(matches!(error, ControlServerError::State));
+    assert!(!fixture.home.root().join("run/control.sock").exists());
     assert!(second.model_endpoint().await.is_none());
-    let view = second_store.target_view().await.unwrap();
-    assert_eq!(view.takeover.state, "unavailable");
-    assert!(view.takeover.endpoint.is_none());
-    assert!(
-        view.problems
-            .iter()
-            .any(|problem| problem.code == "model-route-unavailable")
-    );
-    handle.shutdown().await.unwrap();
     second.shutdown_models().await.unwrap();
     drop(occupied);
 }
 
 #[tokio::test]
-async fn occupied_claude_port_isolates_claude_while_codex_resumes_and_drains() {
+async fn occupied_claude_port_fails_before_uds_and_drains_the_resumed_codex_peer() {
     let fixture = Fixture::new().await;
     let (codex_provider, codex_revision) = fixture.save("Codex", "gpt-test", "secret").await;
     let (claude_provider, claude_revision) =
@@ -2528,6 +2578,162 @@ async fn occupied_claude_port_isolates_claude_while_codex_resumes_and_drains() {
         ),
     );
 
+    let error = ControlServer::bind_with_activation(
+        &fixture.home,
+        Arc::clone(&second_store),
+        "test",
+        Arc::clone(&second),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(matches!(error, ControlServerError::State));
+    assert!(!fixture.home.root().join("run/control.sock").exists());
+    assert!(second.model_endpoint().await.is_none());
+    assert!(second.model_endpoint_for(Target::Claude).await.is_none());
+    second.shutdown_models().await.unwrap();
+    let rebound_codex = tokio::net::TcpListener::bind(codex_endpoint).await.unwrap();
+    drop(rebound_codex);
+    drop(occupied);
+}
+
+#[tokio::test]
+async fn malformed_claude_committed_state_is_target_local_while_codex_and_uds_resume() {
+    for missing in ["snapshot", "routing-credential"] {
+        let fixture = Fixture::new().await;
+        let (codex_provider, codex_revision) =
+            fixture.save("Codex", "gpt-test", "codex-secret").await;
+        let (claude_provider, claude_revision) = fixture
+            .save_claude("Claude", "claude-test", "claude-secret")
+            .await;
+        let first = fixture.dual_service(
+            ActivationHooks::default(),
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+        );
+        let codex = first
+            .activate(command(codex_provider, codex_revision, Uuid::new_v4()))
+            .await
+            .unwrap();
+        first
+            .apply_raw_for_with_context(
+                Target::Claude,
+                Uuid::new_v4(),
+                claude_revision,
+                takeover_action(claude_provider),
+                Some(&claude_context(&fixture.home)),
+            )
+            .await
+            .unwrap();
+        let codex_endpoint: std::net::SocketAddr = codex
+            .view
+            .takeover
+            .endpoint
+            .unwrap()
+            .trim_start_matches("http://")
+            .parse()
+            .unwrap();
+        first.shutdown_models().await.unwrap();
+        fixture
+            .corrupt_committed_target(Target::Claude, missing)
+            .await;
+
+        let second_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+        let second = Arc::new(
+            ActivationService::new(
+                Arc::clone(&second_store),
+                fixture.home.clone(),
+                fixture.probe.clone(),
+                "/usr/bin/codex".into(),
+                Arc::new(NoopUpstream),
+            )
+            .with_claude_runtime(
+                Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+                "/usr/bin/claude".into(),
+            ),
+        );
+        let handle = ControlServer::bind_with_activation(
+            &fixture.home,
+            Arc::clone(&second_store),
+            "test",
+            Arc::clone(&second),
+        )
+        .await
+        .unwrap();
+
+        assert!(handle.socket_path().exists(), "missing {missing}");
+        assert_eq!(second.model_endpoint().await, Some(codex_endpoint));
+        assert!(second.model_endpoint_for(Target::Claude).await.is_none());
+        let claude_view = second_store.target_view_for(Target::Claude).await.unwrap();
+        assert_eq!(claude_view.takeover.state, "unavailable");
+        assert!(claude_view.takeover.endpoint.is_none());
+        assert!(
+            claude_view
+                .problems
+                .iter()
+                .any(|problem| problem.code == "model-route-unavailable")
+        );
+
+        handle.shutdown().await.unwrap();
+        second.shutdown_models().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unconstructible_claude_configuration_home_is_target_local_at_startup() {
+    let fixture = Fixture::new().await;
+    let (codex_provider, codex_revision) = fixture.save("Codex", "gpt", "codex-secret").await;
+    let (claude_provider, claude_revision) = fixture
+        .save_claude("Claude", "claude", "claude-secret")
+        .await;
+    let first = fixture.dual_service(
+        ActivationHooks::default(),
+        Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+    );
+    let codex = first
+        .activate(command(codex_provider, codex_revision, Uuid::new_v4()))
+        .await
+        .unwrap();
+    first
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            claude_revision,
+            takeover_action(claude_provider),
+            Some(&claude_context(&fixture.home)),
+        )
+        .await
+        .unwrap();
+    let codex_endpoint: std::net::SocketAddr = codex
+        .view
+        .takeover
+        .endpoint
+        .unwrap()
+        .trim_start_matches("http://")
+        .parse()
+        .unwrap();
+    first.shutdown_models().await.unwrap();
+    let claude_home = fixture.home.user_home().join(".claude");
+    fs::rename(
+        &claude_home,
+        fixture.home.user_home().join(".claude-preserved"),
+    )
+    .unwrap();
+    fs::write(&claude_home, b"not-a-directory").unwrap();
+
+    let second_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+    let second = Arc::new(
+        ActivationService::new(
+            Arc::clone(&second_store),
+            fixture.home.clone(),
+            fixture.probe.clone(),
+            "/usr/bin/codex".into(),
+            Arc::new(NoopUpstream),
+        )
+        .with_claude_runtime(
+            Arc::new(GoodClaudeProbe(AtomicUsize::new(0))),
+            "/usr/bin/claude".into(),
+        ),
+    );
     let handle = ControlServer::bind_with_activation(
         &fixture.home,
         Arc::clone(&second_store),
@@ -2536,7 +2742,8 @@ async fn occupied_claude_port_isolates_claude_while_codex_resumes_and_drains() {
     )
     .await
     .unwrap();
-    assert!(fixture.home.root().join("run/control.sock").exists());
+
+    assert!(handle.socket_path().exists());
     assert_eq!(second.model_endpoint().await, Some(codex_endpoint));
     assert!(second.model_endpoint_for(Target::Claude).await.is_none());
     let claude_view = second_store.target_view_for(Target::Claude).await.unwrap();
@@ -2548,11 +2755,9 @@ async fn occupied_claude_port_isolates_claude_while_codex_resumes_and_drains() {
             .iter()
             .any(|problem| problem.code == "model-route-unavailable")
     );
+
     handle.shutdown().await.unwrap();
     second.shutdown_models().await.unwrap();
-    let rebound_codex = tokio::net::TcpListener::bind(codex_endpoint).await.unwrap();
-    drop(rebound_codex);
-    drop(occupied);
 }
 
 #[tokio::test]

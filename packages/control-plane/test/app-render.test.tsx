@@ -585,6 +585,40 @@ test("Claude localizes incomplete and unknown Takeover failures without backend 
   }
 })
 
+test("Claude renders a closed blocking selector without undefined or backend text", async () => {
+  const claudeProvider = provider({
+    id: "claude-provider",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-api-key",
+    routingRequirement: "takeover-required",
+  })
+  const codex = new MemoryTargetSession(view())
+  const claude = new MemoryTargetSession(
+    view({ target: "claude", providers: [claudeProvider], currentProviderId: claudeProvider.id }),
+    async () => {
+      throw {
+        code: "provider-mode-active",
+        message: problemMessageSentinel,
+        source: "control-plane-context",
+        selector: "CLAUDE_CODE_USE_VERTEX",
+      }
+    },
+  )
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, { width: 100, height: 24, useThread: false })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.mockInput.typeText("/takeover")
+    setup.mockInput.pressEnter()
+    const frame = await setup.waitForFrame((value) => value.includes("CLAUDE_CODE_USE_VERTEX"))
+    expect(frame).toContain("control-plane-context")
+    expect(frame).not.toContain("undefined")
+    expect(frame).not.toContain(problemMessageSentinel)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
 test("renders every visible Provider editor string through the Chinese catalog", async () => {
   const pending = deferred<ActionOutcome>()
   const initial = view()

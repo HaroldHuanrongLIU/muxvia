@@ -959,6 +959,110 @@ async fn malformed_post_handshake_frame_returns_a_generic_error_and_executes_no_
 }
 
 #[tokio::test]
+async fn incomplete_claude_selector_context_is_rejected_at_the_real_uds_boundary() {
+    let fixture = ControlFixture::start().await;
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "missing-selector",
+            "operation": {
+                "kind": "open-target",
+                "target": "claude",
+                "claudeContext": {
+                    "claudeConfigDir": null,
+                    "selectorState": "enabled",
+                    "hostManagedState": "unmanaged",
+                    "cwd": "/safe/project"
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let reply = read_frame(&mut stream).await.unwrap();
+    assert_eq!(reply["type"], "error");
+    assert_eq!(reply["requestId"], "missing-selector");
+    assert_eq!(reply["problem"]["code"], "unsupported-operation");
+    assert!(!reply.to_string().contains("undefined"));
+
+    let opened = request(
+        &mut stream,
+        "valid-open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    assert_eq!(opened["type"], "response");
+}
+
+#[tokio::test]
+async fn draft_discovery_rejects_cross_target_authentication_before_upstream() {
+    let mut upstream = CountingInspectionServer::start().await;
+    let fixture = ControlFixture::start().await;
+
+    for (target, authentication) in [
+        ("claude", "openai-bearer"),
+        ("codex", "anthropic-api-key"),
+        ("codex", "anthropic-bearer"),
+    ] {
+        let mut stream = fixture.connect().await;
+        hello(&mut stream).await;
+        let claude_context = (target == "claude").then(|| {
+            json!({
+                "claudeConfigDir": null,
+                "selectorState": "unset",
+                "blockingSelector": null,
+                "hostManagedState": "unmanaged",
+                "cwd": "/safe/project"
+            })
+        });
+        let opened = request(
+            &mut stream,
+            &format!("open-{target}"),
+            json!({
+                "kind": "open-target",
+                "target": target,
+                "claudeContext": claude_context
+            }),
+        )
+        .await;
+        assert_eq!(opened["type"], "response");
+
+        let secret = format!("{target}-{authentication}-secret-must-not-escape");
+        let rejected = request(
+            &mut stream,
+            &format!("invalid-{target}-{authentication}"),
+            json!({
+                "kind": "discover-models",
+                "target": target,
+                "source": {
+                    "kind": "draft",
+                    "baseUrl": upstream.base_url,
+                    "authentication": authentication,
+                    "credentialSource": { "kind": "ephemeral", "value": secret }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(rejected["type"], "error");
+        assert_eq!(
+            rejected["problem"]["code"],
+            "invalid-provider-authentication"
+        );
+        assert_eq!(
+            rejected["problem"]["message"],
+            "Draft authentication does not match Target"
+        );
+        assert!(!rejected.to_string().contains(&secret));
+    }
+
+    upstream.assert_no_completion().await;
+}
+
+#[tokio::test]
 async fn unknown_frames_execute_no_action_without_echoing_input() {
     let fixture = ControlFixture::start().await;
 

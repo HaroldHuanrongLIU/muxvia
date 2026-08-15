@@ -372,24 +372,27 @@ function claudePreflightContext(environment: NodeJS.ProcessEnv): ClaudePreflight
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
   ] as const
   const normalized = selectorNames.map((name) => normalizeSelector(environment[name]))
-  const blockingSelector = selectorNames.find((_, index) => (
+  const environmentBlockingSelector = selectorNames.find((_, index) => (
     normalized[index] === "enabled" || normalized[index] === "unknown-nonempty"
-  )) ?? null
+  ))
   const selectorState = normalized.includes("enabled")
     ? "enabled"
     : normalized.includes("unknown-nonempty")
       ? "unknown-nonempty"
       : normalized.every((state) => state === "unset") ? "unset" : "disabled"
+  const hostManagedState = (() => {
+    const state = normalizeSelector(environment.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST)
+    if (state === "enabled") return "managed" as const
+    if (state === "unknown-nonempty") return "unknown" as const
+    return "unmanaged" as const
+  })()
+  const blockingSelector = environmentBlockingSelector
+    ?? (hostManagedState === "unmanaged" ? null : "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST")
   return {
     claudeConfigDir: environment.CLAUDE_CONFIG_DIR ?? null,
     selectorState,
     blockingSelector,
-    hostManagedState: (() => {
-      const state = normalizeSelector(environment.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST)
-      if (state === "enabled") return "managed"
-      if (state === "unknown-nonempty") return "unknown"
-      return "unmanaged"
-    })(),
+    hostManagedState,
     cwd: process.cwd(),
   }
 }

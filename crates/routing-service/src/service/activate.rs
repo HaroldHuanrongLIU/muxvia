@@ -17,8 +17,9 @@ use crate::{
 use crate::{
     codex::{CodexCapability, CodexConfigCodec, CodexProbe, ConfigSnapshot, DesiredCodexState},
     control::protocol::{
-        ActionOutcome, ActionStatus, ActivationMode, ClaudeHostManagedState,
-        ClaudePreflightContext, ClaudeSelectorState, ControlProblem, Target, TargetAction,
+        ActionOutcome, ActionStatus, ActivationMode, ClaudeBlockingSelector,
+        ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState, ControlProblem,
+        Target, TargetAction,
     },
     domain::activation::ActivatedSnapshot,
     home::MuxviaHome,
@@ -27,7 +28,7 @@ use crate::{
     },
     state::{
         ActionFailure, ActivationCommit, ActivationPreparation, ActivationRuntime,
-        ManagedWriteStatus, RecoveryIntent, RecoveryState, StateStore,
+        ManagedWriteStatus, RecoveryIntent, RecoveryState, StateError, StateStore,
     },
 };
 
@@ -495,6 +496,16 @@ impl ActivationService {
                     )
                     .await);
             };
+            if !context.has_valid_blocking_selector() {
+                return Err(self
+                    .store
+                    .failure_for(
+                        target,
+                        "preflight-context-required",
+                        "Claude preflight context is incomplete",
+                    )
+                    .await);
+            }
             if matches!(
                 context.selector_state,
                 ClaudeSelectorState::Enabled | ClaudeSelectorState::UnknownNonempty
@@ -502,16 +513,7 @@ impl ActivationService {
                 context.host_managed_state,
                 ClaudeHostManagedState::Managed | ClaudeHostManagedState::Unknown
             ) {
-                let selector = context
-                    .blocking_selector
-                    .map(|selector| selector.as_str().to_owned())
-                    .or_else(|| {
-                        matches!(
-                            context.host_managed_state,
-                            ClaudeHostManagedState::Managed | ClaudeHostManagedState::Unknown
-                        )
-                        .then(|| "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST".to_owned())
-                    });
+                let selector = context.blocking_selector;
                 return Err(self
                     .target_failure_with_projection(
                         target,
@@ -812,15 +814,20 @@ impl ActivationService {
                 .target_view_for(target)
                 .await
                 .map_err(|_| ModelServerError::State)?;
-            if view
-                .problems
-                .iter()
-                .any(|problem| problem.code == "startup-reconciliation-failed")
-            {
+            if view.problems.iter().any(|problem| {
+                matches!(
+                    problem.code.as_str(),
+                    "startup-reconciliation-failed" | "model-route-unavailable"
+                )
+            }) {
                 continue;
             }
             if let Err(error) = self.bootstrap_committed_takeover_for(target).await {
-                if matches!(error, ModelServerError::State) {
+                if !matches!(
+                    error,
+                    ModelServerError::TargetState | ModelServerError::TargetConfiguration
+                ) {
+                    let _ = self.shutdown_models().await;
                     return Err(error);
                 }
                 self.store
@@ -861,7 +868,7 @@ impl ActivationService {
             .store
             .committed_takeover_for(target)
             .await
-            .map_err(|_| ModelServerError::State)?;
+            .map_err(classify_bootstrap_state_error)?;
         let Some(takeover) = takeover else {
             return Ok(());
         };
@@ -933,18 +940,18 @@ impl ActivationService {
             .store
             .activated_snapshot_for(target)
             .await
-            .map_err(|_| ModelServerError::State)?
-            .ok_or(ModelServerError::State)?;
+            .map_err(classify_bootstrap_state_error)?
+            .ok_or(ModelServerError::TargetState)?;
         let routing_credential = self
             .store
             .routing_credential_for(target)
             .await
-            .map_err(|_| ModelServerError::State)?
-            .ok_or(ModelServerError::State)?;
+            .map_err(classify_bootstrap_state_error)?
+            .ok_or(ModelServerError::TargetState)?;
         match target {
             Target::Codex => {
                 let codec = CodexConfigCodec::for_user_home(self.home.user_home())
-                    .map_err(|_| ModelServerError::State)?;
+                    .map_err(|_| ModelServerError::TargetConfiguration)?;
                 let expected = codec.desired_takeover(
                     snapshot.model(),
                     &format!("http://127.0.0.1:{route_port}/v1"),
@@ -957,7 +964,7 @@ impl ActivationService {
             }
             Target::Claude => {
                 let codec = ClaudeConfigCodec::for_user_home(self.home.user_home())
-                    .map_err(|_| ModelServerError::State)?;
+                    .map_err(|_| ModelServerError::TargetConfiguration)?;
                 let expected = codec.desired_takeover(
                     snapshot.model(),
                     &format!("http://127.0.0.1:{route_port}"),
@@ -1060,7 +1067,7 @@ impl ActivationService {
                         PreflightFailure {
                             code,
                             source: problem.source().map(str::to_owned),
-                            selector: problem.selector().map(str::to_owned),
+                            selector: problem.selector(),
                         }
                     })?;
                 let capability_problem = match self.claude_probe.probe(&self.claude_executable) {
@@ -1257,7 +1264,7 @@ impl ActivationService {
         target: Target,
         code: &str,
         source: Option<String>,
-        selector: Option<String>,
+        selector: Option<ClaudeBlockingSelector>,
     ) -> ActionFailure {
         let stable = match code {
             "stale-revision"
@@ -1295,7 +1302,21 @@ impl ActivationService {
 struct PreflightFailure {
     code: &'static str,
     source: Option<String>,
-    selector: Option<String>,
+    selector: Option<ClaudeBlockingSelector>,
+}
+
+fn classify_bootstrap_state_error(error: StateError) -> ModelServerError {
+    match error {
+        StateError::InvalidActivatedSnapshot => ModelServerError::TargetState,
+        StateError::Unavailable
+        | StateError::Io(_)
+        | StateError::Sqlite(_)
+        | StateError::Serialization(_)
+        | StateError::InvalidRecoveryState
+        | StateError::InvalidRecoveryPayload
+        | StateError::MissingRecoveryIntent
+        | StateError::InvalidProviderRoutingRequirement => ModelServerError::State,
+    }
 }
 
 impl PreflightFailure {

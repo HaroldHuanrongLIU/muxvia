@@ -62,3 +62,30 @@ The initial non-escalated final run failed broadly because the sandbox denied ev
 The 1,225-line activation coordinator and 886-line UI shell remain follow-up refactoring candidates. They were deliberately not reorganized here: extracting broad strategy/state modules is outside Issue #6's final-fix scope and would make this security/correctness wave less surgical.
 
 No unresolved correctness or security concern remains from the reviewed findings.
+
+## Re-review extension
+
+### Startup failure precedence and classification
+
+The re-review identified a conflict between the general target-isolation reading and the explicitly approved Task 5 startup contract. Task 5 says that an occupied persisted port fails closed before the shared UDS. That explicit exception controls: listener `Io`/`AddrInUse`, runtime task failure, non-loopback binding, and global StateStore/DB failures now drain any peer already resumed in the same bootstrap attempt and abort startup before UDS.
+
+The actual isolation gaps remain target-local. Missing committed snapshots, missing Routing Credentials, and an unconstructible target Configuration Home/codec persist `model-route-unavailable`, project no endpoint, and leave that Target control-only while the healthy peer and UDS start. REDs reproduced the former global `State` abort for both committed-state corruptions and the malformed `.claude` home; the occupied-port RED reproduced the unintended UDS success. The full activation suite is GREEN at `44/44`.
+
+### Closed actionable selector contract
+
+Rust, TypeScript/Zod, and JSON Schema now share the same six-value closed selector set: the five supported Claude environment selectors plus the host-managed selector. `ControlProblem.selector` and `ClaudePreflightContext.blockingSelector` use that closed type rather than unrestricted strings. Conditional validation requires an exact environment selector for `enabled`/`unknown-nonempty`, the host selector for a managed/unknown host with no active environment selector, and no selector for an inactive context.
+
+REDs showed Rust, Zod, direct preflight/activation, and real UDS accepting, panicking on, or projecting provider mode without a missing conditional selector; the TypeScript problem decoder accepted an arbitrary selector, and JSON Schema exposed an unrestricted string. GREEN evidence includes Rust protocol `15/15`, control socket `29/29`, Claude configuration `18 passed, 1 helper ignored`, activation `44/44`, the exact real-UDS provider-mode projection, TypeScript protocol/schema and mutation-sensitive renderer coverage. Invalid direct preflight/activation context now returns a fixed `preflight-context-required` before configuration, probe, listener, or mutation. The renderer shows the fixed localized selector/source without `undefined` or backend prose.
+
+### Target-valid draft authentication
+
+Draft Discovery now validates authentication against the canonical target/protocol/authentication declaration rule at the server boundary. Claude rejects OpenAI Bearer; Codex rejects both Anthropic profiles. A real UDS plus loopback RED previously reached upstream and returned a response; GREEN rejects all three with fixed `invalid-provider-authentication`, zero upstream calls, and no credential echo. Existing valid Claude API-key/Bearer tests continue to assert the exact selected header, absent peer header, and `anthropic-version`.
+
+### Extension verification
+
+- Affected Rust suites: activation `44/44`, Claude configuration `18 passed, 1 helper ignored`, control socket `29/29`, protocol `15/15`, provider inspection `14/14`.
+- Focused TypeScript protocol and renderer: `61 passed, 0 failed`.
+- Final `bun run verify`: GREEN; TypeScript/E2E `190 passed, 0 failed`, full Rust workspace GREEN.
+- Final strict Clippy, rustfmt, TypeScript typecheck, JSON parse, and diff checks: GREEN.
+
+No broad coordinator or UI-shell refactor was included.

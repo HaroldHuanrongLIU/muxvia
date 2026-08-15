@@ -14,6 +14,9 @@
       "properties": { "major": { "const": 1 }, "minor": { "const": 0 } },
       "required": ["major", "minor"]
     },
+    "claudeBlockingSelector": {
+      "enum": ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"]
+    },
     "clientFrame": {
       "oneOf": [
         { "type": "object", "properties": { "type": { "const": "hello" }, "rpc": { "$ref": "#/$defs/rpc" }, "release": { "type": "string" } }, "required": ["type", "rpc", "release"] },
@@ -49,11 +52,43 @@
       "properties": {
         "claudeConfigDir": { "type": ["string", "null"] },
         "selectorState": { "enum": ["unset", "disabled", "enabled", "unknown-nonempty"] },
-        "blockingSelector": { "type": ["string", "null"] },
+        "blockingSelector": { "oneOf": [{ "$ref": "#/$defs/claudeBlockingSelector" }, { "type": "null" }] },
         "hostManagedState": { "enum": ["unmanaged", "managed", "unknown"] },
         "cwd": { "type": "string" }
       },
-      "required": ["claudeConfigDir", "selectorState", "hostManagedState", "cwd"]
+      "required": ["claudeConfigDir", "selectorState", "hostManagedState", "cwd"],
+      "allOf": [
+        {
+          "if": { "properties": { "selectorState": { "enum": ["enabled", "unknown-nonempty"] } }, "required": ["selectorState"] },
+          "then": {
+            "properties": { "blockingSelector": { "enum": ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_MANTLE", "CLAUDE_CODE_USE_ANTHROPIC_AWS"] } },
+            "required": ["blockingSelector"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "selectorState": { "enum": ["unset", "disabled"] },
+              "hostManagedState": { "enum": ["managed", "unknown"] }
+            },
+            "required": ["selectorState", "hostManagedState"]
+          },
+          "then": {
+            "properties": { "blockingSelector": { "const": "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST" } },
+            "required": ["blockingSelector"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "selectorState": { "enum": ["unset", "disabled"] },
+              "hostManagedState": { "const": "unmanaged" }
+            },
+            "required": ["selectorState", "hostManagedState"]
+          },
+          "then": { "properties": { "blockingSelector": { "type": "null" } } }
+        }
+      ]
     },
     "draftCredentialSource": {
       "oneOf": [
@@ -173,7 +208,7 @@
         "code": { "type": "string" },
         "message": { "type": "string" },
         "source": { "enum": ["control-plane-context", "user-settings", "managed-settings", "shared-project-settings", "local-project-settings"] },
-        "selector": { "type": "string" }
+        "selector": { "$ref": "#/$defs/claudeBlockingSelector" }
       },
       "required": ["code", "message"]
     },

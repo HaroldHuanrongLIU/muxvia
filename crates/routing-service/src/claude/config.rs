@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as _};
 use serde_json::{Map, Value};
 
 use super::ClaudeProblem;
@@ -62,11 +62,48 @@ impl fmt::Debug for DesiredClaudeState {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize)]
 pub struct ClaudeConfigSnapshot {
     identity: FileIdentity,
     owned: OwnedClaudeState,
-    unrelated: Value,
+    unrelated_fingerprint: String,
+    #[serde(skip)]
+    unrelated: Option<Value>,
+}
+
+impl PartialEq for ClaudeConfigSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+            && self.owned == other.owned
+            && self.unrelated_fingerprint == other.unrelated_fingerprint
+    }
+}
+
+impl<'de> Deserialize<'de> for ClaudeConfigSnapshot {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WireSnapshot {
+            identity: FileIdentity,
+            owned: OwnedClaudeState,
+            #[serde(default)]
+            unrelated_fingerprint: Option<String>,
+            #[serde(default)]
+            unrelated: Option<Value>,
+        }
+
+        let wire = WireSnapshot::deserialize(deserializer)?;
+        let unrelated_fingerprint = match (&wire.unrelated_fingerprint, &wire.unrelated) {
+            (Some(fingerprint), _) => fingerprint.clone(),
+            (None, Some(unrelated)) => semantic_fingerprint(unrelated).map_err(D::Error::custom)?,
+            (None, None) => return Err(D::Error::custom("missing unrelated semantic fingerprint")),
+        };
+        Ok(Self {
+            identity: wire.identity,
+            owned: wire.owned,
+            unrelated_fingerprint,
+            unrelated: wire.unrelated,
+        })
+    }
 }
 
 impl fmt::Debug for ClaudeConfigSnapshot {
@@ -75,7 +112,7 @@ impl fmt::Debug for ClaudeConfigSnapshot {
             .debug_struct("ClaudeConfigSnapshot")
             .field("identity", &self.identity)
             .field("owned", &self.owned)
-            .field("unrelated", &"<semantic-tree>")
+            .field("unrelated", &"<fingerprint>")
             .finish()
     }
 }
@@ -191,7 +228,9 @@ impl ClaudeConfigCodec {
         desired: &DesiredClaudeState,
     ) -> Result<(), ClaudeProblem> {
         let current = self.inspect()?;
-        if current.owned != desired.owned || current.unrelated != before.unrelated {
+        if current.owned != desired.owned
+            || current.unrelated_fingerprint != before.unrelated_fingerprint
+        {
             return Err(ClaudeProblem::new(
                 "configuration-write-failed",
                 Some(self.settings_path()),
@@ -215,11 +254,14 @@ impl ClaudeConfigCodec {
         let remove_file = !before.identity.exists()
             && current
                 .unrelated
-                .as_object()
+                .as_ref()
+                .and_then(Value::as_object)
                 .is_some_and(serde_json::Map::is_empty);
         self.write_owned(&current, &before.owned, remove_file)?;
         let restored = self.inspect()?;
-        if restored.owned != before.owned || restored.unrelated != current.unrelated {
+        if restored.owned != before.owned
+            || restored.unrelated_fingerprint != current.unrelated_fingerprint
+        {
             return Err(ClaudeProblem::new(
                 "recovery-required",
                 Some(self.settings_path()),
@@ -343,14 +385,16 @@ impl ClaudeConfigCodec {
             Ok(current) => current,
             Err(_) => return self.mark_recovery_required(store, intent).await,
         };
-        if current.owned == before.owned && current.unrelated == before.unrelated {
+        if current.owned == before.owned
+            && current.unrelated_fingerprint == before.unrelated_fingerprint
+        {
             return store
                 .set_recovery_state(intent.id(), RecoveryState::RolledBack)
                 .await
                 .map_err(|_| ClaudeProblem::new("recovery-required", Some(self.settings_path())));
         }
         if current.owned == desired.owned
-            && current.unrelated == before.unrelated
+            && current.unrelated_fingerprint == before.unrelated_fingerprint
             && self.restore(before, desired).is_ok()
             && self.matches_before(before)
         {
@@ -378,7 +422,8 @@ impl ClaudeConfigCodec {
 
     fn matches_before(&self, before: &ClaudeConfigSnapshot) -> bool {
         self.inspect().is_ok_and(|current| {
-            current.owned == before.owned && current.unrelated == before.unrelated
+            current.owned == before.owned
+                && current.unrelated_fingerprint == before.unrelated_fingerprint
         })
     }
 
@@ -430,15 +475,29 @@ impl ClaudeConfigCodec {
         }
         let owned = capture_owned(&document);
         let unrelated = unrelated_projection(&document);
+        let unrelated_fingerprint = semantic_fingerprint(&unrelated)
+            .map_err(|_| ClaudeProblem::new("invalid-configuration", Some(self.settings_path())))?;
         Ok((
             ClaudeConfigSnapshot {
                 identity: contents.identity,
                 owned,
-                unrelated,
+                unrelated_fingerprint,
+                unrelated: Some(unrelated),
             },
             document,
         ))
     }
+}
+
+fn semantic_fingerprint(unrelated: &Value) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(unrelated)?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+    let mut encoded = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(encoded)
 }
 
 fn capture_owned(document: &Value) -> OwnedClaudeState {

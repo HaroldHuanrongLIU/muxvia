@@ -205,6 +205,43 @@ fn identity_races_never_replace_operator_changes() {
 }
 
 #[test]
+fn substituted_temporary_path_is_never_installed() {
+    let (_home, plain) = fixture("{}");
+    let before = plain.inspect().unwrap();
+    let home = plain
+        .settings_path()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_owned();
+    let codec = ClaudeConfigCodec::for_user_home_with_pre_rename_hook(
+        &home,
+        Arc::new(move |temporary| {
+            fs::rename(temporary, temporary.with_extension("parked"))?;
+            fs::write(
+                temporary,
+                r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"attacker-substitute"}}"#,
+            )
+        }),
+    )
+    .unwrap();
+
+    let error = codec
+        .atomic_apply(
+            &before,
+            &codec.desired_takeover("model", "http://127.0.0.1:9", "routing-secret"),
+        )
+        .unwrap_err();
+
+    assert_eq!(error.code(), "configuration-write-failed");
+    assert_eq!(fs::read_to_string(codec.settings_path()).unwrap(), "{}");
+    let diagnostic = format!("{error:?}\n{error}");
+    assert!(!diagnostic.contains("routing-secret"));
+    assert!(!diagnostic.contains("attacker-substitute"));
+}
+
+#[test]
 fn third_state_drift_blocks_restore_without_exposing_secrets() {
     let (_home, codec) = fixture("{}");
     let before = codec.inspect().unwrap();

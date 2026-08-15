@@ -882,9 +882,18 @@ fn claude_recovery_payload_is_typed_tagged_and_accepts_legacy_schema_v4_shape() 
     assert!(encoded.get("desired").is_some());
     assert!(!format!("{payload:?}").contains("routing-secret"));
 
+    let mut legacy_before = encoded["before"].clone();
+    legacy_before
+        .as_object_mut()
+        .unwrap()
+        .remove("unrelated_fingerprint");
+    legacy_before
+        .as_object_mut()
+        .unwrap()
+        .insert("unrelated".to_owned(), serde_json::json!({}));
     let legacy = serde_json::json!({
         "target": "claude",
-        "before": serde_json::to_value(before).unwrap(),
+        "before": legacy_before,
         "desired": serde_json::to_value(desired).unwrap()
     });
     let decoded: RecoveryPayload = serde_json::from_value(legacy).unwrap();
@@ -898,5 +907,88 @@ fn claude_recovery_payload_is_typed_tagged_and_accepts_legacy_schema_v4_shape() 
         }
         RecoveryPayload::ClaudeLegacy { .. } => panic!("typed Claude payload decoded as legacy"),
         RecoveryPayload::Codex { .. } => panic!("legacy Claude payload decoded as Codex"),
+    }
+}
+
+#[tokio::test]
+async fn claude_recovery_payload_persists_only_owned_values_and_unrelated_fingerprint() {
+    let root = TempDir::new().unwrap();
+    let codec = ClaudeConfigCodec::for_user_home(root.path()).unwrap();
+    fs::create_dir_all(codec.settings_path().parent().unwrap()).unwrap();
+    fs::write(
+        codec.settings_path(),
+        r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"operator-prior-token","ANTHROPIC_API_KEY":"unrelated-api-key-sentinel","CUSTOM_SECRET":"custom-secret-sentinel"},"custom":{"secret":"custom-secret-sentinel"}}"#,
+    )
+    .unwrap();
+    let store = StateStore::open(&MuxviaHome::from_user_home(root.path()))
+        .await
+        .unwrap();
+    let intent = RecoveryIntent::pending_claude(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        codec.settings_path().to_owned(),
+        codec.inspect().unwrap(),
+        codec.desired_takeover("claude-test", "http://127.0.0.1:43124", "routing-token"),
+        0,
+    );
+    store.insert_recovery_intent(&intent).await.unwrap();
+    let database =
+        tokio_rusqlite::Connection::open(MuxviaHome::from_user_home(root.path()).database_path())
+            .await
+            .unwrap();
+    let payload_json = database
+        .call(move |connection| {
+            connection.query_row(
+                "SELECT payload_json FROM activation_recovery WHERE id = ?1",
+                [intent.id().to_string()],
+                |row| row.get::<_, String>(0),
+            )
+        })
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+
+    assert!(
+        !payload_json.contains("unrelated-api-key-sentinel"),
+        "Claude recovery payload retained an unrelated API key"
+    );
+    assert!(
+        !payload_json.contains("custom-secret-sentinel"),
+        "Claude recovery payload retained an unrelated custom secret"
+    );
+    assert!(
+        payload["before"]["owned"]["auth_token"] == "operator-prior-token",
+        "Claude recovery payload omitted the approved prior owned token field"
+    );
+    assert!(
+        payload["desired"]["owned"]["auth_token"] == "routing-token",
+        "Claude recovery payload omitted the approved desired owned token field"
+    );
+    assert!(
+        payload["before"].get("unrelated_fingerprint").is_some(),
+        "Claude recovery payload omitted the unrelated semantic fingerprint"
+    );
+    assert!(
+        count_json_string(&payload, "operator-prior-token") == 1,
+        "Claude recovery payload duplicated the prior owned token"
+    );
+    assert!(
+        count_json_string(&payload, "routing-token") == 1,
+        "Claude recovery payload duplicated the desired owned token"
+    );
+}
+
+fn count_json_string(value: &serde_json::Value, needle: &str) -> usize {
+    match value {
+        serde_json::Value::String(value) => usize::from(value == needle),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| count_json_string(value, needle))
+            .sum(),
+        serde_json::Value::Object(values) => values
+            .values()
+            .map(|value| count_json_string(value, needle))
+            .sum(),
+        _ => 0,
     }
 }

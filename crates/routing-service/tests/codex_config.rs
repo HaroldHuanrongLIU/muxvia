@@ -667,6 +667,27 @@ fn exchange_mismatch_with_successful_rollback_preserves_operator_target() {
 }
 
 #[test]
+fn installed_target_identity_mismatch_rolls_back_to_displaced_original() {
+    let (_home, plain) = fixture();
+    let original = fs::read(plain.config_path()).unwrap();
+    let before = plain.inspect().unwrap();
+    let codec = CodexConfigCodec::for_user_home_with_exchange_hook(
+        plain.config_path().parent().unwrap().parent().unwrap(),
+        Arc::new(|_temporary, target| {
+            fs::write(target, "attacker-substitute = true\n")?;
+            Ok(false)
+        }),
+    )
+    .unwrap();
+
+    let error = codec.atomic_apply(&before, &desired(&codec)).unwrap_err();
+
+    assert_eq!(error.code(), "configuration-write-failed");
+    assert_eq!(fs::read(codec.config_path()).unwrap(), original);
+    assert!(!format!("{error:?}\n{error}").contains("route-secret"));
+}
+
+#[test]
 fn exchange_mismatch_with_failed_rollback_retains_displaced_operator_artifact() {
     let (_home, plain) = fixture();
     let before = plain.inspect().unwrap();

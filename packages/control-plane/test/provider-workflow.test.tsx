@@ -930,6 +930,222 @@ test("Provider Direct Activation defaults to Current and dispatches the selected
   }
 })
 
+test("Claude picker binds Direct to leader a and Takeover to leader o without duplicate dispatch", async () => {
+  const first = provider({
+    id: "00000000-0000-4000-8000-000000000071",
+    name: "Claude First Provider",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-api-key",
+  })
+  const selected = provider({
+    id: "00000000-0000-4000-8000-000000000072",
+    position: 1,
+    name: "Claude Selected Provider",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-bearer",
+  })
+  const initial = view({ target: "claude", providers: [first, selected], currentProviderId: first.id })
+  const codex = new MemoryTargetSession(view())
+  const claude = new MemoryTargetSession(initial, async () => ({ status: "applied", view: initial }))
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
+    width: 80,
+    height: 24,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    const picker = await setup.waitForFrame((frame) => frame.includes("Claude Selected Provider"))
+    expect(picker).toContain("ctrl+x a direct")
+    expect(picker).toContain("ctrl+x o takeover")
+    setup.mockInput.pressKey("down")
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("a")
+    await setup.waitFor(() => claude.actions.length === 1)
+    expect(claude.actions).toEqual([{
+      kind: "activate-provider",
+      providerId: selected.id,
+      mode: "direct",
+    }])
+
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Claude Selected Provider"))
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("o")
+    await setup.waitFor(() => claude.actions.length === 2)
+    expect(claude.actions).toEqual([
+      { kind: "activate-provider", providerId: selected.id, mode: "direct" },
+      { kind: "activate-provider", providerId: selected.id, mode: "takeover" },
+    ])
+    expect(codex.actions).toEqual([])
+    expect(JSON.stringify(claude.actions)).not.toContain(credentialSecret)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Claude Direct uses the same projected and authoritative Takeover-required confirmation", async () => {
+  const selected = provider({
+    id: "00000000-0000-4000-8000-000000000073",
+    name: "Claude Bridge Provider",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-bearer",
+    routingRequirement: "takeover-required",
+  })
+  const projected = view({ target: "claude", providers: [selected], currentProviderId: selected.id })
+  const directCompatible = view({
+    ...projected,
+    managementRevision: 2,
+    viewSequence: 2,
+    providers: [{ ...selected, routingRequirement: "direct-compatible" }],
+  })
+  const authoritative = view({
+    ...projected,
+    managementRevision: 3,
+    viewSequence: 3,
+  })
+  const codex = new MemoryTargetSession(view())
+  let claude!: MemoryTargetSession
+  claude = new MemoryTargetSession(projected, async (action) => {
+    if (action.kind === "activate-provider" && action.mode === "direct") {
+      claude.setView(authoritative)
+      throw { code: "takeover-required", message: "authoritative-secret-must-not-render" }
+    }
+    return { status: "applied", view: authoritative }
+  })
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
+    width: 80,
+    height: 24,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes(selected.name))
+    const pickerFocus = setup.renderer.currentFocusedRenderable as InputRenderable
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("a")
+    const projectedConfirm = await setup.waitForFrame((frame) => frame.includes("Enable Target Takeover?"))
+    expect(projectedConfirm).toContain("Enable Takeover")
+    expect(projectedConfirm).toContain("Cancel")
+    expect(projectedConfirm).not.toContain("Direct Activation applied")
+    expect(claude.actions).toEqual([])
+    setup.mockInput.pressEscape()
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    expect(setup.renderer.currentFocusedRenderable).toBe(pickerFocus)
+
+    claude.pushView(directCompatible)
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("a")
+    await setup.waitFor(() => claude.actions.length === 1)
+    const authoritativeConfirm = await setup.waitForFrame((frame) => frame.includes("Enable Target Takeover?"))
+    expect(authoritativeConfirm).not.toContain("authoritative-secret-must-not-render")
+    expect(authoritativeConfirm).not.toContain(credentialSecret)
+    expect(claude.actions).toEqual([{
+      kind: "activate-provider",
+      providerId: selected.id,
+      mode: "direct",
+    }])
+
+    setup.mockInput.pressEnter()
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => claude.actions.length === 2)
+    expect(claude.actions[1]).toEqual({
+      kind: "activate-provider",
+      providerId: selected.id,
+      mode: "takeover",
+    })
+    expect(claude.actions).toHaveLength(2)
+    expect(codex.actions).toEqual([])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Claude picker Direct gates duplicate input and installs one restart-guided success", async () => {
+  const selected = provider({
+    id: "00000000-0000-4000-8000-000000000074",
+    name: "Pending Claude Direct",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-api-key",
+  })
+  const initial = view({ target: "claude", providers: [selected] })
+  const applied = view({
+    ...initial,
+    managementRevision: 2,
+    viewSequence: 2,
+    mode: "direct",
+    currentProviderId: selected.id,
+    managedConfiguration: { state: "managed", path: "/tmp/home/.claude/settings.json", restartRequired: true },
+    activatedSnapshot: {
+      id: "00000000-0000-4000-8000-000000000075",
+      providerId: selected.id,
+      model: selected.model,
+      protocol: "anthropic-messages",
+      authentication: "anthropic-api-key",
+      epoch: "00000000-0000-4000-8000-000000000076",
+    },
+  })
+  const pending = deferred<ActionOutcome>()
+  const codex = new MemoryTargetSession(view())
+  const claude = new MemoryTargetSession(initial, async () => await pending.promise)
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
+    width: 80,
+    height: 24,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes(selected.name))
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("a")
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("a")
+    await setup.waitFor(() => claude.actions.length === 1)
+    const pendingFrame = await setup.waitForFrame((frame) => frame.includes("Applying Direct Activation…"))
+    expect(pendingFrame).toContain("Providers")
+    expect(pendingFrame).not.toContain(credentialSecret)
+
+    setup.mockInput.pressKey("p", { ctrl: true })
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    expect(claude.actions).toHaveLength(1)
+    expect(setup.captureCharFrame()).not.toContain("Search commands")
+
+    pending.resolve({ status: "applied", view: applied })
+    const completed = await setup.waitForFrame((frame) =>
+      frame.includes("Direct Activation applied: Pending Claude Direct")
+      && frame.includes("Restart Claude Code to use the managed configuration."))
+    expect(completed).toContain("Mode       Direct")
+    expect(completed.match(/Direct Activation applied:/g)).toHaveLength(1)
+    expect(completed).not.toContain("Providers")
+    expect(completed).not.toContain(credentialSecret)
+    expect(claude.actions).toEqual([{
+      kind: "activate-provider",
+      providerId: selected.id,
+      mode: "direct",
+    }])
+    expect(codex.actions).toEqual([])
+  } finally {
+    pending.resolve({ status: "applied", view: applied })
+    setup.renderer.destroy()
+  }
+})
+
 for (const action of ["activate", "edit"] as const) {
   test(`authoritative removal synchronizes the visible Provider fallback before ${action}`, async () => {
     const fallback = provider({ id: "00000000-0000-4000-8000-000000000011", name: "Fallback Provider" })

@@ -202,6 +202,6 @@ export function ProviderPicker(props: ProviderPickerProps) {
               : ""
       }</text>}</For>
     </box>}</For>
-    <text fg={theme.muted}>{props.t("provider.list.help")}</text>
+    <text fg={theme.muted}>{props.t(props.target === "claude" ? "provider.list.help.claude" : "provider.list.help")}</text>
   </box>
 }

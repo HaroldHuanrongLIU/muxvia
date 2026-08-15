@@ -55,12 +55,16 @@ test("Direct Activation and Takeover confirmation copy is complete in both local
 
   expect([
     en("command.direct.apply"),
+    en("command.direct.apply.description"),
+    en("command.provider.activate.direct.description"),
     en("activity.direct.applied", { name: "Provider" }),
     en("takeover-required.title"),
     en("takeover-required.confirm"),
     en("takeover-required.cancel"),
   ]).toEqual([
     "Apply Direct Activation",
+    "Apply the Current Target Provider directly to Managed Configuration",
+    "Apply the selected Provider directly to Managed Configuration",
     "Direct Activation applied: Provider",
     "Enable Target Takeover?",
     "Enable Takeover",
@@ -68,12 +72,16 @@ test("Direct Activation and Takeover confirmation copy is complete in both local
   ])
   expect([
     zhCN("command.direct.apply"),
+    zhCN("command.direct.apply.description"),
+    zhCN("command.provider.activate.direct.description"),
     zhCN("activity.direct.applied", { name: "Provider" }),
     zhCN("takeover-required.title"),
     zhCN("takeover-required.confirm"),
     zhCN("takeover-required.cancel"),
   ]).toEqual([
     "应用直接激活",
+    "将当前 Target Provider 直接应用到受管理配置",
+    "将选中的 Provider 直接应用到受管理配置",
     "已直接激活：Provider",
     "启用 Target Takeover？",
     "启用 Takeover",

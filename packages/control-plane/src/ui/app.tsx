@@ -467,7 +467,7 @@ function Shell(props: {
           t={props.t}
           pending={() => providerMutationPending() || applying() !== undefined}
           activationMode={applying}
-          allowDirect={() => target === "codex"}
+          allowDirect={() => true}
           onSelectedIdChange={setSelectedProviderId}
           onEdit={() => {
             const provider = selectedProvider()
@@ -655,7 +655,7 @@ function Shell(props: {
     if (applying()) return
     const targetSession = session()
     const target = activeTarget()
-    if (!targetSession || !target || (target === "claude" && mode === "direct")) return
+    if (!targetSession || !target) return
     const provider = view()?.providers.find((candidate) => candidate.id === providerId)
     if (!provider) {
       closeOriginPicker(pickerToken)
@@ -777,6 +777,7 @@ function Shell(props: {
       "target.sidebar.toggle": () => setSidebarOpen((open) => !open),
       "provider.create": openProviderSourcePicker,
       "provider.list": openProviderPicker,
+      "target.direct.apply": () => applyDefaultProvider("direct"),
       "target.takeover.apply": () => applyDefaultProvider("takeover"),
     },
   })

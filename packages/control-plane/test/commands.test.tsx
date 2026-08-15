@@ -250,7 +250,6 @@ test("slash and leader resolve one exact Codex Direct Activation command", async
   })
   try {
     expect(resolveSlash("/direct", "codex")).toBe("target.direct.apply")
-    expect(resolveSlash("/direct", "claude")).toBeUndefined()
 
     setup.keymap.dispatchCommand(resolveSlash("/direct", "codex")!)
     setup.mockInput.pressKey("x", { ctrl: true })
@@ -263,10 +262,33 @@ test("slash and leader resolve one exact Codex Direct Activation command", async
   }
 })
 
-test("Claude accepts Provider and Takeover commands but rejects Direct", () => {
+test("Claude slash and leader resolve the existing Direct Activation command exactly once", async () => {
+  const executed: string[] = []
+  const dispatched: string[] = []
+  const setup = await commandHarness({
+    handlers: { "target.direct.apply": () => executed.push("target.direct.apply") } as Handlers,
+    onDispatch: (id) => dispatched.push(id),
+    scope: "claude",
+  })
+  try {
+    expect(resolveSlash("/direct", "claude")).toBe("target.direct.apply")
+
+    setup.keymap.dispatchCommand(resolveSlash("/direct", "claude")!)
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("d")
+    await setup.renderOnce()
+
+    expect(executed).toEqual(["target.direct.apply", "target.direct.apply"])
+    expect(dispatched.filter((id) => id === "target.direct.apply")).toHaveLength(1)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Claude accepts Provider Direct and Takeover route commands", () => {
   expect(resolveSlash("/provider", "claude")).toBe("provider.create")
   expect(resolveSlash("/takeover", "claude")).toBe("target.takeover.apply")
-  expect(resolveSlash("/direct", "claude")).toBeUndefined()
+  expect(resolveSlash("/direct", "claude")).toBe("target.direct.apply")
 })
 
 test("an overlay layer consumes escape before route and global layers", async () => {

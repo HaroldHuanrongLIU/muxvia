@@ -425,7 +425,7 @@ test("renders a localized unavailable Claude target without operating the Codex 
   }
 })
 
-test("Claude uses its independent real Target session and exposes Takeover without Direct", async () => {
+test("Claude slash leader and palette dispatch the existing Direct command identity", async () => {
   const codex = new MemoryTargetSession(view())
   const claudeProvider = provider({
     id: "00000000-0000-4000-8000-000000000051",
@@ -434,7 +434,7 @@ test("Claude uses its independent real Target session and exposes Takeover witho
     model: "claude-test",
     protocol: "anthropic-messages",
     authentication: "anthropic-api-key",
-    routingRequirement: "takeover-required",
+    routingRequirement: "direct-compatible",
   })
   const claude = new MemoryTargetSession(view({
     target: "claude",
@@ -457,37 +457,108 @@ test("Claude uses its independent real Target session and exposes Takeover witho
     const frame = await setup.waitForFrame((next) => next.includes("Claude Provider"))
     expect(frame).toContain("Claude Code")
     expect(frame).toContain("Claude · Control Plane")
-    expect(frame).not.toContain("Direct Activation")
     expect(codex.actions).toEqual([])
 
-    await setup.mockInput.typeText("/takeover")
+    await setup.mockInput.typeText("/direct")
     setup.mockInput.pressEnter()
     await setup.waitFor(() => claude.actions.length === 1)
     expect(claude.actions).toEqual([{
       kind: "activate-provider",
       providerId: claudeProvider.id,
-      mode: "takeover",
+      mode: "direct",
     }])
     expect(codex.actions).toEqual([])
 
-    await setup.mockInput.typeText("/providers")
-    setup.mockInput.pressEnter()
-    await setup.waitForFrame((next) => next.includes("Providers") && next.includes("Claude Provider"))
     setup.mockInput.pressKey("x", { ctrl: true })
-    setup.mockInput.pressKey("a")
+    setup.mockInput.pressKey("d")
     await setup.waitFor(() => claude.actions.length === 2)
     expect(claude.actions[1]).toEqual({
       kind: "activate-provider",
       providerId: claudeProvider.id,
-      mode: "takeover",
+      mode: "direct",
     })
+
+    setup.mockInput.pressKey("p", { ctrl: true })
+    await setup.waitForFrame((next) => next.includes("Search commands"))
+    await setup.mockInput.typeText("Apply Direct Activation")
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => claude.actions.length === 3)
+    expect(claude.actions[2]).toEqual({
+      kind: "activate-provider",
+      providerId: claudeProvider.id,
+      mode: "direct",
+    })
+    expect(claude.actions).toHaveLength(3)
     expect(codex.actions).toEqual([])
+    expectSecretFree(setup, claude)
   } finally {
     setup.renderer.destroy()
   }
 })
 
-test("switching targets suppresses stale Claude completion while retaining its target-owned view", async () => {
+test("Claude Direct chooses Current then first fallback and rejects Incomplete locally", async () => {
+  const first = provider({
+    id: "claude-first",
+    name: "Claude First",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-api-key",
+  })
+  const current = provider({
+    id: "claude-current",
+    position: 1,
+    name: "Claude Current",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-bearer",
+  })
+  const incomplete = provider({
+    id: "claude-incomplete-direct",
+    name: "Claude Incomplete",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-api-key",
+    credential: "missing",
+    completeness: "incomplete",
+    missingFields: ["credential"],
+  })
+  for (const testCase of [
+    { providers: [first, current], currentProviderId: current.id, expectedId: current.id, expectedActions: 1 },
+    { providers: [first, current], currentProviderId: null, expectedId: first.id, expectedActions: 1 },
+    { providers: [incomplete], currentProviderId: incomplete.id, expectedId: incomplete.id, expectedActions: 0 },
+  ] as const) {
+    const codex = new MemoryTargetSession(view())
+    const initial = view({ target: "claude", providers: [...testCase.providers], currentProviderId: testCase.currentProviderId })
+    const claude = new MemoryTargetSession(initial, async () => ({ status: "applied", view: initial }))
+    const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
+      width: 80,
+      height: 24,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("2")
+      await setup.mockInput.typeText("/direct")
+      setup.mockInput.pressEnter()
+      if (testCase.expectedActions === 0) {
+        const frame = await setup.waitForFrame((value) => value.includes("Complete the required Provider fields and retry."))
+        expect(frame).not.toContain(problemMessageSentinel)
+      } else {
+        await setup.waitFor(() => claude.actions.length === 1)
+        expect(claude.actions).toEqual([{
+          kind: "activate-provider",
+          providerId: testCase.expectedId,
+          mode: "direct",
+        }])
+      }
+      expect(claude.actions).toHaveLength(testCase.expectedActions)
+      expect(codex.actions).toEqual([])
+      expectSecretFree(setup, claude)
+    } finally {
+      setup.renderer.destroy()
+    }
+  }
+})
+
+test("switching targets suppresses stale Claude Direct completion while retaining its target-owned view", async () => {
   const pending = deferred<ActionOutcome>()
   const codex = new MemoryTargetSession(view())
   const claudeProvider = provider({
@@ -495,17 +566,18 @@ test("switching targets suppresses stale Claude completion while retaining its t
     name: "Async Claude Provider",
     protocol: "anthropic-messages",
     authentication: "anthropic-bearer",
-    routingRequirement: "takeover-required",
+    routingRequirement: "direct-compatible",
   })
   const claudeInitial = view({ target: "claude", providers: [claudeProvider] })
   const claudeApplied = view({
     target: "claude",
     managementRevision: 1,
     viewSequence: 1,
-    mode: "takeover",
-    takeover: { state: "active", endpoint: "http://127.0.0.1:43123" },
+    mode: "direct",
+    takeover: { state: "inactive", endpoint: null },
     providers: [claudeProvider],
     currentProviderId: claudeProvider.id,
+    managedConfiguration: { state: "managed", path: "/tmp/home/.claude/settings.json", restartRequired: true },
   })
   const claude = new MemoryTargetSession(claudeInitial, async () => await pending.promise)
   const setup = await testRender(() => <App sessions={{ codex, claude }} />, {
@@ -517,7 +589,7 @@ test("switching targets suppresses stale Claude completion while retaining its t
   try {
     await setup.renderOnce()
     setup.mockInput.pressKey("2")
-    await setup.mockInput.typeText("/takeover")
+    await setup.mockInput.typeText("/direct")
     setup.mockInput.pressEnter()
     await setup.waitFor(() => claude.actions.length === 1)
     setup.mockInput.pressEscape()
@@ -529,15 +601,19 @@ test("switching targets suppresses stale Claude completion while retaining its t
     await flushUi(setup)
     const codexFrame = setup.captureCharFrame()
     expect(codexFrame).toContain("Codex · Control Plane")
-    expect(codexFrame).not.toContain("Target Takeover applied")
+    expect(codexFrame).not.toContain("Direct Activation applied")
+    expect(codexFrame).not.toContain("Restart Claude Code")
+    expect(codexFrame).not.toContain("Async Claude Provider")
     expect(codex.actions).toEqual([])
 
     setup.mockInput.pressEscape()
     await setup.waitForFrame((frame) => frame.includes("Choose a target"))
     setup.mockInput.pressKey("2")
-    const claudeFrame = await setup.waitForFrame((frame) => frame.includes("Mode") && frame.includes("Takeover"))
+    const claudeFrame = await setup.waitForFrame((frame) => frame.includes("Mode") && frame.includes("Direct"))
     expect(claudeFrame).toContain("Async Claude Provider")
-    expect(claudeFrame).not.toContain("Target Takeover applied")
+    expect(claudeFrame).toContain("Restart Claude Code to use the managed configuration.")
+    expect(claudeFrame.match(/Direct Activation applied/g) ?? []).toHaveLength(0)
+    expectSecretFree(setup, claude)
   } finally {
     setup.renderer.destroy()
   }

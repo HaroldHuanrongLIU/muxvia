@@ -355,6 +355,103 @@ async fn request(stream: &mut UnixStream, request_id: &str, operation: Value) ->
 }
 
 #[tokio::test]
+async fn reconciliation_preview_codex_direct_is_read_only_and_emits_no_target_view() {
+    let root = short_temp_root("mx-reconcile-preview");
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    let activation = Arc::new(ActivationService::new(
+        Arc::clone(&store),
+        home.clone(),
+        Arc::new(ControlCodexProbe),
+        "/usr/bin/codex".into(),
+        Arc::new(ControlNoopUpstream),
+    ));
+    let handle =
+        ControlServer::bind_with_activation(&home, Arc::clone(&store), "routing-test", activation)
+            .await
+            .unwrap();
+    let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut stream).await;
+    let opened = request(
+        &mut stream,
+        "open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    assert_eq!(opened["result"]["view"]["managementRevision"], 0);
+
+    let saved = request(
+        &mut stream,
+        "save",
+        json!({
+            "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-provider", "name": "Codex",
+                "baseUrl": "https://api.openai.test/v1", "model": "gpt-test",
+                "credential": {"kind": "replace", "value": "preview-secret"},
+                "authentication": "openai-bearer", "presetKey": null
+            }
+        }),
+    )
+    .await;
+    let provider_id = saved["result"]["outcome"]["view"]["providers"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let _saved_push = read_frame(&mut stream).await.unwrap();
+    let activated = request(
+        &mut stream,
+        "activate",
+        json!({
+            "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
+            "expectedRevision": 1,
+            "action": {"kind": "activate-provider", "providerId": provider_id, "mode": "direct"}
+        }),
+    )
+    .await;
+    let revision = activated["result"]["outcome"]["view"]["managementRevision"]
+        .as_u64()
+        .unwrap();
+    let _activated_push = read_frame(&mut stream).await.unwrap();
+    let before_database = fs::read(home.database_path()).unwrap();
+    let before_config = fs::read(user_home.join(".codex/config.toml")).unwrap();
+
+    let preview = request(
+        &mut stream,
+        "preview",
+        json!({
+            "kind": "preview-reconciliation", "target": "codex", "strategy": "reapply"
+        }),
+    )
+    .await;
+
+    assert_eq!(preview["type"], "response");
+    assert_eq!(preview["result"]["kind"], "reconciliation-preview");
+    assert_eq!(preview["result"]["preview"]["target"], "codex");
+    assert_eq!(preview["result"]["preview"]["strategy"], "reapply");
+    assert_eq!(preview["result"]["preview"]["managementRevision"], revision);
+    assert!(!preview.to_string().contains("preview-secret"));
+    assert_eq!(fs::read(home.database_path()).unwrap(), before_database);
+    assert_eq!(
+        fs::read(user_home.join(".codex/config.toml")).unwrap(),
+        before_config
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), read_frame(&mut stream))
+            .await
+            .is_err(),
+        "preview emitted an unsolicited TargetView"
+    );
+    assert_eq!(handle.tracked_inspections(), 0);
+
+    handle.shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn claude_gap_reopen_preserves_context_for_takeover_and_publishes_only_claude() {
     let root = short_temp_root("mx-claude-act");
     let user_home = root.join("home");

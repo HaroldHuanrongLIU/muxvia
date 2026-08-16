@@ -30,7 +30,10 @@ use crate::{
     domain::provider::has_valid_provider_authentication,
     home::MuxviaHome,
     model::ReqwestUpstream,
-    service::{activate::ActivationService, provider_inspector::ProviderInspector},
+    service::{
+        activate::ActivationService, provider_inspector::ProviderInspector,
+        reconcile::ReconciliationService, reconciliation_adapter::ReconciliationContext,
+    },
     state::{ManagedWriteStatus, StateStore},
 };
 
@@ -57,6 +60,7 @@ pub struct ControlServerHandle {
     task: Option<JoinHandle<()>>,
     completed: watch::Receiver<bool>,
     lifecycle: Arc<ServerLifecycle>,
+    reconciliation: Arc<ReconciliationService>,
 }
 
 #[derive(Default)]
@@ -112,6 +116,20 @@ struct QueuedResponse {
     written: Option<oneshot::Sender<()>>,
 }
 
+#[derive(Clone)]
+struct SessionServices {
+    store: Arc<StateStore>,
+    activation: Arc<ActivationService>,
+    inspector: Arc<ProviderInspector>,
+    reconciliation: Arc<ReconciliationService>,
+}
+
+struct InspectionOperation {
+    target: Target,
+    operation: ControlOperation,
+    opened_claude_context: Option<crate::control::protocol::ClaudePreflightContext>,
+}
+
 impl ControlServer {
     pub async fn bind(
         home: &MuxviaHome,
@@ -160,6 +178,10 @@ impl ControlServer {
     ) -> Result<ControlServerHandle, ControlServerError> {
         let inspector = Arc::new(
             ProviderInspector::new(Arc::clone(&store)).map_err(|_| ControlServerError::State)?,
+        );
+        let reconciliation = Arc::new(
+            ReconciliationService::for_home(Arc::clone(&store), home)
+                .map_err(|_| ControlServerError::State)?,
         );
         for target in [Target::Codex, Target::Claude] {
             let reconciled = match target {
@@ -231,6 +253,7 @@ impl ControlServer {
         let lifecycle = Arc::new(ServerLifecycle::default());
         let handle_lifecycle = Arc::clone(&lifecycle);
         let task_path = socket_path.clone();
+        let handle_reconciliation = Arc::clone(&reconciliation);
         let task = tokio::spawn(async move {
             let mut sessions = JoinSet::new();
             loop {
@@ -253,16 +276,21 @@ impl ControlServer {
                         let store = Arc::clone(&store);
                         let activation = Arc::clone(&activation);
                         let inspector = Arc::clone(&inspector);
+                        let reconciliation = Arc::clone(&reconciliation);
                         let release = release.clone();
                         let lifecycle = Arc::clone(&lifecycle);
                         let session_shutdown = session_shutdown_rx.clone();
+                        let services = SessionServices {
+                            store,
+                            activation,
+                            inspector,
+                            reconciliation,
+                        };
                         sessions.spawn(async move {
                             let _guard = SessionGuard(Arc::clone(&lifecycle));
                             serve_authorized(
                                 stream,
-                                store,
-                                activation,
-                                inspector,
+                                services,
                                 release,
                                 lifecycle,
                                 session_shutdown,
@@ -283,6 +311,7 @@ impl ControlServer {
             task: Some(task),
             completed,
             lifecycle: handle_lifecycle,
+            reconciliation: handle_reconciliation,
         })
     }
 }
@@ -295,6 +324,11 @@ impl ControlServerHandle {
     #[doc(hidden)]
     pub fn tracked_inspections(&self) -> usize {
         self.lifecycle.pending_inspections.load(Ordering::Acquire)
+    }
+
+    #[doc(hidden)]
+    pub async fn tracked_reconciliation_tokens(&self) -> usize {
+        self.reconciliation.token_count().await
     }
 
     pub fn request_shutdown(&mut self) {
@@ -352,9 +386,7 @@ fn remove_socket_if_present(path: &Path) {
 
 async fn serve_authorized(
     mut stream: UnixStream,
-    store: Arc<StateStore>,
-    activation: Arc<ActivationService>,
-    inspector: Arc<ProviderInspector>,
+    services: SessionServices,
     release: String,
     lifecycle: Arc<ServerLifecycle>,
     shutdown: watch::Receiver<bool>,
@@ -375,21 +407,22 @@ async fn serve_authorized(
         return;
     }
 
-    serve_session(
-        stream, store, activation, inspector, release, lifecycle, shutdown,
-    )
-    .await;
+    serve_session(stream, services, release, lifecycle, shutdown).await;
 }
 
 async fn serve_session(
     mut stream: UnixStream,
-    store: Arc<StateStore>,
-    activation: Arc<ActivationService>,
-    inspector: Arc<ProviderInspector>,
+    services: SessionServices,
     release: String,
     lifecycle: Arc<ServerLifecycle>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let SessionServices {
+        store,
+        activation,
+        inspector,
+        reconciliation,
+    } = services;
     let first = match read_frame(&mut stream).await {
         Ok(first) => first,
         Err(FrameError::EndOfStream | FrameError::Io) => return,
@@ -603,18 +636,9 @@ async fn serve_session(
                             }
                         }
                     }
-                    ControlOperation::PreviewReconciliation { .. } => {
-                        if !enqueue_response(&responses, problem_frame(
-                            Some(request_id),
-                            "unsupported-operation",
-                            "Unsupported or malformed request",
-                            None,
-                        )) {
-                            break 'session;
-                        }
-                    }
                     operation @ (ControlOperation::DiscoverModels { .. }
-                    | ControlOperation::CheckReachability { .. }) => {
+                    | ControlOperation::CheckReachability { .. }
+                    | ControlOperation::PreviewReconciliation { .. }) => {
                         if let ControlOperation::DiscoverModels {
                             source: DiscoverySource::Draft { authentication, .. },
                             ..
@@ -654,14 +678,20 @@ async fn serve_session(
                         lifecycle.pending_inspections.fetch_add(1, Ordering::AcqRel);
                         let guard = InspectionGuard(Arc::clone(&lifecycle));
                         let inspector = Arc::clone(&inspector);
+                        let reconciliation = Arc::clone(&reconciliation);
+                        let claude_context = opened_claude_context.clone();
                         let responses = responses.clone();
                         let task_request_id = request_id.clone();
                         let (cancel, cancelled) = oneshot::channel();
                         let abort = inspections.spawn(inspect_and_queue(
                             task_request_id,
-                            target,
-                            operation,
                             inspector,
+                            reconciliation,
+                            InspectionOperation {
+                                target,
+                                operation,
+                                opened_claude_context: claude_context,
+                            },
                             responses,
                             cancelled,
                             guard,
@@ -715,28 +745,56 @@ fn operation_target(operation: &ControlOperation) -> Target {
 
 async fn inspect_and_queue(
     request_id: String,
-    target: Target,
-    operation: ControlOperation,
     inspector: Arc<ProviderInspector>,
+    reconciliation: Arc<ReconciliationService>,
+    work: InspectionOperation,
     responses: mpsc::Sender<QueuedResponse>,
     cancelled: oneshot::Receiver<()>,
     guard: InspectionGuard,
 ) -> InspectionCompletion {
     let _guard = guard;
+    let InspectionOperation {
+        target,
+        operation,
+        opened_claude_context,
+    } = work;
     let inspection = async {
         match operation {
-            ControlOperation::DiscoverModels { source, .. } => ControlResult::ModelDiscovery {
+            ControlOperation::DiscoverModels { source, .. } => Ok(ControlResult::ModelDiscovery {
                 result: inspector.discover_models_for(target, source).await,
-            },
+            }),
             ControlOperation::CheckReachability {
                 provider_id,
                 provider_revision,
                 ..
-            } => ControlResult::Reachability {
+            } => Ok(ControlResult::Reachability {
                 result: inspector
                     .check_reachability_for(target, provider_id, provider_revision)
                     .await,
-            },
+            }),
+            ControlOperation::PreviewReconciliation {
+                strategy,
+                claude_context,
+                ..
+            } => {
+                let context = match target {
+                    Target::Codex => ReconciliationContext::Codex,
+                    Target::Claude => ReconciliationContext::Claude(
+                        claude_context
+                            .or(opened_claude_context)
+                            .ok_or_else(|| ControlProblem {
+                                code: "preflight-context-required".into(),
+                                message: "Claude preflight context is required".into(),
+                                source: None,
+                                selector: None,
+                            })?,
+                    ),
+                };
+                reconciliation
+                    .preview(target, strategy, context)
+                    .await
+                    .map(|preview| ControlResult::ReconciliationPreview { preview })
+            }
             _ => unreachable!(),
         }
     };
@@ -752,12 +810,20 @@ async fn inspect_and_queue(
     };
 
     let (written, write_acknowledged) = oneshot::channel();
+    let frame = match result {
+        Ok(result) => ServerFrame::Response {
+            request_id: request_id.clone(),
+            result,
+        },
+        Err(problem) => ServerFrame::Error {
+            request_id: Some(request_id.clone()),
+            problem,
+            authoritative_view: None,
+        },
+    };
     if responses
         .try_send(QueuedResponse {
-            frame: ServerFrame::Response {
-                request_id: request_id.clone(),
-                result,
-            },
+            frame,
             written: Some(written),
         })
         .is_err()

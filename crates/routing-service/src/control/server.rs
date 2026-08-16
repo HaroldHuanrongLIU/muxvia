@@ -16,6 +16,7 @@ use tokio::{
     sync::{broadcast, mpsc, oneshot, watch},
     task::{Id, JoinHandle, JoinSet},
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     claude::ClaudeConfigCodec,
@@ -97,7 +98,7 @@ impl Drop for InspectionGuard {
 
 struct InspectionRequest {
     task_id: Id,
-    cancel: Option<oneshot::Sender<()>>,
+    cancellation: CancellationToken,
 }
 
 struct InspectionCompletion {
@@ -176,16 +177,17 @@ impl ControlServer {
         activation: Arc<ActivationService>,
         exit_when_idle: bool,
     ) -> Result<ControlServerHandle, ControlServerError> {
+        let reconciliation_runtime = activation.reconciliation_runtime();
+        if reconciliation_runtime.home.root() != home.root() {
+            return Err(ControlServerError::State);
+        }
         let inspector = Arc::new(
             ProviderInspector::new(Arc::clone(&store)).map_err(|_| ControlServerError::State)?,
         );
-        let reconciliation = Arc::new(
-            ReconciliationService::from_runtime(
-                Arc::clone(&store),
-                activation.reconciliation_runtime(),
-            )
-            .map_err(|_| ControlServerError::State)?,
-        );
+        let reconciliation = Arc::new(ReconciliationService::from_runtime(
+            Arc::clone(&store),
+            reconciliation_runtime,
+        ));
         for target in [Target::Codex, Target::Claude] {
             let reconciled = match target {
                 Target::Codex => match CodexConfigCodec::for_user_home(home.user_home()) {
@@ -538,10 +540,8 @@ async fn serve_session(
                 let parsed = serde_json::from_value::<ClientFrame>(raw.clone());
                 let (request_id, operation) = match parsed {
                     Ok(ClientFrame::Cancel { request_id }) => {
-                        if let Some(request) = inspection_requests.get_mut(&request_id)
-                            && let Some(cancel) = request.cancel.take()
-                        {
-                            let _ = cancel.send(());
+                        if let Some(request) = inspection_requests.get(&request_id) {
+                            request.cancellation.cancel();
                         }
                         continue;
                     }
@@ -685,7 +685,7 @@ async fn serve_session(
                         let claude_context = opened_claude_context.clone();
                         let responses = responses.clone();
                         let task_request_id = request_id.clone();
-                        let (cancel, cancelled) = oneshot::channel();
+                        let cancellation = CancellationToken::new();
                         let abort = inspections.spawn(inspect_and_queue(
                             task_request_id,
                             inspector,
@@ -696,12 +696,12 @@ async fn serve_session(
                                 opened_claude_context: claude_context,
                             },
                             responses,
-                            cancelled,
+                            cancellation.clone(),
                             guard,
                         ));
                         inspection_requests.insert(request_id, InspectionRequest {
                             task_id: abort.id(),
-                            cancel: Some(cancel),
+                            cancellation,
                         });
                     }
                 }
@@ -723,10 +723,22 @@ async fn serve_session(
         }
     }
 
-    inspections.abort_all();
+    for request in inspection_requests.values() {
+        request.cancellation.cancel();
+    }
     inspection_requests.clear();
-    while inspections.join_next().await.is_some() {}
     drop(responses);
+    let inspections_drained = tokio::time::timeout(Duration::from_millis(250), async {
+        while inspections.join_next().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    if !inspections_drained {
+        writer_task.abort();
+        let _ = writer_task.await;
+        while inspections.join_next().await.is_some() {}
+        return;
+    }
     if tokio::time::timeout(Duration::from_millis(250), &mut writer_task)
         .await
         .is_err()
@@ -752,7 +764,7 @@ async fn inspect_and_queue(
     reconciliation: Arc<ReconciliationService>,
     work: InspectionOperation,
     responses: mpsc::Sender<QueuedResponse>,
-    cancelled: oneshot::Receiver<()>,
+    cancellation: CancellationToken,
     guard: InspectionGuard,
 ) -> InspectionCompletion {
     let _guard = guard;
@@ -761,20 +773,29 @@ async fn inspect_and_queue(
         operation,
         opened_claude_context,
     } = work;
+    let is_reconciliation_preview =
+        matches!(&operation, ControlOperation::PreviewReconciliation { .. });
+    let inspection_cancellation = cancellation.clone();
     let inspection = async {
         match operation {
-            ControlOperation::DiscoverModels { source, .. } => Ok(ControlResult::ModelDiscovery {
-                result: inspector.discover_models_for(target, source).await,
-            }),
+            ControlOperation::DiscoverModels { source, .. } => Ok((
+                ControlResult::ModelDiscovery {
+                    result: inspector.discover_models_for(target, source).await,
+                },
+                None,
+            )),
             ControlOperation::CheckReachability {
                 provider_id,
                 provider_revision,
                 ..
-            } => Ok(ControlResult::Reachability {
-                result: inspector
-                    .check_reachability_for(target, provider_id, provider_revision)
-                    .await,
-            }),
+            } => Ok((
+                ControlResult::Reachability {
+                    result: inspector
+                        .check_reachability_for(target, provider_id, provider_revision)
+                        .await,
+                },
+                None,
+            )),
             ControlOperation::PreviewReconciliation {
                 strategy,
                 claude_context,
@@ -794,35 +815,67 @@ async fn inspect_and_queue(
                     ),
                 };
                 reconciliation
-                    .preview(target, strategy, context)
+                    .preview_registered_cancellable(
+                        target,
+                        strategy,
+                        context,
+                        inspection_cancellation,
+                    )
                     .await
-                    .map(|preview| ControlResult::ReconciliationPreview { preview })
+                    .map(|registration| {
+                        (
+                            ControlResult::ReconciliationPreview {
+                                preview: registration.preview.clone(),
+                            },
+                            Some(registration),
+                        )
+                    })
             }
             _ => unreachable!(),
         }
     };
-    let result = tokio::select! {
-        biased;
-        _ = cancelled => {
+    let result = if is_reconciliation_preview {
+        let result = inspection.await;
+        if cancellation.is_cancelled() {
+            if let Ok((_, Some(registration))) = result {
+                reconciliation.rollback_preview(registration).await;
+            }
             return InspectionCompletion {
                 request_id,
                 disposition: InspectionDisposition::Cancelled,
             };
         }
-        result = inspection => result,
+        result
+    } else {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return InspectionCompletion {
+                    request_id,
+                    disposition: InspectionDisposition::Cancelled,
+                };
+            }
+            result = inspection => result,
+        }
     };
 
     let (written, write_acknowledged) = oneshot::channel();
-    let frame = match result {
-        Ok(result) => ServerFrame::Response {
-            request_id: request_id.clone(),
-            result,
-        },
-        Err(problem) => ServerFrame::Error {
-            request_id: Some(request_id.clone()),
-            problem,
-            authoritative_view: None,
-        },
+    let (frame, registration) = match result {
+        Ok((result, registration)) => (
+            ServerFrame::Response {
+                request_id: request_id.clone(),
+                result,
+            },
+            registration,
+        ),
+        Err(problem) => (
+            ServerFrame::Error {
+                request_id: Some(request_id.clone()),
+                problem,
+                authoritative_view: None,
+            },
+            None,
+        ),
     };
     if responses
         .try_send(QueuedResponse {
@@ -831,6 +884,9 @@ async fn inspect_and_queue(
         })
         .is_err()
     {
+        if let Some(registration) = registration {
+            reconciliation.rollback_preview(registration).await;
+        }
         return InspectionCompletion {
             request_id,
             disposition: InspectionDisposition::CloseSession,
@@ -839,6 +895,9 @@ async fn inspect_and_queue(
     let disposition = if write_acknowledged.await.is_ok() {
         InspectionDisposition::Written
     } else {
+        if let Some(registration) = registration {
+            reconciliation.rollback_preview(registration).await;
+        }
         InspectionDisposition::CloseSession
     };
     InspectionCompletion {

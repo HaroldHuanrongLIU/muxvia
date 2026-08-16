@@ -6,7 +6,8 @@ use std::{
     sync::Arc,
 };
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -114,24 +115,36 @@ pub(crate) struct ValidatedReconciliation {
 pub(crate) struct ReconciliationService {
     state: Arc<StateStore>,
     tokens: Mutex<HashMap<ObservationKey, ObservationRecord>>,
+    registration_locks: HashMap<ObservationKey, Arc<Mutex<()>>>,
     codex: CodexRuntimeContext,
     claude: ClaudeRuntimeContext,
 }
 
+pub(crate) struct PreviewRegistration {
+    pub(crate) preview: ReconciliationPreview,
+    key: ObservationKey,
+    inserted_token: Uuid,
+    previous: Option<ObservationRecord>,
+    _guard: OwnedMutexGuard<()>,
+}
+
 impl ReconciliationService {
-    pub(crate) fn from_runtime(
-        state: Arc<StateStore>,
-        runtime: ReconciliationRuntime,
-    ) -> Result<Self, ControlProblem> {
+    pub(crate) fn from_runtime(state: Arc<StateStore>, runtime: ReconciliationRuntime) -> Self {
         let home = &runtime.home;
-        let codex_codec = CodexConfigCodec::for_user_home(home.user_home())
-            .map_err(|problem| stable_problem(problem.code()))?;
-        let claude_codec = ClaudeConfigCodec::for_user_home(home.user_home())
-            .map_err(|problem| stable_problem(problem.code()))?;
-        let _ = (codex_codec, claude_codec);
-        Ok(Self {
+        let mut registration_locks = HashMap::new();
+        for target in [Target::Codex, Target::Claude] {
+            for strategy in [
+                ReconciliationStrategy::Adopt,
+                ReconciliationStrategy::Reapply,
+                ReconciliationStrategy::Restore,
+            ] {
+                registration_locks.insert(ObservationKey(target, strategy), Arc::default());
+            }
+        }
+        Self {
             state,
             tokens: Mutex::new(HashMap::new()),
+            registration_locks,
             codex: CodexRuntimeContext {
                 probe: runtime.codex_probe,
                 executable: runtime.codex_executable,
@@ -143,16 +156,47 @@ impl ReconciliationService {
                 executable: runtime.claude_executable,
                 user_home: home.user_home().to_path_buf(),
             },
-        })
+        }
     }
 
+    #[cfg(test)]
     pub(crate) async fn preview(
         &self,
         target: Target,
         strategy: ReconciliationStrategy,
         context: ReconciliationContext,
     ) -> Result<ReconciliationPreview, ControlProblem> {
-        let (record, observed) = self.observe(target, strategy, &context).await?;
+        self.preview_cancellable(target, strategy, context, CancellationToken::new())
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn preview_cancellable(
+        &self,
+        target: Target,
+        strategy: ReconciliationStrategy,
+        context: ReconciliationContext,
+        cancellation: CancellationToken,
+    ) -> Result<ReconciliationPreview, ControlProblem> {
+        Ok(self
+            .preview_registered_cancellable(target, strategy, context, cancellation)
+            .await?
+            .preview)
+    }
+
+    pub(crate) async fn preview_registered_cancellable(
+        &self,
+        target: Target,
+        strategy: ReconciliationStrategy,
+        context: ReconciliationContext,
+        cancellation: CancellationToken,
+    ) -> Result<PreviewRegistration, ControlProblem> {
+        let (record, observed) = self
+            .observe_cancellable(target, strategy, &context, cancellation.clone())
+            .await?;
+        if cancellation.is_cancelled() {
+            return Err(stable_problem("inspection-cancelled"));
+        }
         let preview = ReconciliationPreview {
             observation_token: record.token,
             target,
@@ -169,11 +213,49 @@ impl ReconciliationService {
             restart_required: strategy != ReconciliationStrategy::Adopt,
             unobservable_runtime_boundary: true,
         };
-        self.tokens
-            .lock()
-            .await
-            .insert(ObservationKey(target, strategy), record);
-        Ok(preview)
+        let key = ObservationKey(target, strategy);
+        let registration_lock = Arc::clone(
+            self.registration_locks
+                .get(&key)
+                .expect("every closed reconciliation key has a registration lock"),
+        );
+        let guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(stable_problem("inspection-cancelled"));
+            }
+            guard = registration_lock.lock_owned() => guard,
+        };
+        if cancellation.is_cancelled() {
+            return Err(stable_problem("inspection-cancelled"));
+        }
+        let inserted_token = record.token;
+        let previous = self.tokens.lock().await.insert(key, record);
+        Ok(PreviewRegistration {
+            preview,
+            key,
+            inserted_token,
+            previous,
+            _guard: guard,
+        })
+    }
+
+    pub(crate) async fn rollback_preview(&self, registration: PreviewRegistration) {
+        let mut tokens = self.tokens.lock().await;
+        if tokens
+            .get(&registration.key)
+            .is_none_or(|record| record.token != registration.inserted_token)
+        {
+            return;
+        }
+        match registration.previous {
+            Some(previous) => {
+                tokens.insert(registration.key, previous);
+            }
+            None => {
+                tokens.remove(&registration.key);
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -219,6 +301,20 @@ impl ReconciliationService {
         strategy: ReconciliationStrategy,
         context: &ReconciliationContext,
     ) -> Result<(ObservationRecord, ObservedReconciliation), ControlProblem> {
+        self.observe_cancellable(target, strategy, context, CancellationToken::new())
+            .await
+    }
+
+    async fn observe_cancellable(
+        &self,
+        target: Target,
+        strategy: ReconciliationStrategy,
+        context: &ReconciliationContext,
+        cancellation: CancellationToken,
+    ) -> Result<(ObservationRecord, ObservedReconciliation), ControlProblem> {
+        if cancellation.is_cancelled() {
+            return Err(stable_problem("inspection-cancelled"));
+        }
         if target == Target::Codex
             && self
                 .codex
@@ -264,7 +360,7 @@ impl ReconciliationService {
                 let compatibility = match self
                     .codex
                     .probe
-                    .probe_cancellable(&self.codex.executable)
+                    .probe_cancellable(&self.codex.executable, cancellation.clone())
                     .await
                 {
                     Ok(capability) => ProbedCompatibility::from(capability),
@@ -300,7 +396,7 @@ impl ReconciliationService {
                 let compatibility = match self
                     .claude
                     .probe
-                    .probe_cancellable(&self.claude.executable)
+                    .probe_cancellable(&self.claude.executable, cancellation.clone())
                     .await
                 {
                     Ok(capability) => ProbedCompatibility::from(capability),
@@ -320,6 +416,9 @@ impl ReconciliationService {
                 )
             }
         };
+        if cancellation.is_cancelled() {
+            return Err(stable_problem("inspection-cancelled"));
+        }
         let observed = adapter
             .observe(strategy, &committed, context, compatibility.clone())
             .map_err(|problem| stable_problem(problem.code()))?;
@@ -414,8 +513,10 @@ fn stable_problem(code: &str) -> ControlProblem {
 mod tests {
     use std::{
         fs,
+        future::Future,
         os::unix::fs::symlink,
         path::Path,
+        pin::Pin,
         sync::{Arc, Mutex as StdMutex},
     };
 
@@ -424,6 +525,7 @@ mod tests {
     use futures_util::stream;
     use tempfile::TempDir;
     use tokio_rusqlite::rusqlite::Connection;
+    use tokio_util::sync::CancellationToken;
 
     use super::{ReconciliationRuntime, ReconciliationService, ReconciliationStrategy, Target};
     use crate::{
@@ -469,6 +571,21 @@ mod tests {
                 )),
             }
         }
+
+        fn probe_cancellable<'a>(
+            &'a self,
+            executable: &'a Path,
+            cancellation: CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = Result<CodexCapability, CodexProblem>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(CodexProblem::new("probe-cancelled", Some(executable))),
+                    result = async { self.probe(executable) } => result,
+                }
+            })
+        }
     }
 
     struct TestedClaude;
@@ -477,6 +594,21 @@ mod tests {
         fn probe(&self, _: &Path) -> Result<ClaudeCapability, ClaudeProblem> {
             Ok(ClaudeCapability::Tested {
                 version: "claude-test".into(),
+            })
+        }
+
+        fn probe_cancellable<'a>(
+            &'a self,
+            executable: &'a Path,
+            cancellation: CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = Result<ClaudeCapability, ClaudeProblem>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(ClaudeProblem::new("probe-cancelled", Some(executable))),
+                    result = async { self.probe(executable) } => result,
+                }
             })
         }
     }
@@ -518,7 +650,6 @@ mod tests {
                 configuration_home_override: None,
             },
         )
-        .unwrap()
     }
 
     impl Fixture {
@@ -727,6 +858,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_registration_restores_only_the_token_it_replaced() {
+        let fixture = Fixture::new().await;
+        let first = fixture.preview().await;
+        let cancelled = fixture
+            .service
+            .preview_registered_cancellable(
+                Target::Codex,
+                ReconciliationStrategy::Reapply,
+                ReconciliationContext::Codex,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        fixture.assert_stale(first.observation_token).await;
+        fixture.service.rollback_preview(cancelled).await;
+        fixture
+            .service
+            .validate_preview(
+                Target::Codex,
+                ReconciliationStrategy::Reapply,
+                first.observation_token,
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap();
+
+        let cancelled_b = fixture
+            .service
+            .preview_registered_cancellable(
+                Target::Codex,
+                ReconciliationStrategy::Reapply,
+                ReconciliationContext::Codex,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut nested = Box::pin(fixture.service.preview_registered_cancellable(
+            Target::Codex,
+            ReconciliationStrategy::Reapply,
+            ReconciliationContext::Codex,
+            cancellation.clone(),
+        ));
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(50), &mut nested).await;
+        assert!(blocked.is_err(), "same-key registration was not serialized");
+        cancellation.cancel();
+        let cancelled_wait = tokio::time::timeout(std::time::Duration::from_millis(50), nested)
+            .await
+            .expect("cancelled registration lock wait did not complete");
+        let failure = match cancelled_wait {
+            Ok(_) => panic!("cancelled registration lock wait succeeded"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code, "inspection-cancelled");
+        fixture.service.rollback_preview(cancelled_b).await;
+        let cancelled_c = fixture
+            .service
+            .preview_registered_cancellable(
+                Target::Codex,
+                ReconciliationStrategy::Reapply,
+                ReconciliationContext::Codex,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        fixture.service.rollback_preview(cancelled_c).await;
+        fixture
+            .service
+            .validate_preview(
+                Target::Codex,
+                ReconciliationStrategy::Reapply,
+                first.observation_token,
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn preview_rejects_the_same_nondefault_codex_home_as_activation() {
         let fixture = Fixture::new().await;
         let service = ReconciliationService::from_runtime(
@@ -741,8 +951,7 @@ mod tests {
                     fixture.home.user_home().join("nondefault-codex-home"),
                 ),
             },
-        )
-        .unwrap();
+        );
         let failure = service
             .preview(
                 Target::Codex,
@@ -1014,8 +1223,7 @@ mod tests {
         let service = ReconciliationService::from_runtime(
             Arc::clone(&fixture.store),
             activation.reconciliation_runtime(),
-        )
-        .unwrap();
+        );
         let preview = service
             .preview(
                 Target::Claude,

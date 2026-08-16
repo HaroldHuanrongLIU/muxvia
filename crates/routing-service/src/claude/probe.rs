@@ -1,5 +1,13 @@
-use std::{fmt, future::Future, path::Path, pin::Pin, process::Command};
+use std::{
+    fmt,
+    future::Future,
+    path::Path,
+    pin::Pin,
+    process::{Command, Stdio},
+};
 
+use tokio::io::AsyncReadExt;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::control::protocol::ClaudeBlockingSelector;
@@ -13,9 +21,8 @@ pub trait ClaudeProbe: Send + Sync {
     fn probe_cancellable<'a>(
         &'a self,
         executable: &'a Path,
-    ) -> Pin<Box<dyn Future<Output = Result<ClaudeCapability, ClaudeProblem>> + Send + 'a>> {
-        Box::pin(async move { self.probe(executable) })
-    }
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeCapability, ClaudeProblem>> + Send + 'a>>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +167,7 @@ impl ClaudeProbe for CommandClaudeProbe {
     fn probe_cancellable<'a>(
         &'a self,
         executable: &'a Path,
+        cancellation: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<ClaudeCapability, ClaudeProblem>> + Send + 'a>> {
         Box::pin(async move {
             if !executable.is_absolute() {
@@ -168,9 +176,11 @@ impl ClaudeProbe for CommandClaudeProbe {
                     Some(executable),
                 ));
             }
-            let version = parse_version(&run_read_only_cancellable(executable, "--version").await?)
-                .ok_or_else(|| ClaudeProblem::new("incompatible-target-cli", Some(executable)))?;
-            let help = run_read_only_cancellable(executable, "--help")
+            let version = parse_version(
+                &run_read_only_cancellable(executable, "--version", cancellation.clone()).await?,
+            )
+            .ok_or_else(|| ClaudeProblem::new("incompatible-target-cli", Some(executable)))?;
+            let help = run_read_only_cancellable(executable, "--help", cancellation)
                 .await
                 .map_err(|problem| problem.with_version(version.clone()))?;
             let normalized_help = help.to_ascii_lowercase();
@@ -244,19 +254,66 @@ fn run_read_only(executable: &Path, argument: &str) -> Result<String, ClaudeProb
 async fn run_read_only_cancellable(
     executable: &Path,
     argument: &str,
+    cancellation: CancellationToken,
 ) -> Result<String, ClaudeProblem> {
     let mut command = tokio::process::Command::new(executable);
-    command.arg(argument).kill_on_drop(true);
-    let output = command
-        .output()
-        .await
+    command
+        .arg(argument)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command
+        .spawn()
         .map_err(|_| ClaudeProblem::new("incompatible-target-cli", Some(executable)))?;
-    if !output.status.success() {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ClaudeProblem::new("incompatible-target-cli", Some(executable)))?;
+    let mut reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let status = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            reader.abort();
+            let _ = reader.await;
+            return Err(ClaudeProblem::new("probe-cancelled", Some(executable)));
+        }
+        status = child.wait() => status,
+    };
+    let status = match status {
+        Ok(status) => status,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            reader.abort();
+            let _ = reader.await;
+            return Err(ClaudeProblem::new(
+                "incompatible-target-cli",
+                Some(executable),
+            ));
+        }
+    };
+    let output = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            reader.abort();
+            let _ = reader.await;
+            return Err(ClaudeProblem::new("probe-cancelled", Some(executable)));
+        }
+        output = &mut reader => output,
+    }
+    .map_err(|_| ClaudeProblem::new("incompatible-target-cli", Some(executable)))?
+    .map_err(|_| ClaudeProblem::new("incompatible-target-cli", Some(executable)))?;
+    if !status.success() {
         return Err(ClaudeProblem::new(
             "incompatible-target-cli",
             Some(executable),
         ));
     }
-    String::from_utf8(output.stdout)
+    String::from_utf8(output)
         .map_err(|_| ClaudeProblem::new("incompatible-target-cli", Some(executable)))
 }

@@ -1,6 +1,8 @@
 use std::{
     fmt, fs,
+    future::Future,
     path::Path,
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -36,6 +38,7 @@ use muxvia_routing::{
 use tempfile::TempDir;
 use tokio::sync::{Notify, broadcast};
 use tokio_rusqlite::rusqlite::{Connection as SqliteConnection, OptionalExtension};
+use tokio_util::sync::CancellationToken;
 use toml_edit::DocumentMut;
 use uuid::Uuid;
 
@@ -46,6 +49,23 @@ impl CodexProbe for GoodProbe {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(CodexCapability::Tested {
             version: "test".into(),
+        })
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<CodexCapability, CodexProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandCodexProbe.probe(Path::new("relative-codex")),
+                result = async {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(CodexCapability::Tested { version: "test".into() })
+                } => result,
+            }
         })
     }
 }
@@ -59,6 +79,25 @@ impl CodexProbe for UnknownCompatibleProbe {
             warning: "Codex CLI 99.0.0 is untested; required capabilities were detected".into(),
         })
     }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<CodexCapability, CodexProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandCodexProbe.probe(Path::new("relative-codex")),
+                result = async {
+                    Ok(CodexCapability::UnknownCompatible {
+                        version: "99.0.0".into(),
+                        warning: "Codex CLI 99.0.0 is untested; required capabilities were detected".into(),
+                    })
+                } => result,
+            }
+        })
+    }
 }
 
 struct BadProbe;
@@ -66,6 +105,20 @@ struct BadProbe;
 impl CodexProbe for BadProbe {
     fn probe(&self, _: &Path) -> Result<CodexCapability, CodexProblem> {
         CommandCodexProbe.probe(Path::new("relative-codex"))
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<CodexCapability, CodexProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandCodexProbe.probe(Path::new("relative-codex")),
+                result = async { CommandCodexProbe.probe(Path::new("relative-codex")) } => result,
+            }
+        })
     }
 }
 
@@ -78,6 +131,23 @@ impl ClaudeProbe for GoodClaudeProbe {
             version: "test".into(),
         })
     }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeCapability, ClaudeProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandClaudeProbe.probe(Path::new("relative-claude")),
+                result = async {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(ClaudeCapability::Tested { version: "test".into() })
+                } => result,
+            }
+        })
+    }
 }
 
 struct BadClaudeProbe;
@@ -85,6 +155,20 @@ struct BadClaudeProbe;
 impl ClaudeProbe for BadClaudeProbe {
     fn probe(&self, _: &Path) -> Result<ClaudeCapability, ClaudeProblem> {
         CommandClaudeProbe.probe(Path::new("relative-claude"))
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeCapability, ClaudeProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandClaudeProbe.probe(Path::new("relative-claude")),
+                result = async { CommandClaudeProbe.probe(Path::new("relative-claude")) } => result,
+            }
+        })
     }
 }
 

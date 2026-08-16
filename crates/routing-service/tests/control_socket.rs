@@ -2,8 +2,10 @@
 
 use std::{
     fs,
+    future::Future,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -13,10 +15,11 @@ use std::{
 
 use async_trait::async_trait;
 use muxvia_routing::{
-    claude::{ClaudeCapability, ClaudeProbe, ClaudeProblem},
+    claude::{ClaudeCapability, ClaudeProbe, ClaudeProblem, CommandClaudeProbe},
     codex::{CodexCapability, CodexProbe, CodexProblem, CommandCodexProbe},
     control::{
         framing::{FrameError, read_frame, write_frame},
+        protocol::{ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState, Target},
         server::{ControlServer, ControlServerHandle, peer_uid_matches},
     },
     home::MuxviaHome,
@@ -31,6 +34,7 @@ use tokio::{
     sync::mpsc,
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 struct ControlCodexProbe;
@@ -41,11 +45,52 @@ impl CodexProbe for ControlCodexProbe {
             version: "test".into(),
         })
     }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<CodexCapability, CodexProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandCodexProbe.probe(Path::new("relative-codex")),
+                result = async { Ok(CodexCapability::Tested { version: "test".into() }) } => result,
+            }
+        })
+    }
 }
 
 struct RuntimeSourceCodexProbe {
     expected_executable: PathBuf,
     calls: AtomicUsize,
+}
+
+struct BlockingFallbackCodexProbe {
+    started: std::sync::mpsc::Sender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl CodexProbe for BlockingFallbackCodexProbe {
+    fn probe(&self, _: &Path) -> Result<CodexCapability, CodexProblem> {
+        let _ = self.started.send(());
+        let _ = self.release.lock().unwrap().recv();
+        Ok(CodexCapability::Tested {
+            version: "blocking-fallback".into(),
+        })
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<CodexCapability, CodexProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = self.started.send(());
+            cancellation.cancelled().await;
+            CommandCodexProbe.probe(Path::new("relative-codex"))
+        })
+    }
 }
 
 impl CodexProbe for RuntimeSourceCodexProbe {
@@ -54,6 +99,24 @@ impl CodexProbe for RuntimeSourceCodexProbe {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(CodexCapability::Tested {
             version: "shared-runtime-codex 7.4.1".into(),
+        })
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        executable: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<CodexCapability, CodexProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandCodexProbe.probe(Path::new("relative-codex")),
+                result = async {
+                    assert_eq!(executable, self.expected_executable);
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(CodexCapability::Tested { version: "shared-runtime-codex 7.4.1".into() })
+                } => result,
+            }
         })
     }
 }
@@ -66,6 +129,20 @@ impl ClaudeProbe for ControlClaudeProbe {
             version: "test".into(),
         })
     }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeCapability, ClaudeProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandClaudeProbe.probe(Path::new("relative-claude")),
+                result = async { Ok(ClaudeCapability::Tested { version: "test".into() }) } => result,
+            }
+        })
+    }
 }
 
 struct CountingClaudeProbe(AtomicUsize);
@@ -75,6 +152,23 @@ impl ClaudeProbe for CountingClaudeProbe {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(ClaudeCapability::Tested {
             version: "test".into(),
+        })
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeCapability, ClaudeProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandClaudeProbe.probe(Path::new("relative-claude")),
+                result = async {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(ClaudeCapability::Tested { version: "test".into() })
+                } => result,
+            }
         })
     }
 }
@@ -409,6 +503,55 @@ async fn seed_codex_direct(home: &MuxviaHome, store: Arc<StateStore>) {
         .unwrap();
 }
 
+async fn seed_claude_direct(home: &MuxviaHome, store: Arc<StateStore>) {
+    let created = store
+        .apply_provider_action_for(
+            Target::Claude,
+            Uuid::new_v4(),
+            0,
+            json!({
+                "kind": "create-provider",
+                "name": "Claude",
+                "baseUrl": "https://seed.anthropic.test",
+                "model": "seed-claude",
+                "credential": { "kind": "replace", "value": "seed-claude-secret" },
+                "authentication": "anthropic-api-key",
+                "presetKey": null
+            }),
+        )
+        .await
+        .unwrap();
+    let context = ClaudePreflightContext {
+        claude_config_dir: None,
+        selector_state: ClaudeSelectorState::Unset,
+        blocking_selector: None,
+        host_managed_state: ClaudeHostManagedState::Unmanaged,
+        cwd: home.user_home().to_string_lossy().into_owned(),
+    };
+    let activation = ActivationService::new(
+        Arc::clone(&store),
+        home.clone(),
+        Arc::new(ControlCodexProbe),
+        "/usr/bin/codex".into(),
+        Arc::new(ControlNoopUpstream),
+    )
+    .with_claude_runtime(Arc::new(ControlClaudeProbe), "/usr/bin/claude".into());
+    activation
+        .apply_raw_for_with_context(
+            Target::Claude,
+            Uuid::new_v4(),
+            created.view.management_revision,
+            json!({
+                "kind": "activate-provider",
+                "providerId": created.view.providers[0].id,
+                "mode": "direct"
+            }),
+            Some(&context),
+        )
+        .await
+        .unwrap();
+}
+
 fn hanging_probe_executable(root: &Path) -> (PathBuf, PathBuf) {
     let started = root.join("probe-started");
     let pid = root.join("probe.pid");
@@ -436,19 +579,74 @@ async fn wait_for_path(path: &Path) {
     .unwrap();
 }
 
-async fn wait_for_process_exit(pid_path: &Path) {
+fn process_is_reaped(pid_path: &Path) -> bool {
     let pid: i32 = fs::read_to_string(pid_path).unwrap().parse().unwrap();
-    tokio::time::timeout(Duration::from_millis(500), async move {
-        loop {
-            // SAFETY: signal 0 only checks whether the recorded child PID still exists.
-            if unsafe { libc::kill(pid, 0) } == -1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("hanging probe child survived cancellation");
+    pid_is_reaped(pid)
+}
+
+fn pid_is_reaped(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks whether the recorded child PID still exists.
+    (unsafe { libc::kill(pid, 0) }) == -1
+}
+
+fn completing_probe_executable(root: &Path) -> (PathBuf, PathBuf) {
+    let pids = root.join("completed-probe.pids");
+    let executable = root.join("completing-codex");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ncase \"$1\" in\n --version) printf 'codex-cli 0.106.0\\n' ;;\n --help) printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n' ;;\n *) exit 91 ;;\nesac\n",
+            pids.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    (executable, pids)
+}
+
+fn completing_claude_probe_executable(root: &Path) -> PathBuf {
+    let executable = root.join("completing-claude");
+    fs::write(
+        &executable,
+        "#!/bin/sh\ncase \"$1\" in\n --version) printf '2.1.37 (Claude Code)\\n' ;;\n --help) printf 'Usage: claude [options] [command]\\n--settings <file>\\n--model <model>\\n' ;;\n *) exit 91 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    executable
+}
+
+fn exited_probe_with_inherited_stdout(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let descendant_pid = root.join("probe-descendant.pid");
+    let parent_pid = root.join("probe-parent.pid");
+    let executable = root.join("exited-probe-with-open-stdout");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\ncase \"$1\" in\n --version) (/bin/sleep 2) & printf '%s' \"$!\" > '{}'; printf 'codex-cli 0.106.0\\n' ;;\n --help) printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n' ;;\n *) exit 91 ;;\nesac\n",
+            parent_pid.display(),
+            descendant_pid.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    (executable, descendant_pid, parent_pid)
+}
+
+fn exited_claude_probe_with_inherited_stdout(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let descendant_pid = root.join("claude-probe-descendant.pid");
+    let parent_pid = root.join("claude-probe-parent.pid");
+    let executable = root.join("exited-claude-probe-with-open-stdout");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\ncase \"$1\" in\n --version) (/bin/sleep 2) & printf '%s' \"$!\" > '{}'; printf '2.1.37 (Claude Code)\\n' ;;\n --help) printf 'Usage: claude [options] [command]\\n--settings <file>\\n--model <model>\\n' ;;\n *) exit 91 ;;\nesac\n",
+            parent_pid.display(),
+            descendant_pid.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    (executable, descendant_pid, parent_pid)
 }
 
 async fn start_hanging_preview_fixture(
@@ -503,6 +701,115 @@ async fn start_hanging_preview_fixture(
     (root, handle, stream, pid)
 }
 
+async fn start_custom_blocking_preview_fixture(
+    prefix: &str,
+) -> (
+    PathBuf,
+    ControlServerHandle,
+    UnixStream,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let root = short_temp_root(prefix);
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    seed_codex_direct(&home, Arc::clone(&store)).await;
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let activation = Arc::new(ActivationService::new(
+        Arc::clone(&store),
+        home.clone(),
+        Arc::new(BlockingFallbackCodexProbe {
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        }),
+        "/custom/blocking-probe".into(),
+        Arc::new(ControlNoopUpstream),
+    ));
+    let handle = ControlServer::bind_with_activation(&home, store, "routing-test", activation)
+        .await
+        .unwrap();
+    let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut stream).await;
+    let _opened = request(
+        &mut stream,
+        "open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "blocking-custom-preview",
+            "operation": {
+                "kind": "preview-reconciliation",
+                "target": "codex",
+                "strategy": "reapply"
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    (root, handle, stream, started_rx, release_tx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconciliation_preview_disconnect_cancels_custom_probe_without_sync_fallback() {
+    let (root, handle, stream, started_rx, release_tx) =
+        start_custom_blocking_preview_fixture("mx-preview-custom-cancel").await;
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(handle.tracked_inspections(), 1);
+    drop(stream);
+    let cancelled_before_release = tokio::time::timeout(Duration::from_millis(300), async {
+        while handle.tracked_inspections() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    let _ = release_tx.send(());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while handle.tracked_inspections() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(root);
+    assert!(
+        cancelled_before_release,
+        "preview used the noncancellable synchronous probe fallback"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconciliation_preview_shutdown_cancels_custom_probe_without_sync_fallback() {
+    let (root, handle, _stream, started_rx, release_tx) =
+        start_custom_blocking_preview_fixture("mx-preview-custom-stop").await;
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(handle.tracked_inspections(), 1);
+    let mut shutdown = Box::pin(handle.shutdown());
+    let shutdown_before_release = tokio::time::timeout(Duration::from_millis(300), &mut shutdown)
+        .await
+        .is_ok();
+    let _ = release_tx.send(());
+    if !shutdown_before_release {
+        tokio::time::timeout(Duration::from_secs(1), &mut shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let _ = fs::remove_dir_all(root);
+    assert!(
+        shutdown_before_release,
+        "shutdown used the noncancellable synchronous probe fallback"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconciliation_preview_disconnect_kills_hung_probe_and_reaps_tracking() {
     let (root, handle, stream, pid) = start_hanging_preview_fixture("mx-preview-drop").await;
@@ -515,9 +822,13 @@ async fn reconciliation_preview_disconnect_kills_hung_probe_and_reaps_tracking()
     })
     .await
     .expect("disconnect did not reap hanging preview");
-    wait_for_process_exit(&pid).await;
+    let reaped_before_tracking_completed = process_is_reaped(&pid);
     handle.shutdown().await.unwrap();
     let _ = fs::remove_dir_all(root);
+    assert!(
+        reaped_before_tracking_completed,
+        "tracked inspection completed before the probe child was reaped"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -528,39 +839,308 @@ async fn reconciliation_preview_shutdown_kills_hung_probe_and_is_bounded() {
         .await
         .expect("shutdown was starved by hanging preview")
         .unwrap();
-    wait_for_process_exit(&pid).await;
+    let reaped_before_shutdown_returned = process_is_reaped(&pid);
+    let _ = fs::remove_dir_all(root);
+    assert!(
+        reaped_before_shutdown_returned,
+        "shutdown returned before the probe child was reaped"
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_preview_normal_completion_reaps_every_probe_child_before_response() {
+    let root = short_temp_root("mx-preview-complete");
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    seed_codex_direct(&home, Arc::clone(&store)).await;
+    let (executable, pids_path) = completing_probe_executable(&root);
+    let activation = Arc::new(ActivationService::new(
+        Arc::clone(&store),
+        home.clone(),
+        Arc::new(CommandCodexProbe),
+        executable,
+        Arc::new(ControlNoopUpstream),
+    ));
+    let handle = ControlServer::bind_with_activation(&home, store, "routing-test", activation)
+        .await
+        .unwrap();
+    let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut stream).await;
+    let _opened = request(
+        &mut stream,
+        "open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    let preview = request(
+        &mut stream,
+        "normal-preview",
+        json!({
+            "kind": "preview-reconciliation",
+            "target": "codex",
+            "strategy": "reapply"
+        }),
+    )
+    .await;
+    assert_eq!(preview["type"], "response");
+    assert_eq!(
+        preview["result"]["preview"]["compatibility"],
+        json!({
+            "version": "codex-cli 0.106.0",
+            "classification": "tested",
+            "acknowledgementRequired": false
+        })
+    );
+    assert_eq!(handle.tracked_inspections(), 0);
+    let pids = fs::read_to_string(pids_path)
+        .unwrap()
+        .lines()
+        .map(|pid| pid.parse::<i32>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(pids.len(), 2);
+    assert!(
+        pids.into_iter().all(pid_is_reaped),
+        "normal response was written before every probe child was reaped"
+    );
+    handle.shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn reconciliation_preview_claude_command_probe_projects_exact_success_over_uds() {
+    let root = short_temp_root("mx-preview-claude-command");
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    seed_claude_direct(&home, Arc::clone(&store)).await;
+    let executable = completing_claude_probe_executable(&root);
+    let activation = Arc::new(
+        ActivationService::new(
+            Arc::clone(&store),
+            home.clone(),
+            Arc::new(ControlCodexProbe),
+            "/usr/bin/codex".into(),
+            Arc::new(ControlNoopUpstream),
+        )
+        .with_claude_runtime(Arc::new(CommandClaudeProbe), executable),
+    );
+    let handle = ControlServer::bind_with_activation(&home, store, "routing-test", activation)
+        .await
+        .unwrap();
+    let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut stream).await;
+    let _ = request(
+        &mut stream,
+        "open",
+        json!({
+            "kind": "open-target",
+            "target": "claude",
+            "claudeContext": {
+                "claudeConfigDir": null,
+                "selectorState": "unset",
+                "hostManagedState": "unmanaged",
+                "cwd": user_home
+            }
+        }),
+    )
+    .await;
+    let preview = request(
+        &mut stream,
+        "claude-command-preview",
+        json!({
+            "kind": "preview-reconciliation",
+            "target": "claude",
+            "strategy": "reapply"
+        }),
+    )
+    .await;
+    assert_eq!(
+        preview["result"]["preview"]["compatibility"],
+        json!({
+            "version": "2.1.37 (Claude Code)",
+            "classification": "tested",
+            "acknowledgementRequired": false
+        })
+    );
+    handle.shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconciliation_preview_disconnect_cancels_stdout_reader_after_probe_exit() {
+    let root = short_temp_root("mx-preview-open-stdout");
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    seed_codex_direct(&home, Arc::clone(&store)).await;
+    let (executable, descendant_pid, parent_pid) = exited_probe_with_inherited_stdout(&root);
+    let activation = Arc::new(ActivationService::new(
+        Arc::clone(&store),
+        home.clone(),
+        Arc::new(CommandCodexProbe),
+        executable,
+        Arc::new(ControlNoopUpstream),
+    ));
+    let handle = ControlServer::bind_with_activation(&home, store, "routing-test", activation)
+        .await
+        .unwrap();
+    let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut stream).await;
+    let _ = request(
+        &mut stream,
+        "open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "open-stdout-preview",
+            "operation": {
+                "kind": "preview-reconciliation",
+                "target": "codex",
+                "strategy": "reapply"
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    wait_for_path(&descendant_pid).await;
+    wait_for_path(&parent_pid).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !process_is_reaped(&parent_pid) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("probe parent did not exit before disconnect");
+    assert_eq!(handle.tracked_inspections(), 1);
+    drop(stream);
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while handle.tracked_inspections() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnect did not close the inherited stdout reader");
+    handle.shutdown().await.unwrap();
+    let descendant_pid = fs::read_to_string(&descendant_pid)
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    // SAFETY: the PID was written by the controlled descendant in this test fixture.
+    let _ = unsafe { libc::kill(descendant_pid, libc::SIGTERM) };
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconciliation_preview_disconnect_cancels_claude_stdout_reader_after_probe_exit() {
+    let root = short_temp_root("mx-preview-claude-open-stdout");
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    seed_claude_direct(&home, Arc::clone(&store)).await;
+    let (executable, descendant_pid, parent_pid) = exited_claude_probe_with_inherited_stdout(&root);
+    let activation = Arc::new(
+        ActivationService::new(
+            Arc::clone(&store),
+            home.clone(),
+            Arc::new(ControlCodexProbe),
+            "/usr/bin/codex".into(),
+            Arc::new(ControlNoopUpstream),
+        )
+        .with_claude_runtime(Arc::new(CommandClaudeProbe), executable),
+    );
+    let handle = ControlServer::bind_with_activation(&home, store, "routing-test", activation)
+        .await
+        .unwrap();
+    let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut stream).await;
+    let _ = request(
+        &mut stream,
+        "open",
+        json!({
+            "kind": "open-target",
+            "target": "claude",
+            "claudeContext": {
+                "claudeConfigDir": null,
+                "selectorState": "unset",
+                "hostManagedState": "unmanaged",
+                "cwd": user_home
+            }
+        }),
+    )
+    .await;
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "claude-open-stdout-preview",
+            "operation": {
+                "kind": "preview-reconciliation",
+                "target": "claude",
+                "strategy": "reapply"
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    wait_for_path(&descendant_pid).await;
+    wait_for_path(&parent_pid).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !process_is_reaped(&parent_pid) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Claude probe parent did not exit before disconnect");
+    assert_eq!(handle.tracked_inspections(), 1);
+    drop(stream);
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while handle.tracked_inspections() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnect did not close the Claude inherited stdout reader");
+    handle.shutdown().await.unwrap();
+    let descendant_pid = fs::read_to_string(&descendant_pid)
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    // SAFETY: the PID was written by the controlled descendant in this test fixture.
+    let _ = unsafe { libc::kill(descendant_pid, libc::SIGTERM) };
     let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
 async fn reconciliation_preview_codex_direct_is_read_only_and_emits_no_target_view() {
     let root = short_temp_root("mx-reconcile-preview");
-    let service_user_home = root.join("service-home");
-    let runtime_user_home = root.join("runtime-home");
-    fs::create_dir_all(&service_user_home).unwrap();
-    fs::create_dir_all(&runtime_user_home).unwrap();
-    let service_home = MuxviaHome::from_user_home(&service_user_home);
-    let runtime_home = MuxviaHome::from_user_home(&runtime_user_home);
-    let store = Arc::new(StateStore::open(&service_home).await.unwrap());
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
     let runtime_probe = Arc::new(RuntimeSourceCodexProbe {
         expected_executable: "/runtime/source/codex".into(),
         calls: AtomicUsize::new(0),
     });
     let activation = Arc::new(ActivationService::new(
         Arc::clone(&store),
-        runtime_home,
+        home.clone(),
         runtime_probe.clone(),
         "/runtime/source/codex".into(),
         Arc::new(ControlNoopUpstream),
     ));
-    let handle = ControlServer::bind_with_activation(
-        &service_home,
-        Arc::clone(&store),
-        "routing-test",
-        activation,
-    )
-    .await
-    .unwrap();
+    let handle =
+        ControlServer::bind_with_activation(&home, Arc::clone(&store), "routing-test", activation)
+            .await
+            .unwrap();
     let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
     hello(&mut stream).await;
     let opened = request(
@@ -605,10 +1185,9 @@ async fn reconciliation_preview_codex_direct_is_read_only_and_emits_no_target_vi
         .as_u64()
         .unwrap();
     let _activated_push = read_frame(&mut stream).await.unwrap();
-    let before_database = fs::read(service_home.database_path()).unwrap();
-    let runtime_config = runtime_user_home.join(".codex/config.toml");
+    let before_database = fs::read(home.database_path()).unwrap();
+    let runtime_config = user_home.join(".codex/config.toml");
     let before_config = fs::read(&runtime_config).unwrap();
-    assert!(!service_user_home.join(".codex/config.toml").exists());
 
     let preview = request(
         &mut stream,
@@ -634,12 +1213,8 @@ async fn reconciliation_preview_codex_direct_is_read_only_and_emits_no_target_vi
     assert_eq!(runtime_probe.calls.load(Ordering::SeqCst), 2);
     assert_eq!(preview["result"]["preview"]["managementRevision"], revision);
     assert!(!preview.to_string().contains("preview-secret"));
-    assert_eq!(
-        fs::read(service_home.database_path()).unwrap(),
-        before_database
-    );
+    assert_eq!(fs::read(home.database_path()).unwrap(), before_database);
     assert_eq!(fs::read(runtime_config).unwrap(), before_config);
-    assert!(!service_user_home.join(".codex/config.toml").exists());
     assert!(
         tokio::time::timeout(Duration::from_millis(100), read_frame(&mut stream))
             .await
@@ -648,6 +1223,212 @@ async fn reconciliation_preview_codex_direct_is_read_only_and_emits_no_target_vi
     );
     assert_eq!(handle.tracked_inspections(), 0);
 
+    handle.shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn control_server_rejects_a_server_and_activation_home_mismatch() {
+    let root = short_temp_root("mx-runtime-home-mismatch");
+    fs::create_dir_all(&root).unwrap();
+    let server_home = MuxviaHome::from_root(root.join("server-muxvia")).unwrap();
+    let activation_home = MuxviaHome::from_root(root.join("activation-muxvia")).unwrap();
+    assert_eq!(server_home.user_home(), activation_home.user_home());
+    assert_ne!(server_home.root(), activation_home.root());
+    let store = Arc::new(StateStore::open(&server_home).await.unwrap());
+    let activation = Arc::new(ActivationService::new(
+        Arc::clone(&store),
+        activation_home,
+        Arc::new(ControlCodexProbe),
+        "/runtime/source/codex".into(),
+        Arc::new(ControlNoopUpstream),
+    ));
+    let rejected =
+        match ControlServer::bind_with_activation(&server_home, store, "routing-test", activation)
+            .await
+        {
+            Ok(handle) => {
+                handle.shutdown().await.unwrap();
+                false
+            }
+            Err(_) => true,
+        };
+    let _ = fs::remove_dir_all(root);
+    assert!(
+        rejected,
+        "control server accepted a second Home that disagreed with activation"
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_preview_uses_activation_codex_home_override_and_mutates_nothing() {
+    let root = short_temp_root("mx-preview-codex-home");
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    seed_codex_direct(&home, Arc::clone(&store)).await;
+    let activation = Arc::new(
+        ActivationService::new(
+            Arc::clone(&store),
+            home.clone(),
+            Arc::new(ControlCodexProbe),
+            "/runtime/source/codex".into(),
+            Arc::new(ControlNoopUpstream),
+        )
+        .with_configuration_home_override(Some(user_home.join("nondefault-codex-home"))),
+    );
+    let handle = ControlServer::bind_with_activation(
+        &home,
+        Arc::clone(&store),
+        "routing-test",
+        Arc::clone(&activation),
+    )
+    .await
+    .unwrap();
+    let before_database = fs::read(home.database_path()).unwrap();
+    let config = user_home.join(".codex/config.toml");
+    let before_config = fs::read(&config).unwrap();
+    let before_view = store.target_view_for(Target::Codex).await.unwrap();
+    let mut published = store.subscribe_target_views();
+    assert_eq!(activation.model_endpoint_for(Target::Codex).await, None);
+    let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut stream).await;
+    let _opened = request(
+        &mut stream,
+        "open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    let response = request(
+        &mut stream,
+        "nondefault-home-preview",
+        json!({
+            "kind": "preview-reconciliation",
+            "target": "codex",
+            "strategy": "reapply"
+        }),
+    )
+    .await;
+    assert_eq!(response["type"], "error");
+    assert_eq!(
+        response["problem"],
+        json!({
+            "code": "unsupported-configuration-home",
+            "message": "Configuration Home is unsupported"
+        })
+    );
+    assert_eq!(handle.tracked_reconciliation_tokens().await, 0);
+    assert_eq!(fs::read(home.database_path()).unwrap(), before_database);
+    assert_eq!(fs::read(config).unwrap(), before_config);
+    assert_eq!(
+        store.target_view_for(Target::Codex).await.unwrap(),
+        before_view
+    );
+    assert_eq!(activation.model_endpoint_for(Target::Codex).await, None);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), published.recv())
+            .await
+            .is_err(),
+        "unsupported preview published a TargetView"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), read_frame(&mut stream))
+            .await
+            .is_err(),
+        "unsupported preview pushed a TargetView"
+    );
+    handle.shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn reconciliation_preview_uses_claude_home_context_and_mutates_nothing() {
+    let root = short_temp_root("mx-preview-claude-home");
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    seed_claude_direct(&home, Arc::clone(&store)).await;
+    let activation = Arc::new(
+        ActivationService::new(
+            Arc::clone(&store),
+            home.clone(),
+            Arc::new(ControlCodexProbe),
+            "/usr/bin/codex".into(),
+            Arc::new(ControlNoopUpstream),
+        )
+        .with_claude_runtime(Arc::new(ControlClaudeProbe), "/usr/bin/claude".into()),
+    );
+    let handle = ControlServer::bind_with_activation(
+        &home,
+        Arc::clone(&store),
+        "routing-test",
+        Arc::clone(&activation),
+    )
+    .await
+    .unwrap();
+    let before_database = fs::read(home.database_path()).unwrap();
+    let config = user_home.join(".claude/settings.json");
+    let before_config = fs::read(&config).unwrap();
+    let before_view = store.target_view_for(Target::Claude).await.unwrap();
+    let mut published = store.subscribe_target_views();
+    assert_eq!(activation.model_endpoint_for(Target::Claude).await, None);
+    let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut stream).await;
+    let _opened = request(
+        &mut stream,
+        "open",
+        json!({
+            "kind": "open-target",
+            "target": "claude",
+            "claudeContext": {
+                "claudeConfigDir": user_home.join("nondefault-claude-home"),
+                "selectorState": "unset",
+                "hostManagedState": "unmanaged",
+                "cwd": user_home
+            }
+        }),
+    )
+    .await;
+    let response = request(
+        &mut stream,
+        "nondefault-home-preview",
+        json!({
+            "kind": "preview-reconciliation",
+            "target": "claude",
+            "strategy": "reapply"
+        }),
+    )
+    .await;
+    assert_eq!(response["type"], "error");
+    assert_eq!(
+        response["problem"],
+        json!({
+            "code": "unsupported-configuration-home",
+            "message": "Configuration Home is unsupported"
+        })
+    );
+    assert_eq!(handle.tracked_reconciliation_tokens().await, 0);
+    assert_eq!(fs::read(home.database_path()).unwrap(), before_database);
+    assert_eq!(fs::read(config).unwrap(), before_config);
+    assert_eq!(
+        store.target_view_for(Target::Claude).await.unwrap(),
+        before_view
+    );
+    assert_eq!(activation.model_endpoint_for(Target::Claude).await, None);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), published.recv())
+            .await
+            .is_err(),
+        "unsupported preview published a TargetView"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), read_frame(&mut stream))
+            .await
+            .is_err(),
+        "unsupported preview pushed a TargetView"
+    );
     handle.shutdown().await.unwrap();
     let _ = fs::remove_dir_all(root);
 }
@@ -1134,11 +1915,19 @@ async fn shutdown_closes_accepted_sessions_before_returning() {
 async fn shutdown_is_bounded_when_an_authorized_peer_stops_reading() {
     let mut upstream = HeldInspectionServer::start().await;
     let mut fixture = ControlFixture::start().await;
+    let home = MuxviaHome::from_user_home(&fixture.root.join("home"));
+    seed_codex_direct(&home, Arc::clone(&fixture.store)).await;
+    let revision = fixture
+        .store
+        .target_view()
+        .await
+        .unwrap()
+        .management_revision;
     fixture
         .store
         .apply_provider_action(
             Uuid::new_v4(),
-            0,
+            revision,
             json!({
                 "kind": "create-provider",
                 "name": "Large response",
@@ -1162,6 +1951,46 @@ async fn shutdown_is_bounded_when_an_authorized_peer_stops_reading() {
     )
     .await
     .unwrap();
+    for index in 0..8 {
+        write_frame(
+            &mut stream,
+            &json!({
+                "type": "request",
+                "requestId": format!("fill-writer-{index}"),
+                "operation": { "kind": "open-target", "target": "codex" }
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "preview-behind-backpressure",
+            "operation": {
+                "kind": "preview-reconciliation",
+                "target": "codex",
+                "strategy": "reapply"
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture
+            .handle
+            .as_ref()
+            .unwrap()
+            .tracked_reconciliation_tokens()
+            .await
+            != 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("preview did not register behind the blocked writer");
     write_frame(
         &mut stream,
         &json!({
@@ -1202,6 +2031,16 @@ async fn shutdown_is_bounded_when_an_authorized_peer_stops_reading() {
     fixture.handle.as_mut().unwrap().request_shutdown();
     upstream.wait_dropped().await;
     wait_for_zero_inspections(&fixture).await;
+    assert_eq!(
+        fixture
+            .handle
+            .as_ref()
+            .unwrap()
+            .tracked_reconciliation_tokens()
+            .await,
+        0,
+        "shutdown retained a preview token that its blocked writer never delivered"
+    );
     tokio::time::timeout(Duration::from_secs(1), fixture.shutdown())
         .await
         .expect("Control Server shutdown waited on a non-reading peer")

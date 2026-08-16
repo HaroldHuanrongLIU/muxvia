@@ -224,6 +224,19 @@ fn probe_executable(root: &Path, target: Target) -> PathBuf {
     executable
 }
 
+fn rewrite_probe_as_incompatible(executable: &Path, target: Target) {
+    let script = match target {
+        Target::Codex => {
+            "#!/bin/sh\ncase \"$1\" in\n --version) printf 'codex-cli 77.1.0\\n'; printf 'CODEX_VERSION_STDERR_SENTINEL_95101\\n' >&2 ;;\n --help) printf 'Usage: codex [OPTIONS]\\nCODEX_HELP_STDOUT_SENTINEL_95102\\n'; printf 'CODEX_HELP_STDERR_SENTINEL_95103\\n' >&2 ;;\n *) exit 91 ;;\nesac\n"
+        }
+        Target::Claude => {
+            "#!/bin/sh\ncase \"$1\" in\n --version) printf '77.1.0 (Claude Code)\\n'; printf 'CLAUDE_VERSION_STDERR_SENTINEL_95201\\n' >&2 ;;\n --help) printf 'Usage: claude [options]\\nCLAUDE_HELP_STDOUT_SENTINEL_95202\\n'; printf 'CLAUDE_HELP_STDERR_SENTINEL_95203\\n' >&2 ;;\n *) exit 91 ;;\nesac\n"
+        }
+    };
+    fs::write(executable, script).unwrap();
+    fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 #[tokio::test]
 async fn preview_all_targets_and_strategies_preserves_every_durable_surface_and_publishes_nothing()
 {
@@ -242,10 +255,10 @@ async fn preview_all_targets_and_strategies_preserves_every_durable_surface_and_
             Arc::clone(&store),
             home.clone(),
             Arc::new(CommandCodexProbe),
-            codex_executable,
+            codex_executable.clone(),
             Arc::new(NoopUpstream),
         )
-        .with_claude_runtime(Arc::new(CommandClaudeProbe), claude_executable),
+        .with_claude_runtime(Arc::new(CommandClaudeProbe), claude_executable.clone()),
     );
     let handle = ControlServer::bind_with_activation(
         &home,
@@ -281,6 +294,8 @@ async fn preview_all_targets_and_strategies_preserves_every_durable_surface_and_
         },
     )
     .await;
+    rewrite_probe_as_incompatible(&codex_executable, Target::Codex);
+    rewrite_probe_as_incompatible(&claude_executable, Target::Claude);
 
     let codex_endpoint = activation.model_endpoint_for(Target::Codex).await.unwrap();
     let claude_endpoint = activation.model_endpoint_for(Target::Claude).await.unwrap();
@@ -356,6 +371,21 @@ async fn preview_all_targets_and_strategies_preserves_every_durable_surface_and_
             assert_eq!(response["result"]["kind"], "reconciliation-preview");
             assert_eq!(response["result"]["preview"]["target"], target.as_str());
             assert_eq!(response["result"]["preview"]["strategy"], strategy);
+            assert_eq!(
+                response["result"]["preview"]["compatibility"],
+                match target {
+                    Target::Codex => json!({
+                        "version": "codex-cli 77.1.0",
+                        "classification": "incompatible",
+                        "acknowledgementRequired": false
+                    }),
+                    Target::Claude => json!({
+                        "version": "77.1.0 (Claude Code)",
+                        "classification": "incompatible",
+                        "acknowledgementRequired": false
+                    }),
+                }
+            );
             if target == Target::Codex && strategy == "reapply" {
                 first_reapply_token = response["result"]["preview"]["observationToken"]
                     .as_str()

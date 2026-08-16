@@ -940,6 +940,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rusqlite",
+ "tokio-util",
  "toml_edit",
  "url",
  "uuid",
@@ -1615,6 +1616,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

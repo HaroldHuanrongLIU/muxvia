@@ -473,7 +473,7 @@ impl ActivationService {
                     .apply_provider_action_for(target, action_id, expected_revision, raw_action)
                     .await?;
                 if outcome.status == ActionStatus::Applied {
-                    self.store.publish_target_view(outcome.view.clone());
+                    self.store.publish_target_view(outcome.view.clone()).await;
                 }
                 Ok(outcome)
             }
@@ -918,7 +918,7 @@ impl ActivationService {
                     *self.model_for(target).lock().await = Some(handle);
                 }
                 if self.hooks.reached(ActivationStep::PublishView).is_ok() {
-                    self.store.publish_target_view(outcome.view.clone());
+                    self.store.publish_target_view(outcome.view.clone()).await;
                 }
                 Ok(outcome)
             }
@@ -1586,7 +1586,7 @@ impl ActivationService {
                     .await);
             }
         };
-        self.store.publish_target_view(outcome.view.clone());
+        self.store.publish_target_view(outcome.view.clone()).await;
         Ok(outcome)
     }
 

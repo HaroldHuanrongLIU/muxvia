@@ -1,7 +1,5 @@
-use std::sync::Mutex;
-
 use secrecy::{ExposeSecret, SecretString};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 use tokio_rusqlite::{Connection, rusqlite::params};
 use uuid::Uuid;
 
@@ -56,7 +54,7 @@ pub struct StateStore {
     pub(super) connection: Connection,
     service_epoch: String,
     target_views: broadcast::Sender<TargetView>,
-    published_view_sequences: Mutex<[Option<u64>; 2]>,
+    published_view_sequences: [Mutex<Option<u64>>; 2],
 }
 
 type ActivationPreparationRow = (
@@ -202,7 +200,7 @@ impl StateStore {
             connection,
             service_epoch: Uuid::new_v4().to_string(),
             target_views,
-            published_view_sequences: Mutex::new([None; 2]),
+            published_view_sequences: [Mutex::new(None), Mutex::new(None)],
         })
     }
 
@@ -941,19 +939,21 @@ impl StateStore {
             .map_err(map_state_call_error)
     }
 
-    pub(crate) fn publish_target_view(&self, view: TargetView) {
+    pub(crate) async fn publish_target_view(&self, view: TargetView) {
         let index = match view.target {
             Target::Codex => 0,
             Target::Claude => 1,
         };
-        let mut published = self
-            .published_view_sequences
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if published[index].is_some_and(|sequence| view.view_sequence <= sequence) {
+        let mut published = self.published_view_sequences[index].lock().await;
+        let Ok(authoritative) = self.target_view_for(view.target).await else {
+            return;
+        };
+        if view.view_sequence != authoritative.view_sequence
+            || published.is_some_and(|sequence| view.view_sequence <= sequence)
+        {
             return;
         }
-        published[index] = Some(view.view_sequence);
+        *published = Some(view.view_sequence);
         let _ = self.target_views.send(view);
     }
 
@@ -1195,7 +1195,7 @@ impl StateStore {
             })
             .await
             .map_err(map_state_call_error)?;
-        self.publish_target_view(view.clone());
+        self.publish_target_view(view.clone()).await;
         Ok(view)
     }
 

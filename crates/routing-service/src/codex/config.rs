@@ -223,16 +223,7 @@ fn default_owned_provider_key() -> String {
 
 impl OwnedCodexState {
     fn effective_provider_key(&self) -> &str {
-        if self
-            .model_provider
-            .as_ref()
-            .and_then(|item| item.semantic.as_str())
-            .is_some()
-        {
-            &self.owned_provider_key
-        } else {
-            ""
-        }
+        &self.owned_provider_key
     }
 }
 
@@ -301,9 +292,40 @@ pub(crate) struct CodexObservedDocument {
     bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CodexInstalledFileState {
+    exists: bool,
+    mode: Option<u32>,
+}
+
 impl fmt::Debug for CodexObservedDocument {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("CodexObservedDocument(<redacted>)")
+    }
+}
+
+impl CodexObservedDocument {
+    pub(crate) fn planned_restore_union_file_state(
+        &self,
+        before: &ConfigSnapshot,
+        desired: &DesiredCodexState,
+        provider_restore: &CodexProviderRestoreState,
+        historical_before: &ConfigSnapshot,
+    ) -> Result<CodexInstalledFileState, CodexProblem> {
+        if self.identity != before.identity {
+            return Err(CodexProblem::new("configuration-write-failed", None));
+        }
+        let source = String::from_utf8(self.bytes.clone())
+            .map_err(|_| CodexProblem::new("configuration-write-failed", None))?;
+        let mut document = source
+            .parse::<DocumentMut>()
+            .map_err(|_| CodexProblem::new("configuration-write-failed", None))?;
+        apply_restore_union_document(&mut document, before, desired, provider_restore)
+            .map_err(|_| CodexProblem::new("configuration-write-failed", None))?;
+        Ok(planned_installed_file_state(
+            &document,
+            &historical_before.identity,
+        ))
     }
 }
 
@@ -622,6 +644,7 @@ impl CodexConfigCodec {
         desired: &DesiredCodexState,
         provider_restore: &CodexProviderRestoreState,
         historical_before: &ConfigSnapshot,
+        installed_file_state: &CodexInstalledFileState,
     ) -> Result<(), CodexProblem> {
         let (current, mut document) =
             self.read_snapshot_for_key(before.owned.effective_provider_key())?;
@@ -631,24 +654,23 @@ impl CodexConfigCodec {
                 Some(self.config_path()),
             ));
         }
-        apply_owned(
-            &mut document,
-            before.owned.effective_provider_key(),
-            &desired.owned,
-            false,
-        )
-        .and_then(|()| apply_provider_restore(&mut document, provider_restore))
-        .map_err(|_| CodexProblem::new("configuration-write-failed", Some(self.config_path())))?;
-        let remove_file = !historical_before.identity.exists() && document.as_table().is_empty();
+        apply_restore_union_document(&mut document, before, desired, provider_restore).map_err(
+            |_| CodexProblem::new("configuration-write-failed", Some(self.config_path())),
+        )?;
         self.file
             .replace_with_mode_from(
                 &before.identity,
                 document.to_string().as_bytes(),
-                remove_file,
+                !installed_file_state.exists,
                 &historical_before.identity,
             )
             .map_err(|error| map_file_error(error, Some(self.config_path())))?;
-        self.verify_restore_union(before, desired, provider_restore)
+        self.verify_restore_union(
+            before,
+            desired,
+            provider_restore,
+            Some(installed_file_state),
+        )
     }
 
     pub(crate) fn verify_restore_union(
@@ -656,10 +678,18 @@ impl CodexConfigCodec {
         before: &ConfigSnapshot,
         desired: &DesiredCodexState,
         provider_restore: &CodexProviderRestoreState,
+        installed_file_state: Option<&CodexInstalledFileState>,
     ) -> Result<(), CodexProblem> {
         let (current, document) =
             self.read_snapshot_for_key(desired.owned.effective_provider_key())?;
-        if !restore_union_matches(&current, &document, before, desired, provider_restore) {
+        if !restore_union_matches(
+            &current,
+            &document,
+            before,
+            desired,
+            provider_restore,
+            installed_file_state,
+        ) {
             return Err(CodexProblem::new(
                 "configuration-write-failed",
                 Some(self.config_path()),
@@ -673,6 +703,7 @@ impl CodexConfigCodec {
         before: &ConfigSnapshot,
         desired: &DesiredCodexState,
         provider_restore: &CodexProviderRestoreState,
+        installed_file_state: Option<&CodexInstalledFileState>,
         original: &CodexObservedDocument,
     ) -> Result<(), CodexProblem> {
         let contents = self
@@ -695,7 +726,14 @@ impl CodexConfigCodec {
             &document,
             desired.owned.effective_provider_key(),
         )?;
-        if !restore_union_matches(&current, &document, before, desired, provider_restore) {
+        if !restore_union_matches(
+            &current,
+            &document,
+            before,
+            desired,
+            provider_restore,
+            installed_file_state,
+        ) {
             return Err(CodexProblem::new(
                 "recovery-required",
                 Some(self.config_path()),
@@ -781,12 +819,18 @@ impl CodexConfigCodec {
         before: &ConfigSnapshot,
         expected_current: &DesiredCodexState,
         provider_restore: &CodexProviderRestoreState,
+        installed_file_state: Option<&CodexInstalledFileState>,
     ) -> Result<(), CodexProblem> {
         if self.matches_before(before) {
             return Ok(());
         }
-        self.verify_restore_union(before, expected_current, provider_restore)
-            .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())))?;
+        self.verify_restore_union(
+            before,
+            expected_current,
+            provider_restore,
+            installed_file_state,
+        )
+        .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())))?;
         let (current, mut document) =
             self.read_snapshot_for_key(expected_current.owned.effective_provider_key())?;
         apply_owned(
@@ -805,11 +849,12 @@ impl CodexConfigCodec {
             apply_provider_restore(&mut document, &prior_expected_provider)
                 .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())))?;
         }
+        let remove_file = !before.identity.exists() && document.as_table().is_empty();
         self.file
             .replace_with_mode_from(
                 &current.identity,
                 document.to_string().as_bytes(),
-                false,
+                remove_file,
                 &before.identity,
             )
             .map_err(|error| map_file_error(error, Some(self.config_path())))?;
@@ -932,7 +977,9 @@ impl CodexConfigCodec {
     fn matches_before(&self, before: &ConfigSnapshot) -> bool {
         match self.read_snapshot_for_key(before.owned.effective_provider_key()) {
             Ok((current, _)) => {
-                current.owned == before.owned && current.unrelated == before.unrelated
+                current.owned == before.owned
+                    && current.unrelated == before.unrelated
+                    && snapshot_file_state_matches(&current.identity, &before.identity)
             }
             Err(_) => false,
         }
@@ -1356,6 +1403,17 @@ fn item_semantically_matches(left: &Option<OwnedItem>, right: &Option<OwnedItem>
     left.as_ref().map(|item| &item.semantic) == right.as_ref().map(|item| &item.semantic)
 }
 
+fn snapshot_file_state_matches(left: &FileIdentity, right: &FileIdentity) -> bool {
+    left.exists() == right.exists() && (!left.exists() || left.mode() == right.mode())
+}
+
+fn installed_file_state_matches(
+    identity: &FileIdentity,
+    expected: &CodexInstalledFileState,
+) -> bool {
+    identity.exists() == expected.exists && (!expected.exists || identity.mode() == expected.mode)
+}
+
 #[allow(dead_code)]
 fn semantic_fingerprint(value: &impl Serialize) -> String {
     let bytes =
@@ -1471,6 +1529,7 @@ fn restore_union_matches(
     before: &ConfigSnapshot,
     desired: &DesiredCodexState,
     provider_restore: &CodexProviderRestoreState,
+    installed_file_state: Option<&CodexInstalledFileState>,
 ) -> bool {
     let restored_provider = capture_provider_restore_for_key(document, provider_restore.key());
     let before_unrelated = unrelated_without_provider_fields(
@@ -1482,7 +1541,35 @@ fn restore_union_matches(
     let owned_matches = owned_semantically_matches(&current.owned, &desired.owned);
     let provider_matches = restored_provider == *provider_restore;
     let unrelated_matches = current_unrelated == before_unrelated;
-    owned_matches && provider_matches && unrelated_matches
+    let file_state_matches = installed_file_state
+        .is_none_or(|expected| installed_file_state_matches(&current.identity, expected));
+    owned_matches && provider_matches && unrelated_matches && file_state_matches
+}
+
+fn apply_restore_union_document(
+    document: &mut DocumentMut,
+    before: &ConfigSnapshot,
+    desired: &DesiredCodexState,
+    provider_restore: &CodexProviderRestoreState,
+) -> Result<(), ()> {
+    apply_owned(
+        document,
+        before.owned.effective_provider_key(),
+        &desired.owned,
+        false,
+    )?;
+    apply_provider_restore(document, provider_restore)
+}
+
+fn planned_installed_file_state(
+    document: &DocumentMut,
+    historical_identity: &FileIdentity,
+) -> CodexInstalledFileState {
+    let remove_file = !historical_identity.exists() && document.as_table().is_empty();
+    CodexInstalledFileState {
+        exists: !remove_file,
+        mode: (!remove_file).then_some(historical_identity.mode().unwrap_or(0o600)),
+    }
 }
 
 fn apply_provider_restore(
@@ -1753,6 +1840,38 @@ mod tests {
         ));
 
         assert!(!format!("{direct_snapshot:?}").contains("provider-secret"));
+    }
+
+    #[test]
+    fn legacy_snapshot_defaults_to_redacted_bound_muxvia_provider_ownership() {
+        let root = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(root.path()).unwrap();
+        fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+        fs::write(
+            codec.config_path(),
+            r#"model = "legacy-model"
+model_provider = 7
+[model_providers.muxvia_codex]
+name = "Legacy bound provider"
+base_url = "https://legacy.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer LEGACY_SECRET_97502" }
+supports_websockets = false
+"#,
+        )
+        .unwrap();
+        let (snapshot, _) = codec.read_snapshot_for_key("muxvia_codex").unwrap();
+        let mut legacy = serde_json::to_value(&snapshot).unwrap();
+        legacy["owned"]
+            .as_object_mut()
+            .unwrap()
+            .remove("owned_provider_key");
+
+        let decoded: super::ConfigSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.owned.effective_provider_key(), "muxvia_codex");
+        let diagnostic = format!("{:?}", decoded.owned);
+        assert!(!diagnostic.contains("muxvia_codex"));
+        assert!(!diagnostic.contains("LEGACY_SECRET_97502"));
     }
 
     #[tokio::test]

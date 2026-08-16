@@ -12,7 +12,7 @@ use crate::{
     codex::{
         CodexCapability, CodexConfigCodec, CodexProblem, ConfigSnapshot, DesiredCodexState,
         FileIdentity,
-        config::{CodexObservedDocument, CodexProviderRestoreState},
+        config::{CodexInstalledFileState, CodexObservedDocument, CodexProviderRestoreState},
     },
     control::protocol::{
         ClaudePreflightContext, CompatibilityClassification, ProviderAuthentication,
@@ -109,6 +109,7 @@ pub(crate) enum PreparedConfiguration {
         recovery_before: ConfigSnapshot,
         adopted: Option<(ConfigSnapshot, DesiredCodexState)>,
         restore_provider: Option<CodexProviderRestoreState>,
+        restore_file_state: Option<CodexInstalledFileState>,
         observed_document: CodexObservedDocument,
     },
     Claude {
@@ -160,6 +161,7 @@ impl PreparedConfiguration {
                 desired,
                 recovery_before,
                 restore_provider,
+                restore_file_state,
                 ..
             } => CodexConfigCodec::for_user_home(user_home)
                 .and_then(|codec| match restore_provider {
@@ -168,6 +170,9 @@ impl PreparedConfiguration {
                         desired,
                         provider_restore,
                         recovery_before,
+                        restore_file_state
+                            .as_ref()
+                            .expect("Restore preparation has an installed file state"),
                     ),
                     None => codec.atomic_apply(before, desired),
                 })
@@ -186,12 +191,16 @@ impl PreparedConfiguration {
                 before,
                 desired,
                 restore_provider,
+                restore_file_state,
                 ..
             } => CodexConfigCodec::for_user_home(user_home)
                 .and_then(|codec| match restore_provider {
-                    Some(provider_restore) => {
-                        codec.verify_restore_union(before, desired, provider_restore)
-                    }
+                    Some(provider_restore) => codec.verify_restore_union(
+                        before,
+                        desired,
+                        provider_restore,
+                        restore_file_state.as_ref(),
+                    ),
                     None => codec.verify(before, desired),
                 })
                 .map_err(map_codex_problem),
@@ -209,6 +218,7 @@ impl PreparedConfiguration {
                 before,
                 desired,
                 restore_provider,
+                restore_file_state,
                 observed_document,
                 ..
             } => CodexConfigCodec::for_user_home(user_home)
@@ -217,6 +227,7 @@ impl PreparedConfiguration {
                         before,
                         desired,
                         provider_restore,
+                        restore_file_state.as_ref(),
                         observed_document,
                     ),
                     None => codec.restore_or_confirm_before(before, desired),
@@ -236,6 +247,7 @@ impl PreparedConfiguration {
                 before,
                 desired,
                 restore_provider,
+                restore_file_state,
                 ..
             } => match restore_provider {
                 Some(provider_restore) => serialize_material(
@@ -243,6 +255,7 @@ impl PreparedConfiguration {
                     &DurableCodexDesired::RestoreUnion {
                         desired: desired.clone(),
                         provider_restore: provider_restore.clone(),
+                        installed_file_state: restore_file_state.clone(),
                     },
                 ),
                 None => serialize_material(before, desired),
@@ -353,6 +366,8 @@ enum DurableCodexDesired {
     RestoreUnion {
         desired: DesiredCodexState,
         provider_restore: CodexProviderRestoreState,
+        #[serde(default)]
+        installed_file_state: Option<CodexInstalledFileState>,
     },
 }
 
@@ -386,11 +401,17 @@ pub(crate) fn recover_pending_material(
                 let DurableCodexDesired::RestoreUnion {
                     desired,
                     provider_restore,
+                    installed_file_state,
                 } = serde_json::from_str(desired_json)
                     .map_err(|_| ReconciliationProblem::new("recovery-required"))?;
                 return CodexConfigCodec::for_user_home(user_home)
                     .and_then(|codec| {
-                        codec.restore_union_or_confirm_before(&before, &desired, &provider_restore)
+                        codec.restore_union_or_confirm_before(
+                            &before,
+                            &desired,
+                            &provider_restore,
+                            installed_file_state.as_ref(),
+                        )
                     })
                     .map_err(map_codex_problem);
             }
@@ -534,6 +555,18 @@ fn observe_codex(
     let restore_provider = (strategy == ReconciliationStrategy::Restore)
         .then(|| recovery_before.provider_restore().cloned())
         .flatten();
+    let restore_file_state = restore_provider
+        .as_ref()
+        .map(|provider_restore| {
+            observed_document.planned_restore_union_file_state(
+                &before,
+                &desired,
+                provider_restore,
+                &recovery_before,
+            )
+        })
+        .transpose()
+        .map_err(map_codex_problem)?;
     Ok(ObservedReconciliation {
         observation: ReconciliationObservation {
             file_identity: current.identity().clone(),
@@ -553,6 +586,7 @@ fn observe_codex(
             recovery_before,
             adopted,
             restore_provider,
+            restore_file_state,
             observed_document,
         },
     })
@@ -1308,7 +1342,81 @@ operator_note = "preserve-me"
     }
 
     #[test]
-    fn codex_adopt_then_restore_uses_stable_selected_provider_ownership() {
+    fn codex_reapply_keeps_bound_provider_ownership_when_the_selector_is_absent_or_nonstring() {
+        for selector in [None, Some("model_provider = 7 # operator mutation\n")] {
+            let home = TempDir::new().unwrap();
+            let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+            let recovery_before = codec.inspect().unwrap();
+            let committed = codec.desired_direct(
+                "committed-model",
+                "https://committed.example/v1",
+                "COMMITTED_SECRET_97501",
+            );
+            codec.atomic_apply(&recovery_before, &committed).unwrap();
+            let managed = fs::read_to_string(codec.config_path()).unwrap();
+            let drifted = managed
+                .replace("model = \"committed-model\"", "model = \"drifted-model\"")
+                .replace(
+                    "model_provider = \"muxvia_codex\"\n",
+                    selector.unwrap_or(""),
+                );
+            fs::write(codec.config_path(), &drifted).unwrap();
+            let observed_bytes = fs::read(codec.config_path()).unwrap();
+
+            let observed = TargetReconciliationAdapter::Codex(codec)
+                .observe(
+                    ReconciliationStrategy::Reapply,
+                    &CommittedConfiguration::Codex {
+                        desired: committed.clone(),
+                        recovery_before: recovery_before.clone(),
+                    },
+                    &ReconciliationContext::Codex,
+                    compatibility(),
+                )
+                .unwrap();
+            let (pending_before, pending_desired) = observed.prepared.durable_material().unwrap();
+            observed.prepared.atomic_apply(home.path()).unwrap();
+            observed.prepared.verify(home.path()).unwrap();
+            let reapplied = fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+            assert!(reapplied.contains("model_provider = \"muxvia_codex\""));
+            assert!(reapplied.contains("[model_providers.muxvia_codex]"));
+
+            observed.prepared.exact_rollback(home.path()).unwrap();
+            assert!(
+                fs::read(home.path().join(".codex/config.toml")).unwrap() == observed_bytes,
+                "exact rollback changed the selector-mutated Managed Configuration"
+            );
+
+            let observed = TargetReconciliationAdapter::Codex(
+                CodexConfigCodec::for_user_home(home.path()).unwrap(),
+            )
+            .observe(
+                ReconciliationStrategy::Reapply,
+                &CommittedConfiguration::Codex {
+                    desired: committed,
+                    recovery_before,
+                },
+                &ReconciliationContext::Codex,
+                compatibility(),
+            )
+            .unwrap();
+            observed.prepared.atomic_apply(home.path()).unwrap();
+            super::recover_pending_material(
+                crate::control::protocol::Target::Codex,
+                home.path(),
+                &pending_before,
+                &pending_desired,
+            )
+            .unwrap();
+            assert!(
+                fs::read(home.path().join(".codex/config.toml")).unwrap() == observed_bytes,
+                "startup recovery changed the selector-mutated Managed Configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_adopt_then_restore_uses_bound_missing_snapshot_ownership() {
         let home = TempDir::new().unwrap();
         let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
         let recovery_before = codec.inspect().unwrap();
@@ -1366,9 +1474,10 @@ supports_websockets = false
         .unwrap();
         restored.prepared.atomic_apply(home.path()).unwrap();
         restored.prepared.verify(home.path()).unwrap();
-        let historical = fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
-        assert!(!historical.contains("[model_providers.external]"));
-        assert!(historical.contains("[model_providers.muxvia_codex]"));
+        assert!(
+            !home.path().join(".codex/config.toml").exists(),
+            "Restore retained provider partitions absent from the bound historical snapshot"
+        );
 
         restored.prepared.exact_rollback(home.path()).unwrap();
         let rolled_back = fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
@@ -1608,6 +1717,178 @@ unrelated_secret = "CURRENT_ONLY_UNRELATED_SECRET_97309"
         assert_eq!(
             fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_codex_restore_distinguishes_equal_semantics_with_different_modes() {
+        let home = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+        let config_path = codec.config_path().to_owned();
+        fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+        let historical = r#"model = "historical-model"
+model_provider = "operator"
+unrelated_setting = "preserve"
+
+[model_providers.operator]
+name = "Historical operator"
+base_url = "https://historical.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer HISTORICAL_SECRET_97503" }
+supports_websockets = false
+operator_setting = "preserve"
+"#;
+        fs::write(&config_path, historical).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o640)).unwrap();
+        let recovery_before = codec.inspect().unwrap();
+        let committed = codec.desired_direct(
+            "committed-model",
+            "https://committed.example/v1",
+            "COMMITTED_SECRET_97504",
+        );
+        codec.atomic_apply(&recovery_before, &committed).unwrap();
+        fs::write(&config_path, historical).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let adopted = TargetReconciliationAdapter::Codex(codec)
+            .observe(
+                ReconciliationStrategy::Adopt,
+                &CommittedConfiguration::Codex {
+                    desired: committed,
+                    recovery_before,
+                },
+                &ReconciliationContext::Codex,
+                compatibility(),
+            )
+            .unwrap();
+        let crate::state::RecoveryPayload::Codex { before, desired } =
+            adopted.prepared.adopted_recovery_payload()
+        else {
+            panic!("Codex Adopt must retain Codex recovery material")
+        };
+        let restored = TargetReconciliationAdapter::Codex(
+            CodexConfigCodec::for_user_home(home.path()).unwrap(),
+        )
+        .observe(
+            ReconciliationStrategy::Restore,
+            &CommittedConfiguration::Codex {
+                desired: (*desired).clone(),
+                recovery_before: (*before).clone(),
+            },
+            &ReconciliationContext::Codex,
+            compatibility(),
+        )
+        .unwrap();
+        let (pending_before, pending_desired) = restored.prepared.durable_material().unwrap();
+        restored.prepared.atomic_apply(home.path()).unwrap();
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+
+        super::recover_pending_material(
+            crate::control::protocol::Target::Codex,
+            home.path(),
+            &pending_before,
+            &pending_desired,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let recovered: serde_json::Value =
+            toml_edit::de::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let expected: serde_json::Value = toml_edit::de::from_str(historical).unwrap();
+        assert!(
+            recovered == expected,
+            "startup rollback changed equal-semantics unrelated configuration"
+        );
+
+        let restored = TargetReconciliationAdapter::Codex(
+            CodexConfigCodec::for_user_home(home.path()).unwrap(),
+        )
+        .observe(
+            ReconciliationStrategy::Restore,
+            &CommittedConfiguration::Codex {
+                desired: (*desired).clone(),
+                recovery_before: (*before).clone(),
+            },
+            &ReconciliationContext::Codex,
+            compatibility(),
+        )
+        .unwrap();
+        let (pending_before, pending_desired) = restored.prepared.durable_material().unwrap();
+        restored.prepared.atomic_apply(home.path()).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = super::recover_pending_material(
+            crate::control::protocol::Target::Codex,
+            home.path(),
+            &pending_before,
+            &pending_desired,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "recovery-required");
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn pending_codex_restore_reinstates_an_absent_immediate_before_file() {
+        let home = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+        let config_path = codec.config_path().to_owned();
+        fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            "model = \"historical-model\"\nmodel_provider = \"historical-provider\"\n",
+        )
+        .unwrap();
+        let recovery_before = codec.inspect().unwrap();
+        let committed = codec.desired_direct(
+            "committed-model",
+            "https://committed.example/v1",
+            "COMMITTED_SECRET_97505",
+        );
+        codec.atomic_apply(&recovery_before, &committed).unwrap();
+        fs::remove_file(&config_path).unwrap();
+
+        let restored = TargetReconciliationAdapter::Codex(codec)
+            .observe(
+                ReconciliationStrategy::Restore,
+                &CommittedConfiguration::Codex {
+                    desired: committed,
+                    recovery_before,
+                },
+                &ReconciliationContext::Codex,
+                compatibility(),
+            )
+            .unwrap();
+        let (pending_before, pending_desired) = restored.prepared.durable_material().unwrap();
+        super::recover_pending_material(
+            crate::control::protocol::Target::Codex,
+            home.path(),
+            &pending_before,
+            &pending_desired,
+        )
+        .unwrap();
+        assert!(!config_path.exists());
+
+        restored.prepared.atomic_apply(home.path()).unwrap();
+        assert!(config_path.exists());
+        super::recover_pending_material(
+            crate::control::protocol::Target::Codex,
+            home.path(),
+            &pending_before,
+            &pending_desired,
+        )
+        .unwrap();
+        assert!(
+            !config_path.exists(),
+            "startup rollback retained an empty file for an absent pending before"
         );
     }
 

@@ -2916,6 +2916,160 @@ async fn reconciliation_publication_waits_for_the_initiating_action_response_wri
 }
 
 #[tokio::test]
+async fn late_ack_does_not_publish_before_a_newer_durable_writer_failure() {
+    let mut fixture = ControlFixture::start().await;
+    let home = MuxviaHome::from_user_home(&fixture.root.join("home"));
+    seed_codex_direct(&home, Arc::clone(&fixture.store)).await;
+    inflate_codex_target_view(&fixture.store).await;
+    let config_path = fixture.root.join("home/.codex/config.toml");
+    fs::write(
+        &config_path,
+        fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("seed-model", "older-writer-ack-drift"),
+    )
+    .unwrap();
+
+    let mut older = fixture.connect().await;
+    hello(&mut older).await;
+    let opened = request(
+        &mut older,
+        "older-open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    let preview = request(
+        &mut older,
+        "older-preview",
+        json!({ "kind": "preview-reconciliation", "target": "codex", "strategy": "reapply" }),
+    )
+    .await;
+    let mut newer = fixture.connect().await;
+    hello(&mut newer).await;
+    request(
+        &mut newer,
+        "newer-open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+
+    queue_writer_backpressure(&mut older, "older-fill").await;
+    let older_action_id = Uuid::new_v4();
+    write_frame(
+        &mut older,
+        &json!({
+            "type": "request", "requestId": "older-reapply",
+            "operation": {
+                "kind": "act", "target": "codex", "actionId": older_action_id,
+                "expectedRevision": opened["result"]["view"]["managementRevision"],
+                "action": {
+                    "kind": "reconcile", "strategy": "reapply",
+                    "observationToken": preview["result"]["preview"]["observationToken"]
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let older_durable = tokio::time::timeout(Duration::from_millis(150), async {
+        loop {
+            if let Some(outcome) = fixture
+                .store
+                .receipt_for(Target::Codex, older_action_id)
+                .await
+                .unwrap()
+            {
+                break outcome;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("older reconciliation did not durably commit behind the blocked writer");
+
+    fs::write(
+        &config_path,
+        fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("seed-model", "newer-writer-failure-drift"),
+    )
+    .unwrap();
+    let newer_preview = request(
+        &mut newer,
+        "newer-preview",
+        json!({ "kind": "preview-reconciliation", "target": "codex", "strategy": "reapply" }),
+    )
+    .await;
+    queue_writer_backpressure(&mut newer, "newer-fill").await;
+    let newer_action_id = Uuid::new_v4();
+    write_frame(
+        &mut newer,
+        &json!({
+            "type": "request", "requestId": "newer-reapply",
+            "operation": {
+                "kind": "act", "target": "codex", "actionId": newer_action_id,
+                "expectedRevision": older_durable.view.management_revision,
+                "action": {
+                    "kind": "reconcile", "strategy": "reapply",
+                    "observationToken": newer_preview["result"]["preview"]["observationToken"]
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let newer_durable = tokio::time::timeout(Duration::from_millis(150), async {
+        loop {
+            if let Some(outcome) = fixture
+                .store
+                .receipt_for(Target::Codex, newer_action_id)
+                .await
+                .unwrap()
+            {
+                break outcome;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("newer reconciliation did not durably commit behind the failing writer");
+    assert!(newer_durable.view.view_sequence > older_durable.view.view_sequence);
+    drop(newer);
+
+    let mut older_response = None;
+    for _ in 0..9 {
+        let frame = read_frame(&mut older).await.unwrap();
+        if frame["requestId"] == "older-reapply" {
+            older_response = Some(frame);
+        }
+    }
+    assert_eq!(
+        older_response.expect("older response was not written")["type"],
+        "response"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut older))
+            .await
+            .is_err(),
+        "late acknowledgement published a view older than durable state"
+    );
+
+    let mut reopened = fixture.connect().await;
+    hello(&mut reopened).await;
+    let visible = request(
+        &mut reopened,
+        "open-after-newer-writer-failure",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    assert_eq!(
+        visible["result"]["view"],
+        serde_json::to_value(newer_durable.view).unwrap()
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn durable_live_drift_publication_waits_for_the_initiating_error_writer_ack() {
     let mut fixture = ControlFixture::start().await;
     let home = MuxviaHome::from_user_home(&fixture.root.join("home"));

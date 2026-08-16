@@ -1103,7 +1103,7 @@ async fn enqueue_action_response(
         return false;
     }
     if let Some(view) = publication {
-        store.publish_target_view(view);
+        store.publish_target_view(view).await;
     }
     true
 }

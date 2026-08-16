@@ -821,18 +821,62 @@ impl CodexConfigCodec {
         provider_restore: &CodexProviderRestoreState,
         installed_file_state: Option<&CodexInstalledFileState>,
     ) -> Result<(), CodexProblem> {
-        if self.matches_before(before) {
-            return Ok(());
-        }
-        self.verify_restore_union(
+        self.restore_union_or_confirm_before_inner(
             before,
             expected_current,
             provider_restore,
             installed_file_state,
+            None,
         )
-        .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())))?;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restore_union_or_confirm_before_with_validation_hook(
+        &self,
+        before: &ConfigSnapshot,
+        expected_current: &DesiredCodexState,
+        provider_restore: &CodexProviderRestoreState,
+        installed_file_state: Option<&CodexInstalledFileState>,
+        validation_hook: &dyn Fn(),
+    ) -> Result<(), CodexProblem> {
+        self.restore_union_or_confirm_before_inner(
+            before,
+            expected_current,
+            provider_restore,
+            installed_file_state,
+            Some(validation_hook),
+        )
+    }
+
+    fn restore_union_or_confirm_before_inner(
+        &self,
+        before: &ConfigSnapshot,
+        expected_current: &DesiredCodexState,
+        provider_restore: &CodexProviderRestoreState,
+        installed_file_state: Option<&CodexInstalledFileState>,
+        validation_hook: Option<&dyn Fn()>,
+    ) -> Result<(), CodexProblem> {
         let (current, mut document) =
             self.read_snapshot_for_key(expected_current.owned.effective_provider_key())?;
+        if snapshot_matches_before(&current, before) {
+            return Ok(());
+        }
+        if !restore_union_matches(
+            &current,
+            &document,
+            before,
+            expected_current,
+            provider_restore,
+            installed_file_state,
+        ) {
+            return Err(CodexProblem::new(
+                "recovery-required",
+                Some(self.config_path()),
+            ));
+        }
+        if let Some(hook) = validation_hook {
+            hook();
+        }
         apply_owned(
             &mut document,
             expected_current.owned.effective_provider_key(),
@@ -976,11 +1020,7 @@ impl CodexConfigCodec {
 
     fn matches_before(&self, before: &ConfigSnapshot) -> bool {
         match self.read_snapshot_for_key(before.owned.effective_provider_key()) {
-            Ok((current, _)) => {
-                current.owned == before.owned
-                    && current.unrelated == before.unrelated
-                    && snapshot_file_state_matches(&current.identity, &before.identity)
-            }
+            Ok((current, _)) => snapshot_matches_before(&current, before),
             Err(_) => false,
         }
     }
@@ -1405,6 +1445,12 @@ fn item_semantically_matches(left: &Option<OwnedItem>, right: &Option<OwnedItem>
 
 fn snapshot_file_state_matches(left: &FileIdentity, right: &FileIdentity) -> bool {
     left.exists() == right.exists() && (!left.exists() || left.mode() == right.mode())
+}
+
+fn snapshot_matches_before(current: &ConfigSnapshot, before: &ConfigSnapshot) -> bool {
+    current.owned == before.owned
+        && current.unrelated == before.unrelated
+        && snapshot_file_state_matches(&current.identity, &before.identity)
 }
 
 fn installed_file_state_matches(

@@ -1,5 +1,7 @@
+use std::sync::{Arc, Mutex};
+
 use secrecy::{ExposeSecret, SecretString};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 use tokio_rusqlite::{Connection, rusqlite::params};
 use uuid::Uuid;
 
@@ -54,7 +56,7 @@ pub struct StateStore {
     pub(super) connection: Connection,
     service_epoch: String,
     target_views: broadcast::Sender<TargetView>,
-    published_view_sequences: [Mutex<Option<u64>>; 2],
+    published_view_sequences: [Arc<Mutex<Option<u64>>>; 2],
 }
 
 type ActivationPreparationRow = (
@@ -200,7 +202,7 @@ impl StateStore {
             connection,
             service_epoch: Uuid::new_v4().to_string(),
             target_views,
-            published_view_sequences: [Mutex::new(None), Mutex::new(None)],
+            published_view_sequences: [Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None))],
         })
     }
 
@@ -940,21 +942,52 @@ impl StateStore {
     }
 
     pub(crate) async fn publish_target_view(&self, view: TargetView) {
+        self.publish_target_view_inner(view, None).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn publish_target_view_with_authoritative_read_hook(
+        &self,
+        view: TargetView,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.publish_target_view_inner(view, Some(hook)).await;
+    }
+
+    async fn publish_target_view_inner(
+        &self,
+        view: TargetView,
+        authoritative_read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
         let index = match view.target {
             Target::Codex => 0,
             Target::Claude => 1,
         };
-        let mut published = self.published_view_sequences[index].lock().await;
-        let Ok(authoritative) = self.target_view_for(view.target).await else {
-            return;
-        };
-        if view.view_sequence != authoritative.view_sequence
-            || published.is_some_and(|sequence| view.view_sequence <= sequence)
-        {
-            return;
-        }
-        *published = Some(view.view_sequence);
-        let _ = self.target_views.send(view);
+        let published = Arc::clone(&self.published_view_sequences[index]);
+        let sender = self.target_views.clone();
+        let _ = self
+            .connection
+            .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                let authoritative: u64 = connection.query_row(
+                    "SELECT view_sequence FROM target_route_state WHERE target = ?1",
+                    [view.target.as_str()],
+                    |row| row.get(0),
+                )?;
+                if let Some(hook) = authoritative_read_hook {
+                    hook();
+                }
+                let mut last = published
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if view.view_sequence == authoritative
+                    && last.is_none_or(|sequence| view.view_sequence > sequence)
+                {
+                    *last = Some(view.view_sequence);
+                    let _ = sender.send(view);
+                }
+                Ok(())
+            })
+            .await;
     }
 
     pub async fn mark_configuration_drift_for(&self, target: Target) -> Result<(), StateError> {

@@ -1698,6 +1698,69 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn authoritative_publication_serializes_model_path_mutation_until_sync_send() {
+        let fixture = Fixture::new().await;
+        fixture
+            .store
+            .mark_configuration_drift_for(Target::Codex)
+            .await
+            .unwrap();
+        let candidate = fixture.store.target_view_for(Target::Codex).await.unwrap();
+        let snapshot_id = candidate.activated_snapshot.as_ref().unwrap().id;
+        let mut updates = fixture.store.subscribe_target_views();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let hook_reached = Arc::clone(&reached);
+        let release = Arc::new((StdMutex::new(false), Condvar::new()));
+        let hook_release = Arc::clone(&release);
+        let hook = Arc::new(move || {
+            hook_reached.notify_one();
+            let (released, signal) = &*hook_release;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = signal.wait(released).unwrap();
+            }
+        });
+        let publishing_store = Arc::clone(&fixture.store);
+        let publishing = tokio::spawn(async move {
+            publishing_store
+                .publish_target_view_with_authoritative_read_hook(candidate, hook)
+                .await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), reached.notified())
+            .await
+            .unwrap();
+
+        let mut serving = Box::pin(fixture.store.record_serving_for(Target::Codex, snapshot_id));
+        let interleaved =
+            match tokio::time::timeout(std::time::Duration::from_millis(50), &mut serving).await {
+                Ok(result) => {
+                    result.unwrap();
+                    true
+                }
+                Err(_) => false,
+            };
+        {
+            let (released, signal) = &*release;
+            *released.lock().unwrap() = true;
+            signal.notify_all();
+        }
+        assert!(
+            !interleaved,
+            "model-path mutation interleaved with authoritative publication"
+        );
+
+        publishing.await.unwrap();
+        let published = updates.recv().await.unwrap();
+        let served = serving.await.unwrap();
+        assert!(
+            published.view_sequence < served.view_sequence,
+            "publication did not precede the queued model-path mutation"
+        );
+        let served_publication = updates.recv().await.unwrap();
+        assert_eq!(served_publication.view_sequence, served.view_sequence);
+    }
+
     fn rewrite_same_file_preserving_identity(path: &Path, before: &str, after: &str) {
         assert_eq!(before.len(), after.len());
         let metadata = fs::metadata(path).unwrap();

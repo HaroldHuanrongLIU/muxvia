@@ -100,6 +100,18 @@ pub(crate) struct ReconciliationObservation {
 }
 
 #[derive(Clone)]
+pub(crate) struct CodexRestorePreparation {
+    provider: CodexProviderRestoreState,
+    installed_file: CodexInstalledFileState,
+}
+
+impl fmt::Debug for CodexRestorePreparation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CodexRestorePreparation(<redacted>)")
+    }
+}
+
+#[derive(Clone)]
 // Keep the approved target-native value shape; preparation is not retained as a collection.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum PreparedConfiguration {
@@ -108,8 +120,7 @@ pub(crate) enum PreparedConfiguration {
         desired: DesiredCodexState,
         recovery_before: ConfigSnapshot,
         adopted: Option<(ConfigSnapshot, DesiredCodexState)>,
-        restore_provider: Option<CodexProviderRestoreState>,
-        restore_file_state: Option<CodexInstalledFileState>,
+        restore: Option<CodexRestorePreparation>,
         observed_document: CodexObservedDocument,
     },
     Claude {
@@ -160,19 +171,16 @@ impl PreparedConfiguration {
                 before,
                 desired,
                 recovery_before,
-                restore_provider,
-                restore_file_state,
+                restore,
                 ..
             } => CodexConfigCodec::for_user_home(user_home)
-                .and_then(|codec| match restore_provider {
-                    Some(provider_restore) => codec.atomic_restore_union(
+                .and_then(|codec| match restore {
+                    Some(restore) => codec.atomic_restore_union(
                         before,
                         desired,
-                        provider_restore,
+                        &restore.provider,
                         recovery_before,
-                        restore_file_state
-                            .as_ref()
-                            .expect("Restore preparation has an installed file state"),
+                        &restore.installed_file,
                     ),
                     None => codec.atomic_apply(before, desired),
                 })
@@ -190,16 +198,15 @@ impl PreparedConfiguration {
             Self::Codex {
                 before,
                 desired,
-                restore_provider,
-                restore_file_state,
+                restore,
                 ..
             } => CodexConfigCodec::for_user_home(user_home)
-                .and_then(|codec| match restore_provider {
-                    Some(provider_restore) => codec.verify_restore_union(
+                .and_then(|codec| match restore {
+                    Some(restore) => codec.verify_restore_union(
                         before,
                         desired,
-                        provider_restore,
-                        restore_file_state.as_ref(),
+                        &restore.provider,
+                        Some(&restore.installed_file),
                     ),
                     None => codec.verify(before, desired),
                 })
@@ -217,17 +224,16 @@ impl PreparedConfiguration {
             Self::Codex {
                 before,
                 desired,
-                restore_provider,
-                restore_file_state,
+                restore,
                 observed_document,
                 ..
             } => CodexConfigCodec::for_user_home(user_home)
-                .and_then(|codec| match restore_provider {
-                    Some(provider_restore) => codec.exact_rollback_restore_union(
+                .and_then(|codec| match restore {
+                    Some(restore) => codec.exact_rollback_restore_union(
                         before,
                         desired,
-                        provider_restore,
-                        restore_file_state.as_ref(),
+                        &restore.provider,
+                        Some(&restore.installed_file),
                         observed_document,
                     ),
                     None => codec.restore_or_confirm_before(before, desired),
@@ -246,16 +252,15 @@ impl PreparedConfiguration {
             Self::Codex {
                 before,
                 desired,
-                restore_provider,
-                restore_file_state,
+                restore,
                 ..
-            } => match restore_provider {
-                Some(provider_restore) => serialize_material(
+            } => match restore {
+                Some(restore) => serialize_material(
                     before,
                     &DurableCodexDesired::RestoreUnion {
                         desired: desired.clone(),
-                        provider_restore: provider_restore.clone(),
-                        installed_file_state: restore_file_state.clone(),
+                        provider_restore: restore.provider.clone(),
+                        installed_file_state: Some(restore.installed_file.clone()),
                     },
                 ),
                 None => serialize_material(before, desired),
@@ -404,13 +409,15 @@ pub(crate) fn recover_pending_material(
                     installed_file_state,
                 } = serde_json::from_str(desired_json)
                     .map_err(|_| ReconciliationProblem::new("recovery-required"))?;
+                let installed_file_state = installed_file_state
+                    .ok_or_else(|| ReconciliationProblem::new("recovery-required"))?;
                 return CodexConfigCodec::for_user_home(user_home)
                     .and_then(|codec| {
                         codec.restore_union_or_confirm_before(
                             &before,
                             &desired,
                             &provider_restore,
-                            installed_file_state.as_ref(),
+                            Some(&installed_file_state),
                         )
                     })
                     .map_err(map_codex_problem);
@@ -555,15 +562,14 @@ fn observe_codex(
     let restore_provider = (strategy == ReconciliationStrategy::Restore)
         .then(|| recovery_before.provider_restore().cloned())
         .flatten();
-    let restore_file_state = restore_provider
-        .as_ref()
-        .map(|provider_restore| {
-            observed_document.planned_restore_union_file_state(
-                &before,
-                &desired,
-                provider_restore,
-                &recovery_before,
-            )
+    let restore = restore_provider
+        .map(|provider| {
+            observed_document
+                .planned_restore_union_file_state(&before, &desired, &provider, &recovery_before)
+                .map(|installed_file| CodexRestorePreparation {
+                    provider,
+                    installed_file,
+                })
         })
         .transpose()
         .map_err(map_codex_problem)?;
@@ -585,8 +591,7 @@ fn observe_codex(
             desired,
             recovery_before,
             adopted,
-            restore_provider,
-            restore_file_state,
+            restore,
             observed_document,
         },
     })
@@ -1699,6 +1704,24 @@ unrelated_secret = "CURRENT_ONLY_UNRELATED_SECRET_97309"
             0o640
         );
 
+        let mut legacy_desired: serde_json::Value = serde_json::from_str(&pending_desired).unwrap();
+        legacy_desired
+            .as_object_mut()
+            .unwrap()
+            .remove("installed_file_state");
+        let error = super::recover_pending_material(
+            crate::control::protocol::Target::Codex,
+            home.path(),
+            &pending_before,
+            &serde_json::to_string(&legacy_desired).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "recovery-required");
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+
         super::recover_pending_material(
             crate::control::protocol::Target::Codex,
             home.path(),
@@ -1834,6 +1857,121 @@ operator_setting = "preserve"
             fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
             0o644
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_codex_restore_cas_preserves_semantic_and_mode_races() {
+        for mutate_semantics in [true, false] {
+            let home = TempDir::new().unwrap();
+            let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+            let recovery_before = codec.inspect().unwrap();
+            let committed = codec.desired_direct(
+                "committed-model",
+                "https://committed.example/v1",
+                "COMMITTED_SECRET_97601",
+            );
+            codec.atomic_apply(&recovery_before, &committed).unwrap();
+            let external = r#"model = "external-model"
+model_provider = "external"
+operator_note = "before-race"
+
+[model_providers.external]
+name = "External"
+base_url = "https://external.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer EXTERNAL_SECRET_97602" }
+supports_websockets = false
+"#;
+            fs::write(codec.config_path(), external).unwrap();
+            fs::set_permissions(codec.config_path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+            let adopted = TargetReconciliationAdapter::Codex(codec)
+                .observe(
+                    ReconciliationStrategy::Adopt,
+                    &CommittedConfiguration::Codex {
+                        desired: committed,
+                        recovery_before,
+                    },
+                    &ReconciliationContext::Codex,
+                    compatibility(),
+                )
+                .unwrap();
+            let crate::state::RecoveryPayload::Codex { before, desired } =
+                adopted.prepared.adopted_recovery_payload()
+            else {
+                panic!("Codex Adopt must retain Codex recovery material")
+            };
+            let restored = TargetReconciliationAdapter::Codex(
+                CodexConfigCodec::for_user_home(home.path()).unwrap(),
+            )
+            .observe(
+                ReconciliationStrategy::Restore,
+                &CommittedConfiguration::Codex {
+                    desired: (*desired).clone(),
+                    recovery_before: (*before).clone(),
+                },
+                &ReconciliationContext::Codex,
+                compatibility(),
+            )
+            .unwrap();
+            restored.prepared.atomic_apply(home.path()).unwrap();
+            let PreparedConfiguration::Codex {
+                before,
+                desired,
+                restore: Some(restore),
+                ..
+            } = restored.prepared
+            else {
+                panic!("Codex Restore must carry one typed restore preparation")
+            };
+
+            let config_path = home.path().join(".codex/config.toml");
+            let applied_bytes = fs::read(&config_path).unwrap();
+            let mut raced_bytes = applied_bytes.clone();
+            raced_bytes.extend_from_slice(b"\nexternal_race = true\n");
+            let expected_raced_bytes = raced_bytes.clone();
+            let hook_path = config_path.clone();
+            let hook = move || {
+                if mutate_semantics {
+                    fs::write(&hook_path, &raced_bytes).unwrap();
+                } else {
+                    fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o640)).unwrap();
+                }
+            };
+            let error = CodexConfigCodec::for_user_home(home.path())
+                .unwrap()
+                .restore_union_or_confirm_before_with_validation_hook(
+                    &before,
+                    &desired,
+                    &restore.provider,
+                    Some(&restore.installed_file),
+                    &hook,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error.code(),
+                    "configuration-write-failed" | "recovery-required"
+                ),
+                "Restore race returned an unstable error code"
+            );
+            if mutate_semantics {
+                assert!(
+                    fs::read(&config_path).unwrap() == expected_raced_bytes,
+                    "Restore overwrote an external semantic edit"
+                );
+            } else {
+                assert!(
+                    fs::read(&config_path).unwrap() == applied_bytes,
+                    "Restore changed bytes during a mode-only race"
+                );
+                assert_eq!(
+                    fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+                    0o640
+                );
+            }
+        }
     }
 
     #[test]

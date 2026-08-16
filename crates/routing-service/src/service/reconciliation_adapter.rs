@@ -165,9 +165,6 @@ impl TargetReconciliationAdapter {
         context: &ReconciliationContext,
         compatibility: ProbedCompatibility,
     ) -> Result<ObservedReconciliation, ReconciliationProblem> {
-        if compatibility.classification == CompatibilityClassification::Incompatible {
-            return Err(ReconciliationProblem::new("incompatible-target-cli"));
-        }
         match (self, committed, context) {
             (
                 Self::Codex(codec),
@@ -341,7 +338,7 @@ mod tests {
     use std::{fmt, fs};
 
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     use tempfile::TempDir;
 
@@ -445,11 +442,27 @@ operator_setting = "unrelated-sentinel"
 name = "Muxvia"
 base_url = "https://observed-url-sentinel.example/v1"
 wire_api = "responses"
-http_headers = { Authorization = "Bearer observed-credential-sentinel" }
+http_headers = { "X-Muxvia-Routing-Credential" = "observed-credential-sentinel" }
 supports_websockets = false
 "#,
         )
         .unwrap();
+        let observed = codec.desired_takeover(
+            "observed-model-sentinel",
+            "https://observed-url-sentinel.example/v1",
+            "observed-credential-sentinel",
+        );
+        let recovery_desired: crate::codex::DesiredCodexState =
+            serde_json::from_value(serde_json::json!({
+                "model": null,
+                "model_provider": null,
+                "provider_name": null,
+                "provider_base_url": null,
+                "provider_wire_api": null,
+                "provider_http_headers": null,
+                "provider_supports_websockets": null
+            }))
+            .unwrap();
 
         for (strategy, expected) in [
             (
@@ -544,6 +557,19 @@ supports_websockets = false
                 .unwrap();
             assert_eq!(result.observation.changes, expected);
             assert_eq!(result.observation.shadows, Vec::<ShadowSource>::new());
+            match &result.prepared {
+                PreparedConfiguration::Codex { before, desired } => {
+                    assert_eq!(before, &observed);
+                    match strategy {
+                        ReconciliationStrategy::Adopt => assert_eq!(desired, &observed),
+                        ReconciliationStrategy::Reapply => assert_eq!(desired, &committed),
+                        ReconciliationStrategy::Restore => {
+                            assert_eq!(desired, &recovery_desired)
+                        }
+                    }
+                }
+                PreparedConfiguration::Claude { .. } => panic!("wrong prepared target"),
+            }
             let serialized = serde_json::to_string(&result.observation.changes).unwrap();
             let panic_text = panic_message(
                 std::panic::catch_unwind(|| panic!("{result:?}"))
@@ -664,7 +690,7 @@ supports_websockets = false
     }
 
     #[test]
-    fn reconciliation_problem_diagnostics_are_stable_and_drop_probe_input() {
+    fn reconciliation_mismatch_problem_diagnostics_are_stable_and_drop_probe_input() {
         let home = TempDir::new().unwrap();
         let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
         let recovery_before = codec.inspect().unwrap();
@@ -676,7 +702,7 @@ supports_websockets = false
                     desired: committed,
                     recovery_before,
                 },
-                &ReconciliationContext::Codex,
+                &ReconciliationContext::Claude(claude_context(home.path())),
                 ProbedCompatibility::new(
                     "raw-probe-output-sentinel".to_owned(),
                     CompatibilityClassification::Incompatible,
@@ -684,13 +710,130 @@ supports_websockets = false
             )
             .unwrap_err();
 
-        assert_eq!(error.code(), "incompatible-target-cli");
-        assert_eq!(format!("{error}"), "incompatible-target-cli");
+        assert_eq!(error.code(), "recovery-required");
+        assert_eq!(format!("{error}"), "recovery-required");
         assert_eq!(
             format!("{error:?}"),
-            "ReconciliationProblem { code: \"incompatible-target-cli\" }"
+            "ReconciliationProblem { code: \"recovery-required\" }"
         );
         assert!(!format!("{error:?}\n{error}").contains("raw-probe-output-sentinel"));
+    }
+
+    #[test]
+    fn reconciliation_incompatible_compatibility_is_observed_without_writing() {
+        let home = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+        fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+        fs::write(codec.config_path(), "approval_policy = \"never\"\n").unwrap();
+        let recovery_before = codec.inspect().unwrap();
+        let committed = codec.desired_takeover(
+            "committed-model-sentinel",
+            "https://committed-url-sentinel.example/v1",
+            "committed-credential-sentinel",
+        );
+        codec.atomic_apply(&recovery_before, &committed).unwrap();
+        fs::write(
+            codec.config_path(),
+            r#"profile = "operator-profile"
+model = "observed-model-sentinel"
+model_provider = "muxvia_codex"
+
+[model_providers.muxvia_codex]
+name = "Muxvia"
+base_url = "https://observed-url-sentinel.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer observed-credential-sentinel" }
+supports_websockets = false
+"#,
+        )
+        .unwrap();
+        let path = home.path().join(".codex/config.toml");
+        let file_before = fs::read(&path).unwrap();
+        let identity_before = codec
+            .reconciliation_snapshot()
+            .unwrap()
+            .0
+            .identity()
+            .clone();
+
+        let result = TargetReconciliationAdapter::Codex(codec)
+            .observe(
+                ReconciliationStrategy::Reapply,
+                &CommittedConfiguration::Codex {
+                    desired: committed.clone(),
+                    recovery_before,
+                },
+                &ReconciliationContext::Codex,
+                ProbedCompatibility::new(
+                    "codex-cli 0.0.0".to_owned(),
+                    CompatibilityClassification::Incompatible,
+                ),
+            )
+            .expect("read-only observation must retain incompatible classification");
+
+        assert_eq!(
+            result.observation.compatibility.classification(),
+            CompatibilityClassification::Incompatible
+        );
+        assert_eq!(
+            result.observation.compatibility.version(),
+            "codex-cli 0.0.0"
+        );
+        assert_eq!(result.observation.shadows, vec![ShadowSource::CodexProfile]);
+        assert_eq!(
+            result.observation.changes,
+            vec![
+                ReconciliationFieldChange {
+                    field: ReconciliationField::Provider,
+                    state: ReconciliationFieldState::Unchanged,
+                },
+                ReconciliationFieldChange {
+                    field: ReconciliationField::Credential,
+                    state: ReconciliationFieldState::Unchanged,
+                },
+                ReconciliationFieldChange {
+                    field: ReconciliationField::CurrentProvider,
+                    state: ReconciliationFieldState::Unchanged,
+                },
+                ReconciliationFieldChange {
+                    field: ReconciliationField::ActivatedSnapshot,
+                    state: ReconciliationFieldState::Unchanged,
+                },
+                ReconciliationFieldChange {
+                    field: ReconciliationField::Takeover,
+                    state: ReconciliationFieldState::Unchanged,
+                },
+            ]
+        );
+        match &result.prepared {
+            PreparedConfiguration::Codex { before, desired } => {
+                assert_ne!(before, &committed);
+                assert_eq!(desired, &committed);
+            }
+            PreparedConfiguration::Claude { .. } => panic!("wrong prepared target"),
+        }
+        let diagnostic = format!("{result:?}");
+        for sentinel in [
+            "committed-model-sentinel",
+            "committed-url-sentinel",
+            "committed-credential-sentinel",
+            "observed-model-sentinel",
+            "observed-url-sentinel",
+            "observed-credential-sentinel",
+        ] {
+            assert!(!diagnostic.contains(sentinel));
+            assert!(!diagnostic.contains(&format!("{:?}", sentinel.as_bytes())));
+        }
+        assert_eq!(fs::read(path).unwrap(), file_before);
+        assert_eq!(
+            CodexConfigCodec::for_user_home(home.path())
+                .unwrap()
+                .reconciliation_snapshot()
+                .unwrap()
+                .0
+                .identity(),
+            &identity_before
+        );
     }
 
     #[test]
@@ -954,6 +1097,40 @@ supports_websockets = false
                 .shadows
                 .contains(&ShadowSource::ClaudeHostManaged)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_claude_directory_symlink_does_not_shadow_its_managed_file() {
+        let home = TempDir::new().unwrap();
+        let actual_configuration_home = home.path().join("actual-claude-home");
+        fs::create_dir_all(&actual_configuration_home).unwrap();
+        symlink(&actual_configuration_home, home.path().join(".claude")).unwrap();
+        let codec = ClaudeConfigCodec::for_user_home(home.path()).unwrap();
+        let recovery_before = codec.inspect().unwrap();
+        let committed = codec.desired_takeover(
+            "model-sentinel",
+            "http://127.0.0.1:43124/url-sentinel",
+            "credential-sentinel",
+        );
+        codec.atomic_apply(&recovery_before, &committed).unwrap();
+        let settings_path = actual_configuration_home.join("settings.json");
+        let file_before = shadow_fingerprint(&settings_path);
+
+        let result = TargetReconciliationAdapter::Claude(codec)
+            .observe(
+                ReconciliationStrategy::Reapply,
+                &CommittedConfiguration::Claude {
+                    desired: committed,
+                    recovery_before,
+                },
+                &ReconciliationContext::Claude(claude_context(home.path())),
+                claude_compatibility(),
+            )
+            .unwrap();
+
+        assert_eq!(result.observation.shadows, Vec::<ShadowSource>::new());
+        assert_eq!(shadow_fingerprint(&settings_path), file_before);
     }
 
     fn codec_desired_for_host(home: &std::path::Path) -> crate::claude::DesiredClaudeState {

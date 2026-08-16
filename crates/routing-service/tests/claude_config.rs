@@ -508,19 +508,50 @@ fn reconciliation_probe_projects_only_exact_version_and_closed_classification() 
 
 #[cfg(unix)]
 #[test]
-fn reconciliation_probe_rejects_missing_capability_and_raw_multiline_version() {
-    for (version, help) in [
-        ("2.1.37 (Claude Code)", "Usage: claude [options]"),
+fn reconciliation_probe_rejects_malformed_missing_contradictory_and_non_utf8_output() {
+    for (case, version_command, help_command) in [
         (
-            "2.1.37 (Claude Code)\nraw-probe-output-sentinel",
-            "Usage: claude [options]\n--settings <file>\n--model <model>",
+            "dot-only version",
+            "printf '. (Claude Code)\\n'",
+            "printf 'Usage: claude [options]\\n--settings <file>\\n--model <model>\\n'",
+        ),
+        (
+            "missing version",
+            "printf ''",
+            "printf 'Usage: claude [options]\\n--settings <file>\\n--model <model>\\n'",
+        ),
+        (
+            "contradictory help",
+            "printf '2.1.37 (Claude Code)\\n'",
+            "printf 'Usage: codex [options]\\n--settings <file>\\n--model <model>\\n'",
+        ),
+        (
+            "multiline raw version",
+            "printf '2.1.37 (Claude Code)\\nraw-probe-output-sentinel\\n'",
+            "printf 'Usage: claude [options]\\n--settings <file>\\n--model <model>\\n'",
+        ),
+        (
+            "non-UTF-8 version",
+            "printf '\\377\\n'",
+            "printf 'Usage: claude [options]\\n--settings <file>\\n--model <model>\\n'",
         ),
     ] {
         let temp = TempDir::new().unwrap();
-        let (executable, _) = fake_claude(&temp, version, help, 0);
+        let executable = temp.path().join("claude-incompatible-fixture");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n --version) {version_command} ;;\n --help) {help_command} ;;\n *) exit 91 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let error = CommandClaudeProbe.probe(&executable).unwrap_err();
-        assert_eq!(error.code(), "incompatible-target-cli");
+        let error = match CommandClaudeProbe.probe(&executable) {
+            Ok(capability) => panic!("{case} was accepted: {capability:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "incompatible-target-cli", "{case}");
         assert!(!format!("{error:?}\n{error}").contains("raw-probe-output-sentinel"));
     }
 }

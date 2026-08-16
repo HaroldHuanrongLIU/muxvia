@@ -386,10 +386,10 @@ impl ClaudeConfigCodec {
             .join("settings.json");
         let mut seen = BTreeSet::new();
         for path in shadow_paths {
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
             if path == self.settings_path() || path == canonical_settings_path {
                 continue;
             }
-            let path = std::fs::canonicalize(&path).unwrap_or(path);
             if !seen.insert(path.clone()) || !path.exists() {
                 continue;
             }

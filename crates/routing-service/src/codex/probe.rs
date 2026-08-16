@@ -117,15 +117,27 @@ fn parse_version(output: &str) -> Option<String> {
         return None;
     }
     let number = version.strip_prefix("codex-cli ")?;
-    if number.contains('.')
-        && number.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+')
-        })
-    {
+    if is_version_token(number) {
         Some(version.to_owned())
     } else {
         None
     }
+}
+
+fn is_version_token(number: &str) -> bool {
+    let core_end = number.find(['-', '+']).unwrap_or(number.len());
+    let core = &number[..core_end];
+    core.split('.').count() >= 2
+        && core
+            .split('.')
+            .all(|segment| !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()))
+        && number
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && number.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+')
+        })
 }
 
 fn run_read_only(executable: &Path, argument: &str) -> Result<String, CodexProblem> {

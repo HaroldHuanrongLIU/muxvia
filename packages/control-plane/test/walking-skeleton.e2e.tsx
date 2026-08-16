@@ -3301,80 +3301,92 @@ test("stable target view fingerprint preserves view sequence", () => {
   expect(stableTargetViewFingerprint(second)).not.toBe(stableTargetViewFingerprint(first))
 })
 
-const controlledDirectExpected = {
-  providerId: "provider-1", model: "model-1", settingsPath: "/tmp/settings.json",
-}
+const controlledReconciliationSecret = "controlled-reconciliation-response-secret"
 
-function controlledDirectView(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+function controlledReconciliationView(overrides: Record<string, unknown> = {}): TargetView {
   return {
-    target: "claude",
-    mode: "direct",
-    takeover: { state: "inactive", endpoint: null },
-    currentProviderId: controlledDirectExpected.providerId,
-    servingProviderId: null,
-    managedConfiguration: { state: "applied", path: controlledDirectExpected.settingsPath, restartRequired: true },
-    recovery: { state: "committed" },
-    activatedSnapshot: {
-      providerId: controlledDirectExpected.providerId,
-      model: controlledDirectExpected.model,
-      protocol: "anthropic-messages",
-    },
+    target: "codex",
+    viewSequence: 17,
+    controlled: controlledReconciliationSecret,
     ...overrides,
-  }
+  } as unknown as TargetView
 }
 
-async function controlledDirectResponsePushDiagnostic(frames: readonly unknown[], label: string): Promise<string> {
+function controlledReconciliationOutcome(view: TargetView): Record<string, unknown> {
+  return { status: "applied", view }
+}
+
+function controlledReconciliationResponsePushDiagnostic(
+  frames: readonly unknown[],
+  target: "codex" | "claude",
+  outcome: unknown,
+  label: string,
+): string {
   let diagnostic = ""
   try {
-    await assertClaudeDirectResponseAndPush(frames, 0, controlledDirectExpected, [], label)
+    assertReconciliationResponseBeforeSinglePush(frames, 0, target, outcome, label)
   } catch (error) {
     diagnostic = error instanceof Error ? error.message : String(error)
   }
   return diagnostic
 }
 
-test("Direct response/push audit rejects a push that precedes its response", async () => {
-  const view = controlledDirectView()
-  expect(await controlledDirectResponsePushDiagnostic([
+function expectControlledReconciliationResponsePushFailure(
+  frames: readonly unknown[],
+  target: "codex" | "claude",
+  outcome: unknown,
+  label: string,
+): void {
+  const diagnostic = controlledReconciliationResponsePushDiagnostic(frames, target, outcome, label)
+  expect(diagnostic).toBe(`reconciliation-response-push-mismatch:${label}`)
+  expect(diagnostic.includes(controlledReconciliationSecret)).toBeFalse()
+}
+
+test("Reconciliation response/push audit rejects a push that precedes its response", () => {
+  const view = controlledReconciliationView()
+  const outcome = controlledReconciliationOutcome(view)
+  expectControlledReconciliationResponsePushFailure([
     { type: "target-view", view },
-    { type: "response", result: { kind: "action-outcome", outcome: { status: "applied", view } } },
-  ], "controlled-order")).toBe("claude-direct-response-push-mismatch:controlled-order")
+    { type: "response", result: { kind: "action-outcome", outcome } },
+  ], "codex", outcome, "controlled-order")
 })
 
-test("Direct response/push audit rejects a missing push", async () => {
-  const view = controlledDirectView()
-  expect(await controlledDirectResponsePushDiagnostic([
-    { type: "response", result: { kind: "action-outcome", outcome: { status: "applied", view } } },
-  ], "controlled-missing-push")).toBe("claude-direct-response-push-mismatch:controlled-missing-push")
+test("Reconciliation response/push audit rejects a missing push", () => {
+  const view = controlledReconciliationView()
+  const outcome = controlledReconciliationOutcome(view)
+  expectControlledReconciliationResponsePushFailure([
+    { type: "response", result: { kind: "action-outcome", outcome } },
+  ], "codex", outcome, "controlled-missing-push")
 })
 
-test("Direct response/push audit rejects a duplicate push", async () => {
-  const view = controlledDirectView()
-  expect(await controlledDirectResponsePushDiagnostic([
-    { type: "response", result: { kind: "action-outcome", outcome: { status: "applied", view } } },
+test("Reconciliation response/push audit rejects a duplicate push", () => {
+  const view = controlledReconciliationView()
+  const outcome = controlledReconciliationOutcome(view)
+  expectControlledReconciliationResponsePushFailure([
+    { type: "response", result: { kind: "action-outcome", outcome } },
     { type: "target-view", view },
     { type: "target-view", view },
-  ], "controlled-duplicate-push")).toBe("claude-direct-response-push-mismatch:controlled-duplicate-push")
+  ], "codex", outcome, "controlled-duplicate-push")
 })
 
-test("Direct response/push audit rejects the wrong Target and action view", async () => {
-  for (const [label, view] of [
-    ["wrong-target", controlledDirectView({ target: "codex" })],
-    ["wrong-view", controlledDirectView({
-      activatedSnapshot: {
-        providerId: controlledDirectExpected.providerId,
-        model: "wrong-model",
-        protocol: "anthropic-messages",
-      },
-    })],
-  ] as const) {
-    const diagnostic = await controlledDirectResponsePushDiagnostic([
-      { type: "response", result: { kind: "action-outcome", outcome: { status: "applied", view } } },
-      { type: "target-view", view },
-    ], `controlled-${label}`)
-    expect(diagnostic).toBe(`claude-direct-response-push-mismatch:controlled-${label}`)
-    expect(diagnostic.includes("wrong-model")).toBeFalse()
-  }
+test("Reconciliation response/push audit rejects the wrong Target", () => {
+  const view = controlledReconciliationView({ target: "claude" })
+  const outcome = controlledReconciliationOutcome(view)
+  expectControlledReconciliationResponsePushFailure([
+    { type: "response", result: { kind: "action-outcome", outcome } },
+    { type: "target-view", view },
+  ], "codex", outcome, "controlled-wrong-target")
+})
+
+test("Reconciliation response/push audit rejects the wrong action view", () => {
+  const expectedView = controlledReconciliationView()
+  const expectedOutcome = controlledReconciliationOutcome(expectedView)
+  const wrongView = controlledReconciliationView({ viewSequence: 18 })
+  const wrongOutcome = controlledReconciliationOutcome(wrongView)
+  expectControlledReconciliationResponsePushFailure([
+    { type: "response", result: { kind: "action-outcome", outcome: wrongOutcome } },
+    { type: "target-view", view: wrongView },
+  ], "codex", expectedOutcome, "controlled-wrong-view")
 })
 
 test("listener observer uses event turns and a bounded negative barrier", async () => {

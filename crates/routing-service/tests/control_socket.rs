@@ -213,9 +213,24 @@ impl ControlFixture {
         fs::create_dir_all(&user_home).unwrap();
         let home = MuxviaHome::from_user_home(&user_home);
         let store = Arc::new(StateStore::open(&home).await.unwrap());
-        let handle = ControlServer::bind(&home, Arc::clone(&store), "routing-test")
-            .await
-            .unwrap();
+        let activation = Arc::new(
+            ActivationService::new(
+                Arc::clone(&store),
+                home.clone(),
+                Arc::new(ControlCodexProbe),
+                "/usr/bin/codex".into(),
+                Arc::new(ControlNoopUpstream),
+            )
+            .with_claude_runtime(Arc::new(ControlClaudeProbe), "/usr/bin/claude".into()),
+        );
+        let handle = ControlServer::bind_with_activation(
+            &home,
+            Arc::clone(&store),
+            "routing-test",
+            activation,
+        )
+        .await
+        .unwrap();
         Self {
             root,
             store,
@@ -1213,7 +1228,7 @@ async fn reconciliation_preview_codex_direct_is_read_only_and_emits_no_target_vi
             "acknowledgementRequired": false
         })
     );
-    assert_eq!(runtime_probe.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(runtime_probe.calls.load(Ordering::SeqCst), 3);
     assert_eq!(preview["result"]["preview"]["managementRevision"], revision);
     assert!(!preview.to_string().contains("preview-secret"));
     assert_eq!(fs::read(home.database_path()).unwrap(), before_database);
@@ -1764,6 +1779,18 @@ async fn claude_receipts_replay_before_malformed_actions_or_duplicate_pushes() {
         json!({ "kind": "open-target", "target": "claude" }),
     )
     .await;
+
+    let malformed = request(
+        &mut stream,
+        "claude-malformed-before-context",
+        json!({
+            "kind":"act","target":"claude","actionId":Uuid::new_v4(),
+            "expectedRevision":0,
+            "action":{"kind":"create-provider","name":42}
+        }),
+    )
+    .await;
+    assert_eq!(malformed["problem"]["code"], "invalid-provider");
 
     let action_id = Uuid::new_v4();
     write_frame(

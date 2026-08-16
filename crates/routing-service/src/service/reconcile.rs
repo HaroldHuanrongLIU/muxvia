@@ -14,11 +14,17 @@ use crate::{
     claude::{ClaudeConfigCodec, ClaudeProbe},
     codex::{CodexConfigCodec, CodexProbe, FileIdentity},
     control::protocol::{
-        CompatibilityClassification, CompatibilityView, ControlProblem, ProviderEffect,
-        ReconciliationPreview, ReconciliationStrategy, ShadowSource, Target,
+        ActionOutcome, CompatibilityClassification, CompatibilityView, ControlProblem,
+        ProviderEffect, ReconciliationField, ReconciliationFieldState, ReconciliationPreview,
+        ReconciliationStrategy, ShadowSource, Target,
     },
+    domain::activation::ActivatedSnapshot,
     home::MuxviaHome,
-    state::{StateError, StateStore},
+    model::{ModelServerError, ModelServerHandle},
+    state::{
+        ActionFailure, AdoptReconciliation, ManagedWriteStatus, ReconciliationCommit,
+        ReconciliationCommitFailpoint, ReconciliationCommitInput, StateError, StateStore,
+    },
 };
 
 use super::reconciliation_adapter::{
@@ -41,6 +47,100 @@ pub(crate) struct ReconciliationRuntime {
     pub(crate) codex_executable: PathBuf,
     pub(crate) claude_executable: PathBuf,
     pub(crate) configuration_home_override: Option<PathBuf>,
+    pub(crate) target_runtime: ReconciliationTargetRuntime,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReconciliationTargetRuntime {
+    codex: Arc<Mutex<Option<ModelServerHandle>>>,
+    claude: Arc<Mutex<Option<ModelServerHandle>>>,
+    codex_gate: Arc<Mutex<()>>,
+    claude_gate: Arc<Mutex<()>>,
+}
+
+impl ReconciliationTargetRuntime {
+    pub(crate) fn new(
+        codex: Arc<Mutex<Option<ModelServerHandle>>>,
+        claude: Arc<Mutex<Option<ModelServerHandle>>>,
+        codex_gate: Arc<Mutex<()>>,
+        claude_gate: Arc<Mutex<()>>,
+    ) -> Self {
+        Self {
+            codex,
+            claude,
+            codex_gate,
+            claude_gate,
+        }
+    }
+
+    #[cfg(test)]
+    fn empty() -> Self {
+        Self::new(
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+        )
+    }
+
+    fn slot(&self, target: Target) -> &Mutex<Option<ModelServerHandle>> {
+        match target {
+            Target::Codex => &self.codex,
+            Target::Claude => &self.claude,
+        }
+    }
+
+    fn gate(&self, target: Target) -> &Mutex<()> {
+        match target {
+            Target::Codex => &self.codex_gate,
+            Target::Claude => &self.claude_gate,
+        }
+    }
+
+    fn gate_arc(&self, target: Target) -> Arc<Mutex<()>> {
+        match target {
+            Target::Codex => Arc::clone(&self.codex_gate),
+            Target::Claude => Arc::clone(&self.claude_gate),
+        }
+    }
+
+    pub(crate) async fn active_request_count(&self, target: Target) -> usize {
+        self.slot(target)
+            .lock()
+            .await
+            .as_ref()
+            .map_or(0, ModelServerHandle::active_request_count)
+    }
+
+    pub(crate) async fn reserve_if_idle(
+        &self,
+        target: Target,
+    ) -> Result<Option<ModelServerHandle>, ModelServerError> {
+        let mut slot = self.slot(target).lock().await;
+        if let Some(handle) = slot.as_ref()
+            && !handle.try_reserve_idle()
+        {
+            return Err(ModelServerError::Task);
+        }
+        Ok(slot.take())
+    }
+
+    pub(crate) async fn restore_reserved(&self, target: Target, handle: Option<ModelServerHandle>) {
+        if let Some(handle) = handle {
+            handle.release_idle_reservation();
+            *self.slot(target).lock().await = Some(handle);
+        }
+    }
+
+    pub(crate) async fn shutdown_reserved(
+        &self,
+        handle: Option<ModelServerHandle>,
+    ) -> Result<(), ModelServerError> {
+        match handle {
+            Some(handle) => handle.shutdown().await,
+            None => Ok(()),
+        }
+    }
 }
 
 pub(crate) struct ClaudeRuntimeContext {
@@ -110,6 +210,8 @@ impl fmt::Debug for ObservationRecord {
 #[derive(Debug)]
 pub(crate) struct ValidatedReconciliation {
     pub(crate) prepared: PreparedConfiguration,
+    compatibility: CompatibilityView,
+    management_revision: u64,
 }
 
 pub(crate) struct ReconciliationService {
@@ -118,6 +220,41 @@ pub(crate) struct ReconciliationService {
     registration_locks: HashMap<ObservationKey, Arc<Mutex<()>>>,
     codex: CodexRuntimeContext,
     claude: ClaudeRuntimeContext,
+    target_runtime: ReconciliationTargetRuntime,
+    hooks: ReconciliationHooks,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum ReconciliationFailpoint {
+    #[default]
+    None,
+    AfterIntent,
+    AtomicWrite,
+    Verify,
+    ListenerStop,
+    CredentialInsert,
+    ProviderInsert,
+    SnapshotInsert,
+    FinalRevision,
+    FinalTransaction,
+    RollbackVerify,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ReconciliationHooks {
+    pub(crate) failpoint: ReconciliationFailpoint,
+    #[cfg(test)]
+    pause_after_verify: Option<Arc<ReconciliationPause>>,
+    #[cfg(test)]
+    pause_after_reserve: Option<Arc<ReconciliationPause>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ReconciliationPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 pub(crate) struct PreviewRegistration {
@@ -129,6 +266,9 @@ pub(crate) struct PreviewRegistration {
 }
 
 impl ReconciliationService {
+    pub(crate) async fn lock_target_mutation(&self, target: Target) -> OwnedMutexGuard<()> {
+        self.target_runtime.gate_arc(target).lock_owned().await
+    }
     pub(crate) fn from_runtime(state: Arc<StateStore>, runtime: ReconciliationRuntime) -> Self {
         let home = &runtime.home;
         let mut registration_locks = HashMap::new();
@@ -156,7 +296,15 @@ impl ReconciliationService {
                 executable: runtime.claude_executable,
                 user_home: home.user_home().to_path_buf(),
             },
+            target_runtime: runtime.target_runtime,
+            hooks: ReconciliationHooks::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_hooks(mut self, hooks: ReconciliationHooks) -> Self {
+        self.hooks = hooks;
+        self
     }
 
     #[cfg(test)]
@@ -292,7 +440,573 @@ impl ReconciliationService {
         }
         Ok(ValidatedReconciliation {
             prepared: observed.prepared,
+            compatibility: expected.compatibility,
+            management_revision: expected.management_revision,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn apply(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        expected_revision: u64,
+        strategy: ReconciliationStrategy,
+        observation_token: Uuid,
+        acknowledge_version: Option<String>,
+        context: ReconciliationContext,
+    ) -> Result<ActionOutcome, ActionFailure> {
+        match self.state.receipt_for(target, action_id).await {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => {}
+            Err(_) => return Err(self.failure(target, "state-store-error").await),
+        }
+        let _gate = self.target_runtime.gate(target).lock().await;
+        let key = ObservationKey(target, strategy);
+        let registration_lock = Arc::clone(
+            self.registration_locks
+                .get(&key)
+                .expect("every closed reconciliation key has a registration lock"),
+        );
+        let _registration_guard = registration_lock.lock_owned().await;
+        match self.state.receipt_for(target, action_id).await {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => {}
+            Err(_) => return Err(self.failure(target, "state-store-error").await),
+        }
+        match self.state.managed_write_status_for(target).await {
+            Ok(ManagedWriteStatus::RecoveryRequired) => {
+                return Err(self.failure(target, "recovery-required").await);
+            }
+            Ok(ManagedWriteStatus::Allowed | ManagedWriteStatus::ConfigurationDrift) => {}
+            Err(_) => return Err(self.failure(target, "state-store-error").await),
+        }
+        let validated = match self
+            .validate_preview(target, strategy, observation_token, context)
+            .await
+        {
+            Ok(validated) => validated,
+            Err(problem) => {
+                let mut failure = self.failure(target, &problem.code).await;
+                failure.problem = problem;
+                return Err(failure);
+            }
+        };
+        if validated.management_revision != expected_revision {
+            return Err(self.failure(target, "stale-revision").await);
+        }
+        let current_view = match self.state.target_view_for(target).await {
+            Ok(view) => view,
+            Err(_) => return Err(self.failure(target, "state-store-error").await),
+        };
+        let adopt_takeover =
+            strategy == ReconciliationStrategy::Adopt && current_view.takeover.state == "active";
+        let mut compatibility = validated.compatibility;
+        match compatibility.classification {
+            CompatibilityClassification::Tested => {}
+            CompatibilityClassification::UnknownCompatible => {
+                if compatibility.acknowledgement_required {
+                    if acknowledge_version.as_deref() != Some(compatibility.version.as_str()) {
+                        return Err(self
+                            .failure(target, "compatibility-acknowledgement-required")
+                            .await);
+                    }
+                    compatibility.acknowledgement_required = false;
+                }
+            }
+            CompatibilityClassification::Incompatible => {
+                return Err(self.failure(target, "incompatible-target-cli").await);
+            }
+        }
+        let expected = match self
+            .tokens
+            .lock()
+            .await
+            .get(&key)
+            .filter(|record| record.token == observation_token)
+            .cloned()
+        {
+            Some(expected) => expected,
+            None => return Err(self.failure(target, "stale-reconciliation-preview").await),
+        };
+        if !expected.shadows.is_empty() {
+            return Err(self.failure(target, "shadowing-configuration").await);
+        }
+        if (strategy == ReconciliationStrategy::Restore || adopt_takeover)
+            && self.target_runtime.active_request_count(target).await != 0
+        {
+            return Err(self.failure(target, "target-busy").await);
+        }
+        let adopt = if strategy == ReconciliationStrategy::Adopt {
+            let provider = validated
+                .prepared
+                .adopted_provider()
+                .map_err(|problem| problem.code());
+            let provider = match provider {
+                Ok(provider) => provider,
+                Err(code) => return Err(self.failure(target, code).await),
+            };
+            if adopt_takeover
+                && current_view
+                    .takeover
+                    .endpoint
+                    .as_deref()
+                    .is_some_and(|endpoint| {
+                        points_to_managed_endpoint(&provider.base_url, endpoint)
+                    })
+            {
+                return Err(self.failure(target, "stale-reconciliation-preview").await);
+            }
+            let recovery_payload_json =
+                match serde_json::to_string(&validated.prepared.adopted_recovery_payload()) {
+                    Ok(payload) => payload,
+                    Err(_) => return Err(self.failure(target, "recovery-required").await),
+                };
+            let file_identity_json = match validated.prepared.file_identity_json() {
+                Ok(identity) => identity,
+                Err(problem) => return Err(self.failure(target, problem.code()).await),
+            };
+            let provider_id = Uuid::new_v4();
+            Some(AdoptReconciliation {
+                provider_id,
+                credential_id: Uuid::new_v4(),
+                snapshot: ActivatedSnapshot {
+                    id: Uuid::new_v4(),
+                    target,
+                    provider_id,
+                    base_url: provider.base_url,
+                    model: provider.model,
+                    protocol: provider.protocol,
+                    authentication: provider.authentication,
+                    provider_credential: provider.credential,
+                    epoch: self.state.service_epoch(),
+                },
+                name: match target {
+                    Target::Codex => "Adopted Codex configuration".to_owned(),
+                    Target::Claude => "Adopted Claude configuration".to_owned(),
+                },
+                recovery_id: Uuid::new_v4(),
+                recovery_payload_json,
+                file_identity_json,
+                config_path: match target {
+                    Target::Codex => self.codex.user_home.join(".codex/config.toml"),
+                    Target::Claude => self.claude.user_home.join(".claude/settings.json"),
+                }
+                .to_string_lossy()
+                .into_owned(),
+                managed_config_version: validated.prepared.managed_config_version(),
+                exit_takeover: adopt_takeover,
+            })
+        } else {
+            None
+        };
+        let refreshed_recovery_payload_json = if strategy == ReconciliationStrategy::Reapply {
+            match serde_json::to_string(&validated.prepared.adopted_recovery_payload()) {
+                Ok(payload) => Some(payload),
+                Err(_) => return Err(self.failure(target, "recovery-required").await),
+            }
+        } else {
+            None
+        };
+        let refreshed_file_identity_json = if strategy == ReconciliationStrategy::Reapply {
+            match validated.prepared.file_identity_json() {
+                Ok(identity) => Some(identity),
+                Err(problem) => return Err(self.failure(target, problem.code()).await),
+            }
+        } else {
+            None
+        };
+        let (before_json, desired_json) = match validated.prepared.durable_material() {
+            Ok(material) => material,
+            Err(problem) => return Err(self.failure(target, problem.code()).await),
+        };
+        if self
+            .state
+            .insert_reconciliation_intent(
+                target,
+                action_id,
+                strategy,
+                expected_revision,
+                before_json,
+                desired_json,
+            )
+            .await
+            .is_err()
+        {
+            return Err(self.failure(target, "state-store-error").await);
+        }
+
+        if self.hooks.failpoint == ReconciliationFailpoint::AfterIntent {
+            return self
+                .rollback_after_intent(
+                    target,
+                    action_id,
+                    &validated.prepared,
+                    key,
+                    observation_token,
+                )
+                .await;
+        }
+
+        let applied = if self.hooks.failpoint == ReconciliationFailpoint::AtomicWrite {
+            Err(super::reconciliation_adapter::ReconciliationProblem::fixed(
+                "configuration-write-failed",
+            ))
+        } else {
+            validated.prepared.atomic_apply(&self.codex.user_home)
+        };
+        let verified = applied.and_then(|()| {
+            if self.hooks.failpoint == ReconciliationFailpoint::Verify {
+                Err(super::reconciliation_adapter::ReconciliationProblem::fixed(
+                    "configuration-write-failed",
+                ))
+            } else {
+                validated.prepared.verify(&self.codex.user_home)
+            }
+        });
+        if verified.is_err() {
+            return self
+                .rollback_after_intent(
+                    target,
+                    action_id,
+                    &validated.prepared,
+                    key,
+                    observation_token,
+                )
+                .await;
+        }
+        if self.hooks.failpoint == ReconciliationFailpoint::RollbackVerify {
+            return self
+                .rollback_after_intent(
+                    target,
+                    action_id,
+                    &validated.prepared,
+                    key,
+                    observation_token,
+                )
+                .await;
+        }
+        #[cfg(test)]
+        if let Some(pause) = &self.hooks.pause_after_verify {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+        let mut reserved_runtime = None;
+        if strategy == ReconciliationStrategy::Restore || adopt_takeover {
+            if self.hooks.failpoint == ReconciliationFailpoint::ListenerStop {
+                return self
+                    .rollback_after_intent(
+                        target,
+                        action_id,
+                        &validated.prepared,
+                        key,
+                        observation_token,
+                    )
+                    .await;
+            }
+            reserved_runtime = match self.target_runtime.reserve_if_idle(target).await {
+                Ok(runtime) => runtime,
+                Err(_) => {
+                    return self
+                        .rollback_after_intent_with_code(
+                            target,
+                            action_id,
+                            &validated.prepared,
+                            "target-busy",
+                            key,
+                            observation_token,
+                        )
+                        .await;
+                }
+            };
+            #[cfg(test)]
+            if let Some(pause) = &self.hooks.pause_after_reserve {
+                pause.reached.notify_one();
+                pause.release.notified().await;
+            }
+        }
+        let commit = self
+            .state
+            .commit_reconciliation(ReconciliationCommitInput {
+                target,
+                action_id,
+                expected_revision,
+                strategy,
+                compatibility,
+                adopt,
+                refreshed_recovery_payload_json,
+                refreshed_file_identity_json,
+                failpoint: match self.hooks.failpoint {
+                    ReconciliationFailpoint::CredentialInsert => {
+                        ReconciliationCommitFailpoint::CredentialInsert
+                    }
+                    ReconciliationFailpoint::ProviderInsert => {
+                        ReconciliationCommitFailpoint::ProviderInsert
+                    }
+                    ReconciliationFailpoint::SnapshotInsert => {
+                        ReconciliationCommitFailpoint::SnapshotInsert
+                    }
+                    ReconciliationFailpoint::FinalRevision => {
+                        ReconciliationCommitFailpoint::FinalRevision
+                    }
+                    ReconciliationFailpoint::FinalTransaction => {
+                        ReconciliationCommitFailpoint::FinalTransaction
+                    }
+                    _ => ReconciliationCommitFailpoint::None,
+                },
+            })
+            .await;
+        match commit {
+            Ok(ReconciliationCommit::Applied(outcome)) => {
+                if self
+                    .target_runtime
+                    .shutdown_reserved(reserved_runtime.take())
+                    .await
+                    .is_err()
+                {
+                    let recovery = match self
+                        .state
+                        .mark_committed_reconciliation_recovery_required(target, action_id)
+                        .await
+                    {
+                        Ok(recovery) => recovery,
+                        Err(_) => return Err(self.failure(target, "state-store-error").await),
+                    };
+                    self.consume_token(key, observation_token).await;
+                    self.state.publish_target_view(recovery.view.clone());
+                    return Ok(recovery);
+                }
+                self.consume_token(key, observation_token).await;
+                self.state.publish_target_view(outcome.view.clone());
+                Ok(outcome)
+            }
+            Ok(ReconciliationCommit::Replayed(outcome)) => {
+                let _ = self
+                    .target_runtime
+                    .shutdown_reserved(reserved_runtime.take())
+                    .await;
+                Ok(outcome)
+            }
+            Ok(ReconciliationCommit::Stale) => {
+                self.target_runtime
+                    .restore_reserved(target, reserved_runtime.take())
+                    .await;
+                self.rollback_after_intent_with_code(
+                    target,
+                    action_id,
+                    &validated.prepared,
+                    "stale-revision",
+                    key,
+                    observation_token,
+                )
+                .await
+            }
+            Err(_) => {
+                self.target_runtime
+                    .restore_reserved(target, reserved_runtime.take())
+                    .await;
+                self.rollback_after_intent(
+                    target,
+                    action_id,
+                    &validated.prepared,
+                    key,
+                    observation_token,
+                )
+                .await
+            }
+        }
+    }
+
+    pub(crate) async fn ensure_ordinary_write_allowed(
+        &self,
+        target: Target,
+        context: Option<ReconciliationContext>,
+        probe_unmanaged_provider_write: bool,
+    ) -> Result<(), ActionFailure> {
+        match self.state.managed_write_status_for(target).await {
+            Ok(ManagedWriteStatus::Allowed) => {}
+            Ok(ManagedWriteStatus::ConfigurationDrift) => {
+                return Err(self.failure(target, "configuration-drift").await);
+            }
+            Ok(ManagedWriteStatus::RecoveryRequired) => {
+                return Err(self.failure(target, "recovery-required").await);
+            }
+            Err(_) => return Err(self.failure(target, "state-store-error").await),
+        }
+        let view = match self.state.target_view_for(target).await {
+            Ok(view) => view,
+            Err(_) => return Err(self.failure(target, "state-store-error").await),
+        };
+        if view.managed_configuration.state == "unmanaged" {
+            if !probe_unmanaged_provider_write {
+                return Ok(());
+            }
+            let compatibility = match self.probe_compatibility(target).await {
+                Ok(compatibility) => compatibility,
+                Err(problem) => {
+                    let mut failure = self.failure(target, &problem.code).await;
+                    failure.problem = problem;
+                    return Err(failure);
+                }
+            };
+            return self
+                .ensure_compatibility_allowed(target, &compatibility, false)
+                .await;
+        }
+        let Some(context) = context else {
+            return Err(self.failure(target, "preflight-context-required").await);
+        };
+        let (record, observed) = match self
+            .observe(target, ReconciliationStrategy::Reapply, &context)
+            .await
+        {
+            Ok(observed) => observed,
+            Err(problem) => {
+                let mut failure = self.failure(target, &problem.code).await;
+                failure.problem = problem;
+                return Err(failure);
+            }
+        };
+        if observed.observation.owned_drifted {
+            if self
+                .state
+                .mark_configuration_drift_for(target)
+                .await
+                .is_err()
+            {
+                return Err(self.failure(target, "state-store-error").await);
+            }
+            let failure = self.failure(target, "configuration-drift").await;
+            self.state
+                .publish_target_view(failure.authoritative_view.clone());
+            return Err(failure);
+        }
+        if !record.shadows.is_empty() {
+            return Err(self.failure(target, "shadowing-configuration").await);
+        }
+        self.ensure_compatibility_allowed(target, &record.compatibility, true)
+            .await
+    }
+
+    async fn ensure_compatibility_allowed(
+        &self,
+        target: Target,
+        compatibility: &CompatibilityView,
+        require_acknowledgement: bool,
+    ) -> Result<(), ActionFailure> {
+        match compatibility.classification {
+            CompatibilityClassification::Tested => Ok(()),
+            CompatibilityClassification::UnknownCompatible
+                if !require_acknowledgement || !compatibility.acknowledgement_required =>
+            {
+                Ok(())
+            }
+            CompatibilityClassification::UnknownCompatible => Err(self
+                .failure(target, "compatibility-acknowledgement-required")
+                .await),
+            CompatibilityClassification::Incompatible => {
+                Err(self.failure(target, "incompatible-target-cli").await)
+            }
+        }
+    }
+
+    async fn probe_compatibility(
+        &self,
+        target: Target,
+    ) -> Result<CompatibilityView, ControlProblem> {
+        let observed = match target {
+            Target::Codex => match self
+                .codex
+                .probe
+                .probe_cancellable(&self.codex.executable, CancellationToken::new())
+                .await
+            {
+                Ok(capability) => ProbedCompatibility::from(capability),
+                Err(problem) => ProbedCompatibility::new(
+                    problem.version().unwrap_or("unavailable").to_owned(),
+                    CompatibilityClassification::Incompatible,
+                ),
+            },
+            Target::Claude => match self
+                .claude
+                .probe
+                .probe_cancellable(&self.claude.executable, CancellationToken::new())
+                .await
+            {
+                Ok(capability) => ProbedCompatibility::from(capability),
+                Err(problem) => ProbedCompatibility::new(
+                    problem.version().unwrap_or("unavailable").to_owned(),
+                    CompatibilityClassification::Incompatible,
+                ),
+            },
+        };
+        self.compatibility_view(target, &observed).await
+    }
+
+    async fn rollback_after_intent(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        prepared: &PreparedConfiguration,
+        key: ObservationKey,
+        observation_token: Uuid,
+    ) -> Result<ActionOutcome, ActionFailure> {
+        self.rollback_after_intent_with_code(
+            target,
+            action_id,
+            prepared,
+            "configuration-write-failed",
+            key,
+            observation_token,
+        )
+        .await
+    }
+
+    async fn rollback_after_intent_with_code(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        prepared: &PreparedConfiguration,
+        failure_code: &'static str,
+        key: ObservationKey,
+        observation_token: Uuid,
+    ) -> Result<ActionOutcome, ActionFailure> {
+        let restored = prepared.exact_rollback(&self.codex.user_home);
+        if self.hooks.failpoint != ReconciliationFailpoint::RollbackVerify
+            && restored.is_ok()
+            && self
+                .state
+                .set_reconciliation_intent_state(target, action_id, "rolled-back")
+                .await
+                .is_ok()
+        {
+            return Err(self.failure(target, failure_code).await);
+        }
+        match self
+            .state
+            .mark_reconciliation_recovery_required(target, action_id)
+            .await
+        {
+            Ok(outcome) => {
+                self.consume_token(key, observation_token).await;
+                self.state.publish_target_view(outcome.view.clone());
+                Ok(outcome)
+            }
+            Err(_) => Err(self.failure(target, "state-store-error").await),
+        }
+    }
+
+    async fn consume_token(&self, key: ObservationKey, token: Uuid) {
+        let mut tokens = self.tokens.lock().await;
+        if tokens.get(&key).is_some_and(|record| record.token == token) {
+            tokens.remove(&key);
+        }
+    }
+
+    async fn failure(&self, target: Target, code: &str) -> ActionFailure {
+        self.state
+            .failure_for(target, code, stable_message(code))
+            .await
     }
 
     async fn observe(
@@ -419,9 +1133,19 @@ impl ReconciliationService {
         if cancellation.is_cancelled() {
             return Err(stable_problem("inspection-cancelled"));
         }
-        let observed = adapter
+        let mut observed = adapter
             .observe(strategy, &committed, context, compatibility.clone())
             .map_err(|problem| stable_problem(problem.code()))?;
+        if strategy == ReconciliationStrategy::Adopt
+            && view.takeover.state == "active"
+            && let Some(takeover) = observed
+                .observation
+                .changes
+                .iter_mut()
+                .find(|change| change.field == ReconciliationField::Takeover)
+        {
+            takeover.state = ReconciliationFieldState::Absent;
+        }
         let compatibility = self.compatibility_view(target, &compatibility).await?;
         let record = ObservationRecord {
             token: Uuid::new_v4(),
@@ -504,21 +1228,46 @@ fn stale_preview() -> ControlProblem {
 }
 
 fn stable_problem(code: &str) -> ControlProblem {
-    let message = match code {
+    let message = stable_message(code);
+    ControlProblem {
+        code: code.to_owned(),
+        message: message.to_owned(),
+        source: None,
+        selector: None,
+    }
+}
+
+fn points_to_managed_endpoint(base_url: &str, endpoint: &str) -> bool {
+    let (Ok(base_url), Ok(endpoint)) = (url::Url::parse(base_url), url::Url::parse(endpoint))
+    else {
+        return false;
+    };
+    let base_is_loopback = base_url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    base_is_loopback && base_url.port_or_known_default() == endpoint.port_or_known_default()
+}
+
+fn stable_message(code: &str) -> &'static str {
+    match code {
         "stale-reconciliation-preview" => "Target state changed; preview again",
+        "stale-revision" => "Target state changed; refresh and retry",
         "recovery-required" => "Managed configuration requires recovery",
         "state-store-error" => "State store unavailable",
         "configuration-drift" => "Managed configuration drift must be reconciled",
         "shadowing-configuration" => "A higher-priority configuration source is active",
         "unsupported-configuration-home" => "Configuration Home is unsupported",
         "unsafe-managed-file" => "Managed configuration is unsafe",
+        "compatibility-acknowledgement-required" => {
+            "Acknowledge this exact untested Target CLI version"
+        }
+        "incompatible-target-cli" => "Target CLI is incompatible",
+        "target-busy" => "Target has an active model request",
+        "configuration-write-failed" => "Reconciliation preview failed",
         _ => "Reconciliation preview failed",
-    };
-    ControlProblem {
-        code: code.to_owned(),
-        message: message.to_owned(),
-        source: None,
-        selector: None,
     }
 }
 
@@ -536,6 +1285,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::{body::Bytes, http::StatusCode};
     use futures_util::stream;
+    use secrecy::ExposeSecret;
     use tempfile::TempDir;
     use tokio_rusqlite::rusqlite::Connection;
     use tokio_util::sync::CancellationToken;
@@ -661,6 +1411,7 @@ mod tests {
                 codex_executable: "/usr/bin/codex".into(),
                 claude_executable: "/usr/bin/claude".into(),
                 configuration_home_override: None,
+                target_runtime: super::ReconciliationTargetRuntime::empty(),
             },
         )
     }
@@ -794,6 +1545,24 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(modified))
             .unwrap();
+    }
+
+    fn reconciliation_row_counts(home: &MuxviaHome) -> [u64; 5] {
+        let connection = Connection::open(home.database_path()).unwrap();
+        [
+            "credentials",
+            "providers",
+            "activated_snapshots",
+            "activation_recovery",
+            "action_receipts",
+        ]
+        .map(|table| {
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        })
     }
 
     #[tokio::test]
@@ -963,6 +1732,7 @@ mod tests {
                 configuration_home_override: Some(
                     fixture.home.user_home().join("nondefault-codex-home"),
                 ),
+                target_runtime: super::ReconciliationTargetRuntime::empty(),
             },
         );
         let failure = service
@@ -975,6 +1745,730 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.code, "unsupported-configuration-home");
         assert_eq!(service.token_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_post_intent_failpoints_roll_back_or_persist_replayable_recovery() {
+        for failpoint in [
+            super::ReconciliationFailpoint::AfterIntent,
+            super::ReconciliationFailpoint::AtomicWrite,
+            super::ReconciliationFailpoint::Verify,
+            super::ReconciliationFailpoint::FinalTransaction,
+            super::ReconciliationFailpoint::RollbackVerify,
+        ] {
+            let fixture = Fixture::new().await;
+            let service = reconciliation_service(
+                Arc::clone(&fixture.store),
+                &fixture.home,
+                fixture.probe.clone(),
+            )
+            .with_hooks(super::ReconciliationHooks {
+                failpoint,
+                ..Default::default()
+            });
+            let before = fs::read(fixture.home.user_home().join(".codex/config.toml")).unwrap();
+            let preview = service
+                .preview(
+                    Target::Codex,
+                    ReconciliationStrategy::Reapply,
+                    ReconciliationContext::Codex,
+                )
+                .await
+                .unwrap();
+            let action_id = Uuid::new_v4();
+            let result = service
+                .apply(
+                    Target::Codex,
+                    action_id,
+                    preview.management_revision,
+                    ReconciliationStrategy::Reapply,
+                    preview.observation_token,
+                    None,
+                    ReconciliationContext::Codex,
+                )
+                .await;
+            if failpoint == super::ReconciliationFailpoint::RollbackVerify {
+                let outcome = result.unwrap();
+                assert_eq!(outcome.view.recovery.state, "recovery-required");
+                let replay = fixture
+                    .store
+                    .receipt_for(Target::Codex, action_id)
+                    .await
+                    .unwrap()
+                    .expect("failed rollback must leave a replay-consistent receipt");
+                assert_eq!(replay.view.recovery.state, "recovery-required");
+                let replayed = service
+                    .apply(
+                        Target::Codex,
+                        action_id,
+                        preview.management_revision,
+                        ReconciliationStrategy::Reapply,
+                        preview.observation_token,
+                        None,
+                        ReconciliationContext::Codex,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    replayed.status,
+                    crate::control::protocol::ActionStatus::Replayed
+                );
+                assert_eq!(replayed.view, outcome.view);
+                let blocked_preview = service
+                    .preview(
+                        Target::Codex,
+                        ReconciliationStrategy::Reapply,
+                        ReconciliationContext::Codex,
+                    )
+                    .await
+                    .unwrap();
+                let blocked = service
+                    .apply(
+                        Target::Codex,
+                        Uuid::new_v4(),
+                        blocked_preview.management_revision,
+                        ReconciliationStrategy::Reapply,
+                        blocked_preview.observation_token,
+                        None,
+                        ReconciliationContext::Codex,
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(blocked.problem.code, "recovery-required");
+            } else {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.problem.code, "configuration-write-failed");
+                assert_eq!(
+                    fs::read(fixture.home.user_home().join(".codex/config.toml")).unwrap(),
+                    before
+                );
+                assert!(
+                    fixture
+                        .store
+                        .receipt_for(Target::Codex, action_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn adopt_commit_boundary_failpoints_abort_without_partial_state_or_publish() {
+        for failpoint in [
+            super::ReconciliationFailpoint::CredentialInsert,
+            super::ReconciliationFailpoint::ProviderInsert,
+            super::ReconciliationFailpoint::SnapshotInsert,
+            super::ReconciliationFailpoint::FinalRevision,
+            super::ReconciliationFailpoint::FinalTransaction,
+        ] {
+            let fixture = Fixture::new().await;
+            let config_path = fixture.home.user_home().join(".codex/config.toml");
+            fs::write(
+                &config_path,
+                r#"model = "external-model"
+model_provider = "muxvia_codex"
+unrelated = "preserve"
+
+[model_providers.muxvia_codex]
+name = "External"
+base_url = "https://external.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer distinct-external-secret" }
+supports_websockets = false
+"#,
+            )
+            .unwrap();
+            fixture
+                .store
+                .mark_configuration_drift_for(Target::Codex)
+                .await
+                .unwrap();
+            let before_bytes = fs::read(&config_path).unwrap();
+            let before_counts = reconciliation_row_counts(&fixture.home);
+            let before_view =
+                serde_json::to_value(fixture.store.target_view_for(Target::Codex).await.unwrap())
+                    .unwrap();
+            let service = reconciliation_service(
+                Arc::clone(&fixture.store),
+                &fixture.home,
+                fixture.probe.clone(),
+            )
+            .with_hooks(super::ReconciliationHooks {
+                failpoint,
+                ..Default::default()
+            });
+            let preview = service
+                .preview(
+                    Target::Codex,
+                    ReconciliationStrategy::Adopt,
+                    ReconciliationContext::Codex,
+                )
+                .await
+                .unwrap();
+            let action_id = Uuid::new_v4();
+            let mut updates = fixture.store.subscribe_target_views();
+
+            let failure = service
+                .apply(
+                    Target::Codex,
+                    action_id,
+                    preview.management_revision,
+                    ReconciliationStrategy::Adopt,
+                    preview.observation_token,
+                    None,
+                    ReconciliationContext::Codex,
+                )
+                .await
+                .unwrap_err();
+
+            assert_eq!(failure.problem.code, "configuration-write-failed");
+            assert_eq!(fs::read(&config_path).unwrap(), before_bytes);
+            assert_eq!(reconciliation_row_counts(&fixture.home), before_counts);
+            assert_eq!(
+                serde_json::to_value(fixture.store.target_view_for(Target::Codex).await.unwrap())
+                    .unwrap(),
+                before_view
+            );
+            assert!(
+                fixture
+                    .store
+                    .receipt_for(Target::Codex, action_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                updates.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+            assert_eq!(
+                service
+                    .target_runtime
+                    .active_request_count(Target::Codex)
+                    .await,
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_listener_stop_failpoint_exactly_rolls_back_without_state_or_runtime_mutation()
+    {
+        let fixture = Fixture::new().await;
+        let view = fixture.store.target_view_for(Target::Codex).await.unwrap();
+        let provider_id = view.current_provider_id.as_deref().unwrap();
+        let activation = ActivationService::new(
+            Arc::clone(&fixture.store),
+            fixture.home.clone(),
+            fixture.probe.clone(),
+            "/usr/bin/codex".into(),
+            Arc::new(NoopUpstream),
+        );
+        activation
+            .apply_raw_for(
+                Target::Codex,
+                Uuid::new_v4(),
+                view.management_revision,
+                serde_json::json!({
+                    "kind": "activate-provider",
+                    "providerId": provider_id,
+                    "mode": "takeover"
+                }),
+            )
+            .await
+            .unwrap();
+        let endpoint_before = activation.model_endpoint_for(Target::Codex).await;
+        let config_path = fixture.home.user_home().join(".codex/config.toml");
+        let mut drifted = fs::read_to_string(&config_path).unwrap();
+        drifted.push_str("\nlistener_stop_unrelated = \"preserve\"\n");
+        drifted = drifted.replace("gpt-test", "listener-stop-drift");
+        fs::write(&config_path, drifted).unwrap();
+        fixture
+            .store
+            .mark_configuration_drift_for(Target::Codex)
+            .await
+            .unwrap();
+        let before_bytes = fs::read(&config_path).unwrap();
+        let before_counts = reconciliation_row_counts(&fixture.home);
+        let before_view =
+            serde_json::to_value(fixture.store.target_view_for(Target::Codex).await.unwrap())
+                .unwrap();
+        let service = ReconciliationService::from_runtime(
+            Arc::clone(&fixture.store),
+            activation.reconciliation_runtime(),
+        )
+        .with_hooks(super::ReconciliationHooks {
+            failpoint: super::ReconciliationFailpoint::ListenerStop,
+            ..Default::default()
+        });
+        let preview = service
+            .preview(
+                Target::Codex,
+                ReconciliationStrategy::Restore,
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap();
+        let action_id = Uuid::new_v4();
+        let mut updates = fixture.store.subscribe_target_views();
+
+        let failure = service
+            .apply(
+                Target::Codex,
+                action_id,
+                preview.management_revision,
+                ReconciliationStrategy::Restore,
+                preview.observation_token,
+                None,
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(failure.problem.code, "configuration-write-failed");
+        assert_eq!(fs::read(&config_path).unwrap(), before_bytes);
+        assert_eq!(reconciliation_row_counts(&fixture.home), before_counts);
+        assert_eq!(
+            serde_json::to_value(fixture.store.target_view_for(Target::Codex).await.unwrap())
+                .unwrap(),
+            before_view
+        );
+        assert!(
+            fixture
+                .store
+                .receipt_for(Target::Codex, action_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            updates.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            activation.model_endpoint_for(Target::Codex).await,
+            endpoint_before
+        );
+        activation.shutdown_models().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_target_gate_serializes_reconcile_with_save_and_activation_but_not_peer() {
+        let fixture = Fixture::new().await;
+        let activation = Arc::new(ActivationService::new(
+            Arc::clone(&fixture.store),
+            fixture.home.clone(),
+            fixture.probe.clone(),
+            "/usr/bin/codex".into(),
+            Arc::new(NoopUpstream),
+        ));
+        let pause = Arc::new(super::ReconciliationPause::default());
+        let service = Arc::new(
+            ReconciliationService::from_runtime(
+                Arc::clone(&fixture.store),
+                activation.reconciliation_runtime(),
+            )
+            .with_hooks(super::ReconciliationHooks {
+                pause_after_verify: Some(Arc::clone(&pause)),
+                ..Default::default()
+            }),
+        );
+        let config_path = fixture.home.user_home().join(".codex/config.toml");
+        fs::write(
+            &config_path,
+            fs::read_to_string(&config_path)
+                .unwrap()
+                .replace("gpt-test", "shared-gate-drift"),
+        )
+        .unwrap();
+        let preview = service
+            .preview(
+                Target::Codex,
+                ReconciliationStrategy::Reapply,
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap();
+        let before = fixture.store.target_view_for(Target::Codex).await.unwrap();
+        let provider_id = before.current_provider_id.clone().unwrap();
+        let reconcile = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .apply(
+                        Target::Codex,
+                        Uuid::new_v4(),
+                        preview.management_revision,
+                        ReconciliationStrategy::Reapply,
+                        preview.observation_token,
+                        None,
+                        ReconciliationContext::Codex,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), pause.reached.notified())
+            .await
+            .expect("reconciliation did not pause after verified file write");
+        let save = tokio::spawn({
+            let activation = Arc::clone(&activation);
+            async move {
+                activation
+                    .apply_raw_for(
+                        Target::Codex,
+                        Uuid::new_v4(),
+                        before.management_revision,
+                        serde_json::json!({
+                            "kind":"create-provider","name":"same-target",
+                            "baseUrl":"https://same-target.test/v1","model":"same",
+                            "credential":{"kind":"replace","value":"same-target-secret"},
+                            "authentication":"openai-bearer","presetKey":null
+                        }),
+                    )
+                    .await
+            }
+        });
+        let activate = tokio::spawn({
+            let activation = Arc::clone(&activation);
+            async move {
+                activation
+                    .apply_raw_for(
+                        Target::Codex,
+                        Uuid::new_v4(),
+                        before.management_revision,
+                        serde_json::json!({
+                            "kind":"activate-provider","providerId":provider_id,"mode":"direct"
+                        }),
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!save.is_finished());
+        assert!(!activate.is_finished());
+        let peer = activation
+            .apply_raw_for(
+                Target::Claude,
+                Uuid::new_v4(),
+                0,
+                serde_json::json!({
+                    "kind":"create-provider","name":"peer",
+                    "baseUrl":"https://peer.test/v1","model":"peer",
+                    "credential":{"kind":"replace","value":"peer-secret"},
+                    "authentication":"anthropic-api-key","presetKey":null
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(peer.view.management_revision, 1);
+        pause.release.notify_one();
+        reconcile.await.unwrap().unwrap();
+        assert_eq!(
+            save.await.unwrap().unwrap_err().problem.code,
+            "stale-revision"
+        );
+        assert_eq!(
+            activate.await.unwrap().unwrap_err().problem.code,
+            "stale-revision"
+        );
+        let rendered = fs::read_to_string(config_path).unwrap();
+        assert!(rendered.contains("gpt-test"));
+        assert!(!rendered.contains("shared-gate-drift"));
+    }
+
+    #[tokio::test]
+    async fn restore_idle_reservation_rejects_a_new_real_request_before_commit() {
+        let fixture = Fixture::new().await;
+        let view = fixture.store.target_view_for(Target::Codex).await.unwrap();
+        let provider_id = view.current_provider_id.clone().unwrap();
+        let activation = Arc::new(ActivationService::new(
+            Arc::clone(&fixture.store),
+            fixture.home.clone(),
+            fixture.probe.clone(),
+            "/usr/bin/codex".into(),
+            Arc::new(NoopUpstream),
+        ));
+        activation
+            .apply_raw_for(
+                Target::Codex,
+                Uuid::new_v4(),
+                view.management_revision,
+                serde_json::json!({
+                    "kind":"activate-provider","providerId":provider_id,"mode":"takeover"
+                }),
+            )
+            .await
+            .unwrap();
+        let endpoint = activation.model_endpoint_for(Target::Codex).await.unwrap();
+        let routing_credential = fixture
+            .store
+            .routing_credential_for(Target::Codex)
+            .await
+            .unwrap()
+            .unwrap();
+        let config_path = fixture.home.user_home().join(".codex/config.toml");
+        fs::write(
+            &config_path,
+            fs::read_to_string(&config_path)
+                .unwrap()
+                .replace("gpt-test", "reservation-race-drift"),
+        )
+        .unwrap();
+        let pause = Arc::new(super::ReconciliationPause::default());
+        let service = Arc::new(
+            ReconciliationService::from_runtime(
+                Arc::clone(&fixture.store),
+                activation.reconciliation_runtime(),
+            )
+            .with_hooks(super::ReconciliationHooks {
+                pause_after_reserve: Some(Arc::clone(&pause)),
+                ..Default::default()
+            }),
+        );
+        let preview = service
+            .preview(
+                Target::Codex,
+                ReconciliationStrategy::Restore,
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap();
+        let restore = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .apply(
+                        Target::Codex,
+                        Uuid::new_v4(),
+                        preview.management_revision,
+                        ReconciliationStrategy::Restore,
+                        preview.observation_token,
+                        None,
+                        ReconciliationContext::Codex,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), pause.reached.notified())
+            .await
+            .expect("Restore did not reach the idle reservation");
+        let rejected = reqwest::Client::new()
+            .post(format!("http://{endpoint}/v1/responses"))
+            .header(
+                "X-Muxvia-Routing-Credential",
+                routing_credential.expose_secret(),
+            )
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        pause.release.notify_one();
+        restore.await.unwrap().unwrap();
+        assert!(activation.model_endpoint_for(Target::Codex).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn adopt_transaction_abort_releases_idle_reservation_and_keeps_takeover_live() {
+        let fixture = Fixture::new().await;
+        let view = fixture.store.target_view_for(Target::Codex).await.unwrap();
+        let provider_id = view.current_provider_id.clone().unwrap();
+        let activation = Arc::new(ActivationService::new(
+            Arc::clone(&fixture.store),
+            fixture.home.clone(),
+            fixture.probe.clone(),
+            "/usr/bin/codex".into(),
+            Arc::new(NoopUpstream),
+        ));
+        activation
+            .apply_raw_for(
+                Target::Codex,
+                Uuid::new_v4(),
+                view.management_revision,
+                serde_json::json!({
+                    "kind":"activate-provider","providerId":provider_id,"mode":"takeover"
+                }),
+            )
+            .await
+            .unwrap();
+        let endpoint = activation.model_endpoint_for(Target::Codex).await.unwrap();
+        let routing_credential = fixture
+            .store
+            .routing_credential_for(Target::Codex)
+            .await
+            .unwrap()
+            .unwrap();
+        let config_path = fixture.home.user_home().join(".codex/config.toml");
+        fs::write(
+            &config_path,
+            r#"model = "external-adopt"
+model_provider = "muxvia_codex"
+[model_providers.muxvia_codex]
+name = "External"
+base_url = "https://external-adopt.test/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer external-adopt-secret" }
+supports_websockets = false
+"#,
+        )
+        .unwrap();
+        let before_file = fs::read(&config_path).unwrap();
+        let before_view = fixture.store.target_view_for(Target::Codex).await.unwrap();
+        let service = ReconciliationService::from_runtime(
+            Arc::clone(&fixture.store),
+            activation.reconciliation_runtime(),
+        )
+        .with_hooks(super::ReconciliationHooks {
+            failpoint: super::ReconciliationFailpoint::FinalTransaction,
+            ..Default::default()
+        });
+        let preview = service
+            .preview(
+                Target::Codex,
+                ReconciliationStrategy::Adopt,
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap();
+        let action_id = Uuid::new_v4();
+        let failed = service
+            .apply(
+                Target::Codex,
+                action_id,
+                preview.management_revision,
+                ReconciliationStrategy::Adopt,
+                preview.observation_token,
+                None,
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failed.problem.code, "configuration-write-failed");
+        assert_eq!(fs::read(&config_path).unwrap(), before_file);
+        assert_eq!(
+            fixture.store.target_view_for(Target::Codex).await.unwrap(),
+            before_view
+        );
+        assert_eq!(
+            activation.model_endpoint_for(Target::Codex).await,
+            Some(endpoint)
+        );
+        let admitted = reqwest::Client::new()
+            .post(format!("http://{endpoint}/v1/responses"))
+            .header(
+                "X-Muxvia-Routing-Credential",
+                routing_credential.expose_secret(),
+            )
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
+        assert!(
+            fixture
+                .store
+                .receipt_for(Target::Codex, action_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        activation.shutdown_models().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconciliation_apply_gates_exact_unknown_acknowledgement_and_incompatible_probe() {
+        let fixture = Fixture::new().await;
+        fixture.probe.set(ProbeState::Unknown("codex-next".into()));
+        let preview = fixture.preview().await;
+        let action_id = Uuid::new_v4();
+        let missing = fixture
+            .service
+            .apply(
+                Target::Codex,
+                action_id,
+                preview.management_revision,
+                ReconciliationStrategy::Reapply,
+                preview.observation_token,
+                None,
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            missing.problem.code,
+            "compatibility-acknowledgement-required"
+        );
+        assert!(
+            fixture
+                .store
+                .receipt_for(Target::Codex, action_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .service
+                .tracks_token(
+                    Target::Codex,
+                    ReconciliationStrategy::Reapply,
+                    preview.observation_token
+                )
+                .await
+        );
+        let applied = fixture
+            .service
+            .apply(
+                Target::Codex,
+                action_id,
+                preview.management_revision,
+                ReconciliationStrategy::Reapply,
+                preview.observation_token,
+                Some("codex-next".into()),
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            applied.status,
+            crate::control::protocol::ActionStatus::Applied
+        );
+        let compatibility = fixture
+            .store
+            .compatibility_for(Target::Codex)
+            .await
+            .unwrap();
+        assert_eq!(compatibility.version, "codex-next");
+        assert!(!compatibility.acknowledgement_required);
+
+        let incompatible = Fixture::new().await;
+        incompatible.probe.set(ProbeState::Incompatible);
+        let preview = incompatible.preview().await;
+        let action_id = Uuid::new_v4();
+        let failure = incompatible
+            .service
+            .apply(
+                Target::Codex,
+                action_id,
+                preview.management_revision,
+                ReconciliationStrategy::Reapply,
+                preview.observation_token,
+                Some("unavailable".into()),
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.problem.code, "incompatible-target-cli");
+        assert!(
+            incompatible
+                .store
+                .receipt_for(Target::Codex, action_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

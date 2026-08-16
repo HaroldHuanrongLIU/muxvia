@@ -1,10 +1,431 @@
-use tokio_rusqlite::rusqlite::{OptionalExtension, params};
+use secrecy::ExposeSecret;
+use tokio_rusqlite::rusqlite::{OptionalExtension, TransactionBehavior, params};
+use uuid::Uuid;
 
-use crate::control::protocol::{CompatibilityClassification, CompatibilityView, Target};
+use crate::{
+    control::protocol::{
+        ActionOutcome, ActionStatus, CompatibilityClassification, CompatibilityView,
+        ReconciliationStrategy, Target,
+    },
+    domain::{
+        activation::ActivatedSnapshot, provider::normalize_provider_base_url,
+        view::project_target_view_for,
+    },
+};
 
 use super::{StateError, StateStore};
 
+pub(crate) struct AdoptReconciliation {
+    pub(crate) provider_id: Uuid,
+    pub(crate) credential_id: Uuid,
+    pub(crate) snapshot: ActivatedSnapshot,
+    pub(crate) name: String,
+    pub(crate) recovery_id: Uuid,
+    pub(crate) recovery_payload_json: String,
+    pub(crate) file_identity_json: String,
+    pub(crate) config_path: String,
+    pub(crate) managed_config_version: u32,
+    pub(crate) exit_takeover: bool,
+}
+
+pub(crate) struct ReconciliationCommitInput {
+    pub(crate) target: Target,
+    pub(crate) action_id: Uuid,
+    pub(crate) expected_revision: u64,
+    pub(crate) strategy: ReconciliationStrategy,
+    pub(crate) compatibility: CompatibilityView,
+    pub(crate) adopt: Option<AdoptReconciliation>,
+    pub(crate) refreshed_recovery_payload_json: Option<String>,
+    pub(crate) refreshed_file_identity_json: Option<String>,
+    pub(crate) failpoint: ReconciliationCommitFailpoint,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ReconciliationCommitFailpoint {
+    #[default]
+    None,
+    CredentialInsert,
+    ProviderInsert,
+    SnapshotInsert,
+    FinalRevision,
+    FinalTransaction,
+}
+
+pub(crate) enum ReconciliationCommit {
+    Applied(ActionOutcome),
+    Replayed(ActionOutcome),
+    Stale,
+}
+
 impl StateStore {
+    pub(crate) async fn insert_reconciliation_intent(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        strategy: ReconciliationStrategy,
+        created_revision: u64,
+        before_json: String,
+        desired_json: String,
+    ) -> Result<(), StateError> {
+        self.connection
+            .call(move |connection| {
+                let changed = connection.execute(
+                    "INSERT INTO reconciliation_intents
+                     (action_id, target, strategy, state, created_revision, before_json, desired_json)
+                     VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6)
+                     ON CONFLICT(target, action_id) DO UPDATE SET
+                       strategy = excluded.strategy, state = 'pending',
+                       created_revision = excluded.created_revision,
+                       before_json = excluded.before_json, desired_json = excluded.desired_json
+                     WHERE reconciliation_intents.state = 'rolled-back'",
+                    params![
+                        action_id.to_string(),
+                        target.as_str(),
+                        strategy.as_str(),
+                        created_revision,
+                        before_json,
+                        desired_json
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(StateError::MissingRecoveryIntent);
+                }
+                Ok(())
+            })
+            .await
+            .map_err(super::store::map_state_call_error)
+    }
+
+    pub(crate) async fn set_reconciliation_intent_state(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        state: &'static str,
+    ) -> Result<(), StateError> {
+        self.connection
+            .call(move |connection| {
+                let changed = connection.execute(
+                    "UPDATE reconciliation_intents SET state = ?1
+                     WHERE target = ?2 AND action_id = ?3 AND state = 'pending'",
+                    params![state, target.as_str(), action_id.to_string()],
+                )?;
+                if changed != 1 {
+                    return Err(StateError::MissingRecoveryIntent);
+                }
+                Ok(())
+            })
+            .await
+            .map_err(super::store::map_state_call_error)
+    }
+
+    pub(crate) async fn commit_reconciliation(
+        &self,
+        input: ReconciliationCommitInput,
+    ) -> Result<ReconciliationCommit, StateError> {
+        let service_epoch = self.service_epoch().to_string();
+        self.connection
+            .call(move |connection| -> Result<ReconciliationCommit, StateError> {
+                let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let recorded = transaction.query_row(
+                    "SELECT outcome_json FROM action_receipts WHERE target = ?1 AND action_id = ?2",
+                    params![input.target.as_str(), input.action_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                );
+                match recorded {
+                    Ok(json) => {
+                        let mut outcome: ActionOutcome = serde_json::from_str(&json)?;
+                        outcome.status = ActionStatus::Replayed;
+                        return Ok(ReconciliationCommit::Replayed(outcome));
+                    }
+                    Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => {}
+                    Err(error) => return Err(StateError::Sqlite(error)),
+                }
+                let revision: u64 = transaction.query_row(
+                    "SELECT management_revision FROM target_route_state WHERE target = ?1",
+                    [input.target.as_str()],
+                    |row| row.get(0),
+                )?;
+                if revision != input.expected_revision {
+                    return Ok(ReconciliationCommit::Stale);
+                }
+                let pending: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM reconciliation_intents
+                     WHERE target = ?1 AND action_id = ?2 AND strategy = ?3 AND state = 'pending')",
+                    params![input.target.as_str(), input.action_id.to_string(), input.strategy.as_str()],
+                    |row| row.get(0),
+                )?;
+                if !pending {
+                    return Err(StateError::MissingRecoveryIntent);
+                }
+
+                match input.strategy {
+                    ReconciliationStrategy::Adopt => {
+                        let adopt = input.adopt.ok_or(StateError::InvalidActivatedSnapshot)?;
+                        let normalized = normalize_provider_base_url(&adopt.snapshot.base_url)
+                            .map_err(|_| StateError::InvalidActivatedSnapshot)?;
+                        let prior: Option<(Option<String>, Option<String>)> = transaction
+                            .query_row(
+                                "SELECT p.credential_id, c.bearer_token
+                                 FROM target_route_state r
+                                 LEFT JOIN providers p ON p.id = r.current_provider_id AND p.target = r.target
+                                 LEFT JOIN credentials c ON c.id = p.credential_id AND c.target = p.target
+                                 WHERE r.target = ?1",
+                                [input.target.as_str()],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )
+                            .optional()?;
+                        let observed = adopt.snapshot.provider_credential.expose_secret();
+                        let credential_id = match prior {
+                            Some((Some(id), Some(secret))) if secret == observed => id,
+                            _ => {
+                                transaction.execute(
+                                    "INSERT INTO credentials (id, target, bearer_token) VALUES (?1, ?2, ?3)",
+                                    params![adopt.credential_id.to_string(), input.target.as_str(), observed],
+                                )?;
+                                fail_reconciliation_commit(
+                                    input.failpoint,
+                                    ReconciliationCommitFailpoint::CredentialInsert,
+                                )?;
+                                adopt.credential_id.to_string()
+                            }
+                        };
+                        let position: u64 = transaction.query_row(
+                            "SELECT COALESCE(MAX(position) + 1, 0) FROM providers WHERE target = ?1",
+                            [input.target.as_str()],
+                            |row| row.get(0),
+                        )?;
+                        transaction.execute(
+                            "INSERT INTO providers
+                             (id, target, position, provider_revision, name, base_url, model,
+                              protocol, authentication, credential_id, provenance_kind,
+                              provenance_key, generated_owner_id, routing_requirement)
+                             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9,
+                                     NULL, NULL, NULL, 'direct-compatible')",
+                            params![adopt.provider_id.to_string(), input.target.as_str(), position,
+                                adopt.name, normalized, adopt.snapshot.model,
+                                adopt.snapshot.protocol.to_string(), adopt.snapshot.authentication.to_string(),
+                                credential_id],
+                        )?;
+                        if adopt.exit_takeover {
+                            transaction.execute(
+                                "UPDATE target_route_state SET serving_provider_id = NULL,
+                                   takeover_state = 'inactive', route_port = NULL,
+                                   routing_credential = NULL WHERE target = ?1",
+                                [input.target.as_str()],
+                            )?;
+                        }
+                        fail_reconciliation_commit(
+                            input.failpoint,
+                            ReconciliationCommitFailpoint::ProviderInsert,
+                        )?;
+                        transaction.execute(
+                            "INSERT INTO activated_snapshots
+                             (id, target, provider_id, base_url, model, protocol, authentication,
+                              provider_bearer_token, epoch)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                            params![adopt.snapshot.id.to_string(), input.target.as_str(),
+                                adopt.provider_id.to_string(), normalized, adopt.snapshot.model,
+                                adopt.snapshot.protocol.to_string(), adopt.snapshot.authentication.to_string(),
+                                observed, adopt.snapshot.epoch.to_string()],
+                        )?;
+                        fail_reconciliation_commit(
+                            input.failpoint,
+                            ReconciliationCommitFailpoint::SnapshotInsert,
+                        )?;
+                        transaction.execute(
+                            "INSERT INTO activation_recovery
+                             (id, target, action_id, config_path, file_identity_json, payload_json,
+                              state, created_revision)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'committed', ?7)",
+                            params![adopt.recovery_id.to_string(), input.target.as_str(),
+                                input.action_id.to_string(), adopt.config_path, adopt.file_identity_json,
+                                adopt.recovery_payload_json, input.expected_revision],
+                        )?;
+                        transaction.execute(
+                            "UPDATE target_route_state SET current_provider_id = ?1,
+                               activated_snapshot_id = ?2, recovery_intent_id = ?3,
+                               managed_config_version = ?4, recovery_state = 'clean'
+                             WHERE target = ?5",
+                            params![adopt.provider_id.to_string(), adopt.snapshot.id.to_string(),
+                                adopt.recovery_id.to_string(), adopt.managed_config_version,
+                                input.target.as_str()],
+                        )?;
+                    }
+                    ReconciliationStrategy::Reapply => {
+                        let payload = input
+                            .refreshed_recovery_payload_json
+                            .ok_or(StateError::InvalidRecoveryPayload)?;
+                        let identity = input
+                            .refreshed_file_identity_json
+                            .ok_or(StateError::InvalidRecoveryPayload)?;
+                        let changed = transaction.execute(
+                            "UPDATE activation_recovery SET payload_json = ?1,
+                               file_identity_json = ?2
+                             WHERE id = (SELECT recovery_intent_id FROM target_route_state
+                                         WHERE target = ?3)
+                               AND target = ?3 AND state = 'committed'",
+                            params![payload, identity, input.target.as_str()],
+                        )?;
+                        if changed != 1 {
+                            return Err(StateError::MissingRecoveryIntent);
+                        }
+                    }
+                    ReconciliationStrategy::Restore => {
+                        transaction.execute(
+                            "UPDATE target_route_state SET current_provider_id = NULL,
+                               serving_provider_id = NULL, takeover_state = 'inactive',
+                               route_port = NULL, routing_credential = NULL,
+                               activated_snapshot_id = NULL, managed_config_path = NULL,
+                               recovery_intent_id = NULL, recovery_state = 'clean'
+                             WHERE target = ?1",
+                            [input.target.as_str()],
+                        )?;
+                    }
+                }
+                let (classification, acknowledged) = compatibility_database_values(&input.compatibility)?;
+                transaction.execute(
+                    "INSERT INTO target_compatibility
+                     (target, observed_version, classification, acknowledged_version)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(target) DO UPDATE SET observed_version = excluded.observed_version,
+                       classification = excluded.classification,
+                       acknowledged_version = excluded.acknowledged_version",
+                    params![input.target.as_str(), input.compatibility.version,
+                        classification, acknowledged],
+                )?;
+                transaction.execute(
+                    "DELETE FROM target_problems WHERE target = ?1 AND code IN
+                     ('configuration-drift', 'shadowing-configuration', 'untested-target-cli',
+                      'incompatible-target-cli')",
+                    [input.target.as_str()],
+                )?;
+                transaction.execute(
+                    "UPDATE target_route_state SET management_revision = management_revision + 1,
+                       view_sequence = view_sequence + 1 WHERE target = ?1",
+                    [input.target.as_str()],
+                )?;
+                fail_reconciliation_commit(
+                    input.failpoint,
+                    ReconciliationCommitFailpoint::FinalRevision,
+                )?;
+                transaction.execute(
+                    "UPDATE reconciliation_intents SET state = 'committed'
+                     WHERE target = ?1 AND action_id = ?2 AND state = 'pending'",
+                    params![input.target.as_str(), input.action_id.to_string()],
+                )?;
+                let view = project_target_view_for(&transaction, &service_epoch, input.target)?;
+                let outcome = ActionOutcome { status: ActionStatus::Applied, view };
+                transaction.execute(
+                    "INSERT INTO action_receipts
+                     (target, action_id, action_kind, committed_revision, outcome_json)
+                     VALUES (?1, ?2, 'reconcile', ?3, ?4)",
+                    params![input.target.as_str(), input.action_id.to_string(),
+                        outcome.view.management_revision, serde_json::to_string(&outcome)?],
+                )?;
+                fail_reconciliation_commit(
+                    input.failpoint,
+                    ReconciliationCommitFailpoint::FinalTransaction,
+                )?;
+                transaction.commit()?;
+                Ok(ReconciliationCommit::Applied(outcome))
+            })
+            .await
+            .map_err(super::store::map_state_call_error)
+    }
+
+    pub(crate) async fn mark_reconciliation_recovery_required(
+        &self,
+        target: Target,
+        action_id: Uuid,
+    ) -> Result<ActionOutcome, StateError> {
+        let service_epoch = self.service_epoch().to_string();
+        self.connection
+            .call(move |connection| -> Result<ActionOutcome, StateError> {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let changed = transaction.execute(
+                    "UPDATE reconciliation_intents SET state = 'recovery-required'
+                     WHERE target = ?1 AND action_id = ?2 AND state = 'pending'",
+                    params![target.as_str(), action_id.to_string()],
+                )?;
+                if changed != 1 {
+                    return Err(StateError::MissingRecoveryIntent);
+                }
+                transaction.execute(
+                    "UPDATE target_route_state SET recovery_state = 'recovery-required',
+                       view_sequence = view_sequence + 1 WHERE target = ?1",
+                    [target.as_str()],
+                )?;
+                let view = project_target_view_for(&transaction, &service_epoch, target)?;
+                let outcome = ActionOutcome {
+                    status: ActionStatus::Applied,
+                    view,
+                };
+                transaction.execute(
+                    "INSERT INTO action_receipts
+                     (target, action_id, action_kind, committed_revision, outcome_json)
+                     VALUES (?1, ?2, 'reconcile', ?3, ?4)",
+                    params![
+                        target.as_str(),
+                        action_id.to_string(),
+                        outcome.view.management_revision,
+                        serde_json::to_string(&outcome)?
+                    ],
+                )?;
+                transaction.commit()?;
+                Ok(outcome)
+            })
+            .await
+            .map_err(super::store::map_state_call_error)
+    }
+
+    pub(crate) async fn mark_committed_reconciliation_recovery_required(
+        &self,
+        target: Target,
+        action_id: Uuid,
+    ) -> Result<ActionOutcome, StateError> {
+        let service_epoch = self.service_epoch().to_string();
+        self.connection
+            .call(move |connection| -> Result<ActionOutcome, StateError> {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let changed = transaction.execute(
+                    "UPDATE reconciliation_intents SET state = 'recovery-required'
+                     WHERE target = ?1 AND action_id = ?2 AND state = 'committed'",
+                    params![target.as_str(), action_id.to_string()],
+                )?;
+                if changed != 1 {
+                    return Err(StateError::MissingRecoveryIntent);
+                }
+                transaction.execute(
+                    "UPDATE target_route_state SET recovery_state = 'recovery-required',
+                       view_sequence = view_sequence + 1 WHERE target = ?1",
+                    [target.as_str()],
+                )?;
+                let view = project_target_view_for(&transaction, &service_epoch, target)?;
+                let outcome = ActionOutcome {
+                    status: ActionStatus::Applied,
+                    view,
+                };
+                let changed = transaction.execute(
+                    "UPDATE action_receipts SET outcome_json = ?1
+                     WHERE target = ?2 AND action_id = ?3 AND action_kind = 'reconcile'",
+                    params![
+                        serde_json::to_string(&outcome)?,
+                        target.as_str(),
+                        action_id.to_string()
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(StateError::MissingRecoveryIntent);
+                }
+                transaction.commit()?;
+                Ok(outcome)
+            })
+            .await
+            .map_err(super::store::map_state_call_error)
+    }
+
     pub async fn record_compatibility(
         &self,
         target: Target,
@@ -65,6 +486,40 @@ impl StateStore {
             })
             .await
             .map_err(super::store::map_state_call_error)
+    }
+}
+
+fn fail_reconciliation_commit(
+    actual: ReconciliationCommitFailpoint,
+    expected: ReconciliationCommitFailpoint,
+) -> Result<(), StateError> {
+    if actual == expected {
+        Err(StateError::Unavailable)
+    } else {
+        Ok(())
+    }
+}
+
+fn compatibility_database_values(
+    view: &CompatibilityView,
+) -> Result<(&'static str, Option<String>), StateError> {
+    match view.classification {
+        CompatibilityClassification::Tested => Ok(("tested", None)),
+        CompatibilityClassification::UnknownCompatible if !view.acknowledgement_required => {
+            Ok(("unknown-compatible", Some(view.version.clone())))
+        }
+        CompatibilityClassification::UnknownCompatible
+        | CompatibilityClassification::Incompatible => Err(StateError::InvalidCompatibilityState),
+    }
+}
+
+impl ReconciliationStrategy {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Adopt => "adopt",
+            Self::Reapply => "reapply",
+            Self::Restore => "restore",
+        }
     }
 }
 

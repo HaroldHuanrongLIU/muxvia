@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize, de::Error as _};
 use serde_json::{Map, Value};
 
@@ -136,6 +137,27 @@ impl DesiredClaudeState {
     pub(crate) fn ownership(&self) -> ClaudeConfigOwnership {
         self.ownership_version
     }
+
+    pub(crate) fn reconciliation_provider(
+        &self,
+    ) -> Option<(String, String, ProviderAuthentication, SecretString)> {
+        let model = self.owned.model.as_ref()?.as_str()?.to_owned();
+        let base_url = self.owned.base_url.as_ref()?.as_str()?.to_owned();
+        let (authentication, credential) = match (
+            self.owned.auth_token.as_ref().and_then(Value::as_str),
+            self.owned.api_key.as_ref().and_then(Value::as_str),
+        ) {
+            (Some(token), None) => (ProviderAuthentication::AnthropicBearer, token),
+            (None, Some(key)) => (ProviderAuthentication::AnthropicApiKey, key),
+            _ => return None,
+        };
+        Some((
+            model,
+            base_url,
+            authentication,
+            SecretString::from(credential.to_owned()),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -245,6 +267,16 @@ impl ClaudeConfigSnapshot {
     pub(crate) fn credential_matches(&self, desired: &DesiredClaudeState) -> bool {
         self.owned.auth_token == desired.owned.auth_token
             && self.owned.api_key == desired.owned.api_key
+    }
+
+    pub(crate) fn recovery_before_with_latest_unrelated(&self, recovery_before: &Self) -> Self {
+        Self {
+            ownership_version: recovery_before.ownership_version,
+            identity: self.identity.clone(),
+            owned: recovery_before.owned.clone(),
+            unrelated_fingerprint: self.unrelated_fingerprint.clone(),
+            unrelated: self.unrelated.clone(),
+        }
     }
 }
 

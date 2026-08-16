@@ -32,7 +32,7 @@ use crate::{
     },
 };
 
-use super::reconcile::ReconciliationRuntime;
+use super::reconcile::{ReconciliationRuntime, ReconciliationTargetRuntime};
 
 enum ConfigurationPreflight {
     Codex {
@@ -317,10 +317,10 @@ pub struct ActivationService {
     codex_executable: PathBuf,
     claude_executable: PathBuf,
     upstream: Arc<dyn UpstreamTransport>,
-    codex_gate: Mutex<()>,
-    claude_gate: Mutex<()>,
-    codex_model: Mutex<Option<ModelServerHandle>>,
-    claude_model: Mutex<Option<ModelServerHandle>>,
+    codex_gate: Arc<Mutex<()>>,
+    claude_gate: Arc<Mutex<()>>,
+    codex_model: Arc<Mutex<Option<ModelServerHandle>>>,
+    claude_model: Arc<Mutex<Option<ModelServerHandle>>>,
     hooks: ActivationHooks,
     configuration_home_override: Option<PathBuf>,
 }
@@ -341,10 +341,10 @@ impl ActivationService {
             codex_executable,
             claude_executable: PathBuf::from("/usr/bin/claude"),
             upstream,
-            codex_gate: Mutex::new(()),
-            claude_gate: Mutex::new(()),
-            codex_model: Mutex::new(None),
-            claude_model: Mutex::new(None),
+            codex_gate: Arc::new(Mutex::new(())),
+            claude_gate: Arc::new(Mutex::new(())),
+            codex_model: Arc::new(Mutex::new(None)),
+            claude_model: Arc::new(Mutex::new(None)),
             hooks: ActivationHooks::default(),
             configuration_home_override: None,
         }
@@ -374,6 +374,12 @@ impl ActivationService {
             codex_executable: self.codex_executable.clone(),
             claude_executable: self.claude_executable.clone(),
             configuration_home_override: self.configuration_home_override.clone(),
+            target_runtime: ReconciliationTargetRuntime::new(
+                Arc::clone(&self.codex_model),
+                Arc::clone(&self.claude_model),
+                Arc::clone(&self.codex_gate),
+                Arc::clone(&self.claude_gate),
+            ),
         }
     }
 
@@ -399,6 +405,28 @@ impl ActivationService {
     }
 
     pub async fn apply_raw_for_with_context(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        expected_revision: u64,
+        raw_action: serde_json::Value,
+        claude_context: Option<&ClaudePreflightContext>,
+    ) -> Result<ActionOutcome, ActionFailure> {
+        if let Some(outcome) = self.receipt_for_or_failure(target, action_id).await? {
+            return Ok(outcome);
+        }
+        let _gate = self.gate_for(target).lock().await;
+        self.apply_raw_for_with_context_already_held(
+            target,
+            action_id,
+            expected_revision,
+            raw_action,
+            claude_context,
+        )
+        .await
+    }
+
+    pub(crate) async fn apply_raw_for_with_context_already_held(
         &self,
         target: Target,
         action_id: Uuid,
@@ -440,7 +468,7 @@ impl ActivationService {
                             .await);
                     }
                 };
-                self.activate_for(
+                self.activate_for_after_gate(
                     target,
                     ActivateProviderCommand {
                         action_id,
@@ -489,6 +517,16 @@ impl ActivationService {
         {
             return Ok(outcome);
         }
+        self.activate_for_after_gate(target, command, claude_context)
+            .await
+    }
+
+    async fn activate_for_after_gate(
+        &self,
+        target: Target,
+        command: ActivateProviderCommand,
+        claude_context: Option<&ClaudePreflightContext>,
+    ) -> Result<ActionOutcome, ActionFailure> {
         self.hooks.observer.reached(ActivationStep::Validate);
         if target == Target::Codex
             && self

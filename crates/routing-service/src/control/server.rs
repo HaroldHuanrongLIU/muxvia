@@ -26,7 +26,7 @@ use crate::{
         protocol::{
             ClaudePreflightContext, ClientFrame, ControlOperation, ControlProblem, ControlResult,
             DiscoverySource, FrameLimit, ReconciliationStrategy, RpcVersion, ServerFrame, Target,
-            TargetView,
+            TargetAction, TargetView,
         },
     },
     domain::provider::has_valid_provider_authentication,
@@ -685,16 +685,104 @@ async fn serve_session(
                     ControlOperation::Act { target, action_id, expected_revision, action } => {
                         lifecycle.pending_actions.fetch_add(1, Ordering::AcqRel);
                         let _action = ActionGuard(Arc::clone(&lifecycle));
-                        match activation
-                            .apply_raw_for_with_context(
-                                target,
-                                action_id,
-                                expected_revision,
-                                action,
-                                opened_claude_context.as_ref(),
+                        let parsed_action =
+                            serde_json::from_value::<TargetAction>(action.clone()).ok();
+                        let reconcile_action = parsed_action.as_ref().and_then(|action| match action {
+                                TargetAction::Reconcile {
+                                    strategy,
+                                    observation_token,
+                                    acknowledge_version,
+                                } => Some((*strategy, *observation_token, acknowledge_version.clone())),
+                                _ => None,
+                            });
+                        let probe_unmanaged_provider_write = matches!(
+                            parsed_action,
+                            Some(
+                                TargetAction::CreateProvider { .. }
+                                    | TargetAction::UpdateProvider { .. }
+                                    | TargetAction::ReorderProviders { .. }
+                                    | TargetAction::DeleteProvider { .. }
+                                    | TargetAction::DuplicateProvider { .. }
                             )
-                            .await
-                        {
+                        );
+                        let result = if let Some((strategy, observation_token, acknowledge_version)) = reconcile_action {
+                            match store.receipt_for(target, action_id).await {
+                                Ok(Some(outcome)) => Ok(outcome),
+                                Ok(None) => {
+                                    let context = match target {
+                                        Target::Codex => Some(ReconciliationContext::Codex),
+                                        Target::Claude => opened_claude_context
+                                            .clone()
+                                            .map(ReconciliationContext::Claude),
+                                    };
+                                    match context {
+                                        Some(context) => reconciliation
+                                            .apply(
+                                                target,
+                                                action_id,
+                                                expected_revision,
+                                                strategy,
+                                                observation_token,
+                                                acknowledge_version,
+                                                context,
+                                            )
+                                            .await,
+                                        None => Err(store.failure_for(
+                                            target,
+                                            "preflight-context-required",
+                                            "Claude preflight context is required",
+                                        ).await),
+                                    }
+                                }
+                                Err(_) => Err(store.failure_for(
+                                    target,
+                                    "state-store-error",
+                                    "State store unavailable",
+                                ).await),
+                            }
+                        } else {
+                            match store.receipt_for(target, action_id).await {
+                                Ok(Some(outcome)) => Ok(outcome),
+                                Ok(None) => {
+                                    let context = match target {
+                                        Target::Codex => Some(ReconciliationContext::Codex),
+                                        Target::Claude => opened_claude_context
+                                            .clone()
+                                            .map(ReconciliationContext::Claude),
+                                    };
+                                    let _gate = reconciliation
+                                        .lock_target_mutation(target)
+                                        .await;
+                                    match reconciliation
+                                        .ensure_ordinary_write_allowed(
+                                            target,
+                                            context,
+                                            probe_unmanaged_provider_write,
+                                        )
+                                        .await
+                                    {
+                                        Ok(()) => activation
+                                            .apply_raw_for_with_context_already_held(
+                                                target,
+                                                action_id,
+                                                expected_revision,
+                                                action,
+                                                opened_claude_context.as_ref(),
+                                            )
+                                            .await,
+                                        Err(failure) => Err(failure),
+                                    }
+                                }
+                                Err(_) => Err(store
+                                    .failure_for(
+                                        target,
+                                        "state-store-error",
+                                        "State store unavailable",
+                                    )
+                                    .await),
+                            }
+                        };
+                        match result {
                             Ok(outcome) => {
                                 let response = ServerFrame::Response {
                                     request_id,

@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
 };
 
@@ -14,6 +14,7 @@ use axum::{
     http::{Method, Request, Response, StatusCode},
     routing::post,
 };
+use futures_util::{StreamExt, stream};
 use reqwest::Body as ReqwestBody;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
@@ -72,6 +73,8 @@ pub struct ModelServerHandle {
     task: Option<JoinHandle<Result<(), io::Error>>>,
     status: Arc<AtomicU8>,
     shutdown_requested: Arc<AtomicBool>,
+    active_requests: Arc<AtomicUsize>,
+    accepting_requests: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +109,8 @@ pub(crate) struct RouteState {
     pub(crate) target: Target,
     pub(crate) store: Arc<StateStore>,
     pub(crate) upstream: Arc<dyn UpstreamTransport>,
+    pub(crate) active_requests: Arc<AtomicUsize>,
+    pub(crate) accepting_requests: Arc<AtomicBool>,
 }
 
 impl Clone for RouteState {
@@ -114,6 +119,8 @@ impl Clone for RouteState {
             target: self.target,
             store: Arc::clone(&self.store),
             upstream: Arc::clone(&self.upstream),
+            active_requests: Arc::clone(&self.active_requests),
+            accepting_requests: Arc::clone(&self.accepting_requests),
         }
     }
 }
@@ -149,7 +156,11 @@ impl ModelServer {
             target,
             store,
             upstream,
+            active_requests: Arc::new(AtomicUsize::new(0)),
+            accepting_requests: Arc::new(AtomicBool::new(true)),
         };
+        let active_requests = Arc::clone(&state.active_requests);
+        let accepting_requests = Arc::clone(&state.accepting_requests);
         let router = match target {
             Target::Codex => Router::new().route("/v1/responses", post(route_responses)),
             Target::Claude => Router::new()
@@ -204,6 +215,8 @@ impl ModelServer {
             task: Some(task),
             status,
             shutdown_requested,
+            active_requests,
+            accepting_requests,
         };
         if handle.task.as_ref().is_none_or(JoinHandle::is_finished) {
             return Err(ModelServerError::Task);
@@ -235,6 +248,30 @@ impl ModelServerHandle {
     pub fn is_staged(&self) -> bool {
         self.status() == ModelServerStatus::Starting
             && self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
+    pub fn active_request_count(&self) -> usize {
+        self.active_requests.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn try_reserve_idle(&self) -> bool {
+        if self
+            .accepting_requests
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        if self.active_request_count() == 0 {
+            true
+        } else {
+            self.accepting_requests.store(true, Ordering::Release);
+            false
+        }
+    }
+
+    pub(crate) fn release_idle_reservation(&self) {
+        self.accepting_requests.store(true, Ordering::Release);
     }
 
     pub async fn activate(&mut self) -> Result<(), ModelServerError> {
@@ -316,6 +353,12 @@ async fn route_responses(
         Ok(Some(snapshot)) => snapshot,
         Ok(None) | Err(_) => return local_response(StatusCode::SERVICE_UNAVAILABLE),
     };
+    let Some(active_request) = ActiveRequestGuard::try_begin(
+        Arc::clone(&state.active_requests),
+        Arc::clone(&state.accepting_requests),
+    ) else {
+        return local_response(StatusCode::SERVICE_UNAVAILABLE);
+    };
     let url = match responses_url(snapshot.base_url()) {
         Ok(url) => url,
         Err(_) => return local_response(StatusCode::BAD_GATEWAY),
@@ -345,10 +388,49 @@ async fn route_responses(
 
     let mut response = Response::builder()
         .status(upstream.status)
-        .body(Body::from_stream(upstream.body))
+        .body(body_with_active_guard(upstream.body, active_request))
         .expect("valid upstream status");
     *response.headers_mut() = forward_response_headers(&upstream.headers);
     response
+}
+
+pub(crate) struct ActiveRequestGuard {
+    count: Arc<AtomicUsize>,
+}
+
+impl ActiveRequestGuard {
+    pub(crate) fn try_begin(count: Arc<AtomicUsize>, accepting: Arc<AtomicBool>) -> Option<Self> {
+        if !accepting.load(Ordering::Acquire) {
+            return None;
+        }
+        count.fetch_add(1, Ordering::AcqRel);
+        if accepting.load(Ordering::Acquire) {
+            Some(Self { count })
+        } else {
+            count.fetch_sub(1, Ordering::AcqRel);
+            None
+        }
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn body_with_active_guard(
+    body: std::pin::Pin<
+        Box<
+            dyn futures_util::Stream<Item = Result<axum::body::Bytes, super::UpstreamError>> + Send,
+        >,
+    >,
+    guard: ActiveRequestGuard,
+) -> Body {
+    let guarded = stream::unfold((body, Some(guard)), |(mut body, guard)| async move {
+        body.next().await.map(|item| (item, (body, guard)))
+    });
+    Body::from_stream(guarded)
 }
 
 fn local_response(status: StatusCode) -> Response<Body> {

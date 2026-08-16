@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::{io::Read, sync::Arc};
 
 use axum::{
     body::Body,
@@ -13,7 +13,7 @@ use serde_json::Value;
 use super::{
     auth::bearer_routing_credential_matches,
     headers::{forward_claude_request_headers, forward_response_headers},
-    server::RouteState,
+    server::{ActiveRequestGuard, RouteState, body_with_active_guard},
     upstream::{UpstreamRequest, messages_url},
 };
 use crate::control::protocol::ProviderProtocol;
@@ -40,6 +40,12 @@ pub(crate) async fn route_messages(
     let snapshot = match state.store.activated_snapshot_for(state.target).await {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) | Err(_) => return local_response(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let Some(active_request) = ActiveRequestGuard::try_begin(
+        Arc::clone(&state.active_requests),
+        Arc::clone(&state.accepting_requests),
+    ) else {
+        return local_response(StatusCode::SERVICE_UNAVAILABLE);
     };
     if snapshot.protocol() != ProviderProtocol::AnthropicMessages {
         return local_response(StatusCode::SERVICE_UNAVAILABLE);
@@ -119,7 +125,7 @@ pub(crate) async fn route_messages(
     }
     let mut response = Response::builder()
         .status(upstream.status)
-        .body(Body::from_stream(upstream.body))
+        .body(body_with_active_guard(upstream.body, active_request))
         .expect("valid upstream status");
     *response.headers_mut() = forward_response_headers(&upstream.headers);
     response

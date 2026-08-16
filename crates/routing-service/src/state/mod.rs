@@ -6,6 +6,10 @@ mod store;
 
 pub use crate::control::protocol::CompatibilityClassification;
 pub use migrations::SCHEMA_VERSION;
+pub(crate) use reconciliation::{
+    AdoptReconciliation, ReconciliationCommit, ReconciliationCommitFailpoint,
+    ReconciliationCommitInput,
+};
 pub use recovery::{ManagedWriteStatus, RecoveryIntent, RecoveryPayload, RecoveryState};
 pub use store::{
     ActionFailure, ActivationCommit, ActivationPreparation, ActivationRuntime,

@@ -1,5 +1,6 @@
 use std::{fmt, path::Path};
 
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use toml_edit::{DocumentMut, Item, Table, value};
 
@@ -82,6 +83,33 @@ impl DesiredCodexState {
     pub(crate) fn mode(&self) -> Option<ManagedCodexMode> {
         self.mode
     }
+
+    pub(crate) fn reconciliation_provider(&self) -> Option<(String, String, SecretString)> {
+        let model = self.owned.model.as_ref()?.semantic.as_str()?.to_owned();
+        let base_url = self
+            .owned
+            .provider_base_url
+            .as_ref()?
+            .semantic
+            .as_str()?
+            .to_owned();
+        let headers = self
+            .owned
+            .provider_http_headers
+            .as_ref()?
+            .semantic
+            .as_object()?;
+        let credential = headers
+            .get("Authorization")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .or_else(|| {
+                headers
+                    .get("X-Muxvia-Routing-Credential")
+                    .and_then(serde_json::Value::as_str)
+            })?;
+        Some((model, base_url, SecretString::from(credential.to_owned())))
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -159,6 +187,14 @@ impl ConfigSnapshot {
             &self.owned.provider_http_headers,
             &desired.owned.provider_http_headers,
         )
+    }
+
+    pub(crate) fn recovery_before_with_latest_unrelated(&self, recovery_before: &Self) -> Self {
+        Self {
+            identity: self.identity.clone(),
+            owned: recovery_before.owned.clone(),
+            unrelated: self.unrelated.clone(),
+        }
     }
 }
 

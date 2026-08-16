@@ -1,4 +1,7 @@
 use std::fmt;
+use std::path::Path;
+
+use secrecy::SecretString;
 
 use crate::{
     claude::{
@@ -10,9 +13,11 @@ use crate::{
         FileIdentity,
     },
     control::protocol::{
-        ClaudePreflightContext, CompatibilityClassification, ReconciliationField,
-        ReconciliationFieldChange, ReconciliationFieldState, ReconciliationStrategy, ShadowSource,
+        ClaudePreflightContext, CompatibilityClassification, ProviderAuthentication,
+        ProviderProtocol, ReconciliationField, ReconciliationFieldChange, ReconciliationFieldState,
+        ReconciliationStrategy, ShadowSource, Target,
     },
+    state::RecoveryPayload,
 };
 
 pub(crate) enum TargetReconciliationAdapter {
@@ -88,6 +93,7 @@ pub(crate) struct ReconciliationObservation {
     pub(crate) compatibility: ProbedCompatibility,
     pub(crate) shadows: Vec<ShadowSource>,
     pub(crate) changes: Vec<ReconciliationFieldChange>,
+    pub(crate) owned_drifted: bool,
 }
 
 #[derive(Clone)]
@@ -95,12 +101,14 @@ pub(crate) struct ReconciliationObservation {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum PreparedConfiguration {
     Codex {
-        before: DesiredCodexState,
+        before: ConfigSnapshot,
         desired: DesiredCodexState,
+        recovery_before: ConfigSnapshot,
     },
     Claude {
-        before: DesiredClaudeState,
+        before: ClaudeConfigSnapshot,
         desired: DesiredClaudeState,
+        recovery_before: ClaudeConfigSnapshot,
     },
 }
 
@@ -111,6 +119,171 @@ impl fmt::Debug for PreparedConfiguration {
             Self::Claude { .. } => formatter.write_str("PreparedConfiguration::Claude(<redacted>)"),
         }
     }
+}
+
+pub(crate) struct AdoptedProvider {
+    pub(crate) target: Target,
+    pub(crate) model: String,
+    pub(crate) base_url: String,
+    pub(crate) protocol: ProviderProtocol,
+    pub(crate) authentication: ProviderAuthentication,
+    pub(crate) credential: SecretString,
+}
+
+impl fmt::Debug for AdoptedProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdoptedProvider")
+            .field("target", &self.target)
+            .field("model", &"<redacted>")
+            .field("base_url", &"<redacted>")
+            .field("protocol", &self.protocol)
+            .field("authentication", &self.authentication)
+            .field("credential", &"<redacted>")
+            .finish()
+    }
+}
+
+impl PreparedConfiguration {
+    pub(crate) fn atomic_apply(&self, user_home: &Path) -> Result<(), ReconciliationProblem> {
+        match self {
+            Self::Codex {
+                before, desired, ..
+            } => CodexConfigCodec::for_user_home(user_home)
+                .and_then(|codec| codec.atomic_apply(before, desired))
+                .map_err(map_codex_problem),
+            Self::Claude {
+                before, desired, ..
+            } => ClaudeConfigCodec::for_user_home(user_home)
+                .and_then(|codec| codec.atomic_apply(before, desired))
+                .map_err(map_claude_problem),
+        }
+    }
+
+    pub(crate) fn verify(&self, user_home: &Path) -> Result<(), ReconciliationProblem> {
+        match self {
+            Self::Codex {
+                before, desired, ..
+            } => CodexConfigCodec::for_user_home(user_home)
+                .and_then(|codec| codec.verify(before, desired))
+                .map_err(map_codex_problem),
+            Self::Claude {
+                before, desired, ..
+            } => ClaudeConfigCodec::for_user_home(user_home)
+                .and_then(|codec| codec.verify(before, desired))
+                .map_err(map_claude_problem),
+        }
+    }
+
+    pub(crate) fn exact_rollback(&self, user_home: &Path) -> Result<(), ReconciliationProblem> {
+        match self {
+            Self::Codex {
+                before, desired, ..
+            } => CodexConfigCodec::for_user_home(user_home)
+                .and_then(|codec| codec.restore_or_confirm_before(before, desired))
+                .map_err(map_codex_problem),
+            Self::Claude {
+                before, desired, ..
+            } => ClaudeConfigCodec::for_user_home(user_home)
+                .and_then(|codec| codec.restore_or_confirm_before(before, desired))
+                .map_err(map_claude_problem),
+        }
+    }
+
+    pub(crate) fn durable_material(&self) -> Result<(String, String), ReconciliationProblem> {
+        match self {
+            Self::Codex {
+                before, desired, ..
+            } => serialize_material(before, desired),
+            Self::Claude {
+                before, desired, ..
+            } => serialize_material(before, desired),
+        }
+    }
+
+    pub(crate) fn adopted_provider(&self) -> Result<AdoptedProvider, ReconciliationProblem> {
+        match self {
+            Self::Codex { desired, .. } => {
+                let (model, base_url, credential) = desired
+                    .reconciliation_provider()
+                    .ok_or_else(|| ReconciliationProblem::new("invalid-configuration"))?;
+                Ok(AdoptedProvider {
+                    target: Target::Codex,
+                    model,
+                    base_url,
+                    protocol: ProviderProtocol::OpenaiResponses,
+                    authentication: ProviderAuthentication::OpenaiBearer,
+                    credential,
+                })
+            }
+            Self::Claude { desired, .. } => {
+                let (model, base_url, authentication, credential) = desired
+                    .reconciliation_provider()
+                    .ok_or_else(|| ReconciliationProblem::new("invalid-configuration"))?;
+                Ok(AdoptedProvider {
+                    target: Target::Claude,
+                    model,
+                    base_url,
+                    protocol: ProviderProtocol::AnthropicMessages,
+                    authentication,
+                    credential,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn adopted_recovery_payload(&self) -> RecoveryPayload {
+        match self {
+            Self::Codex {
+                before,
+                desired,
+                recovery_before,
+                ..
+            } => RecoveryPayload::Codex {
+                before: Box::new(before.recovery_before_with_latest_unrelated(recovery_before)),
+                desired: Box::new(desired.clone()),
+            },
+            Self::Claude {
+                before,
+                desired,
+                recovery_before,
+                ..
+            } => RecoveryPayload::Claude {
+                before: Box::new(before.recovery_before_with_latest_unrelated(recovery_before)),
+                desired: Box::new(desired.clone()),
+            },
+        }
+    }
+
+    pub(crate) fn managed_config_version(&self) -> u32 {
+        match self {
+            Self::Codex { .. } => 1,
+            Self::Claude { desired, .. } => match desired.ownership() {
+                crate::claude::ClaudeConfigOwnership::LegacyThree => 1,
+                crate::claude::ClaudeConfigOwnership::FourField => 2,
+            },
+        }
+    }
+
+    pub(crate) fn file_identity_json(&self) -> Result<String, ReconciliationProblem> {
+        match self {
+            Self::Codex { before, .. } => serde_json::to_string(before.identity()),
+            Self::Claude { before, .. } => serde_json::to_string(before.identity()),
+        }
+        .map_err(|_| ReconciliationProblem::new("recovery-required"))
+    }
+}
+
+fn serialize_material(
+    before: &impl serde::Serialize,
+    desired: &impl serde::Serialize,
+) -> Result<(String, String), ReconciliationProblem> {
+    Ok((
+        serde_json::to_string(before)
+            .map_err(|_| ReconciliationProblem::new("recovery-required"))?,
+        serde_json::to_string(desired)
+            .map_err(|_| ReconciliationProblem::new("recovery-required"))?,
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +306,10 @@ pub(crate) struct ReconciliationProblem {
 impl ReconciliationProblem {
     fn new(code: &'static str) -> Self {
         Self { code }
+    }
+
+    pub(crate) fn fixed(code: &'static str) -> Self {
+        Self::new(code)
     }
 
     pub(crate) fn code(&self) -> &'static str {
@@ -204,9 +381,9 @@ fn observe_codex(
     let (current, profile_shadow) = codec.reconciliation_snapshot().map_err(map_codex_problem)?;
     let provider_changed = !current.provider_matches(committed);
     let credential_changed = !current.credential_matches(committed);
-    let before = current.as_desired_like(committed);
+    let before = current.clone();
     let desired = match strategy {
-        ReconciliationStrategy::Adopt => before.clone(),
+        ReconciliationStrategy::Adopt => current.as_desired_like(committed),
         ReconciliationStrategy::Reapply => committed.clone(),
         ReconciliationStrategy::Restore => recovery_before.as_desired_like(committed),
     };
@@ -221,8 +398,13 @@ fn observe_codex(
                 .into_iter()
                 .collect(),
             changes: changes(strategy, provider_changed, credential_changed),
+            owned_drifted: provider_changed || credential_changed,
         },
-        prepared: PreparedConfiguration::Codex { before, desired },
+        prepared: PreparedConfiguration::Codex {
+            before,
+            desired,
+            recovery_before: recovery_before.clone(),
+        },
     })
 }
 
@@ -242,9 +424,9 @@ fn observe_claude(
         .map_err(map_claude_problem)?;
     let provider_changed = !current.provider_matches(committed);
     let credential_changed = !current.credential_matches(committed);
-    let before = current.as_desired_like(committed);
+    let before = current.clone();
     let desired = match strategy {
-        ReconciliationStrategy::Adopt => before.clone(),
+        ReconciliationStrategy::Adopt => current.as_desired_like(committed),
         ReconciliationStrategy::Reapply => committed.clone(),
         ReconciliationStrategy::Restore => recovery_before.as_desired_like(committed),
     };
@@ -256,8 +438,13 @@ fn observe_claude(
             compatibility,
             shadows,
             changes: changes(strategy, provider_changed, credential_changed),
+            owned_drifted: provider_changed || credential_changed,
         },
-        prepared: PreparedConfiguration::Claude { before, desired },
+        prepared: PreparedConfiguration::Claude {
+            before,
+            desired,
+            recovery_before: recovery_before.clone(),
+        },
     })
 }
 
@@ -558,9 +745,10 @@ supports_websockets = false
             assert_eq!(result.observation.changes, expected);
             assert_eq!(result.observation.shadows, Vec::<ShadowSource>::new());
             match &result.prepared {
-                PreparedConfiguration::Codex { before, desired } => {
-                    assert_eq!(before, &observed);
-                    assert_eq!(before.mode(), Some(ManagedCodexMode::Takeover));
+                PreparedConfiguration::Codex {
+                    before, desired, ..
+                } => {
+                    assert_eq!(before.as_desired_like(&committed), observed);
                     match strategy {
                         ReconciliationStrategy::Adopt => {
                             assert_eq!(desired, &observed);
@@ -599,6 +787,76 @@ supports_websockets = false
             assert_eq!(result.observation.owned_fingerprint.len(), 64);
             assert_eq!(result.observation.unrelated_fingerprint.len(), 64);
         }
+    }
+
+    #[test]
+    fn reconciliation_prepared_configuration_exactly_rolls_back_observed_snapshot() {
+        let home = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+        fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+        fs::write(codec.config_path(), "operator = \"before\"\n").unwrap();
+        let recovery_before = codec.inspect().unwrap();
+        let committed = codec.desired_takeover(
+            "ROLLBACK_COMMITTED_MODEL_96601",
+            "http://127.0.0.1:43123/v1",
+            "ROLLBACK_COMMITTED_SECRET_96602",
+        );
+        codec.atomic_apply(&recovery_before, &committed).unwrap();
+        fs::write(
+            codec.config_path(),
+            r#"operator = "latest-unrelated"
+model = "ROLLBACK_OBSERVED_MODEL_96603"
+model_provider = "muxvia_codex"
+
+[model_providers.muxvia_codex]
+name = "Muxvia"
+base_url = "https://rollback-observed.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer ROLLBACK_OBSERVED_SECRET_96604" }
+supports_websockets = false
+"#,
+        )
+        .unwrap();
+        let observed_bytes = fs::read(codec.config_path()).unwrap();
+        #[cfg(unix)]
+        let observed_mode = fs::metadata(codec.config_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        let prepared = TargetReconciliationAdapter::Codex(codec)
+            .observe(
+                ReconciliationStrategy::Reapply,
+                &CommittedConfiguration::Codex {
+                    desired: committed,
+                    recovery_before,
+                },
+                &ReconciliationContext::Codex,
+                compatibility(),
+            )
+            .unwrap()
+            .prepared;
+        let diagnostic = format!("{prepared:?}");
+        for sentinel in [
+            "ROLLBACK_COMMITTED_MODEL_96601",
+            "ROLLBACK_COMMITTED_SECRET_96602",
+            "ROLLBACK_OBSERVED_MODEL_96603",
+            "ROLLBACK_OBSERVED_SECRET_96604",
+        ] {
+            assert!(!diagnostic.contains(sentinel));
+        }
+        prepared.atomic_apply(home.path()).unwrap();
+        prepared.verify(home.path()).unwrap();
+        prepared.exact_rollback(home.path()).unwrap();
+        let config_path = home.path().join(".codex/config.toml");
+        assert!(
+            fs::read(&config_path).unwrap() == observed_bytes,
+            "rollback did not restore the exact observed bytes"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(config_path).unwrap().permissions().mode(),
+            observed_mode
+        );
     }
 
     #[test]
@@ -814,8 +1072,10 @@ supports_websockets = false
             ]
         );
         match &result.prepared {
-            PreparedConfiguration::Codex { before, desired } => {
-                assert_ne!(before, &committed);
+            PreparedConfiguration::Codex {
+                before, desired, ..
+            } => {
+                assert_ne!(before.as_desired_like(&committed), committed);
                 assert_eq!(desired, &committed);
             }
             PreparedConfiguration::Claude { .. } => panic!("wrong prepared target"),
@@ -893,9 +1153,11 @@ supports_websockets = false
                 assert_eq!(result.observation.shadows, Vec::<ShadowSource>::new());
                 match (&result.prepared, strategy) {
                     (
-                        PreparedConfiguration::Claude { before, desired },
+                        PreparedConfiguration::Claude {
+                            before, desired, ..
+                        },
                         ReconciliationStrategy::Adopt,
-                    ) => assert_eq!(before, desired),
+                    ) => assert_eq!(before.as_desired_like(&committed), *desired),
                     (
                         PreparedConfiguration::Claude { desired, .. },
                         ReconciliationStrategy::Reapply,

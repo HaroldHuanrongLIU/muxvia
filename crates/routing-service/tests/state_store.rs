@@ -10,7 +10,10 @@ use muxvia_routing::{
     domain::activation::ActivatedSnapshot,
     domain::provider::normalize_provider_base_url,
     home::MuxviaHome,
-    state::{ActivationCommit, ActivationRuntime, RecoveryIntent, RecoveryPayload, StateStore},
+    state::{
+        ActivationCommit, ActivationRuntime, CompatibilityClassification, RecoveryIntent,
+        RecoveryPayload, StateStore,
+    },
 };
 use secrecy::SecretString;
 use uuid::Uuid;
@@ -101,9 +104,81 @@ async fn fresh_schema_v7_reopens_with_codex_and_claude_route_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, "7");
+    assert_eq!(version, "8");
     assert_eq!(targets, ["claude", "codex"]);
     let _ = fs::remove_dir_all(root);
+}
+
+// Catches compatibility persistence that either shares acknowledgement between
+// Targets, retains it after a version change, or treats an impossible row as safe.
+#[tokio::test]
+async fn reconciliation_compatibility_acknowledgement_is_exact_and_fails_closed() {
+    let fixture = StoreFixture::new().await;
+    let unknown = fixture
+        .store
+        .record_compatibility(
+            Target::Codex,
+            "0.42.0".into(),
+            CompatibilityClassification::UnknownCompatible,
+        )
+        .await
+        .unwrap();
+    assert!(unknown.acknowledgement_required);
+
+    let acknowledged = fixture
+        .store
+        .acknowledge_compatibility(Target::Codex, "0.42.0")
+        .await
+        .unwrap();
+    assert!(!acknowledged.acknowledgement_required);
+
+    let claude = fixture
+        .store
+        .record_compatibility(
+            Target::Claude,
+            "0.42.0".into(),
+            CompatibilityClassification::UnknownCompatible,
+        )
+        .await
+        .unwrap();
+    assert!(claude.acknowledgement_required);
+
+    let changed_version = fixture
+        .store
+        .record_compatibility(
+            Target::Codex,
+            "0.43.0".into(),
+            CompatibilityClassification::UnknownCompatible,
+        )
+        .await
+        .unwrap();
+    assert!(changed_version.acknowledgement_required);
+
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(|connection| {
+            connection.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+            connection.execute(
+                "UPDATE target_compatibility
+                 SET classification = 'tested', acknowledged_version = '0.43.0'
+                 WHERE target = 'codex'",
+                [],
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+    let error = fixture
+        .store
+        .compatibility_for(Target::Codex)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "state store contains invalid compatibility state"
+    );
 }
 
 #[tokio::test]

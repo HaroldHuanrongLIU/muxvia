@@ -93,7 +93,26 @@ CREATE TABLE IF NOT EXISTS activation_recovery (
   UNIQUE (target, action_id)
 );
 
-INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '7');
+CREATE TABLE IF NOT EXISTS target_compatibility (
+  target TEXT PRIMARY KEY CHECK (target IN ('codex', 'claude')),
+  observed_version TEXT NOT NULL,
+  classification TEXT NOT NULL CHECK (classification IN ('tested', 'unknown-compatible', 'incompatible')),
+  acknowledged_version TEXT,
+  CHECK (acknowledged_version IS NULL OR classification = 'unknown-compatible')
+);
+
+CREATE TABLE IF NOT EXISTS reconciliation_intents (
+  action_id TEXT NOT NULL,
+  target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+  strategy TEXT NOT NULL CHECK (strategy IN ('adopt', 'reapply', 'restore')),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'rolled-back', 'recovery-required')),
+  created_revision INTEGER NOT NULL CHECK (created_revision >= 0),
+  before_json TEXT NOT NULL,
+  desired_json TEXT NOT NULL,
+  PRIMARY KEY (target, action_id)
+);
+
+INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '8');
 INSERT OR IGNORE INTO target_route_state (
   target,
   management_revision,

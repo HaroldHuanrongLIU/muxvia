@@ -167,6 +167,12 @@ pub enum ControlOperation {
         #[serde(deserialize_with = "deserialize_positive_provider_revision")]
         provider_revision: u64,
     },
+    PreviewReconciliation {
+        target: Target,
+        strategy: ReconciliationStrategy,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_context: Option<ClaudePreflightContext>,
+    },
 }
 
 /// Secret-free observations supplied while opening the Claude management context.
@@ -394,6 +400,13 @@ impl fmt::Debug for ControlOperation {
                 .field("provider_id", provider_id)
                 .field("provider_revision", provider_revision)
                 .finish(),
+            Self::PreviewReconciliation {
+                target, strategy, ..
+            } => formatter
+                .debug_struct("PreviewReconciliation")
+                .field("target", target)
+                .field("strategy", strategy)
+                .finish(),
         }
     }
 }
@@ -445,6 +458,12 @@ pub enum TargetAction {
     ActivateProvider {
         provider_id: String,
         mode: ActivationMode,
+    },
+    Reconcile {
+        strategy: ReconciliationStrategy,
+        observation_token: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acknowledge_version: Option<String>,
     },
 }
 
@@ -529,6 +548,16 @@ impl fmt::Debug for TargetAction {
                 .field("provider_id", provider_id)
                 .field("mode", mode)
                 .finish(),
+            Self::Reconcile {
+                strategy,
+                observation_token,
+                acknowledge_version,
+            } => formatter
+                .debug_struct("Reconcile")
+                .field("strategy", strategy)
+                .field("observation_token", observation_token)
+                .field("acknowledge_version", acknowledge_version)
+                .finish(),
         }
     }
 }
@@ -609,6 +638,125 @@ pub enum ControlResult {
     ActionOutcome { outcome: ActionOutcome },
     ModelDiscovery { result: ModelDiscoveryResult },
     Reachability { result: ReachabilityResult },
+    ReconciliationPreview { preview: ReconciliationPreview },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReconciliationStrategy {
+    Adopt,
+    Reapply,
+    Restore,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompatibilityClassification {
+    Tested,
+    UnknownCompatible,
+    Incompatible,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReconciliationFieldState {
+    Present,
+    Absent,
+    Unchanged,
+    Changed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReconciliationField {
+    Provider,
+    Credential,
+    CurrentProvider,
+    ActivatedSnapshot,
+    Takeover,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationFieldChange {
+    pub field: ReconciliationField,
+    pub state: ReconciliationFieldState,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompatibilityView {
+    pub version: String,
+    pub classification: CompatibilityClassification,
+    pub acknowledgement_required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShadowSource {
+    CodexProfile,
+    ClaudeManaged,
+    ClaudeShared,
+    ClaudeProject,
+    ClaudeLocal,
+    ClaudeSelector(ClaudeBlockingSelector),
+    ClaudeHostManaged,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderEffect {
+    CreateNew,
+    KeepCurrent,
+    ExitManaged,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconciliationPreview {
+    pub observation_token: Uuid,
+    pub target: Target,
+    pub strategy: ReconciliationStrategy,
+    #[serde(deserialize_with = "deserialize_positive_management_revision")]
+    pub management_revision: u64,
+    pub compatibility: CompatibilityView,
+    pub shadow_sources: Vec<ShadowSource>,
+    pub changes: Vec<ReconciliationFieldChange>,
+    pub provider_effect: ProviderEffect,
+    pub restart_required: bool,
+    pub unobservable_runtime_boundary: bool,
+}
+
+fn deserialize_positive_management_revision<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let management_revision = u64::deserialize(deserializer)?;
+    if management_revision == 0 {
+        return Err(D::Error::custom("invalid-management-revision"));
+    }
+    Ok(management_revision)
+}
+
+impl fmt::Debug for ReconciliationPreview {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReconciliationPreview")
+            .field("observation_token", &self.observation_token)
+            .field("target", &self.target)
+            .field("strategy", &self.strategy)
+            .field("management_revision", &self.management_revision)
+            .field("compatibility", &self.compatibility)
+            .field("shadow_sources", &self.shadow_sources)
+            .field("changes", &self.changes)
+            .field("provider_effect", &self.provider_effect)
+            .field("restart_required", &self.restart_required)
+            .field(
+                "unobservable_runtime_boundary",
+                &self.unobservable_runtime_boundary,
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

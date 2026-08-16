@@ -603,6 +603,16 @@ async fn serve_session(
                             }
                         }
                     }
+                    ControlOperation::PreviewReconciliation { .. } => {
+                        if !enqueue_response(&responses, problem_frame(
+                            Some(request_id),
+                            "unsupported-operation",
+                            "Unsupported or malformed request",
+                            None,
+                        )) {
+                            break 'session;
+                        }
+                    }
                     operation @ (ControlOperation::DiscoverModels { .. }
                     | ControlOperation::CheckReachability { .. }) => {
                         if let ControlOperation::DiscoverModels {
@@ -698,7 +708,8 @@ fn operation_target(operation: &ControlOperation) -> Target {
         ControlOperation::OpenTarget { target, .. }
         | ControlOperation::Act { target, .. }
         | ControlOperation::DiscoverModels { target, .. }
-        | ControlOperation::CheckReachability { target, .. } => *target,
+        | ControlOperation::CheckReachability { target, .. }
+        | ControlOperation::PreviewReconciliation { target, .. } => *target,
     }
 }
 

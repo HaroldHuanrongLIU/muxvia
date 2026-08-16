@@ -166,6 +166,21 @@ CREATE TABLE activation_recovery (
 "#;
 
 const V5_SCHEMA: &str = include_str!("fixtures/state-schema-v5.sql");
+// Immutable schema-v7 fixture. Do not replace this with the live schema: the
+// migration test must continue to exercise the real historical boundary.
+const V7_SCHEMA: &str = r#"
+CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE credentials (id TEXT PRIMARY KEY, target TEXT NOT NULL CHECK (target IN ('codex', 'claude')), bearer_token TEXT NOT NULL, UNIQUE (target, id));
+CREATE TABLE providers (id TEXT PRIMARY KEY, target TEXT NOT NULL CHECK (target IN ('codex', 'claude')), position INTEGER NOT NULL CHECK (position >= 0), provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1), name TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL, protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')), authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')), credential_id TEXT, provenance_kind TEXT, provenance_key TEXT, generated_owner_id TEXT, routing_requirement TEXT NOT NULL DEFAULT 'direct-compatible' CHECK (routing_requirement IN ('direct-compatible', 'takeover-required')), CHECK ((target = 'codex' AND protocol = 'openai-responses' AND authentication = 'openai-bearer') OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer'))), FOREIGN KEY (target, credential_id) REFERENCES credentials(target, id));
+CREATE TABLE target_route_state (target TEXT PRIMARY KEY CHECK (target IN ('codex', 'claude')), management_revision INTEGER NOT NULL, view_sequence INTEGER NOT NULL, current_provider_id TEXT, serving_provider_id TEXT, takeover_state TEXT NOT NULL, route_port INTEGER, routing_credential TEXT, activated_snapshot_id TEXT, managed_config_path TEXT, managed_config_version INTEGER NOT NULL DEFAULT 1 CHECK (managed_config_version IN (1,2)), recovery_intent_id TEXT, recovery_state TEXT NOT NULL);
+CREATE TABLE target_problems (target TEXT NOT NULL CHECK (target IN ('codex', 'claude')), code TEXT NOT NULL, message TEXT NOT NULL, PRIMARY KEY (target, code));
+CREATE TABLE activated_snapshots (id TEXT PRIMARY KEY, target TEXT NOT NULL CHECK (target IN ('codex', 'claude')), provider_id TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL, protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')), authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')), provider_bearer_token TEXT NOT NULL, epoch TEXT NOT NULL, CHECK ((target = 'codex' AND protocol = 'openai-responses' AND authentication = 'openai-bearer') OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer'))));
+CREATE TABLE action_receipts (target TEXT NOT NULL CHECK (target IN ('codex', 'claude')), action_id TEXT NOT NULL, action_kind TEXT NOT NULL, committed_revision INTEGER NOT NULL, outcome_json TEXT NOT NULL, PRIMARY KEY (target, action_id));
+CREATE TABLE activation_recovery (id TEXT PRIMARY KEY, target TEXT NOT NULL CHECK (target IN ('codex', 'claude')), action_id TEXT NOT NULL, config_path TEXT NOT NULL, file_identity_json TEXT NOT NULL, payload_json TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'rolled-back', 'recovery-required')), created_revision INTEGER NOT NULL, UNIQUE (target, action_id));
+INSERT INTO metadata (key, value) VALUES ('schema-version', '7');
+INSERT INTO target_route_state (target, management_revision, view_sequence, takeover_state, recovery_state) VALUES ('codex', 11, 12, 'active', 'clean');
+INSERT INTO target_route_state (target, management_revision, view_sequence, takeover_state, recovery_state) VALUES ('claude', 0, 0, 'inactive', 'clean');
+"#;
 const T05_CLAUDE_RECOVERY_PAYLOAD: &str = include_str!("fixtures/claude-recovery-t05.json");
 
 struct StoreFixture {
@@ -187,67 +202,146 @@ impl StoreFixture {
 }
 
 #[tokio::test]
-async fn schema_v7_fresh_database_has_ownership_version_and_recovery_binding() {
+async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomically() {
     let fixture = StoreFixture::new();
+    fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    connection.execute_batch(V7_SCHEMA).unwrap();
+    connection.execute_batch(
+        "INSERT INTO credentials VALUES ('00000000-0000-4000-8000-000000000701', 'codex', 'provider-secret');
+         INSERT INTO providers (id, target, position, provider_revision, name, base_url, model, protocol, authentication, credential_id, routing_requirement) VALUES ('00000000-0000-4000-8000-000000000702', 'codex', 0, 3, 'Provider', 'https://provider.example/v1', 'model', 'openai-responses', 'openai-bearer', '00000000-0000-4000-8000-000000000701', 'direct-compatible');
+         INSERT INTO activated_snapshots VALUES ('00000000-0000-4000-8000-000000000703', 'codex', '00000000-0000-4000-8000-000000000702', 'https://provider.example/v1', 'model', 'openai-responses', 'openai-bearer', 'snapshot-secret', '00000000-0000-4000-8000-000000000704');
+         UPDATE target_route_state SET current_provider_id = '00000000-0000-4000-8000-000000000702', activated_snapshot_id = '00000000-0000-4000-8000-000000000703', route_port = 43124, routing_credential = 'route-secret', managed_config_path = '/tmp/config' WHERE target = 'codex';
+         INSERT INTO action_receipts VALUES ('codex', '00000000-0000-4000-8000-000000000705', 'activate-provider', 11, '{\"status\":\"applied\"}');
+         INSERT INTO activation_recovery VALUES ('00000000-0000-4000-8000-000000000706', 'codex', '00000000-0000-4000-8000-000000000705', '/tmp/config', '{\"identity\":1}', '{\"recovery\":\"payload\"}', 'committed', 10);",
+    ).unwrap();
+    drop(connection);
     drop(fixture.open().await);
 
     let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
         .await
         .unwrap();
-    let (version, not_null, default_value, table_sql, route_versions, recovery_binding_is_nullable) =
-        database
-            .call(|connection| -> tokio_rusqlite::rusqlite::Result<_> {
-                let version = connection.query_row(
-                    "SELECT value FROM metadata WHERE key = 'schema-version'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )?;
-                let (not_null, default_value) = connection.query_row(
-                    "SELECT \"notnull\", dflt_value
+    let (
+        version,
+        not_null,
+        default_value,
+        table_sql,
+        route_versions,
+        recovery_binding_is_nullable,
+        preserved,
+    ) = database
+        .call(|connection| -> tokio_rusqlite::rusqlite::Result<_> {
+            let version = connection.query_row(
+                "SELECT value FROM metadata WHERE key = 'schema-version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?;
+            let (not_null, default_value) = connection.query_row(
+                "SELECT \"notnull\", dflt_value
                  FROM pragma_table_info('target_route_state')
                  WHERE name = 'managed_config_version'",
-                    [],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
-                )?;
-                let table_sql = connection.query_row(
-                    "SELECT sql FROM sqlite_schema
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )?;
+            let table_sql = connection.query_row(
+                "SELECT sql FROM sqlite_schema
                  WHERE type = 'table' AND name = 'target_route_state'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )?;
-                let route_versions = connection
-                    .prepare(
-                        "SELECT target, managed_config_version
+                [],
+                |row| row.get::<_, String>(0),
+            )?;
+            let route_versions = connection
+                .prepare(
+                    "SELECT target, managed_config_version
                      FROM target_route_state ORDER BY target",
-                    )?
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                let recovery_binding_is_nullable: bool = connection.query_row(
-                    "SELECT \"notnull\" = 0 FROM pragma_table_info('target_route_state')
+                )?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let recovery_binding_is_nullable: bool = connection.query_row(
+                "SELECT \"notnull\" = 0 FROM pragma_table_info('target_route_state')
                  WHERE name = 'recovery_intent_id'",
-                    [],
-                    |row| row.get(0),
-                )?;
-                Ok((
-                    version,
-                    not_null,
-                    default_value,
-                    table_sql,
-                    route_versions,
-                    recovery_binding_is_nullable,
-                ))
-            })
-            .await
-            .unwrap();
+                [],
+                |row| row.get(0),
+            )?;
+            let preserved = connection.query_row(
+                "SELECT c.bearer_token, p.name, s.provider_bearer_token, r.routing_credential,
+                            a.outcome_json, x.payload_json
+                     FROM credentials c JOIN providers p ON p.credential_id = c.id
+                     JOIN activated_snapshots s ON s.id = '00000000-0000-4000-8000-000000000703'
+                     JOIN target_route_state r ON r.target = 'codex'
+                     JOIN action_receipts a ON a.action_id = '00000000-0000-4000-8000-000000000705'
+                     JOIN activation_recovery x ON x.id = '00000000-0000-4000-8000-000000000706'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )?;
+            Ok((
+                version,
+                not_null,
+                default_value,
+                table_sql,
+                route_versions,
+                recovery_binding_is_nullable,
+                preserved,
+            ))
+        })
+        .await
+        .unwrap();
 
-    assert_eq!(version, "7");
+    assert_eq!(version, "8");
     assert_eq!(not_null, 1);
     assert_eq!(default_value.as_deref(), Some("1"));
     assert!(table_sql.contains("CHECK (managed_config_version IN (1,2))"));
     assert_eq!(route_versions, [("claude".into(), 1), ("codex".into(), 1)]);
     assert!(recovery_binding_is_nullable);
+    assert_eq!(
+        preserved,
+        (
+            "provider-secret".into(),
+            "Provider".into(),
+            "snapshot-secret".into(),
+            "route-secret".into(),
+            "{\"status\":\"applied\"}".into(),
+            "{\"recovery\":\"payload\"}".into()
+        )
+    );
+}
+
+// Catches a migration mutation that updates metadata or leaves a new table after
+// an atomic v7-to-v8 migration fails.
+#[tokio::test]
+async fn schema_v8_failed_migration_rolls_back_then_reruns() {
+    let fixture = StoreFixture::new();
+    fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    connection.execute_batch(V7_SCHEMA).unwrap();
+    connection
+        .execute_batch("CREATE VIEW target_compatibility AS SELECT 'blocked' AS target;")
+        .unwrap();
+    drop(connection);
+
+    assert!(StateStore::open(&fixture.home).await.is_err());
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    let failed = (
+        connection.query_row("SELECT value FROM metadata WHERE key = 'schema-version'", [], |row| row.get::<_, String>(0)).unwrap(),
+        connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'reconciliation_intents'", [], |row| row.get::<_, i64>(0)).unwrap(),
+    );
+    assert_eq!(failed, ("7".into(), 0));
+    connection
+        .execute_batch("DROP VIEW target_compatibility;")
+        .unwrap();
+    drop(connection);
+
+    drop(fixture.open().await);
 }
 
 #[tokio::test]
@@ -334,7 +428,7 @@ async fn schema_v7_migrates_real_v5_claude_states_and_binds_the_unique_committed
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "7"
+            "8"
         );
         let route: (
             i64,
@@ -712,7 +806,7 @@ async fn schema_v7_does_not_guess_between_multiple_legacy_committed_intents() {
         .unwrap();
     assert_eq!(
         migrated,
-        ("7".to_owned(), None, "recovery-required".to_owned())
+        ("8".to_owned(), None, "recovery-required".to_owned())
     );
 }
 
@@ -1247,7 +1341,7 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "7");
+    assert_eq!(schema_version, "8");
     assert_eq!(
         view.providers[0].id,
         Uuid::parse_str(existing_provider_id).unwrap()
@@ -1477,7 +1571,7 @@ async fn schema_v4_migrates_v2_routing_requirement_and_historical_receipts() {
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "7");
+    assert_eq!(schema_version, "8");
     assert_eq!(
         store.target_view().await.unwrap().providers[0].routing_requirement,
         ProviderRoutingRequirement::DirectCompatible

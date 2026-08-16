@@ -44,6 +44,10 @@ pub enum StateError {
     InvalidActivatedSnapshot,
     #[error("state store contains an invalid Provider routing requirement")]
     InvalidProviderRoutingRequirement,
+    #[error("state store contains invalid compatibility state")]
+    InvalidCompatibilityState,
+    #[error("state store has no compatibility state for this Target CLI")]
+    MissingCompatibility,
 }
 
 pub struct StateStore {
@@ -1762,7 +1766,9 @@ enum ProviderAttempt {
     Failure(ActionFailure),
 }
 
-fn map_call_error(error: tokio_rusqlite::Error<tokio_rusqlite::rusqlite::Error>) -> StateError {
+pub(super) fn map_call_error(
+    error: tokio_rusqlite::Error<tokio_rusqlite::rusqlite::Error>,
+) -> StateError {
     match error {
         tokio_rusqlite::Error::ConnectionClosed => StateError::Unavailable,
         tokio_rusqlite::Error::Error(error) => StateError::Sqlite(error),

@@ -14,7 +14,7 @@ use crate::control::protocol::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -46,6 +46,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v4(connection)?;
             migrate_v5(connection)?;
             migrate_v6(connection)?;
+            migrate_v7(connection)?;
         }
         Some(2) => {
             migrate_v2(connection)?;
@@ -53,27 +54,68 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v4(connection)?;
             migrate_v5(connection)?;
             migrate_v6(connection)?;
+            migrate_v7(connection)?;
         }
         Some(3) => {
             migrate_v3(connection)?;
             migrate_v4(connection)?;
             migrate_v5(connection)?;
             migrate_v6(connection)?;
+            migrate_v7(connection)?;
         }
         Some(4) => {
             migrate_v4(connection)?;
             migrate_v5(connection)?;
             migrate_v6(connection)?;
+            migrate_v7(connection)?;
         }
         Some(5) => {
             migrate_v5(connection)?;
             migrate_v6(connection)?;
+            migrate_v7(connection)?;
         }
-        Some(6) => migrate_v6(connection)?,
+        Some(6) => {
+            migrate_v6(connection)?;
+            migrate_v7(connection)?;
+        }
+        Some(7) => migrate_v7(connection)?,
         Some(_) => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v7(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE target_compatibility (
+           target TEXT PRIMARY KEY CHECK (target IN ('codex', 'claude')),
+           observed_version TEXT NOT NULL,
+           classification TEXT NOT NULL CHECK (classification IN ('tested', 'unknown-compatible', 'incompatible')),
+           acknowledged_version TEXT,
+           CHECK (acknowledged_version IS NULL OR classification = 'unknown-compatible')
+         );
+         CREATE TABLE reconciliation_intents (
+           action_id TEXT NOT NULL,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           strategy TEXT NOT NULL CHECK (strategy IN ('adopt', 'reapply', 'restore')),
+           state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'rolled-back', 'recovery-required')),
+           created_revision INTEGER NOT NULL CHECK (created_revision >= 0),
+           before_json TEXT NOT NULL,
+           desired_json TEXT NOT NULL,
+           PRIMARY KEY (target, action_id)
+         );",
+    )?;
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.execute(
+        "UPDATE metadata SET value = '8' WHERE key = 'schema-version'",
+        [],
+    )?;
+    transaction.commit()
 }
 
 fn migrate_v6(connection: &mut Connection) -> Result<()> {

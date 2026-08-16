@@ -27,9 +27,54 @@ test.each([
   ["discover-models.json", parseClientFrame],
   ["check-reachability.json", parseClientFrame],
   ["cancel-inspection.json", parseClientFrame],
+  ["preview-reconciliation.json", parseServerFrame],
+  ["apply-reconciliation.json", parseTargetAction],
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)
+})
+
+// Catches a parser mutation that accepts arbitrary reconciliation values or lets
+// additive secret-bearing fields survive its typed public projection.
+test("reconciliation contracts are closed, validated, and secret-free", async () => {
+  const preview = await readFixture("preview-reconciliation.json") as {
+    result: {
+      preview: { changes: Array<Record<string, unknown>>; providerCredential?: string }
+    }
+  }
+  const result = preview.result.preview
+  result.providerCredential = "preview-secret-must-not-escape"
+  result.changes[0]!.rawConfiguration = "preview-secret-must-not-escape"
+
+  const parsed = parseServerFrame(preview)
+  const serialized = JSON.stringify(parsed)
+  expect(serialized).not.toContain("preview-secret-must-not-escape")
+  expect(JSON.parse(serialized)).toEqual(await readFixture("preview-reconciliation.json"))
+
+  for (const invalid of [
+    {
+      type: "request", requestId: "preview", operation: {
+        kind: "preview-reconciliation", target: "codex", strategy: "automatic",
+      },
+    },
+    {
+      type: "response", requestId: "preview", result: {
+        kind: "reconciliation-preview", preview: {
+          observationToken: "00000000-0000-4000-8000-000000000701",
+          target: "codex", strategy: "adopt", managementRevision: 0,
+          compatibility: { version: "0.42.0", classification: "arbitrary", acknowledgementRequired: false },
+          shadowSources: ["arbitrary-source"], changes: [], providerEffect: "create-new",
+          restartRequired: false, unobservableRuntimeBoundary: true,
+        },
+      },
+    },
+  ]) {
+    expect(() => parseClientFrame(invalid)).toThrow()
+    expect(() => parseServerFrame(invalid)).toThrow()
+  }
+  expect(() => parseTargetAction({
+    kind: "reconcile", strategy: "restore", observationToken: "not-a-uuid",
+  })).toThrow()
 })
 
 test("round-trips draft discovery sources and view-free inspection results", () => {

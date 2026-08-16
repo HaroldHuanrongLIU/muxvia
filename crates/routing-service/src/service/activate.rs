@@ -439,6 +439,10 @@ impl ActivationService {
                 )
                 .await
             }
+            Ok(TargetAction::Reconcile { .. }) => Err(self
+                .store
+                .failure_for(target, "invalid-provider", "Provider action is malformed")
+                .await),
             Err(_) => Err(self
                 .store
                 .failure_for(target, "invalid-provider", "Provider action is malformed")
@@ -1498,7 +1502,9 @@ fn classify_bootstrap_state_error(error: StateError) -> ModelServerError {
         | StateError::InvalidRecoveryState
         | StateError::InvalidRecoveryPayload
         | StateError::MissingRecoveryIntent
-        | StateError::InvalidProviderRoutingRequirement => ModelServerError::State,
+        | StateError::InvalidProviderRoutingRequirement
+        | StateError::InvalidCompatibilityState
+        | StateError::MissingCompatibility => ModelServerError::State,
     }
 }
 

@@ -1,0 +1,6 @@
+{
+  "kind": "reconcile",
+  "strategy": "reapply",
+  "observationToken": "00000000-0000-4000-8000-000000000701",
+  "acknowledgeVersion": "0.42.0"
+}

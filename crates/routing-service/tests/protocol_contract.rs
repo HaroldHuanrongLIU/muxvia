@@ -58,6 +58,60 @@ fn fixtures_round_trip_as_their_protocol_types() {
     }
 }
 
+// Catches a protocol mutation that accepts arbitrary reconciliation discriminators,
+// loses the opaque observation token, or retains additive secret-bearing fields.
+#[test]
+fn reconciliation_preview_and_apply_contracts_are_closed_and_secret_free() {
+    let mut preview = fixture("preview-reconciliation.json");
+    preview["result"]["preview"]["providerCredential"] =
+        serde_json::json!("preview-secret-must-not-escape");
+    preview["result"]["preview"]["changes"][0]["rawConfiguration"] =
+        serde_json::json!("preview-secret-must-not-escape");
+
+    let parsed: ServerFrame = serde_json::from_value(preview).unwrap();
+    let serialized = serde_json::to_string(&parsed).unwrap();
+    assert!(!serialized.contains("preview-secret-must-not-escape"));
+    assert!(!format!("{parsed:?}").contains("preview-secret-must-not-escape"));
+
+    let expected = fixture("preview-reconciliation.json");
+    assert_eq!(serde_json::to_value(parsed).unwrap(), expected);
+
+    let apply = fixture("apply-reconciliation.json");
+    let action: TargetAction = serde_json::from_value(apply.clone()).unwrap();
+    assert_eq!(serde_json::to_value(action).unwrap(), apply);
+
+    for invalid in [
+        serde_json::json!({
+            "type": "request", "requestId": "preview", "operation": {
+                "kind": "preview-reconciliation", "target": "codex", "strategy": "automatic"
+            }
+        }),
+        serde_json::json!({
+            "type": "response", "requestId": "preview", "result": {
+                "kind": "reconciliation-preview", "preview": {
+                    "observationToken": "00000000-0000-4000-8000-000000000701",
+                    "target": "codex", "strategy": "adopt", "managementRevision": 0,
+                    "compatibility": { "version": "0.42.0", "classification": "arbitrary", "acknowledgementRequired": false },
+                    "shadowSources": ["arbitrary-source"], "changes": [],
+                    "providerEffect": "create-new", "restartRequired": false,
+                    "unobservableRuntimeBoundary": true
+                }
+            }
+        }),
+        serde_json::json!({
+            "kind": "reconcile", "strategy": "restore", "observationToken": "not-a-uuid"
+        }),
+    ] {
+        let is_action = invalid.get("kind").is_some();
+        if is_action {
+            assert!(serde_json::from_value::<TargetAction>(invalid).is_err());
+        } else {
+            assert!(serde_json::from_value::<ClientFrame>(invalid.clone()).is_err());
+            assert!(serde_json::from_value::<ServerFrame>(invalid).is_err());
+        }
+    }
+}
+
 #[test]
 fn inspection_protocol_round_trips_all_sources_cancellation_and_view_free_results() {
     let saved = DiscoverySource::Saved {

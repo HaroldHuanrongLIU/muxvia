@@ -326,7 +326,8 @@ async fn schema_v8_failed_migration_rolls_back_then_reruns() {
         .unwrap();
     drop(connection);
 
-    drop(fixture.open().await);
+    let rerun_store = StateStore::open(&fixture.home).await.unwrap();
+    drop(rerun_store);
     let connection = Connection::open(fixture.home.database_path()).unwrap();
     let rerun = (
         connection.query_row("SELECT value FROM metadata WHERE key = 'schema-version'", [], |row| row.get::<_, String>(0)).unwrap(),

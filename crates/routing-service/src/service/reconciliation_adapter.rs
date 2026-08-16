@@ -615,7 +615,7 @@ fn observe_claude(
     let credential_changed = !current.credential_matches(committed);
     let before = current.clone();
     let desired = match strategy {
-        ReconciliationStrategy::Adopt => current.as_desired_like(committed),
+        ReconciliationStrategy::Adopt => current.as_adopted_direct(),
         ReconciliationStrategy::Reapply => committed.clone(),
         ReconciliationStrategy::Restore => recovery_before.as_desired_like(committed),
     };
@@ -2398,7 +2398,7 @@ supports_websockets = false
                             before, desired, ..
                         },
                         ReconciliationStrategy::Adopt,
-                    ) => assert_eq!(before.as_desired_like(&committed), *desired),
+                    ) => assert_eq!(before.as_adopted_direct(), *desired),
                     (
                         PreparedConfiguration::Claude { desired, .. },
                         ReconciliationStrategy::Reapply,

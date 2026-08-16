@@ -2212,6 +2212,22 @@ async fn adopt_claude_supports_api_key_and_bearer_authentication_shapes() {
                 .unwrap();
         assert_eq!(rendered["env"]["UNRELATED"], "preserved");
         let _push = read_frame(&mut stream).await.unwrap();
+        let activated_after_adopt = request(
+            &mut stream,
+            "activate-after-adopt",
+            json!({
+                "kind":"act","target":"claude","actionId":Uuid::new_v4(),
+                "expectedRevision":view["managementRevision"],
+                "action":{"kind":"activate-provider","providerId":current_id,"mode":"takeover"}
+            }),
+        )
+        .await;
+        assert_eq!(
+            activated_after_adopt["type"], "response",
+            "Claude {suffix} Adopt could not re-enter Takeover: {:?}",
+            activated_after_adopt["problem"]["code"]
+        );
+        let _push = read_frame(&mut stream).await.unwrap();
         let mut replay_stream = UnixStream::connect(handle.socket_path()).await.unwrap();
         hello(&mut replay_stream).await;
         let opened_without_context = request(

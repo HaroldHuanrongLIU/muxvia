@@ -258,6 +258,14 @@ impl ClaudeConfigSnapshot {
         }
     }
 
+    pub(crate) fn as_adopted_direct(&self) -> DesiredClaudeState {
+        DesiredClaudeState {
+            ownership_version: self.ownership_version,
+            mode: ManagedClaudeMode::Direct,
+            owned: self.owned.clone(),
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn provider_matches(&self, desired: &DesiredClaudeState) -> bool {
         self.owned.base_url == desired.owned.base_url && self.owned.model == desired.owned.model

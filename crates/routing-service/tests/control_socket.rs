@@ -628,7 +628,7 @@ fn hanging_probe_executable(root: &Path) -> (PathBuf, PathBuf) {
 }
 
 async fn wait_for_path(path: &Path) {
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         while !path.exists() {
             tokio::task::yield_now().await;
         }

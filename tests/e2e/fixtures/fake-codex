@@ -5,7 +5,7 @@ case "${1-}" in
     printf '%s\n' 'codex-cli 0.106.0'
     ;;
   --help)
-    printf '%s\n' 'Usage: codex [OPTIONS]'
+    printf '%s\n' 'Usage: codex [OPTIONS]' '--config <key=value>'
     ;;
   *)
     printf '%s\n' 'unexpected fake Codex invocation' >&2

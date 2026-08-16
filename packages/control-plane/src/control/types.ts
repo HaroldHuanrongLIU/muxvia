@@ -37,7 +37,20 @@ const claudePreflightContextSchema = z.object({
 const controlProblemSchema = z.object({
   code: z.string(),
   message: z.string(),
-  source: z.enum(["control-plane-context", "user-settings", "managed-settings", "shared-project-settings", "local-project-settings"]).optional(),
+  source: z.enum([
+    "control-plane-context",
+    "user-settings",
+    "managed-settings",
+    "shared-project-settings",
+    "local-project-settings",
+    "codex-profile",
+    "claude-managed",
+    "claude-shared",
+    "claude-project",
+    "claude-local",
+    "claude-selector",
+    "claude-host-managed",
+  ]).optional(),
   selector: claudeBlockingSelectorSchema.optional(),
 })
 
@@ -157,6 +170,11 @@ const discoverySourceSchema = z.discriminatedUnion("kind", [
 
 const reconciliationStrategySchema = z.enum(["adopt", "reapply", "restore"])
 const compatibilityClassificationSchema = z.enum(["tested", "unknown-compatible", "incompatible"])
+const compatibilityViewSchema = z.object({
+  version: z.string(),
+  classification: compatibilityClassificationSchema,
+  acknowledgementRequired: z.boolean(),
+})
 const reconciliationFieldStateSchema = z.enum(["present", "absent", "unchanged", "changed"])
 const reconciliationFieldSchema = z.enum([
   "provider",
@@ -181,11 +199,7 @@ const reconciliationPreviewSchema = z.object({
   target: targetSchema,
   strategy: reconciliationStrategySchema,
   managementRevision: z.number().int().positive(),
-  compatibility: z.object({
-    version: z.string(),
-    classification: compatibilityClassificationSchema,
-    acknowledgementRequired: z.boolean(),
-  }),
+  compatibility: compatibilityViewSchema,
   shadowSources: z.array(shadowSourceSchema),
   changes: z.array(z.object({
     field: reconciliationFieldSchema,
@@ -245,6 +259,10 @@ const targetActionSchema = z.discriminatedUnion("kind", [
     observationToken: z.string().uuid(),
     acknowledgeVersion: z.string().optional(),
   }),
+  z.object({
+    kind: z.literal("acknowledge-compatibility"),
+    version: z.string(),
+  }),
 ])
 
 const controlOperationSchema = z.discriminatedUnion("kind", [
@@ -277,7 +295,17 @@ const controlOperationSchema = z.discriminatedUnion("kind", [
     strategy: reconciliationStrategySchema,
     claudeContext: claudePreflightContextSchema.optional(),
   }),
+  z.object({
+    kind: z.literal("preview-compatibility"),
+    target: targetSchema,
+  }),
 ])
+
+const compatibilityPreviewSchema = z.object({
+  target: targetSchema,
+  managementRevision: z.number().int().nonnegative(),
+  compatibility: compatibilityViewSchema,
+})
 
 const actionOutcomeSchema = z.object({
   status: z.enum(["applied", "replayed"]),
@@ -352,6 +380,7 @@ const controlResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("model-discovery"), result: modelDiscoveryResultSchema }),
   z.object({ kind: z.literal("reachability"), result: reachabilityResultSchema }),
   z.object({ kind: z.literal("reconciliation-preview"), preview: reconciliationPreviewSchema }),
+  z.object({ kind: z.literal("compatibility-preview"), preview: compatibilityPreviewSchema }),
 ])
 
 const clientFrameSchema = z.discriminatedUnion("type", [
@@ -394,6 +423,7 @@ export type ModelDiscoveryResult = z.infer<typeof modelDiscoveryResultSchema>
 export type ReachabilityResult = z.infer<typeof reachabilityResultSchema>
 export type ReconciliationStrategy = z.infer<typeof reconciliationStrategySchema>
 export type CompatibilityClassification = z.infer<typeof compatibilityClassificationSchema>
+export type CompatibilityPreview = z.infer<typeof compatibilityPreviewSchema>
 export type ReconciliationPreview = z.infer<typeof reconciliationPreviewSchema>
 
 export const parseClientFrame = (value: unknown): ClientFrame => clientFrameSchema.parse(value)

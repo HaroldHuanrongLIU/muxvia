@@ -14,9 +14,10 @@ use crate::{
     claude::{ClaudeConfigCodec, ClaudeProbe},
     codex::{CodexConfigCodec, CodexProbe, FileIdentity},
     control::protocol::{
-        ActionOutcome, ActionStatus, CompatibilityClassification, CompatibilityView,
-        ControlProblem, ProviderEffect, ReconciliationField, ReconciliationFieldState,
-        ReconciliationPreview, ReconciliationStrategy, ShadowSource, Target,
+        ActionOutcome, ActionStatus, CompatibilityClassification, CompatibilityPreview,
+        CompatibilityView, ControlProblem, ProviderEffect, ReconciliationField,
+        ReconciliationFieldState, ReconciliationPreview, ReconciliationStrategy, ShadowSource,
+        Target,
     },
     domain::activation::ActivatedSnapshot,
     home::MuxviaHome,
@@ -455,6 +456,138 @@ impl ReconciliationService {
             previous,
             _guard: guard,
         })
+    }
+
+    pub(crate) async fn preview_compatibility_cancellable(
+        &self,
+        target: Target,
+        cancellation: CancellationToken,
+    ) -> Result<CompatibilityPreview, ControlProblem> {
+        let view = self
+            .state
+            .target_view_for(target)
+            .await
+            .map_err(map_state_problem)?;
+        let compatibility = self
+            .probe_compatibility_cancellable(target, cancellation)
+            .await?;
+        Ok(CompatibilityPreview {
+            target,
+            management_revision: view.management_revision,
+            compatibility,
+        })
+    }
+
+    pub(crate) async fn acknowledge_compatibility(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        expected_revision: u64,
+        version: String,
+    ) -> DeferredPublication<Result<ActionOutcome, ActionFailure>> {
+        match self.state.receipt_for(target, action_id).await {
+            Ok(Some(outcome)) => return DeferredPublication::none(Ok(outcome)),
+            Ok(None) => {}
+            Err(_) => {
+                return DeferredPublication::none(Err(self
+                    .failure(target, "state-store-error")
+                    .await));
+            }
+        }
+        let _gate = self.target_runtime.gate(target).lock().await;
+        match self.state.receipt_for(target, action_id).await {
+            Ok(Some(outcome)) => return DeferredPublication::none(Ok(outcome)),
+            Ok(None) => {}
+            Err(_) => {
+                return DeferredPublication::none(Err(self
+                    .failure(target, "state-store-error")
+                    .await));
+            }
+        }
+        let compatibility = match self.probe_compatibility(target).await {
+            Ok(compatibility) => compatibility,
+            Err(problem) => {
+                let mut failure = self.failure(target, &problem.code).await;
+                failure.problem = problem;
+                return DeferredPublication::none(Err(failure));
+            }
+        };
+        if compatibility.classification == CompatibilityClassification::Incompatible {
+            let blocked = self
+                .project_ordinary_problem(target, "incompatible-target-cli", None, compatibility)
+                .await;
+            return DeferredPublication {
+                result: match blocked.result {
+                    Ok(()) => Err(self.failure(target, "incompatible-target-cli").await),
+                    Err(failure) => Err(failure),
+                },
+                publication: blocked.publication,
+            };
+        }
+        if compatibility.classification != CompatibilityClassification::UnknownCompatible
+            || compatibility.version != version
+        {
+            let publication =
+                if compatibility.classification == CompatibilityClassification::UnknownCompatible {
+                    match self
+                        .state
+                        .project_managed_write_problem(
+                            target,
+                            "compatibility-acknowledgement-required",
+                            None,
+                            compatibility,
+                        )
+                        .await
+                    {
+                        Ok(publication) => publication,
+                        Err(_) => {
+                            return DeferredPublication::none(Err(self
+                                .failure(target, "state-store-error")
+                                .await));
+                        }
+                    }
+                } else {
+                    None
+                };
+            return DeferredPublication {
+                result: Err(self
+                    .failure(target, "compatibility-acknowledgement-required")
+                    .await),
+                publication,
+            };
+        }
+        if compatibility.acknowledgement_required
+            && self
+                .state
+                .project_managed_write_problem(
+                    target,
+                    "compatibility-acknowledgement-required",
+                    None,
+                    compatibility,
+                )
+                .await
+                .is_err()
+        {
+            return DeferredPublication::none(Err(self.failure(target, "state-store-error").await));
+        }
+        match self
+            .state
+            .apply_compatibility_acknowledgement(target, action_id, expected_revision, version)
+            .await
+        {
+            Ok(result) => {
+                let publication = result.as_ref().ok().and_then(|outcome| {
+                    (outcome.status == ActionStatus::Applied).then(|| outcome.view.clone())
+                });
+                DeferredPublication {
+                    result,
+                    publication,
+                }
+            }
+            Err(_) => {
+                DeferredPublication::none(Err(self.failure(target, "state-store-error").await))
+            }
+        }
     }
 
     pub(crate) async fn rollback_preview(&self, registration: PreviewRegistration) {
@@ -1080,12 +1213,15 @@ impl ReconciliationService {
             }
         };
         let mut failure = self.failure(target, stable_code).await;
-        failure.problem.source = failure
+        if let Some(problem) = failure
             .authoritative_view
             .problems
             .iter()
             .find(|problem| problem.code == stable_code)
-            .and_then(|problem| problem.source.clone());
+        {
+            failure.problem.source.clone_from(&problem.source);
+            failure.problem.selector = problem.selector;
+        }
         DeferredPublication {
             result: Err(failure),
             publication,
@@ -1118,11 +1254,20 @@ impl ReconciliationService {
         &self,
         target: Target,
     ) -> Result<CompatibilityView, ControlProblem> {
+        self.probe_compatibility_cancellable(target, CancellationToken::new())
+            .await
+    }
+
+    async fn probe_compatibility_cancellable(
+        &self,
+        target: Target,
+        cancellation: CancellationToken,
+    ) -> Result<CompatibilityView, ControlProblem> {
         let observed = match target {
             Target::Codex => match self
                 .codex
                 .probe
-                .probe_cancellable(&self.codex.executable, CancellationToken::new())
+                .probe_cancellable(&self.codex.executable, cancellation.clone())
                 .await
             {
                 Ok(capability) => ProbedCompatibility::from(capability),
@@ -1134,7 +1279,7 @@ impl ReconciliationService {
             Target::Claude => match self
                 .claude
                 .probe
-                .probe_cancellable(&self.claude.executable, CancellationToken::new())
+                .probe_cancellable(&self.claude.executable, cancellation)
                 .await
             {
                 Ok(capability) => ProbedCompatibility::from(capability),

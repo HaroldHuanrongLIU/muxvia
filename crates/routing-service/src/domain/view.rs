@@ -1,10 +1,10 @@
 use tokio_rusqlite::rusqlite::{Connection, Result};
 
 use crate::control::protocol::{
-    ActivatedSnapshotView, ControlProblem, CredentialPresence, ManagedConfigurationView,
-    ProviderAuthentication, ProviderCompleteness, ProviderProtocol, ProviderProvenanceView,
-    ProviderReferenceView, ProviderRequirement, ProviderRoutingRequirement, ProviderView,
-    RecoveryView, RouteHealthView, ServiceView, TakeoverView, Target, TargetView,
+    ActivatedSnapshotView, ClaudeBlockingSelector, ControlProblem, CredentialPresence,
+    ManagedConfigurationView, ProviderAuthentication, ProviderCompleteness, ProviderProtocol,
+    ProviderProvenanceView, ProviderReferenceView, ProviderRequirement, ProviderRoutingRequirement,
+    ProviderView, RecoveryView, RouteHealthView, ServiceView, TakeoverView, Target, TargetView,
 };
 use crate::domain::provider::has_valid_provider_declaration;
 use crate::state::providers::provider_presets;
@@ -206,15 +206,23 @@ pub(crate) fn project_target_view_for(
         Err(error) => return Err(error),
     };
     let mut problem_statement = connection.prepare(
-        "SELECT code, message, source FROM target_problems WHERE target = ?1 ORDER BY code",
+        "SELECT code, message, source, selector
+         FROM target_problems WHERE target = ?1 ORDER BY code",
     )?;
     let problems = problem_statement
         .query_map([target_name], |row| {
+            let selector = row
+                .get::<_, Option<String>>(3)?
+                .map(|value| {
+                    ClaudeBlockingSelector::from_str(&value)
+                        .ok_or(tokio_rusqlite::rusqlite::Error::InvalidQuery)
+                })
+                .transpose()?;
             Ok(ControlProblem {
                 code: row.get(0)?,
                 message: row.get(1)?,
                 source: row.get(2)?,
-                selector: None,
+                selector,
             })
         })?
         .collect::<Result<Vec<_>>>()?;

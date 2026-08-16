@@ -237,6 +237,7 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
         not_null,
         default_value,
         table_sql,
+        problem_table_sql,
         route_versions,
         recovery_binding_is_nullable,
         after_migration,
@@ -257,6 +258,12 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
             let table_sql = connection.query_row(
                 "SELECT sql FROM sqlite_schema
                  WHERE type = 'table' AND name = 'target_route_state'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?;
+            let problem_table_sql = connection.query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'target_problems'",
                 [],
                 |row| row.get::<_, String>(0),
             )?;
@@ -281,6 +288,7 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
                 not_null,
                 default_value,
                 table_sql,
+                problem_table_sql,
                 route_versions,
                 recovery_binding_is_nullable,
                 after_migration,
@@ -293,6 +301,16 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
     assert_eq!(not_null, 1);
     assert_eq!(default_value.as_deref(), Some("1"));
     assert!(table_sql.contains("CHECK (managed_config_version IN (1,2))"));
+    for selector in [
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_MANTLE",
+        "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+        "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    ] {
+        assert!(problem_table_sql.contains(selector));
+    }
     assert_eq!(route_versions, [("claude".into(), 1), ("codex".into(), 1)]);
     assert!(recovery_binding_is_nullable);
     assert_eq!(

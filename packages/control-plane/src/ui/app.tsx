@@ -50,6 +50,7 @@ type ReconciliationWorkflowState = ReconciliationUiState & {
 }
 
 const reconciliationProblemCodes = new Set([
+  "compatibility-acknowledgement-required",
   "configuration-drift",
   "shadowing-configuration",
   "untested-target-cli",
@@ -387,10 +388,95 @@ function Shell(props: {
     }
   }
 
-  const acknowledgeReconciliation = (target: Target, token: OverlayToken, version: string) => {
-    updateReconciliation(target, token, (state) => state.preview?.compatibility.version === version
-      ? { ...state, acknowledgedVersion: version, errorCode: undefined }
-      : state)
+  const previewCompatibility = async (
+    target: Target,
+    token: OverlayToken,
+  ) => {
+    const current = reconciliationByTarget()[target]
+    if (!current || current.overlayToken !== token || current.pending) return
+    reconciliationAborts[target]?.abort()
+    const controller = new AbortController()
+    reconciliationAborts[target] = controller
+    const generation = ++reconciliationGenerations[target]
+    const originSession = current.originSession
+    updateReconciliation(target, token, (state) => ({
+      ...state,
+      generation,
+      compatibilityPreview: undefined,
+      pending: "preview",
+      errorCode: undefined,
+    }))
+    try {
+      const preview = await originSession.previewCompatibility(controller.signal)
+      const latest = reconciliationByTarget()[target]
+      if (
+        disposed
+        || exiting
+        || controller.signal.aborted
+        || !latest
+        || latest.overlayToken !== token
+        || latest.originSession !== originSession
+        || latest.generation !== generation
+      ) return
+      updateReconciliation(target, token, (state) => ({
+        ...state,
+        compatibilityPreview: preview,
+        pending: undefined,
+      }))
+    } catch (error) {
+      const latest = reconciliationByTarget()[target]
+      if (controller.signal.aborted || !latest || latest.overlayToken !== token || latest.generation !== generation) return
+      updateReconciliation(target, token, (state) => ({
+        ...state,
+        pending: undefined,
+        errorCode: safeReconciliationProblem(error),
+      }))
+    } finally {
+      if (reconciliationAborts[target] === controller) delete reconciliationAborts[target]
+    }
+  }
+
+  const acknowledgeReconciliation = async (target: Target, token: OverlayToken, version: string) => {
+    const current = reconciliationByTarget()[target]
+    if (!current || current.overlayToken !== token || current.pending) return
+    if (!current.compatibilityOnly) {
+      updateReconciliation(target, token, (state) => state.preview?.compatibility.version === version
+        ? { ...state, acknowledgedVersion: version, errorCode: undefined }
+        : state)
+      return
+    }
+    if (
+      current.compatibilityPreview?.compatibility.classification !== "unknown-compatible"
+      || !current.compatibilityPreview.compatibility.acknowledgementRequired
+      || current.compatibilityPreview.compatibility.version !== version
+    ) return
+    const originSession = current.originSession
+    const generation = current.generation
+    updateReconciliation(target, token, (state) => ({ ...state, pending: "apply", errorCode: undefined }))
+    try {
+      const outcome = await originSession.acknowledgeCompatibility(version)
+      const latest = reconciliationByTarget()[target]
+      if (
+        disposed
+        || exiting
+        || !latest
+        || latest.overlayToken !== token
+        || latest.originSession !== originSession
+        || latest.generation !== generation
+      ) return
+      installView(outcome.view, "action")
+      overlay.close(token)
+    } catch (error) {
+      if (disposed || exiting) return
+      installView(originSession.get() as TargetViewProjection, "action")
+      const latest = reconciliationByTarget()[target]
+      if (!latest || latest.overlayToken !== token || latest.generation !== generation) return
+      updateReconciliation(target, token, (state) => ({
+        ...state,
+        pending: undefined,
+        errorCode: safeReconciliationProblem(error),
+      }))
+    }
   }
 
   const applyReconciliation = async (target: Target, token: OverlayToken) => {
@@ -464,10 +550,10 @@ function Shell(props: {
   const openReconciliation = () => {
     const target = activeTarget()
     const originSession = session(target)
+    if (!target || !originSession) return
+    const blocked = managedWriteProblem(views()[target])
     if (
-      !target
-      || !originSession
-      || !managedWriteProblem(views()[target])
+      !blocked
       || reconciliationScheduled[target]
       || overlay.depth > 0
     ) return
@@ -477,11 +563,14 @@ function Shell(props: {
       if (disposed || exiting || activeTarget() !== target || overlay.depth > 0) return
       const token = Symbol(`reconciliation-${target}`)
       const generation = ++reconciliationGenerations[target]
+      const compatibilityOnly = blocked === "compatibility-acknowledgement-required"
+        || blocked === "incompatible-target-cli"
       const initial: ReconciliationWorkflowState = {
         target,
         originSession,
         overlayToken: token,
         generation,
+        compatibilityOnly,
       }
       setReconciliationByTarget((states) => ({ ...states, [target]: initial }))
       overlay.replace({
@@ -492,7 +581,7 @@ function Shell(props: {
           state={() => reconciliationByTarget()[target] ?? initial}
           t={props.t}
           onPreview={(strategy) => { void previewReconciliation(target, token, strategy) }}
-          onAcknowledge={(version) => acknowledgeReconciliation(target, token, version)}
+          onAcknowledge={(version) => { void acknowledgeReconciliation(target, token, version) }}
           onApply={() => { void applyReconciliation(target, token) }}
           onCancel={() => closeReconciliation(target, token)}
         />,
@@ -505,6 +594,7 @@ function Shell(props: {
             : states)
         },
       })
+      if (compatibilityOnly) void previewCompatibility(target, token)
     })
   }
 

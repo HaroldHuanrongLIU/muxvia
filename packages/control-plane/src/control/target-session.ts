@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto"
 import { ControlError, type RpcTransport } from "./rpc-client"
 import type {
   ActionOutcome,
+  CompatibilityPreview,
   DiscoverySource,
   ClaudePreflightContext,
   ModelDiscoveryResult,
@@ -31,6 +32,8 @@ export interface TargetSession {
     strategy: ReconciliationStrategy,
     signal?: AbortSignal,
   ): Promise<ReconciliationPreview>
+  previewCompatibility(signal?: AbortSignal): Promise<CompatibilityPreview>
+  acknowledgeCompatibility(version: string): Promise<ActionOutcome>
   applyReconciliation(input: {
     strategy: ReconciliationStrategy
     observationToken: string
@@ -159,6 +162,28 @@ class TargetSessionImpl implements TargetSession {
       throw new ControlError("invalid-response", "Reconciliation preview response did not match request")
     }
     return freezeReconciliationPreview(response.preview)
+  }
+
+  async previewCompatibility(signal?: AbortSignal): Promise<CompatibilityPreview> {
+    if (this.#closed) {
+      throw new ControlError("connection-closed", "Target session is closed")
+    }
+    const response = await this.#rpc.request({
+      kind: "preview-compatibility",
+      target: this.#target,
+    }, { signal })
+    if (
+      response.kind !== "compatibility-preview"
+      || response.preview.target !== this.#target
+    ) {
+      throw new ControlError("invalid-response", "Compatibility preview response did not match request")
+    }
+    Object.freeze(response.preview.compatibility)
+    return Object.freeze(response.preview)
+  }
+
+  acknowledgeCompatibility(version: string): Promise<ActionOutcome> {
+    return this.act({ kind: "acknowledge-compatibility", version })
   }
 
   applyReconciliation(input: {

@@ -699,6 +699,13 @@ async fn serve_session(
                                 } => Some((*strategy, *observation_token, acknowledge_version.clone())),
                                 _ => None,
                             });
+                        let compatibility_acknowledgement =
+                            parsed_action.as_ref().and_then(|action| match action {
+                                TargetAction::AcknowledgeCompatibility { version } => {
+                                    Some(version.clone())
+                                }
+                                _ => None,
+                            });
                         let probe_unmanaged_provider_write = matches!(
                             parsed_action.as_ref(),
                             Some(
@@ -746,6 +753,16 @@ async fn serve_session(
                                     "State store unavailable",
                                 ).await), None),
                             }
+                        } else if let Some(version) = compatibility_acknowledgement {
+                            let deferred = reconciliation
+                                .acknowledge_compatibility(
+                                    target,
+                                    action_id,
+                                    expected_revision,
+                                    version,
+                                )
+                                .await;
+                            (deferred.result, deferred.publication)
                         } else {
                             match store.receipt_for(target, action_id).await {
                                 Ok(Some(outcome)) => (Ok(outcome), None),
@@ -820,7 +837,8 @@ async fn serve_session(
                     }
                     operation @ (ControlOperation::DiscoverModels { .. }
                     | ControlOperation::CheckReachability { .. }
-                    | ControlOperation::PreviewReconciliation { .. }) => {
+                    | ControlOperation::PreviewReconciliation { .. }
+                    | ControlOperation::PreviewCompatibility { .. }) => {
                         if let ControlOperation::DiscoverModels {
                             source: DiscoverySource::Draft { authentication, .. },
                             ..
@@ -933,7 +951,8 @@ fn operation_target(operation: &ControlOperation) -> Target {
         | ControlOperation::Act { target, .. }
         | ControlOperation::DiscoverModels { target, .. }
         | ControlOperation::CheckReachability { target, .. }
-        | ControlOperation::PreviewReconciliation { target, .. } => *target,
+        | ControlOperation::PreviewReconciliation { target, .. }
+        | ControlOperation::PreviewCompatibility { target } => *target,
     }
 }
 
@@ -1010,6 +1029,10 @@ async fn inspect_and_queue(
                         )
                     })
             }
+            ControlOperation::PreviewCompatibility { .. } => reconciliation
+                .preview_compatibility_cancellable(target, inspection_cancellation)
+                .await
+                .map(|preview| (ControlResult::CompatibilityPreview { preview }, None)),
             _ => unreachable!(),
         }
     };

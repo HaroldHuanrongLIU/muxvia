@@ -173,6 +173,9 @@ pub enum ControlOperation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_context: Option<ClaudePreflightContext>,
     },
+    PreviewCompatibility {
+        target: Target,
+    },
 }
 
 /// Secret-free observations supplied while opening the Claude management context.
@@ -272,6 +275,18 @@ impl ClaudeBlockingSelector {
             Self::Mantle => "CLAUDE_CODE_USE_MANTLE",
             Self::AnthropicAws => "CLAUDE_CODE_USE_ANTHROPIC_AWS",
             Self::HostManaged => "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "CLAUDE_CODE_USE_BEDROCK" => Some(Self::Bedrock),
+            "CLAUDE_CODE_USE_VERTEX" => Some(Self::Vertex),
+            "CLAUDE_CODE_USE_FOUNDRY" => Some(Self::Foundry),
+            "CLAUDE_CODE_USE_MANTLE" => Some(Self::Mantle),
+            "CLAUDE_CODE_USE_ANTHROPIC_AWS" => Some(Self::AnthropicAws),
+            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST" => Some(Self::HostManaged),
+            _ => None,
         }
     }
 }
@@ -407,6 +422,10 @@ impl fmt::Debug for ControlOperation {
                 .field("target", target)
                 .field("strategy", strategy)
                 .finish(),
+            Self::PreviewCompatibility { target } => formatter
+                .debug_struct("PreviewCompatibility")
+                .field("target", target)
+                .finish(),
         }
     }
 }
@@ -464,6 +483,9 @@ pub enum TargetAction {
         observation_token: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         acknowledge_version: Option<String>,
+    },
+    AcknowledgeCompatibility {
+        version: String,
     },
 }
 
@@ -558,6 +580,10 @@ impl fmt::Debug for TargetAction {
                 .field("observation_token", observation_token)
                 .field("acknowledge_version", acknowledge_version)
                 .finish(),
+            Self::AcknowledgeCompatibility { version } => formatter
+                .debug_struct("AcknowledgeCompatibility")
+                .field("version", version)
+                .finish(),
         }
     }
 }
@@ -639,6 +665,7 @@ pub enum ControlResult {
     ModelDiscovery { result: ModelDiscoveryResult },
     Reachability { result: ReachabilityResult },
     ReconciliationPreview { preview: ReconciliationPreview },
+    CompatibilityPreview { preview: CompatibilityPreview },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -655,6 +682,14 @@ pub enum CompatibilityClassification {
     Tested,
     UnknownCompatible,
     Incompatible,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompatibilityPreview {
+    pub target: Target,
+    pub management_revision: u64,
+    pub compatibility: CompatibilityView,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]

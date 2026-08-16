@@ -57,6 +57,11 @@ CREATE TABLE IF NOT EXISTS target_problems (
     'codex-profile', 'claude-managed', 'claude-shared', 'claude-project',
     'claude-local', 'claude-selector', 'claude-host-managed'
   )),
+  selector TEXT CHECK (selector IS NULL OR selector IN (
+    'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX',
+    'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_MANTLE',
+    'CLAUDE_CODE_USE_ANTHROPIC_AWS', 'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST'
+  )),
   PRIMARY KEY (target, code)
 );
 

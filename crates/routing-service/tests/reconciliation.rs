@@ -2658,17 +2658,88 @@ async fn ordinary_write_gates_are_target_local_while_read_only_operations_remain
             .iter()
             .any(|problem| problem["code"] == "compatibility-acknowledgement-required")
     );
-    store
-        .record_compatibility(
-            Target::Claude,
-            "77.2.0 (Claude Code)".into(),
-            muxvia_routing::control::protocol::CompatibilityClassification::UnknownCompatible,
-        )
-        .await
+    let compatibility_preview = request(
+        &mut claude,
+        "peer-compatibility-preview",
+        json!({"kind":"preview-reconciliation","target":"claude","strategy":"reapply"}),
+    )
+    .await;
+    assert_eq!(compatibility_preview["type"], "response");
+    assert_eq!(
+        compatibility_preview["result"]["preview"]["compatibility"]["version"],
+        "77.2.0 (Claude Code)"
+    );
+    assert_eq!(
+        compatibility_preview["result"]["preview"]["compatibility"]["acknowledgementRequired"],
+        true
+    );
+    let compatibility_action_id = Uuid::new_v4();
+    let compatibility_token = compatibility_preview["result"]["preview"]["observationToken"]
+        .as_str()
         .unwrap();
-    store
-        .acknowledge_compatibility(Target::Claude, "77.2.0 (Claude Code)")
-        .await
+    let reconciled = request(
+        &mut claude,
+        "peer-compatibility-apply",
+        json!({
+            "kind":"act","target":"claude","actionId":compatibility_action_id,
+            "expectedRevision":claude_revision,
+            "action":{
+                "kind":"reconcile","strategy":"reapply","observationToken":compatibility_token,
+                "acknowledgeVersion":"77.2.0 (Claude Code)"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(reconciled["type"], "response");
+    assert!(
+        !reconciled["result"]["outcome"]["view"]["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|problem| problem["code"] == "compatibility-acknowledgement-required")
+    );
+    let reconciled_push = read_frame(&mut claude).await.unwrap();
+    assert_eq!(reconciled_push["type"], "target-view");
+    assert!(
+        !reconciled_push["view"]["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|problem| problem["code"] == "compatibility-acknowledgement-required")
+    );
+    assert!(
+        !store
+            .target_view_for(Target::Claude)
+            .await
+            .unwrap()
+            .problems
+            .iter()
+            .any(|problem| problem.code == "compatibility-acknowledgement-required")
+    );
+    let replay = request(
+        &mut claude,
+        "peer-compatibility-replay",
+        json!({
+            "kind":"act","target":"claude","actionId":compatibility_action_id,
+            "expectedRevision":0,"action":{"malformed":true}
+        }),
+    )
+    .await;
+    assert_eq!(replay["result"]["outcome"]["status"], "replayed");
+    assert!(
+        !replay["result"]["outcome"]["view"]["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|problem| problem["code"] == "compatibility-acknowledgement-required")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), read_frame(&mut claude))
+            .await
+            .is_err()
+    );
+    let claude_revision = reconciled["result"]["outcome"]["view"]["managementRevision"]
+        .as_u64()
         .unwrap();
     let peer_saved = request(
         &mut claude,

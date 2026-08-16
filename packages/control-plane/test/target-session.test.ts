@@ -9,6 +9,7 @@ import { RpcClient } from "../src/control/rpc-client"
 import type {
   ClientFrame,
   ClaudePreflightContext,
+  CompatibilityPreview,
   ReconciliationPreview,
   ServerFrame,
   TargetView,
@@ -201,6 +202,15 @@ class ScriptedServer {
       type: "response",
       requestId: frame.requestId,
       result: { kind: "reconciliation-preview", preview },
+    })
+  }
+
+  replyCompatibilityPreview(index: number, preview: CompatibilityPreview): void {
+    const frame = this.requests()[index]!
+    this.send({
+      type: "response",
+      requestId: frame.requestId,
+      result: { kind: "compatibility-preview", preview },
     })
   }
 
@@ -466,6 +476,52 @@ test("reconciliation preview captures target and Claude context without waiting 
   expect(await preview).toEqual(expected)
   server.replyApplied(viewAtRevision(2, 2, "claude"))
   await action
+  await session.close()
+  await server.close()
+})
+
+test("compatibility preview and acknowledgement use the public target-scoped workflow", async () => {
+  const initial = viewAtRevision(1)
+  initial.problems = [{
+    code: "compatibility-acknowledgement-required",
+    message: "Acknowledge the exact version",
+  }]
+  const { session, server } = await openScriptedSession(initial)
+
+  const inspecting = session.previewCompatibility()
+  await server.waitForRequests(2)
+  expect(server.requests()[1]!.operation).toEqual({
+    kind: "preview-compatibility",
+    target: "codex",
+  })
+  const preview: CompatibilityPreview = {
+    target: "codex",
+    managementRevision: 1,
+    compatibility: {
+      version: "codex-unknown-8.1",
+      classification: "unknown-compatible",
+      acknowledgementRequired: true,
+    },
+  }
+  server.replyCompatibilityPreview(1, preview)
+  expect(await inspecting).toEqual(preview)
+
+  const acknowledging = session.acknowledgeCompatibility("codex-unknown-8.1")
+  await server.waitForRequests(3)
+  expect(server.requests()[2]!.operation).toMatchObject({
+    kind: "act",
+    target: "codex",
+    expectedRevision: 1,
+    action: {
+      kind: "acknowledge-compatibility",
+      version: "codex-unknown-8.1",
+    },
+  })
+  const acknowledged = viewAtRevision(1, 2)
+  server.replyApplied(acknowledged)
+  expect((await acknowledging).view).toEqual(acknowledged)
+  expect(session.get()).toEqual(acknowledged)
+
   await session.close()
   await server.close()
 })

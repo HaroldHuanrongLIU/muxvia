@@ -88,10 +88,17 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
 fn migrate_v7(connection: &mut Connection) -> Result<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
-        "ALTER TABLE target_problems ADD COLUMN source TEXT
+         "ALTER TABLE target_problems ADD COLUMN source TEXT
            CHECK (source IS NULL OR source IN (
              'codex-profile', 'claude-managed', 'claude-shared', 'claude-project',
              'claude-local', 'claude-selector', 'claude-host-managed'
+           ));
+         ALTER TABLE target_problems ADD COLUMN selector TEXT
+           CHECK (selector IS NULL OR selector IN (
+             'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX',
+             'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_MANTLE',
+             'CLAUDE_CODE_USE_ANTHROPIC_AWS',
+             'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST'
            ));
          CREATE TABLE target_compatibility (
            target TEXT PRIMARY KEY CHECK (target IN ('codex', 'claude')),

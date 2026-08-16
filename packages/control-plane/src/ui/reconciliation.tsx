@@ -3,7 +3,7 @@ import { useTerminalDimensions } from "@opentui/solid"
 import { For, onMount, Show, type Accessor } from "solid-js"
 
 import { useCommandLayer } from "../commands/keymap"
-import type { ReconciliationPreview, ReconciliationStrategy, Target } from "../control/types"
+import type { CompatibilityPreview, ReconciliationPreview, ReconciliationStrategy, Target } from "../control/types"
 import { messageKeyForProblem, type MessageKey, type Translator } from "../i18n"
 import { theme } from "../theme"
 
@@ -11,6 +11,8 @@ export interface ReconciliationUiState {
   target: Target
   strategy?: ReconciliationStrategy
   preview?: ReconciliationPreview
+  compatibilityOnly?: boolean
+  compatibilityPreview?: CompatibilityPreview
   pending?: "preview" | "apply"
   errorCode?: string
   acknowledgedVersion?: string
@@ -33,7 +35,7 @@ function strategyKey(strategy: ReconciliationStrategy): MessageKey {
   }
 }
 
-function compatibilityKey(preview: ReconciliationPreview): MessageKey {
+function compatibilityKey(preview: Pick<ReconciliationPreview, "compatibility">): MessageKey {
   switch (preview.compatibility.classification) {
     case "tested": return "reconciliation.compatibility.tested"
     case "unknown-compatible": return "reconciliation.compatibility.unknown-compatible"
@@ -98,10 +100,10 @@ export function Reconciliation(props: ReconciliationProps) {
     scope: "reconciliation",
     priority: 400,
     handlers: {
-      "target.reconciliation.preview.adopt": () => props.onPreview("adopt"),
-      "target.reconciliation.preview.reapply": () => props.onPreview("reapply"),
-      "target.reconciliation.preview.restore": () => props.onPreview("restore"),
-      "target.reconciliation.apply": props.onApply,
+      "target.reconciliation.preview.adopt": () => { if (!props.state().compatibilityOnly) props.onPreview("adopt") },
+      "target.reconciliation.preview.reapply": () => { if (!props.state().compatibilityOnly) props.onPreview("reapply") },
+      "target.reconciliation.preview.restore": () => { if (!props.state().compatibilityOnly) props.onPreview("restore") },
+      "target.reconciliation.apply": () => { if (!props.state().compatibilityOnly) props.onApply() },
       "target.reconciliation.cancel": props.onCancel,
     },
   })
@@ -111,7 +113,9 @@ export function Reconciliation(props: ReconciliationProps) {
   }))
 
   const acknowledge = () => {
-    const preview = props.state().preview
+    const preview = props.state().compatibilityOnly
+      ? props.state().compatibilityPreview
+      : props.state().preview
     if (
       props.state().pending
       || !preview?.compatibility.acknowledgementRequired
@@ -147,11 +151,13 @@ export function Reconciliation(props: ReconciliationProps) {
         width="100%"
       />
     </box>
-    <For each={["adopt", "reapply", "restore"] as const}>{(strategy) => (
-      <text fg={props.state().strategy === strategy ? theme.primary : theme.muted}>
-        {props.t(strategyKey(strategy))}
-      </text>
-    )}</For>
+    <Show when={!props.state().compatibilityOnly}>
+      <For each={["adopt", "reapply", "restore"] as const}>{(strategy) => (
+        <text fg={props.state().strategy === strategy ? theme.primary : theme.muted}>
+          {props.t(strategyKey(strategy))}
+        </text>
+      )}</For>
+    </Show>
     <Show when={props.state().pending === "preview"}>
       <text fg={theme.warning}>{props.t("reconciliation.previewing")}</text>
     </Show>
@@ -189,9 +195,23 @@ export function Reconciliation(props: ReconciliationProps) {
         </text>
       </Show>
     </box>}</For>
+    <For each={props.state().compatibilityPreview ? [props.state().compatibilityPreview!] : []}>{(preview) => <box flexDirection="column">
+      <text fg={preview.compatibility.classification === "incompatible" ? theme.error : theme.text}>
+        {props.t(compatibilityKey(preview), { version: preview.compatibility.version })}
+      </text>
+      <Show when={preview.compatibility.acknowledgementRequired}>
+        <text fg={theme.warning}>
+          {props.t("reconciliation.acknowledgement", { version: preview.compatibility.version })}
+        </text>
+      </Show>
+    </box>}</For>
     <Show when={props.state().pending === "apply"}>
       <text fg={theme.warning}>{props.t("reconciliation.applying")}</text>
     </Show>
-    <text fg={theme.muted}>{props.t("reconciliation.help")}</text>
+    <text fg={theme.muted}>{props.t(props.state().compatibilityOnly
+      ? props.state().compatibilityPreview?.compatibility.classification === "incompatible"
+        ? "reconciliation.compatibility.read-only-help"
+        : "reconciliation.compatibility.help"
+      : "reconciliation.help")}</text>
   </box>
 }

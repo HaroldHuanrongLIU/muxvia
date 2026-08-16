@@ -20,8 +20,8 @@ use muxvia_routing::{
     control::{
         framing::{FrameError, read_frame, write_frame},
         protocol::{
-            ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState,
-            CompatibilityClassification, ReconciliationStrategy, Target,
+            ClaudeBlockingSelector, ClaudeHostManagedState, ClaudePreflightContext,
+            ClaudeSelectorState, CompatibilityClassification, ReconciliationStrategy, Target,
         },
         server::{ControlServer, ControlServerHandle, peer_uid_matches},
     },
@@ -84,6 +84,28 @@ impl CodexProbe for UnknownCodexProbe {
                 biased;
                 _ = cancellation.cancelled() => CommandCodexProbe.probe(Path::new("relative-codex")),
                 result = async { self.probe(Path::new("/usr/bin/codex")) } => result,
+            }
+        })
+    }
+}
+
+struct IncompatibleCodexProbe;
+
+impl CodexProbe for IncompatibleCodexProbe {
+    fn probe(&self, _: &Path) -> Result<CodexCapability, CodexProblem> {
+        CommandCodexProbe.probe(Path::new("relative-codex"))
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<CodexCapability, CodexProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandCodexProbe.probe(Path::new("relative-codex")),
+                result = async { self.probe(Path::new("relative-codex")) } => result,
             }
         })
     }
@@ -193,6 +215,28 @@ impl ClaudeProbe for UnknownClaudeProbe {
                 biased;
                 _ = cancellation.cancelled() => CommandClaudeProbe.probe(Path::new("relative-claude")),
                 result = async { self.probe(Path::new("/usr/bin/claude")) } => result,
+            }
+        })
+    }
+}
+
+struct IncompatibleClaudeProbe;
+
+impl ClaudeProbe for IncompatibleClaudeProbe {
+    fn probe(&self, _: &Path) -> Result<ClaudeCapability, ClaudeProblem> {
+        CommandClaudeProbe.probe(Path::new("relative-claude"))
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeCapability, ClaudeProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandClaudeProbe.probe(Path::new("relative-claude")),
+                result = async { self.probe(Path::new("relative-claude")) } => result,
             }
         })
     }
@@ -4557,10 +4601,66 @@ async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_tar
                 .exists()
         );
 
-        store
-            .acknowledge_compatibility(target, &version)
-            .await
-            .unwrap();
+        let preview = request(
+            &mut stream,
+            "compatibility-preview",
+            json!({ "kind": "preview-compatibility", "target": target_name }),
+        )
+        .await;
+        assert_eq!(preview["type"], "response");
+        assert_eq!(preview["result"]["kind"], "compatibility-preview");
+        assert_eq!(preview["result"]["preview"]["target"], target_name);
+        assert_eq!(
+            preview["result"]["preview"]["compatibility"]["version"],
+            version
+        );
+        assert_eq!(
+            preview["result"]["preview"]["compatibility"]["classification"],
+            "unknown-compatible"
+        );
+        assert_eq!(
+            preview["result"]["preview"]["compatibility"]["acknowledgementRequired"],
+            true
+        );
+        let acknowledgement_action_id = Uuid::new_v4();
+        let acknowledged = request(
+            &mut stream,
+            "compatibility-acknowledgement",
+            json!({
+                "kind": "act", "target": target_name, "actionId": acknowledgement_action_id,
+                "expectedRevision": revision,
+                "action": { "kind": "acknowledge-compatibility", "version": version }
+            }),
+        )
+        .await;
+        assert_eq!(acknowledged["type"], "response");
+        assert_eq!(acknowledged["result"]["outcome"]["status"], "applied");
+        assert!(
+            !acknowledged["result"]["outcome"]["view"]["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|problem| problem["code"] == "compatibility-acknowledgement-required")
+        );
+        let acknowledgement_push = read_frame(&mut stream).await.unwrap();
+        assert_eq!(acknowledgement_push["type"], "target-view");
+        let replayed = request(
+            &mut stream,
+            "compatibility-acknowledgement-replay",
+            json!({
+                "kind": "act", "target": target_name, "actionId": acknowledgement_action_id,
+                "expectedRevision": revision + 99,
+                "action": { "kind": "acknowledge-compatibility", "version": "stale-version" }
+            }),
+        )
+        .await;
+        assert_eq!(replayed["result"]["outcome"]["status"], "replayed");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read_frame(&mut stream))
+                .await
+                .is_err(),
+            "a compatibility acknowledgement replay published a duplicate Target View"
+        );
         let activated = request(
             &mut stream,
             "acknowledged-activation",
@@ -4584,6 +4684,267 @@ async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_tar
         );
         let _activation_push = read_frame(&mut stream).await.unwrap();
         handle.shutdown().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unmanaged_incompatible_activation_exposes_only_public_read_only_guidance() {
+    for (target, target_name) in [(Target::Codex, "codex"), (Target::Claude, "claude")] {
+        let root = short_temp_root(&format!("mx-incompatible-{target_name}"));
+        let user_home = root.join("home");
+        fs::create_dir_all(&user_home).unwrap();
+        let home = MuxviaHome::from_user_home(&user_home);
+        let store = Arc::new(StateStore::open(&home).await.unwrap());
+        let saved = store
+            .apply_provider_action_for(
+                target,
+                Uuid::new_v4(),
+                0,
+                match target {
+                    Target::Codex => json!({
+                        "kind": "create-provider", "name": "Codex incompatible",
+                        "baseUrl": "https://api.openai.test/v1", "model": "gpt-test",
+                        "credential": {"kind": "replace", "value": "INCOMPATIBLE_CODEX_SECRET_98501"},
+                        "authentication": "openai-bearer", "presetKey": null
+                    }),
+                    Target::Claude => json!({
+                        "kind": "create-provider", "name": "Claude incompatible",
+                        "baseUrl": "https://api.anthropic.test", "model": "claude-test",
+                        "credential": {"kind": "replace", "value": "INCOMPATIBLE_CLAUDE_SECRET_98502"},
+                        "authentication": "anthropic-api-key", "presetKey": null
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let provider_id = saved.view.providers[0].id;
+        let activation = Arc::new(
+            ActivationService::new(
+                Arc::clone(&store),
+                home.clone(),
+                Arc::new(IncompatibleCodexProbe),
+                "/usr/bin/codex".into(),
+                Arc::new(ControlNoopUpstream),
+            )
+            .with_claude_runtime(Arc::new(IncompatibleClaudeProbe), "/usr/bin/claude".into()),
+        );
+        let handle = ControlServer::bind_with_activation(
+            &home,
+            Arc::clone(&store),
+            "routing-test",
+            activation,
+        )
+        .await
+        .unwrap();
+        let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+        hello(&mut stream).await;
+        let claude_context = (target == Target::Claude).then(|| {
+            json!({
+                "claudeConfigDir": null, "selectorState": "unset",
+                "blockingSelector": null, "hostManagedState": "unmanaged", "cwd": user_home
+            })
+        });
+        let opened = request(
+            &mut stream,
+            "open",
+            json!({
+                "kind": "open-target", "target": target_name,
+                "claudeContext": claude_context
+            }),
+        )
+        .await;
+        let revision = opened["result"]["view"]["managementRevision"]
+            .as_u64()
+            .unwrap();
+        let blocked = request(
+            &mut stream,
+            "blocked-activation",
+            json!({
+                "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
+                "expectedRevision": revision,
+                "action": {"kind": "activate-provider", "providerId": provider_id, "mode": "direct"}
+            }),
+        )
+        .await;
+        assert_eq!(blocked["problem"]["code"], "incompatible-target-cli");
+        let blocker_push = read_frame(&mut stream).await.unwrap();
+        assert_eq!(blocker_push["type"], "target-view");
+
+        let preview = request(
+            &mut stream,
+            "compatibility-preview",
+            json!({"kind": "preview-compatibility", "target": target_name}),
+        )
+        .await;
+        assert_eq!(preview["type"], "response");
+        assert_eq!(
+            preview["result"]["preview"]["compatibility"]["classification"],
+            "incompatible"
+        );
+        assert_eq!(
+            preview["result"]["preview"]["compatibility"]["version"],
+            "unavailable"
+        );
+        let rejected_ack = request(
+            &mut stream,
+            "incompatible-acknowledgement",
+            json!({
+                "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
+                "expectedRevision": revision,
+                "action": {"kind": "acknowledge-compatibility", "version": "unavailable"}
+            }),
+        )
+        .await;
+        assert_eq!(rejected_ack["problem"]["code"], "incompatible-target-cli");
+        assert!(
+            !user_home
+                .join(format!(
+                    ".{target_name}/{}",
+                    if target == Target::Codex {
+                        "config.toml"
+                    } else {
+                        "settings.json"
+                    }
+                ))
+                .exists()
+        );
+        handle.shutdown().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn durable_claude_shadow_problem_retains_every_exact_selector_across_reopen() {
+    for selector in [
+        ClaudeBlockingSelector::Bedrock,
+        ClaudeBlockingSelector::Vertex,
+        ClaudeBlockingSelector::Foundry,
+        ClaudeBlockingSelector::Mantle,
+        ClaudeBlockingSelector::AnthropicAws,
+        ClaudeBlockingSelector::HostManaged,
+    ] {
+        let root = short_temp_root(&format!("mx-selector-{}", selector.as_str().len()));
+        let user_home = root.join("home");
+        fs::create_dir_all(&user_home).unwrap();
+        let home = MuxviaHome::from_user_home(&user_home);
+        let store = Arc::new(StateStore::open(&home).await.unwrap());
+        let saved = store
+            .apply_provider_action_for(
+                Target::Claude,
+                Uuid::new_v4(),
+                0,
+                json!({
+                    "kind": "create-provider", "name": "Claude managed",
+                    "baseUrl": "https://api.anthropic.test", "model": "claude-test",
+                    "credential": {"kind": "replace", "value": "SELECTOR_SECRET_98601"},
+                    "authentication": "anthropic-api-key", "presetKey": null
+                }),
+            )
+            .await
+            .unwrap();
+        let provider_id = saved.view.providers[0].id;
+        let activation = Arc::new(
+            ActivationService::new(
+                Arc::clone(&store),
+                home.clone(),
+                Arc::new(ControlCodexProbe),
+                "/usr/bin/codex".into(),
+                Arc::new(ControlNoopUpstream),
+            )
+            .with_claude_runtime(Arc::new(ControlClaudeProbe), "/usr/bin/claude".into()),
+        );
+        activation
+            .apply_raw_for_with_context(
+                Target::Claude,
+                Uuid::new_v4(),
+                saved.view.management_revision,
+                json!({
+                    "kind": "activate-provider", "providerId": provider_id, "mode": "direct"
+                }),
+                Some(&ClaudePreflightContext {
+                    claude_config_dir: None,
+                    selector_state: ClaudeSelectorState::Unset,
+                    blocking_selector: None,
+                    host_managed_state: ClaudeHostManagedState::Unmanaged,
+                    cwd: user_home.to_string_lossy().into_owned(),
+                }),
+            )
+            .await
+            .unwrap();
+        let handle = ControlServer::bind_with_activation(
+            &home,
+            Arc::clone(&store),
+            "routing-test",
+            activation,
+        )
+        .await
+        .unwrap();
+        let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+        hello(&mut stream).await;
+        let host_managed = selector == ClaudeBlockingSelector::HostManaged;
+        let opened = request(
+            &mut stream,
+            "open",
+            json!({
+                "kind": "open-target", "target": "claude",
+                "claudeContext": {
+                    "claudeConfigDir": null,
+                    "selectorState": if host_managed { "unset" } else { "enabled" },
+                    "blockingSelector": selector,
+                    "hostManagedState": if host_managed { "managed" } else { "unmanaged" },
+                    "cwd": user_home
+                }
+            }),
+        )
+        .await;
+        let revision = opened["result"]["view"]["managementRevision"]
+            .as_u64()
+            .unwrap();
+        let blocked = request(
+            &mut stream,
+            "shadowed-write",
+            json!({
+                "kind": "act", "target": "claude", "actionId": Uuid::new_v4(),
+                "expectedRevision": revision,
+                "action": {
+                    "kind": "create-provider", "name": "blocked", "baseUrl": "https://blocked.test",
+                    "model": "blocked", "credential": {"kind": "replace", "value": "BLOCKED_SELECTOR_SECRET_98602"},
+                    "authentication": "anthropic-api-key", "presetKey": null
+                }
+            }),
+        )
+        .await;
+        assert_eq!(blocked["problem"]["code"], "shadowing-configuration");
+        assert_eq!(
+            blocked["problem"]["source"],
+            if host_managed {
+                "claude-host-managed"
+            } else {
+                "claude-selector"
+            }
+        );
+        assert_eq!(blocked["problem"]["selector"], selector.as_str());
+        let push = read_frame(&mut stream).await.unwrap();
+        let pushed_problem = push["view"]["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|problem| problem["code"] == "shadowing-configuration")
+            .unwrap();
+        assert_eq!(pushed_problem["selector"], selector.as_str());
+        handle.shutdown().await.unwrap();
+
+        let reopened = StateStore::open(&home).await.unwrap();
+        let persisted = reopened
+            .target_view_for(Target::Claude)
+            .await
+            .unwrap()
+            .problems
+            .into_iter()
+            .find(|problem| problem.code == "shadowing-configuration")
+            .unwrap();
+        assert_eq!(persisted.selector, Some(selector));
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -23,7 +23,7 @@ type Pending = {
 export type RequestOptions = { signal?: AbortSignal }
 export type InspectionOperation = Extract<
   ControlOperation,
-  { kind: "discover-models" | "check-reachability" | "preview-reconciliation" }
+  { kind: "discover-models" | "check-reachability" | "preview-reconciliation" | "preview-compatibility" }
 >
 type NonInspectionOperation = Exclude<ControlOperation, InspectionOperation>
 

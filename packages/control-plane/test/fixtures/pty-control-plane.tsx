@@ -52,6 +52,8 @@ class FixtureSession implements TargetSession {
   async checkReachability(): Promise<never> { throw new Error("not used by this fixture") }
   async previewReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
   async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
+  async previewCompatibility(): Promise<never> { throw new Error("compatibility preview not configured in this fixture") }
+  async acknowledgeCompatibility(): Promise<never> { throw new Error("compatibility acknowledgement not configured in this fixture") }
   async act(_action: TargetAction): Promise<ActionOutcome> {
     return { status: "applied", view: initialView }
   }

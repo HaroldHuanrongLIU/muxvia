@@ -3,7 +3,7 @@ import { testRender } from "@opentui/solid"
 
 import { App } from "../src/ui/app"
 import type { TargetSession } from "../src/control/target-session"
-import type { ActionOutcome, TargetAction, TargetView } from "../src/control/types"
+import type { ActionOutcome, CompatibilityPreview, TargetAction, TargetView } from "../src/control/types"
 import {
   assertControlledSecretSource,
   assertSecretFreeStructured,
@@ -113,6 +113,8 @@ class MemoryTargetSession implements TargetSession {
   async checkReachability(): Promise<never> { throw new Error("not used by this fixture") }
   async previewReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
   async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
+  async previewCompatibility(): Promise<CompatibilityPreview> { throw new Error("compatibility preview not configured in this fixture") }
+  async acknowledgeCompatibility(): Promise<ActionOutcome> { throw new Error("compatibility acknowledgement not configured in this fixture") }
 
   async act(action: TargetAction): Promise<ActionOutcome> {
     this.actions.push(projectAction(action))
@@ -887,6 +889,36 @@ test("maps known and unknown problems without rendering backend messages", async
     expect(frame).toContain("Credential  Absent")
     expect(frame).not.toContain(problemMessageSentinel)
     expect(frame).not.toContain(credentialSentinel)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test.each([
+  ["CLAUDE_CODE_USE_BEDROCK", "claude-selector"],
+  ["CLAUDE_CODE_USE_VERTEX", "claude-selector"],
+  ["CLAUDE_CODE_USE_FOUNDRY", "claude-selector"],
+  ["CLAUDE_CODE_USE_MANTLE", "claude-selector"],
+  ["CLAUDE_CODE_USE_ANTHROPIC_AWS", "claude-selector"],
+  ["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "claude-host-managed"],
+] as const)("renders the exact durable Claude selector %s without backend text", async (selector, source) => {
+  const session = new MemoryTargetSession(view({
+    target: "claude",
+    problems: [{
+      code: "shadowing-configuration",
+      message: problemMessageSentinel,
+      source,
+      selector,
+    }],
+  }))
+  const codex = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App sessions={{ codex, claude: session }} />, { width: 100, height: 24, useThread: false })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    const frame = await setup.waitForFrame((next) => next.includes(selector))
+    expect(frame).toContain(source)
+    expect(frame).not.toContain(problemMessageSentinel)
   } finally {
     setup.renderer.destroy()
   }

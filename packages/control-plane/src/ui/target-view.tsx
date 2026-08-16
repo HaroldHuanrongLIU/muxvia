@@ -33,7 +33,8 @@ function activityColor(kind: ActivityEntry["kind"]): string {
 
 export function TargetView(props: TargetViewProps) {
   const reconciliationAvailable = () => props.view.problems.some((problem) => (
-    problem.code === "configuration-drift"
+    problem.code === "compatibility-acknowledgement-required"
+    || problem.code === "configuration-drift"
     || problem.code === "shadowing-configuration"
     || problem.code === "untested-target-cli"
     || problem.code === "incompatible-target-cli"
@@ -57,6 +58,12 @@ export function TargetView(props: TargetViewProps) {
     const key = messageKeyForProblem(problem.code)
     if (key === "error.generic") return props.t(key, { code: problem.code })
     if (key === "error.shadowing-configuration") {
+      if (problem.selector) {
+        return props.t("error.shadowing-configuration-selector", {
+          source: problem.source ?? props.t("value.none"),
+          selector: problem.selector,
+        })
+      }
       return props.t(key, { source: problem.source ?? props.t("value.none") })
     }
     if (key === "error.provider-mode-active") {

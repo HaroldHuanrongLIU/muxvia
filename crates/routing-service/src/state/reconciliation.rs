@@ -15,7 +15,7 @@ use crate::{
     },
 };
 
-use super::{StateError, StateStore};
+use super::{ActionFailure, StateError, StateStore};
 
 pub(crate) struct AdoptReconciliation {
     pub(crate) provider_id: Uuid,
@@ -90,6 +90,7 @@ impl StateStore {
         compatibility: CompatibilityView,
     ) -> Result<Option<TargetView>, StateError> {
         let service_epoch = self.service_epoch().to_string();
+        let selector = source.as_ref().and_then(shadow_selector_code);
         let source = source.as_ref().map(shadow_source_code);
         let message = match code {
             "shadowing-configuration" => "A higher-priority configuration source is active",
@@ -143,13 +144,15 @@ impl StateStore {
                         params![target.as_str(), code],
                     )?;
                     let problem_changed = transaction.execute(
-                        "INSERT INTO target_problems (target, code, message, source)
-                     VALUES (?1, ?2, ?3, ?4)
+                        "INSERT INTO target_problems (target, code, message, source, selector)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT(target, code) DO UPDATE SET
-                       message = excluded.message, source = excluded.source
+                       message = excluded.message, source = excluded.source,
+                       selector = excluded.selector
                      WHERE target_problems.message != excluded.message
-                        OR target_problems.source IS NOT excluded.source",
-                        params![target.as_str(), code, message, source],
+                        OR target_problems.source IS NOT excluded.source
+                        OR target_problems.selector IS NOT excluded.selector",
+                        params![target.as_str(), code, message, source, selector],
                     )?;
                     if compatibility_changed || removed > 0 || problem_changed > 0 {
                         transaction.execute(
@@ -448,7 +451,7 @@ impl StateStore {
                 transaction.execute(
                     "DELETE FROM target_problems WHERE target = ?1 AND code IN
                      ('configuration-drift', 'shadowing-configuration', 'untested-target-cli',
-                      'incompatible-target-cli')",
+                      'compatibility-acknowledgement-required', 'incompatible-target-cli')",
                     [input.target.as_str()],
                 )?;
                 transaction.execute(
@@ -639,6 +642,118 @@ impl StateStore {
             .await
             .map_err(super::store::map_state_call_error)
     }
+
+    pub(crate) async fn apply_compatibility_acknowledgement(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        expected_revision: u64,
+        version: String,
+    ) -> Result<Result<ActionOutcome, ActionFailure>, StateError> {
+        let service_epoch = self.service_epoch().to_string();
+        self.connection
+            .call(
+                move |connection| -> Result<Result<ActionOutcome, ActionFailure>, StateError> {
+                    let transaction =
+                        connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let recorded = transaction.query_row(
+                        "SELECT outcome_json FROM action_receipts
+                         WHERE target = ?1 AND action_id = ?2",
+                        params![target.as_str(), action_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    );
+                    match recorded {
+                        Ok(json) => {
+                            let mut outcome: ActionOutcome = serde_json::from_str(&json)?;
+                            outcome.status = ActionStatus::Replayed;
+                            transaction.commit()?;
+                            return Ok(Ok(outcome));
+                        }
+                        Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => {}
+                        Err(error) => return Err(StateError::Sqlite(error)),
+                    }
+                    let current_revision: u64 = transaction.query_row(
+                        "SELECT management_revision FROM target_route_state WHERE target = ?1",
+                        [target.as_str()],
+                        |row| row.get(0),
+                    )?;
+                    if current_revision != expected_revision {
+                        let authoritative_view =
+                            project_target_view_for(&transaction, &service_epoch, target)?;
+                        transaction.commit()?;
+                        return Ok(Err(ActionFailure {
+                            problem: crate::control::protocol::ControlProblem {
+                                code: "stale-revision".into(),
+                                message: "Target state changed; refresh and retry".into(),
+                                source: None,
+                                selector: None,
+                            },
+                            authoritative_view,
+                        }));
+                    }
+                    let compatibility = read_compatibility(&transaction, target)?;
+                    if compatibility.classification
+                        != CompatibilityClassification::UnknownCompatible
+                        || compatibility.version != version
+                    {
+                        let code = if compatibility.classification
+                            == CompatibilityClassification::Incompatible
+                        {
+                            "incompatible-target-cli"
+                        } else {
+                            "compatibility-acknowledgement-required"
+                        };
+                        let authoritative_view =
+                            project_target_view_for(&transaction, &service_epoch, target)?;
+                        transaction.commit()?;
+                        return Ok(Err(ActionFailure {
+                            problem: crate::control::protocol::ControlProblem {
+                                code: code.into(),
+                                message: "Compatibility acknowledgement is not valid".into(),
+                                source: None,
+                                selector: None,
+                            },
+                            authoritative_view,
+                        }));
+                    }
+                    transaction.execute(
+                        "UPDATE target_compatibility SET acknowledged_version = ?1
+                         WHERE target = ?2",
+                        params![version, target.as_str()],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM target_problems
+                         WHERE target = ?1 AND code = 'compatibility-acknowledgement-required'",
+                        [target.as_str()],
+                    )?;
+                    transaction.execute(
+                        "UPDATE target_route_state SET view_sequence = view_sequence + 1
+                         WHERE target = ?1",
+                        [target.as_str()],
+                    )?;
+                    let view = project_target_view_for(&transaction, &service_epoch, target)?;
+                    let outcome = ActionOutcome {
+                        status: ActionStatus::Applied,
+                        view,
+                    };
+                    transaction.execute(
+                        "INSERT INTO action_receipts
+                         (target, action_id, action_kind, committed_revision, outcome_json)
+                         VALUES (?1, ?2, 'acknowledge-compatibility', ?3, ?4)",
+                        params![
+                            target.as_str(),
+                            action_id.to_string(),
+                            outcome.view.management_revision,
+                            serde_json::to_string(&outcome)?
+                        ],
+                    )?;
+                    transaction.commit()?;
+                    Ok(Ok(outcome))
+                },
+            )
+            .await
+            .map_err(super::store::map_state_call_error)
+    }
 }
 
 fn fail_reconciliation_commit(
@@ -747,6 +862,16 @@ fn shadow_source_code(source: &ShadowSource) -> &'static str {
         ShadowSource::ClaudeLocal => "claude-local",
         ShadowSource::ClaudeSelector(_) => "claude-selector",
         ShadowSource::ClaudeHostManaged => "claude-host-managed",
+    }
+}
+
+fn shadow_selector_code(source: &ShadowSource) -> Option<&'static str> {
+    match source {
+        ShadowSource::ClaudeSelector(selector) => Some(selector.as_str()),
+        ShadowSource::ClaudeHostManaged => {
+            Some(crate::control::protocol::ClaudeBlockingSelector::HostManaged.as_str())
+        }
+        _ => None,
     }
 }
 

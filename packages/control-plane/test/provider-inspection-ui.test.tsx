@@ -173,6 +173,8 @@ class InspectionTargetSession implements TargetSession {
   }
   async previewReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
   async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
+  async previewCompatibility(): Promise<never> { throw new Error("compatibility preview not configured in this fixture") }
+  async acknowledgeCompatibility(): Promise<never> { throw new Error("compatibility acknowledgement not configured in this fixture") }
   subscribe(listener: (next: TargetView) => void): () => void {
     this.#listeners.add(listener)
     return () => this.#listeners.delete(listener)

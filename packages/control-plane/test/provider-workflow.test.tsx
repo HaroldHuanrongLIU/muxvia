@@ -6,6 +6,7 @@ import { MuxviaKeymapProvider, useMuxviaKeymap } from "../src/commands/keymap"
 import type { TargetSession } from "../src/control/target-session"
 import type {
   ActionOutcome,
+  CompatibilityPreview,
   DiscoverySource,
   ModelDiscoveryResult,
   ReachabilityResult,
@@ -114,6 +115,7 @@ class MemoryTargetSession implements TargetSession {
     observationToken: string
     acknowledgeVersion?: string
   }> = []
+  readonly compatibilityPreviews: CompatibilityPreview[] = []
   readonly reachabilityChecks: string[] = []
   readonly discoveryRequests: DiscoverySource[] = []
   lastError: unknown
@@ -121,6 +123,7 @@ class MemoryTargetSession implements TargetSession {
   #view: TargetView
   #handler: (action: TargetAction) => Promise<ActionOutcome>
   previewHandler?: (strategy: ReconciliationStrategy, signal?: AbortSignal) => Promise<ReconciliationPreview>
+  compatibilityPreviewHandler?: (signal?: AbortSignal) => Promise<CompatibilityPreview>
   reconciliationHandler?: (input: {
     strategy: ReconciliationStrategy
     observationToken: string
@@ -170,6 +173,15 @@ class MemoryTargetSession implements TargetSession {
     const preview = await this.previewHandler(strategy, signal)
     this.reconciliationPreviewResults.push(preview)
     return preview
+  }
+  async previewCompatibility(signal?: AbortSignal): Promise<CompatibilityPreview> {
+    if (!this.compatibilityPreviewHandler) throw new Error("compatibility preview not configured in this fixture")
+    const preview = await this.compatibilityPreviewHandler(signal)
+    this.compatibilityPreviews.push(preview)
+    return preview
+  }
+  async acknowledgeCompatibility(version: string): Promise<ActionOutcome> {
+    return await this.act({ kind: "acknowledge-compatibility", version })
   }
   async applyReconciliation(input: {
     strategy: ReconciliationStrategy
@@ -1715,6 +1727,130 @@ test("authoritative takeover-required preserves the pending picker and restores 
     setup.renderer.destroy()
   }
 })
+
+test.each(["codex", "claude"] as const)(
+  "First unmanaged unknown-compatible %s uses compatibility-only preview and public exact acknowledgement",
+  async (target) => {
+    const initial = view({
+      target,
+      managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
+      problems: [{
+        code: "compatibility-acknowledgement-required",
+        message: "backend text must not render",
+      }],
+    })
+    const acknowledged = view({
+      ...initial,
+      viewSequence: initial.viewSequence + 1,
+      problems: [],
+    })
+    const session = new MemoryTargetSession(initial, async (action) => {
+      expect(action).toEqual({
+        kind: "acknowledge-compatibility",
+        version: `${target}-unknown-8.1`,
+      })
+      return { status: "applied", view: acknowledged }
+    })
+    session.compatibilityPreviewHandler = async () => ({
+      target,
+      managementRevision: initial.managementRevision,
+      compatibility: {
+        version: `${target}-unknown-8.1`,
+        classification: "unknown-compatible",
+        acknowledgementRequired: true,
+      },
+    })
+    const setup = await testRender(() => <App sessions={{ [target]: session }} />, {
+      width: 80,
+      height: 30,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey(target === "codex" ? "1" : "2")
+      await setup.mockInput.typeText("/reconcile")
+      setup.mockInput.pressEnter()
+      const previewFrame = await waitForReconciliationFrame(
+        setup,
+        [session],
+        (frame) => frame.includes(`Untested but compatible · ${target}-unknown-8.1`),
+        `unmanaged-compatibility-preview-${target}`,
+      )
+      expect(session.compatibilityPreviews).toHaveLength(1)
+      expect(session.reconciliationPreviews).toHaveLength(0)
+      expect(previewFrame).not.toContain("Adopt observed configuration")
+      expect(previewFrame).not.toContain("Reapply committed configuration")
+      expect(previewFrame).not.toContain("Restore pre-Muxvia configuration")
+
+      setup.mockInput.pressKey("y")
+      await waitForReconciliationState(
+        setup,
+        [session],
+        () => session.actions.length === 1,
+        `unmanaged-compatibility-acknowledgement-${target}`,
+      )
+      expect(session.actions).toEqual([{
+        kind: "acknowledge-compatibility",
+        version: `${target}-unknown-8.1`,
+      }])
+      expect(session.get().problems).toEqual([])
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)
+
+test.each(["codex", "claude"] as const)(
+  "First unmanaged incompatible %s exposes exact read-only compatibility guidance",
+  async (target) => {
+    const initial = view({
+      target,
+      managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
+      problems: [{ code: "incompatible-target-cli", message: "backend text must not render" }],
+    })
+    const session = new MemoryTargetSession(initial)
+    session.compatibilityPreviewHandler = async () => ({
+      target,
+      managementRevision: initial.managementRevision,
+      compatibility: {
+        version: `${target}-incompatible-8.1`,
+        classification: "incompatible",
+        acknowledgementRequired: false,
+      },
+    })
+    const setup = await testRender(() => <App sessions={{ [target]: session }} />, {
+      width: 80,
+      height: 30,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey(target === "codex" ? "1" : "2")
+      await setup.mockInput.typeText("/reconcile")
+      setup.mockInput.pressEnter()
+      const frame = await waitForReconciliationFrame(
+        setup,
+        [session],
+        (current) => current.includes(`Incompatible · ${target}-incompatible-8.1`),
+        `unmanaged-incompatible-preview-${target}`,
+      )
+      expect(frame).toContain("Read-only inspection · Esc cancel")
+      expect(frame).not.toContain("Adopt observed configuration")
+      expect(frame).not.toContain("Reapply committed configuration")
+      expect(frame).not.toContain("Restore pre-Muxvia configuration")
+      setup.mockInput.pressKey("y")
+      setup.mockInput.pressEnter()
+      await Promise.resolve()
+      await setup.renderOnce()
+      expect(session.actions).toHaveLength(0)
+      expect(session.reconciliationPreviews).toHaveLength(0)
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)
 
 test.each(["codex", "claude"] as const)(
   "Reconciliation previews and applies unknown-compatible Adopt for %s with exact origin focus and one activity",

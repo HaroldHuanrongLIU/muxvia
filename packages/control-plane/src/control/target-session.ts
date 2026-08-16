@@ -61,7 +61,7 @@ class TargetSessionImpl implements TargetSession {
     this.#rpc = rpc
     this.#view = initialView
     this.#target = initialView.target
-    this.#claudeContext = claudeContext
+    this.#claudeContext = captureClaudeContext(claudeContext)
     this.#lastNotifiedSequence = initialView.viewSequence
     this.#removePushListener = rpc.onTargetView((view) => this.#receivePush(view))
   }
@@ -151,8 +151,12 @@ class TargetSessionImpl implements TargetSession {
       strategy,
       claudeContext: this.#claudeContext,
     }, { signal })
-    if (response.kind !== "reconciliation-preview") {
-      throw new ControlError("invalid-response", "Expected a reconciliation preview")
+    if (
+      response.kind !== "reconciliation-preview"
+      || response.preview.target !== this.#target
+      || response.preview.strategy !== strategy
+    ) {
+      throw new ControlError("invalid-response", "Reconciliation preview response did not match request")
     }
     return freezeReconciliationPreview(response.preview)
   }
@@ -226,6 +230,19 @@ class TargetSessionImpl implements TargetSession {
     this.#lastNotifiedSequence = view.viewSequence
     for (const listener of this.#listeners) listener(view)
   }
+}
+
+function captureClaudeContext(
+  context: ClaudePreflightContext | undefined,
+): ClaudePreflightContext | undefined {
+  if (!context) return undefined
+  return Object.freeze({
+    claudeConfigDir: context.claudeConfigDir,
+    selectorState: context.selectorState,
+    ...(context.blockingSelector === undefined ? {} : { blockingSelector: context.blockingSelector }),
+    hostManagedState: context.hostManagedState,
+    cwd: context.cwd,
+  })
 }
 
 function freezeReconciliationPreview(preview: ReconciliationPreview): ReconciliationPreview {

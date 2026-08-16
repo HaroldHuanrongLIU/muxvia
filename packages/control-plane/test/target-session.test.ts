@@ -8,6 +8,7 @@ import { encodeFrame, FrameDecoder } from "../src/control/framing"
 import { RpcClient } from "../src/control/rpc-client"
 import type {
   ClientFrame,
+  ClaudePreflightContext,
   ReconciliationPreview,
   ServerFrame,
   TargetView,
@@ -433,16 +434,19 @@ test("explicit refresh accepts unsaved Blank and Preset drafts without Provider 
 test("reconciliation preview captures target and Claude context without waiting for queued actions", async () => {
   const { server, path } = await ScriptedServer.start()
   const client = await RpcClient.connect(path, "control-test")
-  const claudeContext = {
+  const claudeContext: ClaudePreflightContext = {
     claudeConfigDir: "/tmp/claude-home",
     selectorState: "disabled" as const,
     hostManagedState: "unmanaged" as const,
     cwd: "/tmp/project",
   }
+  const capturedContext = structuredClone(claudeContext)
   const opening = client.openTarget("claude", claudeContext)
   await server.waitForRequests(1)
   server.replyOpen(0, viewAtRevision(1, 1, "claude"))
   const session = await opening
+  claudeContext.claudeConfigDir = "/tmp/mutated-claude-home"
+  claudeContext.cwd = "/tmp/mutated-project"
 
   const action = session.act({ kind: "activate-provider", providerId: "provider-1", mode: "direct" })
   const preview = session.previewReconciliation("reapply")
@@ -454,7 +458,7 @@ test("reconciliation preview captures target and Claude context without waiting 
     kind: "preview-reconciliation",
     target: "claude",
     strategy: "reapply",
-    claudeContext,
+    claudeContext: capturedContext,
   })
 
   const expected = reconciliationPreview("claude")
@@ -480,9 +484,44 @@ test("reconciliation preview supports abort and validates its response kind", as
   const invalid = session.previewReconciliation("restore")
   await server.waitForRequests(3)
   server.replyWithTargetView(2, viewAtRevision(2))
-  await expect(invalid).rejects.toMatchObject({ code: "invalid-response" })
+  await expect(invalid).rejects.toMatchObject({
+    code: "invalid-response",
+    message: "Reconciliation preview response did not match request",
+  })
   expect(session.get().managementRevision).toBe(1)
 
+  await session.close()
+  await server.close()
+})
+
+test("reconciliation preview rejects a response for another target with a fixed diagnostic", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  const pending = session.previewReconciliation("restore")
+  await server.waitForRequests(2)
+  const wrongTarget = reconciliationPreview("claude", "restore")
+  server.replyPreview(1, wrongTarget)
+
+  await expect(pending).rejects.toMatchObject({
+    code: "invalid-response",
+    message: "Reconciliation preview response did not match request",
+  })
+  expect(session.get().managementRevision).toBe(1)
+  await session.close()
+  await server.close()
+})
+
+test("reconciliation preview rejects another strategy with a fixed diagnostic", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  const pending = session.previewReconciliation("reapply")
+  await server.waitForRequests(2)
+  const wrongStrategy = reconciliationPreview("codex", "adopt")
+  server.replyPreview(1, wrongStrategy)
+
+  await expect(pending).rejects.toMatchObject({
+    code: "invalid-response",
+    message: "Reconciliation preview response did not match request",
+  })
+  expect(session.get().managementRevision).toBe(1)
   await session.close()
   await server.close()
 })
@@ -557,16 +596,19 @@ test("reconciliation methods reject after close", async () => {
 test("a Claude reconciliation push gap refresh retains its captured context", async () => {
   const { server, path } = await ScriptedServer.start()
   const client = await RpcClient.connect(path, "control-test")
-  const claudeContext = {
+  const claudeContext: ClaudePreflightContext = {
     claudeConfigDir: null,
     selectorState: "disabled" as const,
     hostManagedState: "unmanaged" as const,
     cwd: "/tmp/reconciliation-project",
   }
+  const capturedContext = structuredClone(claudeContext)
   const opening = client.openTarget("claude", claudeContext)
   await server.waitForRequests(1)
   server.replyOpen(0, viewAtRevision(1, 1, "claude"))
   const session = await opening
+  claudeContext.claudeConfigDir = "/tmp/mutated-gap-home"
+  claudeContext.cwd = "/tmp/mutated-gap-project"
 
   const apply = session.applyReconciliation({
     strategy: "adopt",
@@ -591,7 +633,7 @@ test("a Claude reconciliation push gap refresh retains its captured context", as
   expect(server.requests()[2]!.operation).toEqual({
     kind: "open-target",
     target: "claude",
-    claudeContext,
+    claudeContext: capturedContext,
   })
   server.replyOpen(2, viewAtRevision(4, 4, "claude"))
 

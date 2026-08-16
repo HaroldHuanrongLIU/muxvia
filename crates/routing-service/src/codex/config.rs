@@ -122,6 +122,37 @@ impl ConfigSnapshot {
     pub(crate) fn identity(&self) -> &FileIdentity {
         &self.identity
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn owned_fingerprint(&self) -> String {
+        owned_semantic_fingerprint(&self.owned)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn unrelated_fingerprint(&self) -> String {
+        semantic_fingerprint(&self.unrelated)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn as_desired_like(&self, committed: &DesiredCodexState) -> DesiredCodexState {
+        DesiredCodexState {
+            owned: self.owned.clone(),
+            mode: committed.mode,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn provider_matches(&self, desired: &DesiredCodexState) -> bool {
+        provider_semantically_matches(&self.owned, &desired.owned)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn credential_matches(&self, desired: &DesiredCodexState) -> bool {
+        item_semantically_matches(
+            &self.owned.provider_http_headers,
+            &desired.owned.provider_http_headers,
+        )
+    }
 }
 
 pub struct CodexConfigCodec {
@@ -174,6 +205,15 @@ impl CodexConfigCodec {
     pub fn inspect(&self) -> Result<ConfigSnapshot, CodexProblem> {
         self.inspect_state(None)
             .map(ManagedCodexState::into_snapshot)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn reconciliation_snapshot(&self) -> Result<(ConfigSnapshot, bool), CodexProblem> {
+        let (snapshot, document) = self.read_snapshot()?;
+        let profile_shadow = document
+            .get("profile")
+            .is_some_and(|profile| !profile.is_none());
+        Ok((snapshot, profile_shadow))
     }
 
     fn inspect_state(
@@ -562,19 +602,62 @@ fn value_to_owned_rendered(value: &toml_edit::Value) -> String {
 }
 
 fn owned_semantically_matches(left: &OwnedCodexState, right: &OwnedCodexState) -> bool {
-    fn equal(left: &Option<OwnedItem>, right: &Option<OwnedItem>) -> bool {
-        left.as_ref().map(|item| &item.semantic) == right.as_ref().map(|item| &item.semantic)
-    }
-    equal(&left.model, &right.model)
-        && equal(&left.model_provider, &right.model_provider)
-        && equal(&left.provider_name, &right.provider_name)
-        && equal(&left.provider_base_url, &right.provider_base_url)
-        && equal(&left.provider_wire_api, &right.provider_wire_api)
-        && equal(&left.provider_http_headers, &right.provider_http_headers)
-        && equal(
+    item_semantically_matches(&left.model, &right.model)
+        && item_semantically_matches(&left.model_provider, &right.model_provider)
+        && item_semantically_matches(&left.provider_name, &right.provider_name)
+        && item_semantically_matches(&left.provider_base_url, &right.provider_base_url)
+        && item_semantically_matches(&left.provider_wire_api, &right.provider_wire_api)
+        && item_semantically_matches(&left.provider_http_headers, &right.provider_http_headers)
+        && item_semantically_matches(
             &left.provider_supports_websockets,
             &right.provider_supports_websockets,
         )
+}
+
+#[allow(dead_code)]
+fn provider_semantically_matches(left: &OwnedCodexState, right: &OwnedCodexState) -> bool {
+    item_semantically_matches(&left.model, &right.model)
+        && item_semantically_matches(&left.model_provider, &right.model_provider)
+        && item_semantically_matches(&left.provider_name, &right.provider_name)
+        && item_semantically_matches(&left.provider_base_url, &right.provider_base_url)
+        && item_semantically_matches(&left.provider_wire_api, &right.provider_wire_api)
+        && item_semantically_matches(
+            &left.provider_supports_websockets,
+            &right.provider_supports_websockets,
+        )
+}
+
+fn item_semantically_matches(left: &Option<OwnedItem>, right: &Option<OwnedItem>) -> bool {
+    left.as_ref().map(|item| &item.semantic) == right.as_ref().map(|item| &item.semantic)
+}
+
+#[allow(dead_code)]
+fn semantic_fingerprint(value: &impl Serialize) -> String {
+    let bytes =
+        serde_json::to_vec(value).expect("serializing captured Codex semantics cannot fail");
+    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+    let mut encoded = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+#[allow(dead_code)]
+fn owned_semantic_fingerprint(owned: &OwnedCodexState) -> String {
+    fn semantic(item: &Option<OwnedItem>) -> Option<&serde_json::Value> {
+        item.as_ref().map(|item| &item.semantic)
+    }
+    semantic_fingerprint(&(
+        semantic(&owned.model),
+        semantic(&owned.model_provider),
+        semantic(&owned.provider_name),
+        semantic(&owned.provider_base_url),
+        semantic(&owned.provider_wire_api),
+        semantic(&owned.provider_http_headers),
+        semantic(&owned.provider_supports_websockets),
+    ))
 }
 
 fn unrelated_projection(document: &DocumentMut) -> Result<serde_json::Value, CodexProblem> {

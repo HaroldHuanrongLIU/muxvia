@@ -3,6 +3,7 @@ use std::{fmt, path::Path, process::Command};
 use uuid::Uuid;
 
 use crate::control::protocol::ClaudeBlockingSelector;
+use crate::control::protocol::CompatibilityClassification;
 
 const TESTED_CLAUDE_VERSION: &str = "2.1.37 (Claude Code)";
 
@@ -14,6 +15,21 @@ pub trait ClaudeProbe: Send + Sync {
 pub enum ClaudeCapability {
     Tested { version: String },
     UnknownCompatible { version: String, warning: String },
+}
+
+impl ClaudeCapability {
+    pub fn version(&self) -> &str {
+        match self {
+            Self::Tested { version } | Self::UnknownCompatible { version, .. } => version,
+        }
+    }
+
+    pub fn classification(&self) -> CompatibilityClassification {
+        match self {
+            Self::Tested { .. } => CompatibilityClassification::Tested,
+            Self::UnknownCompatible { .. } => CompatibilityClassification::UnknownCompatible,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -101,13 +117,18 @@ impl ClaudeProbe for CommandClaudeProbe {
         let version = run_read_only(executable, "--version")?;
         let help = run_read_only(executable, "--help")?;
         let normalized_help = help.to_ascii_lowercase();
-        if !normalized_help.contains("usage:") || !normalized_help.contains("claude") {
+        if !normalized_help.contains("usage:")
+            || !normalized_help.contains("claude")
+            || !normalized_help.contains("--settings")
+            || !normalized_help.contains("--model")
+        {
             return Err(ClaudeProblem::new(
                 "incompatible-target-cli",
                 Some(executable),
             ));
         }
-        let version = version.trim().to_owned();
+        let version = parse_version(&version)
+            .ok_or_else(|| ClaudeProblem::new("incompatible-target-cli", Some(executable)))?;
         if version == TESTED_CLAUDE_VERSION {
             Ok(ClaudeCapability::Tested { version })
         } else {
@@ -116,6 +137,24 @@ impl ClaudeProbe for CommandClaudeProbe {
                 version,
             })
         }
+    }
+}
+
+fn parse_version(output: &str) -> Option<String> {
+    let mut lines = output.lines();
+    let version = lines.next()?.trim();
+    if version.is_empty() || lines.next().is_some() {
+        return None;
+    }
+    let number = version.strip_suffix(" (Claude Code)")?;
+    if number.contains('.')
+        && number.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+')
+        })
+    {
+        Some(version.to_owned())
+    } else {
+        None
     }
 }
 

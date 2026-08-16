@@ -2,6 +2,8 @@ use std::{fmt, path::Path, process::Command};
 
 use uuid::Uuid;
 
+use crate::control::protocol::CompatibilityClassification;
+
 const TESTED_CODEX_VERSION: &str = "codex-cli 0.106.0";
 
 pub trait CodexProbe: Send + Sync {
@@ -12,6 +14,21 @@ pub trait CodexProbe: Send + Sync {
 pub enum CodexCapability {
     Tested { version: String },
     UnknownCompatible { version: String, warning: String },
+}
+
+impl CodexCapability {
+    pub fn version(&self) -> &str {
+        match self {
+            Self::Tested { version } | Self::UnknownCompatible { version, .. } => version,
+        }
+    }
+
+    pub fn classification(&self) -> CompatibilityClassification {
+        match self {
+            Self::Tested { .. } => CompatibilityClassification::Tested,
+            Self::UnknownCompatible { .. } => CompatibilityClassification::UnknownCompatible,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -70,15 +87,18 @@ impl CodexProbe for CommandCodexProbe {
         }
         let version = run_read_only(executable, "--version")?;
         let help = run_read_only(executable, "--help")?;
-        if !help.to_ascii_lowercase().contains("usage:")
-            || !help.to_ascii_lowercase().contains("codex")
+        let normalized_help = help.to_ascii_lowercase();
+        if !normalized_help.contains("usage:")
+            || !normalized_help.contains("codex")
+            || !normalized_help.contains("--config")
         {
             return Err(CodexProblem::new(
                 "incompatible-target-cli",
                 Some(executable),
             ));
         }
-        let version = version.trim().to_owned();
+        let version = parse_version(&version)
+            .ok_or_else(|| CodexProblem::new("incompatible-target-cli", Some(executable)))?;
         if version == TESTED_CODEX_VERSION {
             Ok(CodexCapability::Tested { version })
         } else {
@@ -87,6 +107,24 @@ impl CodexProbe for CommandCodexProbe {
                 version,
             })
         }
+    }
+}
+
+fn parse_version(output: &str) -> Option<String> {
+    let mut lines = output.lines();
+    let version = lines.next()?.trim();
+    if version.is_empty() || lines.next().is_some() {
+        return None;
+    }
+    let number = version.strip_prefix("codex-cli ")?;
+    if number.contains('.')
+        && number.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+')
+        })
+    {
+        Some(version.to_owned())
+    } else {
+        None
     }
 }
 

@@ -13,7 +13,7 @@ use crate::{
     config::managed_file::{FileIdentity, ManagedFile, ManagedFileError, PreRenameHook},
     control::protocol::{
         ClaudeBlockingSelector, ClaudeHostManagedState, ClaudePreflightContext,
-        ClaudeSelectorState, ProviderAuthentication, Target,
+        ClaudeSelectorState, ProviderAuthentication, ShadowSource, Target,
     },
     state::{RecoveryIntent, RecoveryState, StateStore},
 };
@@ -215,6 +215,37 @@ impl ClaudeConfigSnapshot {
     pub(crate) fn ownership(&self) -> ClaudeConfigOwnership {
         self.ownership_version
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn owned_fingerprint(&self) -> String {
+        semantic_fingerprint(&self.owned)
+            .expect("serializing captured Claude semantics cannot fail")
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn unrelated_fingerprint(&self) -> &str {
+        &self.unrelated_fingerprint
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn as_desired_like(&self, committed: &DesiredClaudeState) -> DesiredClaudeState {
+        DesiredClaudeState {
+            ownership_version: self.ownership_version,
+            mode: committed.mode,
+            owned: self.owned.clone(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn provider_matches(&self, desired: &DesiredClaudeState) -> bool {
+        self.owned.base_url == desired.owned.base_url && self.owned.model == desired.owned.model
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn credential_matches(&self, desired: &DesiredClaudeState) -> bool {
+        self.owned.auth_token == desired.owned.auth_token
+            && self.owned.api_key == desired.owned.api_key
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,6 +321,92 @@ impl ClaudeConfigCodec {
 
     pub fn inspect(&self) -> Result<ClaudeConfigSnapshot, ClaudeProblem> {
         self.inspect_with_ownership(ClaudeConfigOwnership::FourField)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn reconciliation_snapshot(
+        &self,
+        context: &ClaudePreflightContext,
+        ownership: ClaudeConfigOwnership,
+    ) -> Result<(ClaudeConfigSnapshot, Vec<ShadowSource>), ClaudeProblem> {
+        if !context.has_valid_blocking_selector() {
+            return Err(ClaudeProblem::new(
+                "preflight-context-required",
+                Some(self.settings_path()),
+            ));
+        }
+        let cwd = PathBuf::from(&context.cwd);
+        if !cwd.is_absolute() {
+            return Err(ClaudeProblem::new("preflight-context-required", None));
+        }
+        let cwd = std::fs::canonicalize(cwd)
+            .map_err(|_| ClaudeProblem::new("preflight-context-required", None))?;
+        if !cwd.is_dir() {
+            return Err(ClaudeProblem::new("preflight-context-required", None));
+        }
+        if let Some(observed) = &context.claude_config_dir {
+            let observed = PathBuf::from(observed);
+            let resolved = std::fs::canonicalize(&observed).unwrap_or(observed);
+            let supported = self
+                .settings_path()
+                .parent()
+                .is_some_and(|parent| resolved == parent || resolved == self.configured_home);
+            if !supported {
+                return Err(ClaudeProblem::new(
+                    "unsupported-configuration-home",
+                    Some(&resolved),
+                ));
+            }
+        }
+
+        let (snapshot, user_document) = self.read_snapshot(ownership)?;
+        let mut shadows = Vec::new();
+        if matches!(
+            context.host_managed_state,
+            ClaudeHostManagedState::Managed | ClaudeHostManagedState::Unknown
+        ) {
+            shadows.push(ShadowSource::ClaudeHostManaged);
+        } else if matches!(
+            context.selector_state,
+            ClaudeSelectorState::Enabled | ClaudeSelectorState::UnknownNonempty
+        ) {
+            shadows.push(ShadowSource::ClaudeSelector(
+                context
+                    .blocking_selector
+                    .expect("validated Claude context has an exact selector"),
+            ));
+        }
+        collect_provider_mode_shadows(&user_document, &mut shadows);
+
+        let mut shadow_paths = self.managed_settings_paths.clone();
+        shadow_paths.push(cwd.join(".claude/settings.json"));
+        shadow_paths.push(cwd.join(".claude/settings.local.json"));
+        let canonical_settings_path = std::fs::canonicalize(&self.configured_home)
+            .unwrap_or_else(|_| self.configured_home.clone())
+            .join("settings.json");
+        let mut seen = BTreeSet::new();
+        for path in shadow_paths {
+            if path == self.settings_path() || path == canonical_settings_path {
+                continue;
+            }
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            if !seen.insert(path.clone()) || !path.exists() {
+                continue;
+            }
+            let document = fs_read_json(&path)?;
+            let source = if path.ends_with(".claude/settings.local.json") {
+                ShadowSource::ClaudeLocal
+            } else if path.ends_with(".claude/settings.json") && path.starts_with(&cwd) {
+                ShadowSource::ClaudeShared
+            } else {
+                ShadowSource::ClaudeManaged
+            };
+            if has_owned_shadow(&document, ownership) && !shadows.contains(&source) {
+                shadows.push(source);
+            }
+            collect_provider_mode_shadows(&document, &mut shadows);
+        }
+        Ok((snapshot, shadows))
     }
 
     pub(crate) fn inspect_with_ownership(
@@ -764,8 +881,8 @@ impl ClaudeConfigCodec {
     }
 }
 
-fn semantic_fingerprint(unrelated: &Value) -> Result<String, serde_json::Error> {
-    let bytes = serde_json::to_vec(unrelated)?;
+fn semantic_fingerprint(value: &impl Serialize) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(value)?;
     let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
     let mut encoded = String::with_capacity(digest.as_ref().len() * 2);
     for byte in digest.as_ref() {
@@ -866,6 +983,29 @@ fn validate_provider_modes(
         }
     }
     Ok(())
+}
+
+#[allow(dead_code)]
+fn collect_provider_mode_shadows(document: &Value, shadows: &mut Vec<ShadowSource>) {
+    let Some(env) = document.get("env").and_then(Value::as_object) else {
+        return;
+    };
+    for selector in PROVIDER_SELECTORS
+        .into_iter()
+        .chain([ClaudeBlockingSelector::HostManaged])
+    {
+        if !env.get(selector.as_str()).is_some_and(selector_blocks) {
+            continue;
+        }
+        let source = if selector == ClaudeBlockingSelector::HostManaged {
+            ShadowSource::ClaudeHostManaged
+        } else {
+            ShadowSource::ClaudeSelector(selector)
+        };
+        if !shadows.contains(&source) {
+            shadows.push(source);
+        }
+    }
 }
 
 fn selector_blocks(value: &Value) -> bool {

@@ -5,8 +5,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 use muxvia_routing::{
     claude::{ClaudeConfigCodec, DesiredClaudeState},
-    codex::CodexConfigCodec,
-    control::protocol::Target,
+    codex::{CodexConfigCodec, CodexProbe, CommandCodexProbe},
+    control::protocol::{CompatibilityClassification, Target},
     home::MuxviaHome,
     state::{RecoveryIntent, RecoveryPayload, RecoveryState, StateStore},
 };
@@ -14,6 +14,58 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 const T05_CLAUDE_RECOVERY_PAYLOAD: &str = include_str!("fixtures/claude-recovery-t05.json");
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reconciliation_probe_version_change_invalidates_exact_acknowledgement() {
+    let root = TempDir::new().unwrap();
+    let executable = root.path().join("codex-version-fixture");
+    let write_version = |version: &str| {
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n --version) printf '%s\\n' '{}' ;;\n --help) printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n' ;;\n *) exit 91 ;;\nesac\n",
+                version
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let home = MuxviaHome::from_user_home(root.path());
+    let store = StateStore::open(&home).await.unwrap();
+
+    write_version("codex-cli 99.0.0");
+    let first = CommandCodexProbe.probe(&executable).unwrap();
+    store
+        .record_compatibility(
+            Target::Codex,
+            first.version().to_owned(),
+            CompatibilityClassification::UnknownCompatible,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .acknowledge_compatibility(Target::Codex, "codex-cli 99.0.0")
+            .await
+            .unwrap()
+            .acknowledgement_required
+    );
+
+    write_version("codex-cli 99.0.1");
+    let changed = CommandCodexProbe.probe(&executable).unwrap();
+    let state = store
+        .record_compatibility(
+            Target::Codex,
+            changed.version().to_owned(),
+            CompatibilityClassification::UnknownCompatible,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(state.version, "codex-cli 99.0.1");
+    assert!(state.acknowledgement_required);
+}
 
 struct Fixture {
     _root: TempDir,

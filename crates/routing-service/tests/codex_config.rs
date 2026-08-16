@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 use muxvia_routing::codex::{
     CodexCapability, CodexConfigCodec, CodexProbe, CodexProblem, CommandCodexProbe,
 };
+use muxvia_routing::control::protocol::CompatibilityClassification;
 use tempfile::TempDir;
 
 const ORIGINAL: &str = r#"# keep this comment
@@ -545,7 +546,7 @@ fn command_probe_runs_only_version_and_help() {
     fs::write(
         &executable,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\n  --version) printf 'codex-cli 0.106.0\\n' ;;\n  --help) printf 'Usage: codex [OPTIONS] [PROMPT]\\n' ;;\n  *) exit 91 ;;\nesac\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\n  --version) printf 'codex-cli 0.106.0\\n' ;;\n  --help) printf 'Usage: codex [OPTIONS] [PROMPT]\\n--config <key=value>\\n' ;;\n  *) exit 91 ;;\nesac\n",
             log.display()
         ),
     )
@@ -555,6 +556,58 @@ fn command_probe_runs_only_version_and_help() {
     let capability = CommandCodexProbe.probe(&executable).unwrap();
     assert!(matches!(capability, CodexCapability::Tested { .. }));
     assert_eq!(fs::read_to_string(log).unwrap(), "--version\n--help\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn reconciliation_probe_projects_only_exact_version_and_closed_classification() {
+    let temp = TempDir::new().unwrap();
+    let executable = temp.path().join("codex-reconciliation-fixture");
+    fs::write(
+        &executable,
+        "#!/bin/sh\ncase \"$1\" in\n --version) printf 'codex-cli 0.106.0\\n' ;;\n --help) printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n' ;;\n *) exit 91 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let capability = CommandCodexProbe.probe(&executable).unwrap();
+
+    assert_eq!(capability.version(), "codex-cli 0.106.0");
+    assert_eq!(
+        capability.classification(),
+        CompatibilityClassification::Tested
+    );
+    assert_eq!(
+        format!("{capability:?}"),
+        "Tested { version: \"codex-cli 0.106.0\" }"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reconciliation_probe_rejects_missing_capability_and_raw_multiline_version() {
+    for (version, help) in [
+        ("codex-cli 0.106.0", "Usage: codex [OPTIONS]"),
+        (
+            "codex-cli 0.106.0\nraw-probe-output-sentinel",
+            "Usage: codex [OPTIONS]\n--config <key=value>",
+        ),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let executable = temp.path().join("codex-incompatible-fixture");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n --version) printf '%s\\n' '{}' ;;\n --help) printf '%s\\n' '{}' ;;\n *) exit 91 ;;\nesac\n",
+                version, help
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = CommandCodexProbe.probe(&executable).unwrap_err();
+        assert_eq!(error.code(), "incompatible-target-cli");
+        assert!(!format!("{error:?}\n{error}").contains("raw-probe-output-sentinel"));
+    }
 }
 
 #[cfg(unix)]
@@ -575,7 +628,7 @@ fn unknown_compatible_probe_version_returns_a_warning() {
     let executable = temp.path().join("codex-fixture");
     fs::write(
         &executable,
-        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 99.0.0' ;;\n --help) echo 'Usage: codex [OPTIONS]' ;;\n *) exit 91 ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1\" in\n --version) echo 'codex-cli 99.0.0' ;;\n --help) printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n' ;;\n *) exit 91 ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();

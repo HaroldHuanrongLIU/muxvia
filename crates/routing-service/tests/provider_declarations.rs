@@ -211,10 +211,21 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
         "INSERT INTO credentials VALUES ('00000000-0000-4000-8000-000000000701', 'codex', 'provider-secret');
          INSERT INTO providers (id, target, position, provider_revision, name, base_url, model, protocol, authentication, credential_id, routing_requirement) VALUES ('00000000-0000-4000-8000-000000000702', 'codex', 0, 3, 'Provider', 'https://provider.example/v1', 'model', 'openai-responses', 'openai-bearer', '00000000-0000-4000-8000-000000000701', 'direct-compatible');
          INSERT INTO activated_snapshots VALUES ('00000000-0000-4000-8000-000000000703', 'codex', '00000000-0000-4000-8000-000000000702', 'https://provider.example/v1', 'model', 'openai-responses', 'openai-bearer', 'snapshot-secret', '00000000-0000-4000-8000-000000000704');
-         UPDATE target_route_state SET current_provider_id = '00000000-0000-4000-8000-000000000702', activated_snapshot_id = '00000000-0000-4000-8000-000000000703', route_port = 43124, routing_credential = 'route-secret', managed_config_path = '/tmp/config' WHERE target = 'codex';
+         UPDATE target_route_state SET current_provider_id = '00000000-0000-4000-8000-000000000702', takeover_state = 'inactive', activated_snapshot_id = '00000000-0000-4000-8000-000000000703', managed_config_path = '/tmp/config', route_port = NULL, routing_credential = NULL WHERE target = 'codex';
          INSERT INTO action_receipts VALUES ('codex', '00000000-0000-4000-8000-000000000705', 'activate-provider', 11, '{\"status\":\"applied\"}');
-         INSERT INTO activation_recovery VALUES ('00000000-0000-4000-8000-000000000706', 'codex', '00000000-0000-4000-8000-000000000705', '/tmp/config', '{\"identity\":1}', '{\"recovery\":\"payload\"}', 'committed', 10);",
+         INSERT INTO activation_recovery VALUES ('00000000-0000-4000-8000-000000000706', 'codex', '00000000-0000-4000-8000-000000000705', '/tmp/config', '{\"identity\":1}', '{\"recovery\":\"payload\"}', 'pending', 10);",
     ).unwrap();
+    connection.execute_batch(
+        r#"INSERT INTO credentials VALUES ('00000000-0000-4000-8000-000000000707', 'claude', 'claude-provider-secret');
+           INSERT INTO providers (id, target, position, provider_revision, name, base_url, model, protocol, authentication, credential_id, routing_requirement) VALUES ('00000000-0000-4000-8000-000000000708', 'claude', 0, 4, 'Claude Provider', 'https://claude.example/v1', 'claude-model', 'anthropic-messages', 'anthropic-api-key', '00000000-0000-4000-8000-000000000707', 'takeover-required');
+           INSERT INTO activated_snapshots VALUES ('00000000-0000-4000-8000-000000000709', 'claude', '00000000-0000-4000-8000-000000000708', 'https://claude.example/v1', 'claude-model', 'anthropic-messages', 'anthropic-api-key', 'claude-snapshot-secret', '00000000-0000-4000-8000-000000000710');
+           UPDATE target_route_state SET current_provider_id = '00000000-0000-4000-8000-000000000708', serving_provider_id = '00000000-0000-4000-8000-000000000708', takeover_state = 'active', activated_snapshot_id = '00000000-0000-4000-8000-000000000709', managed_config_path = '/tmp/claude-config', managed_config_version = 1, route_port = 43125, routing_credential = 'claude-route-secret' WHERE target = 'claude';
+           INSERT INTO action_receipts VALUES ('claude', '00000000-0000-4000-8000-000000000712', 'activate-provider', 13, '{"status":"replayed"}');
+           INSERT INTO activation_recovery VALUES ('00000000-0000-4000-8000-000000000711', 'claude', '00000000-0000-4000-8000-000000000712', '/tmp/claude-config', '{"identity":2}', '{"recovery":"claude-payload"}', 'pending', 12);
+           INSERT INTO target_problems VALUES ('codex', 'configuration-drift', 'fixed-codex');
+           INSERT INTO target_problems VALUES ('claude', 'shadowing-configuration', 'fixed-claude');"#,
+    ).unwrap();
+    let before_migration = v7_projection_fingerprint(&connection);
     drop(connection);
     drop(fixture.open().await);
 
@@ -228,7 +239,7 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
         table_sql,
         route_versions,
         recovery_binding_is_nullable,
-        preserved,
+        after_migration,
     ) = database
         .call(|connection| -> tokio_rusqlite::rusqlite::Result<_> {
             let version = connection.query_row(
@@ -264,26 +275,7 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
                 [],
                 |row| row.get(0),
             )?;
-            let preserved = connection.query_row(
-                "SELECT c.bearer_token, p.name, s.provider_bearer_token, r.routing_credential,
-                            a.outcome_json, x.payload_json
-                     FROM credentials c JOIN providers p ON p.credential_id = c.id
-                     JOIN activated_snapshots s ON s.id = '00000000-0000-4000-8000-000000000703'
-                     JOIN target_route_state r ON r.target = 'codex'
-                     JOIN action_receipts a ON a.action_id = '00000000-0000-4000-8000-000000000705'
-                     JOIN activation_recovery x ON x.id = '00000000-0000-4000-8000-000000000706'",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                },
-            )?;
+            let after_migration = v7_projection_fingerprint(connection);
             Ok((
                 version,
                 not_null,
@@ -291,7 +283,7 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
                 table_sql,
                 route_versions,
                 recovery_binding_is_nullable,
-                preserved,
+                after_migration,
             ))
         })
         .await
@@ -304,15 +296,8 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
     assert_eq!(route_versions, [("claude".into(), 1), ("codex".into(), 1)]);
     assert!(recovery_binding_is_nullable);
     assert_eq!(
-        preserved,
-        (
-            "provider-secret".into(),
-            "Provider".into(),
-            "snapshot-secret".into(),
-            "route-secret".into(),
-            "{\"status\":\"applied\"}".into(),
-            "{\"recovery\":\"payload\"}".into()
-        )
+        after_migration, before_migration,
+        "schema-v8 migration changed preserved v7 state"
     );
 }
 
@@ -325,7 +310,7 @@ async fn schema_v8_failed_migration_rolls_back_then_reruns() {
     let connection = Connection::open(fixture.home.database_path()).unwrap();
     connection.execute_batch(V7_SCHEMA).unwrap();
     connection
-        .execute_batch("CREATE VIEW target_compatibility AS SELECT 'blocked' AS target;")
+        .execute_batch("CREATE TABLE reconciliation_intents (action_id TEXT NOT NULL);")
         .unwrap();
     drop(connection);
 
@@ -333,15 +318,60 @@ async fn schema_v8_failed_migration_rolls_back_then_reruns() {
     let connection = Connection::open(fixture.home.database_path()).unwrap();
     let failed = (
         connection.query_row("SELECT value FROM metadata WHERE key = 'schema-version'", [], |row| row.get::<_, String>(0)).unwrap(),
-        connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'reconciliation_intents'", [], |row| row.get::<_, i64>(0)).unwrap(),
+        connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'target_compatibility'", [], |row| row.get::<_, i64>(0)).unwrap(),
     );
     assert_eq!(failed, ("7".into(), 0));
     connection
-        .execute_batch("DROP VIEW target_compatibility;")
+        .execute_batch("DROP TABLE reconciliation_intents;")
         .unwrap();
     drop(connection);
 
     drop(fixture.open().await);
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    let rerun = (
+        connection.query_row("SELECT value FROM metadata WHERE key = 'schema-version'", [], |row| row.get::<_, String>(0)).unwrap(),
+        connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'target_compatibility'", [], |row| row.get::<_, i64>(0)).unwrap(),
+        connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'reconciliation_intents'", [], |row| row.get::<_, i64>(0)).unwrap(),
+    );
+    assert_eq!(rerun, ("8".into(), 1, 1));
+}
+
+fn v7_projection_fingerprint(connection: &Connection) -> Vec<u64> {
+    let projections = [
+        "SELECT json_array(id, target, bearer_token) FROM credentials ORDER BY target, id",
+        "SELECT json_array(id, target, position, provider_revision, name, base_url, model, protocol, authentication, credential_id, provenance_kind, provenance_key, generated_owner_id, routing_requirement) FROM providers ORDER BY target, position, id",
+        "SELECT json_array(target, management_revision, view_sequence, current_provider_id, serving_provider_id, takeover_state, route_port, routing_credential, activated_snapshot_id, managed_config_path, managed_config_version, recovery_intent_id, recovery_state) FROM target_route_state ORDER BY target",
+        "SELECT json_array(target, code, message) FROM target_problems ORDER BY target, code",
+        "SELECT json_array(id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch) FROM activated_snapshots ORDER BY target, id",
+        "SELECT json_array(target, action_id, action_kind, committed_revision, outcome_json) FROM action_receipts ORDER BY target, action_id",
+        "SELECT json_array(id, target, action_id, config_path, file_identity_json, payload_json, state, created_revision) FROM activation_recovery ORDER BY target, id",
+    ];
+    let mut fingerprints = Vec::new();
+    for projection in projections {
+        let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+        fingerprint = fingerprint_bytes(fingerprint, projection.as_bytes());
+        let rows = connection
+            .prepare(projection)
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for row in rows {
+            fingerprint = fingerprint_bytes(fingerprint, row.as_bytes());
+            fingerprint = fingerprint_bytes(fingerprint, &[0]);
+        }
+        fingerprints.push(fingerprint);
+    }
+    fingerprints
+}
+
+fn fingerprint_bytes(mut fingerprint: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        fingerprint ^= u64::from(*byte);
+        fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    fingerprint
 }
 
 #[tokio::test]

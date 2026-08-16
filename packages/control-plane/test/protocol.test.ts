@@ -51,29 +51,30 @@ test("reconciliation contracts are closed, validated, and secret-free", async ()
   expect(serialized).not.toContain("preview-secret-must-not-escape")
   expect(JSON.parse(serialized)).toEqual(await readFixture("preview-reconciliation.json"))
 
-  for (const invalid of [
-    {
-      type: "request", requestId: "preview", operation: {
-        kind: "preview-reconciliation", target: "codex", strategy: "automatic",
-      },
-    },
-    {
-      type: "response", requestId: "preview", result: {
-        kind: "reconciliation-preview", preview: {
-          observationToken: "00000000-0000-4000-8000-000000000701",
-          target: "codex", strategy: "adopt", managementRevision: 0,
-          compatibility: { version: "0.42.0", classification: "arbitrary", acknowledgementRequired: false },
-          shadowSources: ["arbitrary-source"], changes: [], providerEffect: "create-new",
-          restartRequired: false, unobservableRuntimeBoundary: true,
-        },
-      },
-    },
-  ]) {
-    expect(() => parseClientFrame(invalid)).toThrow()
+  const validPreview = await readFixture("preview-reconciliation.json") as any
+  const previewMutations: Array<(value: any) => void> = [
+    (value) => { value.result.preview.observationToken = "not-a-uuid" },
+    (value) => { value.result.preview.managementRevision = 0 },
+    (value) => { value.result.preview.compatibility.classification = "arbitrary" },
+    (value) => { value.result.preview.shadowSources[0] = "arbitrary-source" },
+    (value) => { value.result.preview.changes[0].field = "arbitrary-field" },
+    (value) => { value.result.preview.changes[0].state = "arbitrary-state" },
+  ]
+  for (const mutate of previewMutations) {
+    const invalid = structuredClone(validPreview)
+    mutate(invalid)
     expect(() => parseServerFrame(invalid)).toThrow()
   }
+  expect(() => parseClientFrame({
+    type: "request", requestId: "preview", operation: {
+      kind: "preview-reconciliation", target: "codex", strategy: "automatic",
+    },
+  })).toThrow()
   expect(() => parseTargetAction({
     kind: "reconcile", strategy: "restore", observationToken: "not-a-uuid",
+  })).toThrow()
+  expect(() => parseTargetAction({
+    kind: "reconcile", strategy: "automatic", observationToken: "00000000-0000-4000-8000-000000000701",
   })).toThrow()
 })
 

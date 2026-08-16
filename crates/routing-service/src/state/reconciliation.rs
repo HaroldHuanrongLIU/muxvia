@@ -4,13 +4,6 @@ use crate::control::protocol::{CompatibilityClassification, CompatibilityView, T
 
 use super::{StateError, StateStore};
 
-/// Durable, secret-free compatibility state for one Target CLI.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompatibilityState {
-    pub target: Target,
-    pub view: CompatibilityView,
-}
-
 impl StateStore {
     pub async fn record_compatibility(
         &self,
@@ -72,16 +65,6 @@ impl StateStore {
             })
             .await
             .map_err(super::store::map_state_call_error)
-    }
-
-    pub async fn compatibility_state_for(
-        &self,
-        target: Target,
-    ) -> Result<CompatibilityState, StateError> {
-        Ok(CompatibilityState {
-            target,
-            view: self.compatibility_for(target).await?,
-        })
     }
 }
 

@@ -80,35 +80,54 @@ fn reconciliation_preview_and_apply_contracts_are_closed_and_secret_free() {
     let action: TargetAction = serde_json::from_value(apply.clone()).unwrap();
     assert_eq!(serde_json::to_value(action).unwrap(), apply);
 
-    for invalid in [
-        serde_json::json!({
-            "type": "request", "requestId": "preview", "operation": {
-                "kind": "preview-reconciliation", "target": "codex", "strategy": "automatic"
-            }
-        }),
-        serde_json::json!({
-            "type": "response", "requestId": "preview", "result": {
-                "kind": "reconciliation-preview", "preview": {
-                    "observationToken": "00000000-0000-4000-8000-000000000701",
-                    "target": "codex", "strategy": "adopt", "managementRevision": 0,
-                    "compatibility": { "version": "0.42.0", "classification": "arbitrary", "acknowledgementRequired": false },
-                    "shadowSources": ["arbitrary-source"], "changes": [],
-                    "providerEffect": "create-new", "restartRequired": false,
-                    "unobservableRuntimeBoundary": true
-                }
-            }
-        }),
-        serde_json::json!({
-            "kind": "reconcile", "strategy": "restore", "observationToken": "not-a-uuid"
-        }),
+    let valid_preview = fixture("preview-reconciliation.json");
+    for (path, invalid_value) in [
+        (
+            "/result/preview/observationToken",
+            serde_json::json!("not-a-uuid"),
+        ),
+        ("/result/preview/managementRevision", serde_json::json!(0)),
+        (
+            "/result/preview/compatibility/classification",
+            serde_json::json!("arbitrary"),
+        ),
+        (
+            "/result/preview/shadowSources/0",
+            serde_json::json!("arbitrary-source"),
+        ),
+        (
+            "/result/preview/changes/0/field",
+            serde_json::json!("arbitrary-field"),
+        ),
+        (
+            "/result/preview/changes/0/state",
+            serde_json::json!("arbitrary-state"),
+        ),
     ] {
-        let is_action = invalid.get("kind").is_some();
-        if is_action {
-            assert!(serde_json::from_value::<TargetAction>(invalid).is_err());
-        } else {
-            assert!(serde_json::from_value::<ClientFrame>(invalid.clone()).is_err());
-            assert!(serde_json::from_value::<ServerFrame>(invalid).is_err());
+        let mut invalid = valid_preview.clone();
+        *invalid.pointer_mut(path).unwrap() = invalid_value;
+        assert!(
+            serde_json::from_value::<ServerFrame>(invalid).is_err(),
+            "accepted invalid reconciliation preview {path}"
+        );
+    }
+    let invalid_operation = serde_json::json!({
+        "type": "request", "requestId": "preview", "operation": {
+            "kind": "preview-reconciliation", "target": "codex", "strategy": "automatic"
         }
+    });
+    assert!(serde_json::from_value::<ClientFrame>(invalid_operation).is_err());
+
+    for (field, invalid_value) in [
+        ("strategy", serde_json::json!("automatic")),
+        ("observationToken", serde_json::json!("not-a-uuid")),
+    ] {
+        let mut invalid = fixture("apply-reconciliation.json");
+        invalid[field] = invalid_value;
+        assert!(
+            serde_json::from_value::<TargetAction>(invalid).is_err(),
+            "accepted invalid reconciliation action {field}"
+        );
     }
 }
 

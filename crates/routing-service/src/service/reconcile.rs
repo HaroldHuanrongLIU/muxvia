@@ -504,6 +504,20 @@ impl ReconciliationService {
                     .await));
             }
         }
+        let current_view = match self.state.target_view_for(target).await {
+            Ok(view) => view,
+            Err(_) => {
+                return DeferredPublication::none(Err(self
+                    .failure(target, "state-store-error")
+                    .await));
+            }
+        };
+        if current_view.management_revision != expected_revision {
+            return DeferredPublication::none(Err(ActionFailure {
+                problem: stable_problem("stale-revision"),
+                authoritative_view: current_view,
+            }));
+        }
         let compatibility = match self.probe_compatibility(target).await {
             Ok(compatibility) => compatibility,
             Err(problem) => {

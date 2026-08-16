@@ -243,6 +243,15 @@ async function openScriptedSession(initial: TargetView) {
   return { session, server }
 }
 
+function ordinaryActionTypeExcludesCompatibilityResolution(
+  session: Awaited<ReturnType<typeof openScriptedSession>>["session"],
+): void {
+  // @ts-expect-error Compatibility Resolve is available only through resolveCompatibility.
+  void session.act({ kind: "resolve-compatibility", version: "codex-forged-type" })
+}
+
+void ordinaryActionTypeExcludesCompatibilityResolution
+
 test("a Claude session captures its target and preflight context for gap refresh", async () => {
   const { server, path } = await ScriptedServer.start()
   const client = await RpcClient.connect(path, "control-test")
@@ -565,6 +574,45 @@ test("compatibility Probe rejects a mismatched response with the canonical fixed
   })
   await session.close()
   await server.close()
+})
+
+test("generic act rejects a forged compatibility resolution before writing a request", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  try {
+    const rejected = session
+      .act({ kind: "resolve-compatibility", version: "codex-forged-runtime" } as never)
+      .then(
+        () => ({ code: "unexpected-success", message: "unexpected success" }),
+        (error: unknown) => error,
+      )
+    const result = await Promise.race([
+      rejected,
+      new Promise<{ code: string; message: string }>((resolve) => {
+        setImmediate(() => resolve({ code: "timeout", message: "request did not reject locally" }))
+      }),
+    ])
+    expect(server.requests()).toHaveLength(1)
+    expect(result).toMatchObject({
+      code: "unsupported-operation",
+      message: "Compatibility resolution requires resolveCompatibility",
+    })
+    const ordinary = session.act({
+      kind: "activate-provider",
+      providerId: "provider-1",
+      mode: "direct",
+    })
+    await server.waitForRequests(2)
+    expect(server.requests()[1]!.operation).toMatchObject({
+      kind: "act",
+      expectedRevision: 1,
+      action: { kind: "activate-provider", providerId: "provider-1", mode: "direct" },
+    })
+    server.replyApplied(viewAtRevision(2, 2))
+    await expect(ordinary).resolves.toMatchObject({ status: "applied" })
+  } finally {
+    await session.close()
+    await server.close()
+  }
 })
 
 test("a queued compatibility resolution retains the Probe revision after an earlier action commits", async () => {

@@ -91,10 +91,14 @@ impl CodexProbe for UnknownCodexProbe {
 
 struct ChangingCodexProbe {
     state: Arc<AtomicUsize>,
+    calls: Option<Arc<AtomicUsize>>,
 }
 
 impl CodexProbe for ChangingCodexProbe {
     fn probe(&self, _: &Path) -> Result<CodexCapability, CodexProblem> {
+        if let Some(calls) = &self.calls {
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
         match self.state.load(Ordering::SeqCst) {
             0 => Ok(CodexCapability::UnknownCompatible {
                 version: "codex-stale-unknown".into(),
@@ -255,10 +259,14 @@ impl ClaudeProbe for UnknownClaudeProbe {
 
 struct ChangingClaudeProbe {
     state: Arc<AtomicUsize>,
+    calls: Option<Arc<AtomicUsize>>,
 }
 
 impl ClaudeProbe for ChangingClaudeProbe {
     fn probe(&self, _: &Path) -> Result<ClaudeCapability, ClaudeProblem> {
+        if let Some(calls) = &self.calls {
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
         match self.state.load(Ordering::SeqCst) {
             0 => Ok(ClaudeCapability::UnknownCompatible {
                 version: "claude-stale-unknown".into(),
@@ -369,6 +377,24 @@ fn assert_compatibility_wire_is_secret_free(value: &Value, secrets: &[&str], lab
     assert!(!contaminated, "compatibility-wire-secret:{label}");
 }
 
+fn assert_compatibility_json_equal(
+    actual: &Value,
+    expected: &Value,
+    secrets: &[&str],
+    label: &'static str,
+) {
+    let contaminated = [actual, expected].into_iter().any(|value| {
+        let serialized = serde_json::to_vec(value).unwrap_or_default();
+        let debug = format!("{value:?}").into_bytes();
+        secrets.iter().any(|secret| {
+            contains_bytes(&serialized, secret.as_bytes())
+                || contains_bytes(&debug, secret.as_bytes())
+        })
+    });
+    assert!(!contaminated, "compatibility-json-secret:{label}");
+    assert!(actual == expected, "compatibility-json-mismatch:{label}");
+}
+
 #[test]
 fn compatibility_wire_scanner_rejects_a_controlled_mutation_with_fixed_diagnostic() {
     const SECRETS: &[&str] = &[
@@ -393,6 +419,50 @@ fn compatibility_wire_scanner_rejects_a_controlled_mutation_with_fixed_diagnosti
     let fixed = diagnostic == "compatibility-wire-secret:mutation";
     let leaked = SECRETS.iter().any(|secret| diagnostic.contains(secret));
     assert!(fixed && !leaked, "compatibility-wire-scanner-diagnostic");
+}
+
+#[test]
+fn target_view_json_equality_scans_same_and_opposite_operands_before_comparison() {
+    const SECRET: &str = "TARGET_VIEW_JSON_EQUALITY_SECRET_98806";
+    for (actual, expected) in [
+        (json!({"problem": SECRET}), json!({"problem": SECRET})),
+        (
+            json!({"problem": SECRET}),
+            json!({"problem": "fixed-safe-value"}),
+        ),
+    ] {
+        let panic = std::panic::catch_unwind(|| {
+            assert_compatibility_json_equal(&actual, &expected, &[SECRET], "mutation");
+        })
+        .unwrap_err();
+        let diagnostic = panic
+            .downcast_ref::<&str>()
+            .map(|value| (*value).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        let fixed = diagnostic == "compatibility-json-secret:mutation";
+        let leaked = diagnostic.contains(SECRET);
+        assert!(fixed && !leaked, "target-view-json-secret-diagnostic");
+    }
+
+    let mismatch = std::panic::catch_unwind(|| {
+        assert_compatibility_json_equal(
+            &json!({"problem": "first"}),
+            &json!({"problem": "second"}),
+            &[SECRET],
+            "mutation",
+        );
+    })
+    .unwrap_err();
+    let mismatch_diagnostic = mismatch
+        .downcast_ref::<&str>()
+        .map(|value| (*value).to_owned())
+        .or_else(|| mismatch.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    assert!(
+        mismatch_diagnostic == "compatibility-json-mismatch:mutation",
+        "target-view-json-mismatch-diagnostic"
+    );
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -4873,6 +4943,7 @@ async fn tested_probe_resolves_stale_unknown_and_incompatible_blockers_for_both_
                 home.clone(),
                 Arc::new(ChangingCodexProbe {
                     state: Arc::clone(&probe_state),
+                    calls: None,
                 }),
                 "/usr/bin/codex".into(),
                 Arc::new(ControlNoopUpstream),
@@ -4880,6 +4951,7 @@ async fn tested_probe_resolves_stale_unknown_and_incompatible_blockers_for_both_
             .with_claude_runtime(
                 Arc::new(ChangingClaudeProbe {
                     state: Arc::clone(&probe_state),
+                    calls: None,
                 }),
                 "/usr/bin/claude".into(),
             ),
@@ -5051,12 +5123,28 @@ async fn compatibility_resolution_binds_the_probed_revision_across_two_real_sess
         let home = MuxviaHome::from_user_home(&user_home);
         let store = Arc::new(StateStore::open(&home).await.unwrap());
         let probe_state = Arc::new(AtomicUsize::new(0));
+        let probe_calls = Arc::new(AtomicUsize::new(0));
+        let managed_path = user_home.join(match target {
+            Target::Codex => ".codex/config.toml",
+            Target::Claude => ".claude/settings.json",
+        });
+        fs::create_dir_all(managed_path.parent().unwrap()).unwrap();
+        fs::write(
+            &managed_path,
+            match target {
+                Target::Codex => "unrelated = \"REVISION_RACE_CONFIG_SENTINEL_98803\"\n",
+                Target::Claude => "{\"unrelated\":\"REVISION_RACE_SETTINGS_SENTINEL_98805\"}\n",
+            },
+        )
+        .unwrap();
+        let managed_before = secret_file_fingerprint(&managed_path);
         let activation = Arc::new(
             ActivationService::new(
                 Arc::clone(&store),
                 home.clone(),
                 Arc::new(ChangingCodexProbe {
                     state: Arc::clone(&probe_state),
+                    calls: Some(Arc::clone(&probe_calls)),
                 }),
                 "/usr/bin/codex".into(),
                 Arc::new(ControlNoopUpstream),
@@ -5064,6 +5152,7 @@ async fn compatibility_resolution_binds_the_probed_revision_across_two_real_sess
             .with_claude_runtime(
                 Arc::new(ChangingClaudeProbe {
                     state: Arc::clone(&probe_state),
+                    calls: Some(Arc::clone(&probe_calls)),
                 }),
                 "/usr/bin/claude".into(),
             ),
@@ -5072,7 +5161,7 @@ async fn compatibility_resolution_binds_the_probed_revision_across_two_real_sess
             &home,
             Arc::clone(&store),
             "routing-test",
-            activation,
+            Arc::clone(&activation),
         )
         .await
         .unwrap();
@@ -5159,37 +5248,69 @@ async fn compatibility_resolution_binds_the_probed_revision_across_two_real_sess
             assert_compatibility_wire_is_secret_free(&push, SECRETS, label);
             assert_eq!(push["view"]["managementRevision"], 1);
         }
-        probe_state.store(0, Ordering::SeqCst);
         let before_stale =
             serde_json::to_value(store.target_view_for(target).await.unwrap()).unwrap();
         let compatibility_before_missing = store.compatibility_for(target).await.is_err();
-
-        let stale = request(
-            &mut first,
-            "resolve-stale-probe",
-            json!({
-                "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
-                "expectedRevision": 0,
-                "action": {"kind": "resolve-compatibility", "version": unknown_version}
-            }),
-        )
-        .await;
-        assert_compatibility_wire_is_secret_free(&stale, SECRETS, "revision-race-stale-response");
-        assert_eq!(stale["problem"]["code"], "stale-revision");
-        let after_stale =
-            serde_json::to_value(store.target_view_for(target).await.unwrap()).unwrap();
-        let compatibility_after_missing = store.compatibility_for(target).await.is_err();
-        assert_eq!(after_stale, before_stale);
-        assert!(compatibility_before_missing && compatibility_after_missing);
-        for stream in [&mut first, &mut second] {
-            assert!(
-                tokio::time::timeout(Duration::from_millis(50), read_frame(stream))
-                    .await
-                    .is_err(),
-                "stale compatibility resolution published a Target View"
+        let runtime_before = activation.model_endpoint_for(target).await;
+        for (cli_state, request_id) in [
+            (1, "resolve-stale-after-incompatible"),
+            (2, "resolve-stale-after-version-change"),
+        ] {
+            probe_state.store(cli_state, Ordering::SeqCst);
+            let calls_before = probe_calls.load(Ordering::SeqCst);
+            let action_id = Uuid::new_v4();
+            let stale = request(
+                &mut first,
+                request_id,
+                json!({
+                    "kind": "act", "target": target_name, "actionId": action_id,
+                    "expectedRevision": 0,
+                    "action": {"kind": "resolve-compatibility", "version": unknown_version}
+                }),
+            )
+            .await;
+            assert_compatibility_wire_is_secret_free(
+                &stale,
+                SECRETS,
+                "revision-race-stale-response",
             );
+            assert_eq!(stale["problem"]["code"], "stale-revision");
+            let after_stale =
+                serde_json::to_value(store.target_view_for(target).await.unwrap()).unwrap();
+            let compatibility_after_missing = store.compatibility_for(target).await.is_err();
+            assert_compatibility_json_equal(
+                &after_stale,
+                &before_stale,
+                SECRETS,
+                "revision-race-target-view",
+            );
+            assert!(compatibility_before_missing && compatibility_after_missing);
+            assert!(
+                store
+                    .receipt_for(target, action_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "stale compatibility resolution wrote a receipt"
+            );
+            assert_eq!(
+                probe_calls.load(Ordering::SeqCst),
+                calls_before,
+                "stale compatibility resolution re-probed the Target CLI"
+            );
+            assert_secret_file_unchanged(&managed_path, &managed_before);
+            assert_eq!(activation.model_endpoint_for(target).await, runtime_before);
+            for stream in [&mut first, &mut second] {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), read_frame(stream))
+                        .await
+                        .is_err(),
+                    "stale compatibility resolution published a Target View"
+                );
+            }
         }
 
+        probe_state.store(0, Ordering::SeqCst);
         let fresh_probe = request(
             &mut first,
             "probe-at-one",

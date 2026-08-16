@@ -7,6 +7,7 @@ import type {
   DiscoverySource,
   ClaudePreflightContext,
   ModelDiscoveryResult,
+  OrdinaryTargetAction,
   ReachabilityResult,
   ReconciliationPreview,
   ReconciliationStrategy,
@@ -26,7 +27,7 @@ export interface CompatibilityResolution {
 
 export interface TargetSession {
   get(): Readonly<TargetView>
-  act(action: TargetAction): Promise<ActionOutcome>
+  act(action: OrdinaryTargetAction): Promise<ActionOutcome>
   discoverModels(source: DiscoverySource, signal?: AbortSignal): Promise<ModelDiscoveryResult>
   checkReachability(
     providerId: string,
@@ -78,7 +79,13 @@ class TargetSessionImpl implements TargetSession {
     return this.#view
   }
 
-  act(action: TargetAction): Promise<ActionOutcome> {
+  act(action: OrdinaryTargetAction): Promise<ActionOutcome> {
+    if ((action as TargetAction).kind === "resolve-compatibility") {
+      return Promise.reject(new ControlError(
+        "unsupported-operation",
+        "Compatibility resolution requires resolveCompatibility",
+      ))
+    }
     return this.#enqueueAction(action)
   }
 

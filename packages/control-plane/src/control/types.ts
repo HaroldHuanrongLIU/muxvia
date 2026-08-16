@@ -414,6 +414,7 @@ export type Target = z.infer<typeof targetSchema>
 export type ClaudePreflightContext = z.infer<typeof claudePreflightContextSchema>
 export type ClaudeBlockingSelector = z.infer<typeof claudeBlockingSelectorSchema>
 export type TargetAction = z.infer<typeof targetActionSchema>
+export type OrdinaryTargetAction = Exclude<TargetAction, { kind: "resolve-compatibility" }>
 export type ActionOutcome = z.infer<typeof actionOutcomeSchema>
 export type ControlProblem = z.infer<typeof controlProblemSchema>
 export type ControlOperation = z.infer<typeof controlOperationSchema>

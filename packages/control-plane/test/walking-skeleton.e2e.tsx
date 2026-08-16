@@ -16,7 +16,11 @@ import { RpcClient } from "../src/control/rpc-client"
 import { encodeFrame, FrameDecoder } from "../src/control/framing"
 import { App } from "../src/ui/app"
 import type { TargetSession } from "../src/control/target-session"
-import { parseClientFrame, type TargetAction, type TargetView } from "../src/control/types"
+import {
+  parseClientFrame,
+  type OrdinaryTargetAction,
+  type TargetView,
+} from "../src/control/types"
 import { CLAUDE_SSE_BYTES, SSE_BYTES, startFakeUpstream, type CapturedRequest } from "../../../tests/e2e/fake-upstream"
 
 const providerSecret = "provider-secret-must-not-escape"
@@ -895,7 +899,7 @@ function asyncErrorSurface(error: unknown): unknown {
 
 async function actSecretSafe(
   session: TargetSession,
-  action: TargetAction,
+  action: OrdinaryTargetAction,
   secrets: readonly string[],
   label: string,
 ): Promise<Awaited<ReturnType<TargetSession["act"]>>> {
@@ -3812,7 +3816,11 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
     codexClient = undefined
     claudeClient = undefined
   }
-  const safeAct = async (session: TargetSession, action: TargetAction, label: string) => {
+  const safeAct = async (
+    session: TargetSession,
+    action: OrdinaryTargetAction,
+    label: string,
+  ) => {
     try {
       const outcome = await eventBarrier(session.act(action), `${label}-rpc-response`)
       assertSecretSafeStructured(outcome, secrets(), `${label}-outcome`)

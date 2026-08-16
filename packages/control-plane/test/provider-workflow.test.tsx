@@ -9,6 +9,7 @@ import type {
   CompatibilityProbe,
   DiscoverySource,
   ModelDiscoveryResult,
+  OrdinaryTargetAction,
   ReachabilityResult,
   ReconciliationPreview,
   ReconciliationStrategy,
@@ -145,7 +146,10 @@ class MemoryTargetSession implements TargetSession {
   }
 
   get(): Readonly<TargetView> { return this.#view }
-  async act(action: TargetAction): Promise<ActionOutcome> {
+  async act(action: OrdinaryTargetAction): Promise<ActionOutcome> {
+    return await this.#applyAction(action)
+  }
+  async #applyAction(action: TargetAction): Promise<ActionOutcome> {
     this.actions.push(projectAction(action))
     try {
       const outcome = await this.#handler(action)
@@ -191,7 +195,7 @@ class MemoryTargetSession implements TargetSession {
       this.#view = outcome.view
       return outcome
     }
-    return await this.act({ kind: "resolve-compatibility", version: input.version })
+    return await this.#applyAction({ kind: "resolve-compatibility", version: input.version })
   }
   async applyReconciliation(input: {
     strategy: ReconciliationStrategy

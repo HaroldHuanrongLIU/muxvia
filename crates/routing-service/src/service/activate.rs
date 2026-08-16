@@ -38,6 +38,7 @@ enum ConfigurationPreflight {
     Codex {
         codec: CodexConfigCodec,
         before: Box<ConfigSnapshot>,
+        recovery_before: Box<ConfigSnapshot>,
         ownership: Option<Box<DesiredCodexState>>,
     },
     Claude {
@@ -50,6 +51,7 @@ enum ActivationConfiguration {
     Codex {
         codec: CodexConfigCodec,
         before: Box<ConfigSnapshot>,
+        recovery_before: Box<ConfigSnapshot>,
         desired: DesiredCodexState,
     },
     Claude {
@@ -79,6 +81,7 @@ impl ActivationConfiguration {
                 codec,
                 before,
                 desired,
+                ..
             } => RecoveryIntent::pending(
                 id,
                 action_id,
@@ -102,12 +105,29 @@ impl ActivationConfiguration {
         }
     }
 
+    fn committed_recovery_payload_json(&self) -> Result<Option<String>, &'static str> {
+        match self {
+            Self::Codex {
+                recovery_before,
+                desired,
+                ..
+            } => serde_json::to_string(&RecoveryPayload::Codex {
+                before: recovery_before.clone(),
+                desired: Box::new(desired.clone()),
+            })
+            .map(Some)
+            .map_err(|_| "internal-failure"),
+            Self::Claude { .. } => Ok(None),
+        }
+    }
+
     fn atomic_apply(&self) -> Result<(), &'static str> {
         match self {
             Self::Codex {
                 codec,
                 before,
                 desired,
+                ..
             } => codec
                 .atomic_apply(before, desired)
                 .map_err(|problem| problem.code()),
@@ -127,6 +147,7 @@ impl ActivationConfiguration {
                 codec,
                 before,
                 desired,
+                ..
             } => codec
                 .verify(before, desired)
                 .map_err(|problem| problem.code()),
@@ -146,6 +167,7 @@ impl ActivationConfiguration {
                 codec,
                 before,
                 desired,
+                ..
             } => codec
                 .restore_or_confirm_before(before, desired)
                 .map_err(|_| ()),
@@ -664,6 +686,7 @@ impl ActivationService {
                 ConfigurationPreflight::Codex {
                     codec,
                     before,
+                    recovery_before,
                     ownership,
                 } => {
                     let desired = match ownership.as_deref() {
@@ -684,6 +707,7 @@ impl ActivationService {
                         ActivationConfiguration::Codex {
                             codec,
                             before,
+                            recovery_before,
                             desired,
                         },
                         None,
@@ -762,6 +786,7 @@ impl ActivationService {
                     ConfigurationPreflight::Codex {
                         codec,
                         before,
+                        recovery_before,
                         ownership,
                     } => {
                         let desired = match ownership.as_deref() {
@@ -780,6 +805,7 @@ impl ActivationService {
                         ActivationConfiguration::Codex {
                             codec,
                             before,
+                            recovery_before,
                             desired,
                         }
                     }
@@ -856,8 +882,10 @@ impl ActivationService {
                 pause.reached.notify_one();
                 pause.release.notified().await;
             }
+            let committed_recovery_payload_json =
+                configuration.committed_recovery_payload_json()?;
             self.store
-                .commit_activation_for(
+                .commit_activation_for_with_recovery_payload(
                     target,
                     command.action_id,
                     command.expected_revision,
@@ -870,6 +898,7 @@ impl ActivationService {
                     recovery_id,
                     configuration.config_path().to_string_lossy().into_owned(),
                     capability_problem,
+                    committed_recovery_payload_json,
                 )
                 .await
                 .map_err(|_| "internal-failure")
@@ -1228,10 +1257,16 @@ impl ActivationService {
                 let (before, ownership) = self
                     .inspect_config(&codec, preparation)
                     .map_err(PreflightFailure::new)?;
+                let recovery_before = match preparation.prior_recovery_payload.as_ref() {
+                    Some(RecoveryPayload::Codex { before, .. }) => before.clone(),
+                    Some(_) => return Err(PreflightFailure::new("recovery-required")),
+                    None => Box::new(before.clone()),
+                };
                 Ok((
                     ConfigurationPreflight::Codex {
                         codec,
                         before: Box::new(before),
+                        recovery_before,
                         ownership: ownership.map(Box::new),
                     },
                     capability_problem,

@@ -2,6 +2,7 @@ use std::fmt;
 use std::path::Path;
 
 use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     claude::{
@@ -11,6 +12,7 @@ use crate::{
     codex::{
         CodexCapability, CodexConfigCodec, CodexProblem, ConfigSnapshot, DesiredCodexState,
         FileIdentity,
+        config::{CodexObservedDocument, CodexProviderRestoreState},
     },
     control::protocol::{
         ClaudePreflightContext, CompatibilityClassification, ProviderAuthentication,
@@ -106,6 +108,8 @@ pub(crate) enum PreparedConfiguration {
         desired: DesiredCodexState,
         recovery_before: ConfigSnapshot,
         adopted: Option<(ConfigSnapshot, DesiredCodexState)>,
+        restore_provider: Option<CodexProviderRestoreState>,
+        observed_document: CodexObservedDocument,
     },
     Claude {
         before: ClaudeConfigSnapshot,
@@ -152,9 +156,21 @@ impl PreparedConfiguration {
     pub(crate) fn atomic_apply(&self, user_home: &Path) -> Result<(), ReconciliationProblem> {
         match self {
             Self::Codex {
-                before, desired, ..
+                before,
+                desired,
+                recovery_before,
+                restore_provider,
+                ..
             } => CodexConfigCodec::for_user_home(user_home)
-                .and_then(|codec| codec.atomic_apply(before, desired))
+                .and_then(|codec| match restore_provider {
+                    Some(provider_restore) => codec.atomic_restore_union(
+                        before,
+                        desired,
+                        provider_restore,
+                        recovery_before,
+                    ),
+                    None => codec.atomic_apply(before, desired),
+                })
                 .map_err(map_codex_problem),
             Self::Claude {
                 before, desired, ..
@@ -167,9 +183,17 @@ impl PreparedConfiguration {
     pub(crate) fn verify(&self, user_home: &Path) -> Result<(), ReconciliationProblem> {
         match self {
             Self::Codex {
-                before, desired, ..
+                before,
+                desired,
+                restore_provider,
+                ..
             } => CodexConfigCodec::for_user_home(user_home)
-                .and_then(|codec| codec.verify(before, desired))
+                .and_then(|codec| match restore_provider {
+                    Some(provider_restore) => {
+                        codec.verify_restore_union(before, desired, provider_restore)
+                    }
+                    None => codec.verify(before, desired),
+                })
                 .map_err(map_codex_problem),
             Self::Claude {
                 before, desired, ..
@@ -182,9 +206,21 @@ impl PreparedConfiguration {
     pub(crate) fn exact_rollback(&self, user_home: &Path) -> Result<(), ReconciliationProblem> {
         match self {
             Self::Codex {
-                before, desired, ..
+                before,
+                desired,
+                restore_provider,
+                observed_document,
+                ..
             } => CodexConfigCodec::for_user_home(user_home)
-                .and_then(|codec| codec.restore_or_confirm_before(before, desired))
+                .and_then(|codec| match restore_provider {
+                    Some(provider_restore) => codec.exact_rollback_restore_union(
+                        before,
+                        desired,
+                        provider_restore,
+                        observed_document,
+                    ),
+                    None => codec.restore_or_confirm_before(before, desired),
+                })
                 .map_err(map_codex_problem),
             Self::Claude {
                 before, desired, ..
@@ -197,8 +233,20 @@ impl PreparedConfiguration {
     pub(crate) fn durable_material(&self) -> Result<(String, String), ReconciliationProblem> {
         match self {
             Self::Codex {
-                before, desired, ..
-            } => serialize_material(before, desired),
+                before,
+                desired,
+                restore_provider,
+                ..
+            } => match restore_provider {
+                Some(provider_restore) => serialize_material(
+                    before,
+                    &DurableCodexDesired::RestoreUnion {
+                        desired: desired.clone(),
+                        provider_restore: provider_restore.clone(),
+                    },
+                ),
+                None => serialize_material(before, desired),
+            },
             Self::Claude {
                 before, desired, ..
             } => serialize_material(before, desired),
@@ -214,6 +262,9 @@ impl PreparedConfiguration {
                     .as_ref()
                     .map(|(_, desired)| desired)
                     .unwrap_or(desired);
+                if desired.uses_routing_credential_header() {
+                    return Err(ReconciliationProblem::new("invalid-provider-credential"));
+                }
                 let (name, model, base_url, credential) = desired
                     .reconciliation_provider()
                     .ok_or_else(|| ReconciliationProblem::new("invalid-configuration"))?;
@@ -251,18 +302,17 @@ impl PreparedConfiguration {
     pub(crate) fn adopted_recovery_payload(&self) -> RecoveryPayload {
         match self {
             Self::Codex {
-                before,
                 desired,
                 recovery_before,
                 adopted,
                 ..
             } => {
-                let (before, desired) = adopted
+                let desired = adopted
                     .as_ref()
-                    .map(|(before, desired)| (before, desired))
-                    .unwrap_or((before, desired));
+                    .map(|(_, desired)| desired)
+                    .unwrap_or(desired);
                 RecoveryPayload::Codex {
-                    before: Box::new(before.recovery_before_with_latest_unrelated(recovery_before)),
+                    before: Box::new(recovery_before.clone()),
                     desired: Box::new(desired.clone()),
                 }
             }
@@ -297,6 +347,15 @@ impl PreparedConfiguration {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "material", rename_all = "kebab-case")]
+enum DurableCodexDesired {
+    RestoreUnion {
+        desired: DesiredCodexState,
+        provider_restore: CodexProviderRestoreState,
+    },
+}
+
 fn serialize_material(
     before: &impl serde::Serialize,
     desired: &impl serde::Serialize,
@@ -319,6 +378,22 @@ pub(crate) fn recover_pending_material(
         Target::Codex => {
             let before: ConfigSnapshot = serde_json::from_str(before_json)
                 .map_err(|_| ReconciliationProblem::new("recovery-required"))?;
+            if serde_json::from_str::<serde_json::Value>(desired_json)
+                .ok()
+                .and_then(|value| value.get("material").cloned())
+                .is_some()
+            {
+                let DurableCodexDesired::RestoreUnion {
+                    desired,
+                    provider_restore,
+                } = serde_json::from_str(desired_json)
+                    .map_err(|_| ReconciliationProblem::new("recovery-required"))?;
+                return CodexConfigCodec::for_user_home(user_home)
+                    .and_then(|codec| {
+                        codec.restore_union_or_confirm_before(&before, &desired, &provider_restore)
+                    })
+                    .map_err(map_codex_problem);
+            }
             let desired: DesiredCodexState = serde_json::from_str(desired_json)
                 .map_err(|_| ReconciliationProblem::new("recovery-required"))?;
             CodexConfigCodec::for_user_home(user_home)
@@ -429,7 +504,7 @@ fn observe_codex(
     recovery_before: &ConfigSnapshot,
     compatibility: ProbedCompatibility,
 ) -> Result<ObservedReconciliation, ReconciliationProblem> {
-    let (current, selected, profile_shadow) = codec
+    let (current, selected, observed_document, profile_shadow) = codec
         .reconciliation_snapshots_for(committed)
         .map_err(map_codex_problem)?;
     let compared = if strategy == ReconciliationStrategy::Adopt {
@@ -440,13 +515,25 @@ fn observe_codex(
     let provider_changed = !compared.provider_matches(committed);
     let credential_changed = !compared.credential_matches(committed);
     let before = current.clone();
+    let adopted = (strategy == ReconciliationStrategy::Adopt)
+        .then(|| (selected.clone(), selected.as_adopted_direct()));
+    let recovery_before = match (strategy, adopted.as_ref()) {
+        (ReconciliationStrategy::Adopt, Some((_, adopted_desired))) => recovery_before
+            .with_provider_restore_for(adopted_desired)
+            .map_err(map_codex_problem)?,
+        (ReconciliationStrategy::Restore, _) => recovery_before
+            .with_provider_restore_for(committed)
+            .map_err(map_codex_problem)?,
+        _ => recovery_before.clone(),
+    };
     let desired = match strategy {
         ReconciliationStrategy::Adopt => current.as_desired_like(committed),
         ReconciliationStrategy::Reapply => committed.clone(),
         ReconciliationStrategy::Restore => recovery_before.as_desired_like(committed),
     };
-    let adopted = (strategy == ReconciliationStrategy::Adopt)
-        .then(|| (selected.clone(), selected.as_adopted_direct()));
+    let restore_provider = (strategy == ReconciliationStrategy::Restore)
+        .then(|| recovery_before.provider_restore().cloned())
+        .flatten();
     Ok(ObservedReconciliation {
         observation: ReconciliationObservation {
             file_identity: current.identity().clone(),
@@ -463,8 +550,10 @@ fn observe_codex(
         prepared: PreparedConfiguration::Codex {
             before,
             desired,
-            recovery_before: recovery_before.clone(),
+            recovery_before,
             adopted,
+            restore_provider,
+            observed_document,
         },
     })
 }
@@ -987,6 +1076,14 @@ supports_websockets = false
                 "Authorization = \"Bearer SELECTED_SECRET_97102\"",
                 "Authorization = \"Bearer    \"",
             ),
+            valid.replace(
+                "Authorization = \"Bearer SELECTED_SECRET_97102\"",
+                "\"X-Muxvia-Routing-Credential\" = \"DIFFERENT_ROUTE_SECRET_97302\"",
+            ),
+            valid.replace(
+                "Authorization = \"Bearer SELECTED_SECRET_97102\"",
+                "Authorization = \"Bearer SELECTED_SECRET_97102\", \"X-Muxvia-Routing-Credential\" = \"DIFFERENT_ROUTE_SECRET_97302\"",
+            ),
             valid.replace("model = \"selected-model\"", "model = 7"),
             valid.replace(
                 "base_url = \"https://selected.example/v1\"",
@@ -1007,7 +1104,7 @@ supports_websockets = false
             let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
             fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
             let recovery_before = codec.inspect().unwrap();
-            fs::write(codec.config_path(), configuration).unwrap();
+            fs::write(codec.config_path(), &configuration).unwrap();
             let committed = codec.desired_direct(
                 "committed-model",
                 "https://committed.example/v1",
@@ -1040,8 +1137,119 @@ supports_websockets = false
                     assert!(!diagnostic.contains(&format!("{:?}", secret.as_bytes())));
                 }
             } else {
-                assert_eq!(adopted.unwrap_err().code(), "invalid-configuration");
+                let expected = if configuration.contains("DIFFERENT_ROUTE_SECRET_97302") {
+                    "invalid-provider-credential"
+                } else {
+                    "invalid-configuration"
+                };
+                assert_eq!(adopted.unwrap_err().code(), expected);
             }
+        }
+    }
+
+    #[test]
+    fn codex_adopt_rejects_an_unrepresentable_bound_provider_before_without_mutation() {
+        let historical_variants = [
+            (
+                "wire_api = \"chat\"",
+                "http_headers = { Authorization = \"Bearer HISTORICAL_SECRET_97401\" }",
+                "supports_websockets = false",
+            ),
+            (
+                "wire_api = \"responses\"",
+                "http_headers = { Authorization = \"Bearer HISTORICAL_SECRET_97401\" }",
+                "supports_websockets = true",
+            ),
+            (
+                "wire_api = \"responses\"",
+                "http_headers = { Authorization = \"Bearer HISTORICAL_SECRET_97401\", \"X-Operator-Secret\" = \"UNRELATED_SECRET_97402\" }",
+                "supports_websockets = false",
+            ),
+        ];
+
+        for (wire_api, headers, websocket) in historical_variants {
+            let home = TempDir::new().unwrap();
+            let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+            fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+            let historical = format!(
+                r#"model = "historical-model"
+model_provider = "operator"
+unrelated_secret = "UNRELATED_SECRET_97403"
+
+[model_providers.operator]
+name = "Historical operator"
+base_url = "https://historical.example/v1"
+{wire_api}
+{headers}
+{websocket}
+operator_decoration = "preserve"
+"#
+            );
+            fs::write(codec.config_path(), &historical).unwrap();
+            let recovery_before = codec.inspect().unwrap();
+            let committed = codec.desired_direct(
+                "committed-model",
+                "https://committed.example/v1",
+                "COMMITTED_SECRET_97404",
+            );
+            codec.atomic_apply(&recovery_before, &committed).unwrap();
+            let external = r#"model = "external-model"
+model_provider = "operator"
+unrelated_secret = "UNRELATED_SECRET_97403"
+
+[model_providers.operator]
+name = "External operator"
+base_url = "https://external.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer EXTERNAL_SECRET_97405" }
+supports_websockets = false
+operator_decoration = "preserve"
+"#;
+            fs::write(codec.config_path(), external).unwrap();
+            let before = fs::read(codec.config_path()).unwrap();
+            let before_mode = fs::metadata(codec.config_path())
+                .unwrap()
+                .permissions()
+                .mode();
+
+            let error = TargetReconciliationAdapter::Codex(codec)
+                .observe(
+                    ReconciliationStrategy::Adopt,
+                    &CommittedConfiguration::Codex {
+                        desired: committed,
+                        recovery_before,
+                    },
+                    &ReconciliationContext::Codex,
+                    compatibility(),
+                )
+                .unwrap_err();
+
+            assert_eq!(error.code(), "invalid-configuration");
+            let diagnostic = format!("{error:?}");
+            for secret in [
+                "HISTORICAL_SECRET_97401",
+                "UNRELATED_SECRET_97402",
+                "UNRELATED_SECRET_97403",
+                "COMMITTED_SECRET_97404",
+                "EXTERNAL_SECRET_97405",
+            ] {
+                assert!(!diagnostic.contains(secret), "diagnostic leaked a secret");
+                assert!(
+                    !diagnostic.contains(&format!("{:?}", secret.as_bytes())),
+                    "diagnostic leaked numeric secret bytes"
+                );
+            }
+            assert!(
+                fs::read(home.path().join(".codex/config.toml")).unwrap() == before,
+                "rejected Adopt changed the Managed Configuration"
+            );
+            assert_eq!(
+                fs::metadata(home.path().join(".codex/config.toml"))
+                    .unwrap()
+                    .permissions()
+                    .mode(),
+                before_mode
+            );
         }
     }
 
@@ -1167,6 +1375,240 @@ supports_websockets = false
         assert!(rolled_back.contains("model_provider = \"external\""));
         assert!(rolled_back.contains("EXTERNAL_SECRET_97204"));
         assert!(rolled_back.contains("[model_providers.muxvia_codex]"));
+    }
+
+    #[test]
+    fn codex_adopt_restore_removes_a_historically_absent_file_without_unrelated_values() {
+        let home = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+        let recovery_before = codec.inspect().unwrap();
+        let committed = codec.desired_direct(
+            "committed-model",
+            "https://committed.example/v1",
+            "COMMITTED_SECRET_97406",
+        );
+        codec.atomic_apply(&recovery_before, &committed).unwrap();
+        let external = r#"model = "external-model"
+model_provider = "external"
+
+[model_providers.external]
+name = "External"
+base_url = "https://external.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer EXTERNAL_SECRET_97407" }
+supports_websockets = false
+"#;
+        fs::write(codec.config_path(), external).unwrap();
+
+        let adopted = TargetReconciliationAdapter::Codex(codec)
+            .observe(
+                ReconciliationStrategy::Adopt,
+                &CommittedConfiguration::Codex {
+                    desired: committed,
+                    recovery_before,
+                },
+                &ReconciliationContext::Codex,
+                compatibility(),
+            )
+            .unwrap();
+        let crate::state::RecoveryPayload::Codex { before, desired } =
+            adopted.prepared.adopted_recovery_payload()
+        else {
+            panic!("Codex Adopt must retain Codex recovery material")
+        };
+        let restored = TargetReconciliationAdapter::Codex(
+            CodexConfigCodec::for_user_home(home.path()).unwrap(),
+        )
+        .observe(
+            ReconciliationStrategy::Restore,
+            &CommittedConfiguration::Codex {
+                desired: (*desired).clone(),
+                recovery_before: (*before).clone(),
+            },
+            &ReconciliationContext::Codex,
+            compatibility(),
+        )
+        .unwrap();
+
+        restored.prepared.atomic_apply(home.path()).unwrap();
+        restored.prepared.verify(home.path()).unwrap();
+        assert!(
+            !home.path().join(".codex/config.toml").exists(),
+            "Restore retained a historically absent empty Managed Configuration"
+        );
+
+        restored.prepared.exact_rollback(home.path()).unwrap();
+        assert!(
+            fs::read(home.path().join(".codex/config.toml")).unwrap() == external.as_bytes(),
+            "exact rollback did not restore the observed Managed Configuration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_adopt_restore_preserves_the_exact_bound_same_key_historical_document() {
+        let home = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+        let config_path = codec.config_path().to_owned();
+        fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+        let historical = r#"# historical top decoration
+model = "historical-model" # historical model decoration
+model_provider = "operator" # historical selector decoration
+operator_setting = { keep = "historical-unrelated" }
+
+[model_providers.operator]
+name = "Historical Operator" # historical provider decoration
+base_url = "https://historical.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer HISTORICAL_SECRET_97305" }
+supports_websockets = false
+operator_note = "same-key-unrelated"
+"#;
+        fs::write(codec.config_path(), historical).unwrap();
+        fs::set_permissions(codec.config_path(), fs::Permissions::from_mode(0o640)).unwrap();
+        let recovery_before = codec.inspect().unwrap();
+        let committed = codec.desired_direct(
+            "committed-model",
+            "https://committed.example/v1",
+            "COMMITTED_SECRET_97306",
+        );
+        codec.atomic_apply(&recovery_before, &committed).unwrap();
+        let managed = fs::read_to_string(codec.config_path()).unwrap();
+        let external = managed
+            .replace("model = \"committed-model\"", "model = \"adopted-model\"")
+            .replace(
+                "model_provider = \"muxvia_codex\"",
+                "model_provider = \"operator\"",
+            )
+            .replace("Historical Operator", "Adopted Operator")
+            .replace(
+                "https://historical.example/v1",
+                "https://adopted.example/v1",
+            )
+            .replace("HISTORICAL_SECRET_97305", "ADOPTED_SECRET_97307")
+            + r#"
+
+[current_only]
+unrelated_secret = "CURRENT_ONLY_UNRELATED_SECRET_97309"
+"#;
+        fs::write(codec.config_path(), &external).unwrap();
+        fs::set_permissions(codec.config_path(), fs::Permissions::from_mode(0o600)).unwrap();
+
+        let adopted = TargetReconciliationAdapter::Codex(codec)
+            .observe(
+                ReconciliationStrategy::Adopt,
+                &CommittedConfiguration::Codex {
+                    desired: committed,
+                    recovery_before,
+                },
+                &ReconciliationContext::Codex,
+                compatibility(),
+            )
+            .unwrap();
+        let recovery_payload = adopted.prepared.adopted_recovery_payload();
+        let serialized_recovery = serde_json::to_string(&recovery_payload).unwrap();
+        let current_only_secret_absent =
+            !serialized_recovery.contains("CURRENT_ONLY_UNRELATED_SECRET_97309");
+        assert!(
+            current_only_secret_absent,
+            "recovery payload included a current-only unrelated value"
+        );
+        let recovery_diagnostic = format!("{recovery_payload:?}");
+        for secret in [
+            "HISTORICAL_SECRET_97305",
+            "ADOPTED_SECRET_97307",
+            "CURRENT_ONLY_UNRELATED_SECRET_97309",
+        ] {
+            assert!(!recovery_diagnostic.contains(secret));
+            assert!(!recovery_diagnostic.contains(&format!("{:?}", secret.as_bytes())));
+        }
+        let crate::state::RecoveryPayload::Codex { before, desired } = recovery_payload else {
+            panic!("Codex Adopt must retain Codex recovery material")
+        };
+        let committed_after_adopt = CommittedConfiguration::Codex {
+            desired: (*desired).clone(),
+            recovery_before: (*before).clone(),
+        };
+        let restored = TargetReconciliationAdapter::Codex(
+            CodexConfigCodec::for_user_home(home.path()).unwrap(),
+        )
+        .observe(
+            ReconciliationStrategy::Restore,
+            &committed_after_adopt,
+            &ReconciliationContext::Codex,
+            compatibility(),
+        )
+        .unwrap();
+        restored.prepared.atomic_apply(home.path()).unwrap();
+        restored.prepared.verify(home.path()).unwrap();
+        restored.prepared.exact_rollback(home.path()).unwrap();
+        assert!(
+            fs::read(&config_path).unwrap() == external.as_bytes(),
+            "exact rollback changed the observed Codex document"
+        );
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let restored = TargetReconciliationAdapter::Codex(
+            CodexConfigCodec::for_user_home(home.path()).unwrap(),
+        )
+        .observe(
+            ReconciliationStrategy::Restore,
+            &committed_after_adopt,
+            &ReconciliationContext::Codex,
+            compatibility(),
+        )
+        .unwrap();
+        let (pending_before, pending_desired) = restored.prepared.durable_material().unwrap();
+        restored.prepared.atomic_apply(home.path()).unwrap();
+        restored.prepared.verify(home.path()).unwrap();
+
+        let restored_document = fs::read_to_string(&config_path).unwrap();
+        let restored_semantic: serde_json::Value =
+            toml_edit::de::from_str(&restored_document).unwrap();
+        let mut historical_semantic: serde_json::Value =
+            toml_edit::de::from_str(historical).unwrap();
+        historical_semantic["current_only"] = serde_json::json!({
+            "unrelated_secret": "CURRENT_ONLY_UNRELATED_SECRET_97309"
+        });
+        assert!(
+            restored_semantic == historical_semantic,
+            "Restore did not recover the bounded historical semantics"
+        );
+        for decoration in [
+            "# historical top decoration",
+            "# historical model decoration",
+            "# historical selector decoration",
+            "# historical provider decoration",
+        ] {
+            assert!(restored_document.contains(decoration));
+        }
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+
+        super::recover_pending_material(
+            crate::control::protocol::Target::Codex,
+            home.path(),
+            &pending_before,
+            &pending_desired,
+        )
+        .unwrap();
+        let recovered_document = fs::read_to_string(&config_path).unwrap();
+        let recovered_semantic: serde_json::Value =
+            toml_edit::de::from_str(&recovered_document).unwrap();
+        let external_semantic: serde_json::Value = toml_edit::de::from_str(&external).unwrap();
+        assert!(
+            recovered_semantic == external_semantic,
+            "startup recovery did not restore the observed Codex semantics"
+        );
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

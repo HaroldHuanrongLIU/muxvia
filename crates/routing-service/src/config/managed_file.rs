@@ -43,6 +43,10 @@ impl FileIdentity {
         self.exists
     }
 
+    pub(crate) fn mode(&self) -> Option<u32> {
+        self.mode
+    }
+
     fn same_inode(&self, other: &Self) -> bool {
         self.exists && other.exists && self.device == other.device && self.inode == other.inode
     }
@@ -250,6 +254,31 @@ impl ManagedFile {
         bytes: &[u8],
         remove_file: bool,
     ) -> Result<(), ManagedFileError> {
+        self.replace_with_mode(expected, bytes, remove_file, expected.mode.unwrap_or(0o600))
+    }
+
+    pub(crate) fn replace_with_mode_from(
+        &self,
+        expected: &FileIdentity,
+        bytes: &[u8],
+        remove_file: bool,
+        mode_source: &FileIdentity,
+    ) -> Result<(), ManagedFileError> {
+        self.replace_with_mode(
+            expected,
+            bytes,
+            remove_file,
+            mode_source.mode.unwrap_or(0o600),
+        )
+    }
+
+    fn replace_with_mode(
+        &self,
+        expected: &FileIdentity,
+        bytes: &[u8],
+        remove_file: bool,
+        mode: u32,
+    ) -> Result<(), ManagedFileError> {
         let parent = self.path.parent().ok_or(ManagedFileError::WriteFailed)?;
         create_private_parent(parent).map_err(|_| ManagedFileError::WriteFailed)?;
         let directory = rustix::fs::openat(
@@ -273,15 +302,12 @@ impl ManagedFile {
             &directory,
             temporary_name.as_str(),
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_raw_mode(expected.mode.unwrap_or(0o600) as _),
+            Mode::from_raw_mode(mode as _),
         )
         .map_err(|_| ManagedFileError::WriteFailed)?;
         let mut temporary = File::from(temporary_fd);
-        rustix::fs::fchmod(
-            &temporary,
-            Mode::from_raw_mode(expected.mode.unwrap_or(0o600) as _),
-        )
-        .map_err(|_| ManagedFileError::WriteFailed)?;
+        rustix::fs::fchmod(&temporary, Mode::from_raw_mode(mode as _))
+            .map_err(|_| ManagedFileError::WriteFailed)?;
         let retain_temporary = Cell::new(false);
         let result = (|| {
             temporary

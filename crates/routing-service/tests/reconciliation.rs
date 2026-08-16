@@ -1016,6 +1016,30 @@ async fn adopt_reconciliation_creates_immutable_history_and_receipt_first_replay
     )
     .await
     .unwrap();
+    let historical_configuration = r#"# bound historical configuration
+model = "historical-local-model" # historical model decoration
+model_provider = "operator_openai" # historical selector decoration
+operator_setting = "historical-unrelated"
+
+[model_providers.operator_openai]
+name = "Historical local provider" # historical provider decoration
+base_url = "https://historical-local.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer HISTORICAL_LOCAL_SECRET_97308" }
+supports_websockets = false
+operator_note = "preserve-this-unrelated-field"
+"#;
+    fs::create_dir_all(user_home.join(".codex")).unwrap();
+    fs::write(
+        user_home.join(".codex/config.toml"),
+        historical_configuration,
+    )
+    .unwrap();
+    fs::set_permissions(
+        user_home.join(".codex/config.toml"),
+        fs::Permissions::from_mode(0o640),
+    )
+    .unwrap();
     activate_takeover(
         handle.socket_path(),
         Target::Codex,
@@ -1114,12 +1138,67 @@ supports_websockets = false
         route_secret_view
     );
     assert!(activation.model_endpoint_for(Target::Codex).await.is_some());
+    let different_routing_header_secret =
+        "DIFFERENT_STALE_ROUTING_HEADER_SECRET_97303_MUST_NOT_PERSIST_000000";
+    let different_routing_header_configuration = format!(
+        r#"model = "must-not-adopt-routing-header"
+model_provider = "external_route"
+
+[model_providers.external_route]
+name = "External route"
+base_url = "https://different-routing-header.example/v1"
+wire_api = "responses"
+http_headers = {{ "X-Muxvia-Routing-Credential" = {} }}
+supports_websockets = false
+"#,
+        serde_json::to_string(different_routing_header_secret).unwrap()
+    );
+    fs::write(
+        user_home.join(".codex/config.toml"),
+        &different_routing_header_configuration,
+    )
+    .unwrap();
+    let different_route_bytes = fs::read(user_home.join(".codex/config.toml")).unwrap();
+    let different_route_view = store.target_view_for(Target::Codex).await.unwrap();
+    let different_preview = request(
+        &mut recursive,
+        "different-route-preview",
+        json!({"kind":"preview-reconciliation","target":"codex","strategy":"adopt"}),
+    )
+    .await;
+    let different_rejected_raw = request_raw(
+        &mut recursive,
+        "different-route-apply",
+        json!({
+            "kind":"act","target":"codex","actionId":Uuid::new_v4(),
+            "expectedRevision":historical.management_revision,
+            "action":{"kind":"reconcile","strategy":"adopt",
+                "observationToken":different_preview["result"]["preview"]["observationToken"],
+                "acknowledgeVersion":"codex-cli 77.1.0"}
+        }),
+    )
+    .await;
+    assert_raw_frame_is_safe(&different_rejected_raw, &[different_routing_header_secret]);
+    let different_rejected: Value = serde_json::from_slice(&different_rejected_raw).unwrap();
+    assert_eq!(
+        different_rejected["problem"]["code"],
+        "invalid-provider-credential"
+    );
+    assert!(
+        fs::read(user_home.join(".codex/config.toml")).unwrap() == different_route_bytes,
+        "rejected routing-header Adopt changed the Managed Configuration"
+    );
+    assert_eq!(
+        store.target_view_for(Target::Codex).await.unwrap(),
+        different_route_view
+    );
     drop(recursive);
     fs::write(
         user_home.join(".codex/config.toml"),
         r#"model = "adopted-model"
 model_provider = "operator_openai"
 operator_setting = "preserved"
+current_only_unrelated_secret = "CURRENT_ONLY_UNRELATED_SECRET_97310"
 
 [model_providers.muxvia_codex]
 name = "Stale Muxvia"
@@ -1129,11 +1208,12 @@ http_headers = { Authorization = "Bearer STALE_MUXVIA_SECRET_96204" }
 supports_websockets = true
 
 [model_providers.operator_openai]
-name = "Externally adopted"
+name = "Externally adopted" # current provider decoration
 base_url = "https://adopted.example/v1"
 wire_api = "responses"
 http_headers = { Authorization = "Bearer ADOPTED_SECRET_96202" }
 supports_websockets = false
+operator_note = "preserve-this-unrelated-field"
 "#,
     )
     .unwrap();
@@ -1211,6 +1291,26 @@ supports_websockets = false
         Some(peer_endpoint)
     );
     assert!(TcpStream::connect(peer_endpoint).await.is_ok());
+    let database = tokio_rusqlite::Connection::open(home.database_path())
+        .await
+        .unwrap();
+    let recovery_payload_json = database
+        .call(|connection| {
+            connection.query_row(
+                "SELECT a.payload_json FROM target_route_state r
+                 JOIN activation_recovery a
+                   ON a.id = r.recovery_intent_id AND a.target = r.target
+                 WHERE r.target = 'codex' AND a.state = 'committed'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        !recovery_payload_json.contains("CURRENT_ONLY_UNRELATED_SECRET_97310"),
+        "Codex Adopt persisted a current-only unrelated secret in recovery payload JSON"
+    );
 
     let replay = request(&mut stream, "replay", operation).await;
     assert_eq!(replay["result"]["outcome"]["status"], "replayed");
@@ -1302,6 +1402,92 @@ supports_websockets = false
     assert_eq!(
         fs::read_to_string(user_home.join(".codex/config.toml")).unwrap(),
         activated_configuration
+    );
+
+    let restore_drift = activated_configuration.replacen(
+        "model = \"historical-model\"",
+        "model = \"restore-after-restart-drift\"",
+        1,
+    );
+    fs::write(user_home.join(".codex/config.toml"), restore_drift).unwrap();
+    restarted_store
+        .mark_configuration_drift_for(Target::Codex)
+        .await
+        .unwrap();
+    let mut restore_stream = UnixStream::connect(restarted.socket_path()).await.unwrap();
+    hello(&mut restore_stream).await;
+    let restore_opened = request(
+        &mut restore_stream,
+        "open-before-historical-restore",
+        open_operation(Target::Codex, &user_home),
+    )
+    .await;
+    let restore_preview = request(
+        &mut restore_stream,
+        "preview-historical-restore",
+        json!({"kind":"preview-reconciliation","target":"codex","strategy":"restore"}),
+    )
+    .await;
+    let restore_response = request(
+        &mut restore_stream,
+        "apply-historical-restore",
+        json!({
+            "kind":"act","target":"codex","actionId":Uuid::new_v4(),
+            "expectedRevision":restore_opened["result"]["view"]["managementRevision"],
+            "action":{"kind":"reconcile","strategy":"restore",
+                "observationToken":restore_preview["result"]["preview"]["observationToken"],
+                "acknowledgeVersion":"codex-cli 77.1.0"}
+        }),
+    )
+    .await;
+    assert_eq!(restore_response["type"], "response", "{restore_response}");
+    assert_eq!(
+        restore_response["result"]["outcome"]["view"]["mode"], "unmanaged",
+        "{restore_response}"
+    );
+    let _restore_push = read_frame(&mut restore_stream).await.unwrap();
+    let restored_configuration = fs::read_to_string(user_home.join(".codex/config.toml")).unwrap();
+    for expected in [
+        "model = \"historical-local-model\" # historical model decoration",
+        "model_provider = \"operator_openai\" # historical selector decoration",
+        "name = \"Historical local provider\" # historical provider decoration",
+        "base_url = \"https://historical-local.example/v1\"",
+        "Bearer HISTORICAL_LOCAL_SECRET_97308",
+        "operator_setting = \"preserved\"",
+        "current_only_unrelated_secret = \"CURRENT_ONLY_UNRELATED_SECRET_97310\"",
+        "operator_note = \"preserve-this-unrelated-field\"",
+    ] {
+        assert!(
+            restored_configuration.contains(expected),
+            "historical Restore lost an approved bounded field"
+        );
+    }
+    assert!(!restored_configuration.contains("restore-after-restart-drift"));
+    assert!(!restored_configuration.contains("[model_providers.muxvia_codex]"));
+    assert!(!restored_configuration.contains("STALE_MUXVIA_SECRET_96204"));
+    assert_eq!(
+        fs::metadata(user_home.join(".codex/config.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+    let restored_view = restarted_store
+        .target_view_for(Target::Codex)
+        .await
+        .unwrap();
+    assert_eq!(restored_view.mode, "unmanaged");
+    assert_eq!(restored_view.recovery.state, "clean");
+    assert!(!restored_view.problems.iter().any(|problem| {
+        matches!(
+            problem.code.as_str(),
+            "recovery-required" | "startup-reconciliation-failed"
+        )
+    }));
+    assert_eq!(
+        restarted_activation.model_endpoint_for(Target::Codex).await,
+        None
     );
 
     restarted.shutdown().await.unwrap();
@@ -1783,10 +1969,7 @@ async fn restore_returns_target_busy_without_mutation_while_real_request_is_pinn
         }),
     )
     .await;
-    assert_eq!(
-        busy_adopt["problem"]["code"],
-        "stale-reconciliation-preview"
-    );
+    assert_eq!(busy_adopt["problem"]["code"], "invalid-provider-credential");
     assert_eq!(
         store.target_view_for(Target::Codex).await.unwrap(),
         before_view

@@ -2854,6 +2854,32 @@ async fn reconciliation_publication_waits_for_the_initiating_action_response_wri
         "subscriber received reconciliation publication before action response writer ack"
     );
 
+    let newest = fixture.store.target_view_for(Target::Codex).await.unwrap();
+    let newer = request(
+        &mut subscriber,
+        "newer-provider",
+        json!({
+            "kind":"act","target":"codex","actionId":Uuid::new_v4(),
+            "expectedRevision":newest.management_revision,
+            "action":create_action("Newer provider", "NEWER_SECRET_97301")
+        }),
+    )
+    .await;
+    assert_eq!(newer["type"], "response");
+    let newer_push = read_frame(&mut subscriber).await.unwrap();
+    assert_eq!(newer_push["view"], newer["result"]["outcome"]["view"]);
+    assert!(
+        newer_push["view"]["viewSequence"].as_u64().unwrap()
+            > fixture
+                .store
+                .receipt_for(Target::Codex, action_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .view
+                .view_sequence
+    );
+
     let mut response = None;
     for _ in 0..9 {
         let frame = read_frame(&mut initiator).await.unwrap();
@@ -2863,9 +2889,29 @@ async fn reconciliation_publication_waits_for_the_initiating_action_response_wri
     }
     let response = response.expect("initiating reconciliation response was not written");
     assert_eq!(response["type"], "response");
-    let pushed = read_frame(&mut subscriber).await.unwrap();
-    assert_eq!(pushed["type"], "target-view");
-    assert_eq!(pushed["view"], response["result"]["outcome"]["view"]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut subscriber))
+            .await
+            .is_err(),
+        "late old writer ack published a regressing reconciliation view"
+    );
+    let replay = request(
+        &mut subscriber,
+        "superseded-replay",
+        json!({
+            "kind":"act","target":"codex","actionId":action_id,
+            "expectedRevision":0,
+            "action":create_action("ignored replay", "IGNORED_REPLAY_SECRET_97304")
+        }),
+    )
+    .await;
+    assert_eq!(replay["result"]["outcome"]["status"], "replayed");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut subscriber))
+            .await
+            .is_err(),
+        "receipt replay published after its original view was superseded"
+    );
     fixture.shutdown().await;
 }
 
@@ -2942,6 +2988,28 @@ async fn durable_live_drift_publication_waits_for_the_initiating_error_writer_ac
         "subscriber received live-drift publication before error writer ack"
     );
 
+    let preview = request(
+        &mut subscriber,
+        "newer-reapply-preview",
+        json!({"kind":"preview-reconciliation","target":"codex","strategy":"reapply"}),
+    )
+    .await;
+    let newest = fixture.store.target_view_for(Target::Codex).await.unwrap();
+    let newer = request(
+        &mut subscriber,
+        "newer-reapply",
+        json!({
+            "kind":"act","target":"codex","actionId":Uuid::new_v4(),
+            "expectedRevision":newest.management_revision,
+            "action":{"kind":"reconcile","strategy":"reapply",
+                "observationToken":preview["result"]["preview"]["observationToken"]}
+        }),
+    )
+    .await;
+    assert_eq!(newer["type"], "response");
+    let newer_push = read_frame(&mut subscriber).await.unwrap();
+    assert_eq!(newer_push["view"], newer["result"]["outcome"]["view"]);
+
     let mut error = None;
     for _ in 0..9 {
         let frame = read_frame(&mut initiator).await.unwrap();
@@ -2951,9 +3019,12 @@ async fn durable_live_drift_publication_waits_for_the_initiating_error_writer_ac
     }
     let error = error.expect("initiating live-drift error was not written");
     assert_eq!(error["problem"]["code"], "configuration-drift");
-    let pushed = read_frame(&mut subscriber).await.unwrap();
-    assert_eq!(pushed["type"], "target-view");
-    assert_eq!(pushed["view"], error["authoritativeView"]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut subscriber))
+            .await
+            .is_err(),
+        "late old writer ack published a regressing live-drift view"
+    );
     let initiating_push = read_frame(&mut initiator).await.unwrap();
     assert_eq!(initiating_push["type"], "target-view");
     let repeated = request(
@@ -2971,7 +3042,7 @@ async fn durable_live_drift_publication_waits_for_the_initiating_error_writer_ac
         }),
     )
     .await;
-    assert_eq!(repeated["problem"]["code"], "configuration-drift");
+    assert_eq!(repeated["problem"]["code"], "stale-revision");
     assert!(
         tokio::time::timeout(Duration::from_millis(80), read_frame(&mut subscriber))
             .await

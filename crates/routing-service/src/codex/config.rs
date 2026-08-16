@@ -26,7 +26,57 @@ pub struct OwnedCodexState {
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct OwnedItem {
+pub(crate) enum CodexProviderRestoreState {
+    Absent {
+        key: String,
+    },
+    Present {
+        key: String,
+        #[serde(flatten)]
+        fields: Box<CodexProviderRestoreFields>,
+    },
+    Unrepresentable {
+        key: String,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CodexProviderRestoreFields {
+    name: Option<OwnedItem>,
+    base_url: Option<OwnedItem>,
+    wire_api: Option<OwnedItem>,
+    http_headers: Option<OwnedItem>,
+    supports_websockets: Option<OwnedItem>,
+}
+
+impl fmt::Debug for CodexProviderRestoreState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent { .. } => formatter.write_str("CodexProviderRestoreState::Absent"),
+            Self::Present { .. } => {
+                formatter.write_str("CodexProviderRestoreState::Present(<redacted>)")
+            }
+            Self::Unrepresentable { .. } => {
+                formatter.write_str("CodexProviderRestoreState::Unrepresentable")
+            }
+        }
+    }
+}
+
+impl CodexProviderRestoreState {
+    fn key(&self) -> &str {
+        match self {
+            Self::Absent { key } | Self::Present { key, .. } | Self::Unrepresentable { key } => key,
+        }
+    }
+
+    fn is_unrepresentable(&self) -> bool {
+        matches!(self, Self::Unrepresentable { .. })
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct OwnedItem {
     rendered: String,
     semantic: serde_json::Value,
 }
@@ -136,12 +186,7 @@ impl DesiredCodexState {
         let credential = headers
             .get("Authorization")
             .and_then(serde_json::Value::as_str)
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .or_else(|| {
-                headers
-                    .get("X-Muxvia-Routing-Credential")
-                    .and_then(serde_json::Value::as_str)
-            })?;
+            .and_then(|value| value.strip_prefix("Bearer "))?;
         if credential.trim().is_empty() {
             return None;
         }
@@ -151,6 +196,14 @@ impl DesiredCodexState {
             base_url,
             SecretString::from(credential.to_owned()),
         ))
+    }
+
+    pub(crate) fn uses_routing_credential_header(&self) -> bool {
+        self.owned
+            .provider_http_headers
+            .as_ref()
+            .and_then(|item| item.semantic.as_object())
+            .is_some_and(|headers| headers.contains_key("X-Muxvia-Routing-Credential"))
     }
 
     fn with_provider_ownership(mut self, ownership: &Self) -> Self {
@@ -203,6 +256,8 @@ pub struct ConfigSnapshot {
     identity: FileIdentity,
     owned: OwnedCodexState,
     unrelated: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_restore: Option<CodexProviderRestoreState>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,7 +290,20 @@ impl fmt::Debug for ConfigSnapshot {
             .field("identity", &self.identity)
             .field("owned", &self.owned)
             .field("unrelated", &"<semantic-tree>")
+            .field("provider_restore", &self.provider_restore)
             .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CodexObservedDocument {
+    identity: FileIdentity,
+    bytes: Vec<u8>,
+}
+
+impl fmt::Debug for CodexObservedDocument {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CodexObservedDocument(<redacted>)")
     }
 }
 
@@ -282,12 +350,33 @@ impl ConfigSnapshot {
         )
     }
 
-    pub(crate) fn recovery_before_with_latest_unrelated(&self, recovery_before: &Self) -> Self {
-        Self {
-            identity: self.identity.clone(),
-            owned: recovery_before.owned.clone(),
-            unrelated: self.unrelated.clone(),
+    pub(crate) fn with_provider_restore_for(
+        &self,
+        desired: &DesiredCodexState,
+    ) -> Result<Self, CodexProblem> {
+        let key = desired.owned.effective_provider_key();
+        if key.is_empty() {
+            return Err(CodexProblem::new("invalid-configuration", None));
         }
+        let provider_restore = match self
+            .provider_restore
+            .as_ref()
+            .filter(|state| state.key() == key)
+            .cloned()
+        {
+            Some(state) => state,
+            None => provider_restore_from_unrelated(&self.unrelated, key),
+        };
+        if provider_restore.is_unrepresentable() {
+            return Err(CodexProblem::new("invalid-configuration", None));
+        }
+        let mut before = self.clone();
+        before.provider_restore = Some(provider_restore);
+        Ok(before)
+    }
+
+    pub(crate) fn provider_restore(&self) -> Option<&CodexProviderRestoreState> {
+        self.provider_restore.as_ref()
     }
 }
 
@@ -355,12 +444,12 @@ impl CodexConfigCodec {
     pub(crate) fn reconciliation_snapshots_for(
         &self,
         committed: &DesiredCodexState,
-    ) -> Result<(ConfigSnapshot, ConfigSnapshot, bool), CodexProblem> {
+    ) -> Result<(ConfigSnapshot, ConfigSnapshot, CodexObservedDocument, bool), CodexProblem> {
         let contents = self
             .file
             .read()
             .map_err(|error| map_file_error(error, Some(self.config_path())))?;
-        let source = String::from_utf8(contents.bytes).map_err(|_| {
+        let source = String::from_utf8(contents.bytes.clone()).map_err(|_| {
             CodexProblem::new("configuration-write-failed", Some(self.config_path()))
         })?;
         let document = source.parse::<DocumentMut>().map_err(|_| {
@@ -372,12 +461,19 @@ impl CodexConfigCodec {
             &document,
             committed.owned.effective_provider_key(),
         )?;
-        let selected =
-            snapshot_from_document(contents.identity, &document, selected_provider_key.as_str())?;
+        let selected = snapshot_from_document(
+            contents.identity.clone(),
+            &document,
+            selected_provider_key.as_str(),
+        )?;
+        let observed_document = CodexObservedDocument {
+            identity: contents.identity,
+            bytes: contents.bytes,
+        };
         let profile_shadow = document
             .get("profile")
             .is_some_and(|profile| !profile.is_none());
-        Ok((managed, selected, profile_shadow))
+        Ok((managed, selected, observed_document, profile_shadow))
     }
 
     fn inspect_state(
@@ -520,6 +616,115 @@ impl CodexConfigCodec {
         self.verify(before, desired)
     }
 
+    pub(crate) fn atomic_restore_union(
+        &self,
+        before: &ConfigSnapshot,
+        desired: &DesiredCodexState,
+        provider_restore: &CodexProviderRestoreState,
+        historical_before: &ConfigSnapshot,
+    ) -> Result<(), CodexProblem> {
+        let (current, mut document) =
+            self.read_snapshot_for_key(before.owned.effective_provider_key())?;
+        if current != *before {
+            return Err(CodexProblem::new(
+                "configuration-write-failed",
+                Some(self.config_path()),
+            ));
+        }
+        apply_owned(
+            &mut document,
+            before.owned.effective_provider_key(),
+            &desired.owned,
+            false,
+        )
+        .and_then(|()| apply_provider_restore(&mut document, provider_restore))
+        .map_err(|_| CodexProblem::new("configuration-write-failed", Some(self.config_path())))?;
+        let remove_file = !historical_before.identity.exists() && document.as_table().is_empty();
+        self.file
+            .replace_with_mode_from(
+                &before.identity,
+                document.to_string().as_bytes(),
+                remove_file,
+                &historical_before.identity,
+            )
+            .map_err(|error| map_file_error(error, Some(self.config_path())))?;
+        self.verify_restore_union(before, desired, provider_restore)
+    }
+
+    pub(crate) fn verify_restore_union(
+        &self,
+        before: &ConfigSnapshot,
+        desired: &DesiredCodexState,
+        provider_restore: &CodexProviderRestoreState,
+    ) -> Result<(), CodexProblem> {
+        let (current, document) =
+            self.read_snapshot_for_key(desired.owned.effective_provider_key())?;
+        if !restore_union_matches(&current, &document, before, desired, provider_restore) {
+            return Err(CodexProblem::new(
+                "configuration-write-failed",
+                Some(self.config_path()),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn exact_rollback_restore_union(
+        &self,
+        before: &ConfigSnapshot,
+        desired: &DesiredCodexState,
+        provider_restore: &CodexProviderRestoreState,
+        original: &CodexObservedDocument,
+    ) -> Result<(), CodexProblem> {
+        let contents = self
+            .file
+            .read()
+            .map_err(|error| map_file_error(error, Some(self.config_path())))?;
+        if contents.identity.exists() == original.identity.exists()
+            && contents.identity.mode() == original.identity.mode()
+            && contents.bytes == original.bytes
+        {
+            return Ok(());
+        }
+        let source = String::from_utf8(contents.bytes)
+            .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())))?;
+        let document = source
+            .parse::<DocumentMut>()
+            .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())))?;
+        let current = snapshot_from_document(
+            contents.identity.clone(),
+            &document,
+            desired.owned.effective_provider_key(),
+        )?;
+        if !restore_union_matches(&current, &document, before, desired, provider_restore) {
+            return Err(CodexProblem::new(
+                "recovery-required",
+                Some(self.config_path()),
+            ));
+        }
+        self.file
+            .replace_with_mode_from(
+                &contents.identity,
+                &original.bytes,
+                !original.identity.exists(),
+                &original.identity,
+            )
+            .map_err(|error| map_file_error(error, Some(self.config_path())))?;
+        let restored = self
+            .file
+            .read()
+            .map_err(|error| map_file_error(error, Some(self.config_path())))?;
+        if restored.identity.exists() != original.identity.exists()
+            || restored.identity.mode() != original.identity.mode()
+            || restored.bytes != original.bytes
+        {
+            return Err(CodexProblem::new(
+                "recovery-required",
+                Some(self.config_path()),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn restore(
         &self,
         before: &ConfigSnapshot,
@@ -561,6 +766,53 @@ impl CodexConfigCodec {
             return Ok(());
         }
         self.restore(before, expected_current)?;
+        if self.matches_before(before) {
+            Ok(())
+        } else {
+            Err(CodexProblem::new(
+                "recovery-required",
+                Some(self.config_path()),
+            ))
+        }
+    }
+
+    pub(crate) fn restore_union_or_confirm_before(
+        &self,
+        before: &ConfigSnapshot,
+        expected_current: &DesiredCodexState,
+        provider_restore: &CodexProviderRestoreState,
+    ) -> Result<(), CodexProblem> {
+        if self.matches_before(before) {
+            return Ok(());
+        }
+        self.verify_restore_union(before, expected_current, provider_restore)
+            .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())))?;
+        let (current, mut document) =
+            self.read_snapshot_for_key(expected_current.owned.effective_provider_key())?;
+        apply_owned(
+            &mut document,
+            expected_current.owned.effective_provider_key(),
+            &before.owned,
+            false,
+        )
+        .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())))?;
+        if expected_current.owned.effective_provider_key() != before.owned.effective_provider_key()
+        {
+            let prior_expected_provider = provider_restore_from_unrelated_unchecked(
+                &before.unrelated,
+                expected_current.owned.effective_provider_key(),
+            )?;
+            apply_provider_restore(&mut document, &prior_expected_provider)
+                .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())))?;
+        }
+        self.file
+            .replace_with_mode_from(
+                &current.identity,
+                document.to_string().as_bytes(),
+                false,
+                &before.identity,
+            )
+            .map_err(|error| map_file_error(error, Some(self.config_path())))?;
         if self.matches_before(before) {
             Ok(())
         } else {
@@ -749,6 +1001,7 @@ fn snapshot_from_document(
         identity,
         owned: capture_owned_for_key(document, provider_key)?,
         unrelated: unrelated_projection_for_key(document, provider_key)?,
+        provider_restore: capture_selected_provider_restore(document, provider_key),
     })
 }
 
@@ -766,6 +1019,232 @@ fn selected_provider_key(document: &DocumentMut) -> Option<String> {
         .and_then(Item::as_value)
         .and_then(value_semantic)
         .and_then(|value| value.as_str().map(str::to_owned))
+}
+
+fn capture_selected_provider_restore(
+    document: &DocumentMut,
+    owned_provider_key: &str,
+) -> Option<CodexProviderRestoreState> {
+    let key = selected_provider_key(document)?;
+    if key.trim().is_empty() || key == owned_provider_key {
+        return None;
+    }
+    Some(capture_provider_restore_for_key(document, &key))
+}
+
+fn capture_provider_restore_for_key(
+    document: &DocumentMut,
+    key: &str,
+) -> CodexProviderRestoreState {
+    let Some(provider) = document
+        .get("model_providers")
+        .and_then(|providers| providers.get(key))
+        .and_then(Item::as_table_like)
+    else {
+        return CodexProviderRestoreState::Absent {
+            key: key.to_owned(),
+        };
+    };
+    let name = nested_item_text(document, key, "name");
+    let base_url = nested_item_text(document, key, "base_url");
+    let wire_api = nested_item_text(document, key, "wire_api");
+    let http_headers = nested_item_text(document, key, "http_headers");
+    let supports_websockets = nested_item_text(document, key, "supports_websockets");
+    if [
+        &name,
+        &base_url,
+        &wire_api,
+        &http_headers,
+        &supports_websockets,
+    ]
+    .into_iter()
+    .all(Option::is_none)
+    {
+        return CodexProviderRestoreState::Absent {
+            key: key.to_owned(),
+        };
+    }
+    let strings_are_representable = [&name, &base_url].into_iter().all(|item| {
+        item.as_ref().is_none_or(|item| {
+            item.semantic
+                .as_str()
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+    });
+    let wire_is_representable = wire_api.as_ref().is_none_or(|item| {
+        item.semantic
+            .as_str()
+            .is_some_and(|value| value == "responses")
+    });
+    let websocket_is_representable = supports_websockets
+        .as_ref()
+        .is_none_or(|item| item.semantic.as_bool() == Some(false));
+    let auth_is_representable = http_headers.as_ref().is_none_or(|item| {
+        item.semantic.as_object().is_some_and(|headers| {
+            headers.len() == 1
+                && headers
+                    .get("Authorization")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|value| value.strip_prefix("Bearer "))
+                    .is_some_and(|credential| !credential.trim().is_empty())
+        })
+    });
+    if !strings_are_representable
+        || !wire_is_representable
+        || !websocket_is_representable
+        || !auth_is_representable
+        || provider.get("name").is_some() != name.is_some()
+        || provider.get("base_url").is_some() != base_url.is_some()
+        || provider.get("wire_api").is_some() != wire_api.is_some()
+        || provider.get("http_headers").is_some() != http_headers.is_some()
+        || provider.get("supports_websockets").is_some() != supports_websockets.is_some()
+    {
+        return CodexProviderRestoreState::Unrepresentable {
+            key: key.to_owned(),
+        };
+    }
+    CodexProviderRestoreState::Present {
+        key: key.to_owned(),
+        fields: Box::new(CodexProviderRestoreFields {
+            name,
+            base_url,
+            wire_api,
+            http_headers,
+            supports_websockets,
+        }),
+    }
+}
+
+fn provider_restore_from_unrelated(
+    unrelated: &serde_json::Value,
+    key: &str,
+) -> CodexProviderRestoreState {
+    let Some(provider) = unrelated
+        .get("model_providers")
+        .and_then(|providers| providers.get(key))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return CodexProviderRestoreState::Absent {
+            key: key.to_owned(),
+        };
+    };
+    let string_item = |field: &str| -> Result<Option<OwnedItem>, ()> {
+        match provider.get(field) {
+            None => Ok(None),
+            Some(json_value) => {
+                let string = json_value
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or(())?;
+                Ok(desired_item(value(string)))
+            }
+        }
+    };
+    let name = string_item("name");
+    let base_url = string_item("base_url");
+    let wire_api = match provider.get("wire_api") {
+        None => Ok(None),
+        Some(json_value) if json_value.as_str() == Some("responses") => {
+            Ok(desired_item(value("responses")))
+        }
+        Some(_) => Err(()),
+    };
+    let supports_websockets = match provider.get("supports_websockets") {
+        None => Ok(None),
+        Some(json_value) if json_value.as_bool() == Some(false) => Ok(desired_item(value(false))),
+        Some(_) => Err(()),
+    };
+    let http_headers = match provider.get("http_headers") {
+        None => Ok(None),
+        Some(value) => value
+            .as_object()
+            .filter(|headers| headers.len() == 1)
+            .and_then(|headers| headers.get("Authorization"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|authorization| {
+                authorization
+                    .strip_prefix("Bearer ")
+                    .filter(|credential| !credential.trim().is_empty())
+                    .map(|_| authorization)
+            })
+            .and_then(|authorization| {
+                let encoded = serde_json::to_string(authorization).ok()?;
+                parse_owned_item(&format!(" {{ Authorization = {encoded} }}"))
+            })
+            .map(Some)
+            .ok_or(()),
+    };
+    if [
+        name.as_ref().ok(),
+        base_url.as_ref().ok(),
+        wire_api.as_ref().ok(),
+        http_headers.as_ref().ok(),
+        supports_websockets.as_ref().ok(),
+    ]
+    .into_iter()
+    .all(|item| item.is_some_and(Option::is_none))
+    {
+        return CodexProviderRestoreState::Absent {
+            key: key.to_owned(),
+        };
+    }
+    match (name, base_url, wire_api, http_headers, supports_websockets) {
+        (Ok(name), Ok(base_url), Ok(wire_api), Ok(http_headers), Ok(supports_websockets)) => {
+            CodexProviderRestoreState::Present {
+                key: key.to_owned(),
+                fields: Box::new(CodexProviderRestoreFields {
+                    name,
+                    base_url,
+                    wire_api,
+                    http_headers,
+                    supports_websockets,
+                }),
+            }
+        }
+        _ => CodexProviderRestoreState::Unrepresentable {
+            key: key.to_owned(),
+        },
+    }
+}
+
+fn provider_restore_from_unrelated_unchecked(
+    unrelated: &serde_json::Value,
+    key: &str,
+) -> Result<CodexProviderRestoreState, CodexProblem> {
+    let Some(provider) = unrelated
+        .get("model_providers")
+        .and_then(|providers| providers.get(key))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(CodexProviderRestoreState::Absent {
+            key: key.to_owned(),
+        });
+    };
+    let item = |field: &str| -> Result<Option<OwnedItem>, CodexProblem> {
+        provider
+            .get(field)
+            .map(|semantic| {
+                let rendered = semantic
+                    .serialize(toml_edit::ser::ValueSerializer::new())
+                    .map(|value| value_to_owned_rendered(&value))
+                    .map_err(|_| CodexProblem::new("recovery-required", None))?;
+                Ok(OwnedItem {
+                    rendered,
+                    semantic: semantic.clone(),
+                })
+            })
+            .transpose()
+    };
+    Ok(CodexProviderRestoreState::Present {
+        key: key.to_owned(),
+        fields: Box::new(CodexProviderRestoreFields {
+            name: item("name")?,
+            base_url: item("base_url")?,
+            wire_api: item("wire_api")?,
+            http_headers: item("http_headers")?,
+            supports_websockets: item("supports_websockets")?,
+        }),
+    })
 }
 
 fn capture_owned_for_key(
@@ -951,6 +1430,123 @@ fn unrelated_projection_for_key(
         .map_err(|_| CodexProblem::new("configuration-write-failed", None))
 }
 
+fn unrelated_without_provider_fields(
+    unrelated: &serde_json::Value,
+    provider_key: &str,
+) -> serde_json::Value {
+    let mut unrelated = unrelated.clone();
+    if let Some(providers) = unrelated
+        .get_mut("model_providers")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        if let Some(provider) = providers
+            .get_mut(provider_key)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for key in [
+                "name",
+                "base_url",
+                "wire_api",
+                "http_headers",
+                "supports_websockets",
+            ] {
+                provider.remove(key);
+            }
+            if provider.is_empty() {
+                providers.remove(provider_key);
+            }
+        }
+        if providers.is_empty() {
+            unrelated
+                .as_object_mut()
+                .map(|root| root.remove("model_providers"));
+        }
+    }
+    unrelated
+}
+
+fn restore_union_matches(
+    current: &ConfigSnapshot,
+    document: &DocumentMut,
+    before: &ConfigSnapshot,
+    desired: &DesiredCodexState,
+    provider_restore: &CodexProviderRestoreState,
+) -> bool {
+    let restored_provider = capture_provider_restore_for_key(document, provider_restore.key());
+    let before_unrelated = unrelated_without_provider_fields(
+        &before.unrelated,
+        desired.owned.effective_provider_key(),
+    );
+    let current_unrelated =
+        unrelated_without_provider_fields(&current.unrelated, provider_restore.key());
+    let owned_matches = owned_semantically_matches(&current.owned, &desired.owned);
+    let provider_matches = restored_provider == *provider_restore;
+    let unrelated_matches = current_unrelated == before_unrelated;
+    owned_matches && provider_matches && unrelated_matches
+}
+
+fn apply_provider_restore(
+    document: &mut DocumentMut,
+    provider_restore: &CodexProviderRestoreState,
+) -> Result<(), ()> {
+    let (key, fields) = match provider_restore {
+        CodexProviderRestoreState::Absent { key } => (key.as_str(), None),
+        CodexProviderRestoreState::Present { key, fields } => (
+            key.as_str(),
+            Some([
+                ("name", fields.name.as_ref()),
+                ("base_url", fields.base_url.as_ref()),
+                ("wire_api", fields.wire_api.as_ref()),
+                ("http_headers", fields.http_headers.as_ref()),
+                ("supports_websockets", fields.supports_websockets.as_ref()),
+            ]),
+        ),
+        CodexProviderRestoreState::Unrepresentable { .. } => return Err(()),
+    };
+    if fields
+        .as_ref()
+        .is_some_and(|fields| fields.iter().any(|(_, value)| value.is_some()))
+    {
+        if document.get("model_providers").is_none() {
+            document["model_providers"] = Item::Table(Table::new());
+        }
+        let providers = document["model_providers"].as_table_mut().ok_or(())?;
+        if providers.get(key).is_none() {
+            providers[key] = Item::Table(Table::new());
+        }
+        let provider = providers[key].as_table_mut().ok_or(())?;
+        for (field, value) in fields.expect("checked provider fields") {
+            if let Some(value) = value {
+                set_table_item(provider, field, value, false)?;
+            } else {
+                provider.remove(field);
+            }
+        }
+    } else if let Some(providers) = document
+        .get_mut("model_providers")
+        .and_then(Item::as_table_like_mut)
+    {
+        if let Some(provider) = providers.get_mut(key).and_then(Item::as_table_like_mut) {
+            for field in [
+                "name",
+                "base_url",
+                "wire_api",
+                "http_headers",
+                "supports_websockets",
+            ] {
+                provider.remove(field);
+            }
+            if provider.is_empty() {
+                providers.remove(key);
+            }
+        }
+        if providers.is_empty() {
+            document.remove("model_providers");
+        }
+    }
+    Ok(())
+}
+
 fn apply_owned(
     document: &mut DocumentMut,
     current_provider_key: &str,
@@ -1013,8 +1609,7 @@ fn apply_owned(
                 provider.remove(key);
             }
         }
-    } else if current_provider_key == provider_key
-        && !provider_key.is_empty()
+    } else if !provider_key.is_empty()
         && let Some(providers) = document
             .get_mut("model_providers")
             .and_then(Item::as_table_like_mut)
@@ -1187,7 +1782,7 @@ supports_websockets = false
 "#,
         )
         .unwrap();
-        let (_, external, _) = codec.reconciliation_snapshots_for(&committed).unwrap();
+        let (_, external, _, _) = codec.reconciliation_snapshots_for(&committed).unwrap();
         let external_desired = external.as_adopted_direct();
         let candidate = codec.desired_takeover_with_ownership(
             "candidate-model",

@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::broadcast;
 use tokio_rusqlite::{Connection, rusqlite::params};
@@ -54,6 +56,7 @@ pub struct StateStore {
     pub(super) connection: Connection,
     service_epoch: String,
     target_views: broadcast::Sender<TargetView>,
+    published_view_sequences: Mutex<[Option<u64>; 2]>,
 }
 
 type ActivationPreparationRow = (
@@ -199,6 +202,7 @@ impl StateStore {
             connection,
             service_epoch: Uuid::new_v4().to_string(),
             target_views,
+            published_view_sequences: Mutex::new([None; 2]),
         })
     }
 
@@ -634,6 +638,35 @@ impl StateStore {
         config_path: String,
         capability_problem: Option<ControlProblem>,
     ) -> Result<ActivationCommit, StateError> {
+        self.commit_activation_for_with_recovery_payload(
+            target,
+            action_id,
+            expected_revision,
+            snapshot,
+            runtime,
+            managed_config_version,
+            recovery_id,
+            config_path,
+            capability_problem,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn commit_activation_for_with_recovery_payload(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        expected_revision: u64,
+        snapshot: ActivatedSnapshot,
+        runtime: ActivationRuntime,
+        managed_config_version: u32,
+        recovery_id: Uuid,
+        config_path: String,
+        capability_problem: Option<ControlProblem>,
+        committed_recovery_payload_json: Option<String>,
+    ) -> Result<ActivationCommit, StateError> {
         if snapshot.target != target
             || !has_valid_provider_declaration(target, snapshot.protocol, snapshot.authentication)
         {
@@ -731,6 +764,17 @@ impl StateStore {
             if !payload.matches_managed_config_version(target, managed_config_version) {
                 return Err(StateError::InvalidRecoveryPayload);
             }
+            let committed_payload_json = match committed_recovery_payload_json {
+                Some(payload_json) => {
+                    let payload: RecoveryPayload = serde_json::from_str(&payload_json)
+                        .map_err(|_| StateError::InvalidRecoveryPayload)?;
+                    if !payload.matches_managed_config_version(target, managed_config_version) {
+                        return Err(StateError::InvalidRecoveryPayload);
+                    }
+                    payload_json
+                }
+                None => payload_json,
+            };
             transaction.execute(
                 "INSERT INTO activated_snapshots
                  (id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch)
@@ -740,9 +784,14 @@ impl StateStore {
                     provider_credential, snapshot.epoch.to_string()],
             )?;
             let changed = transaction.execute(
-                "UPDATE activation_recovery SET state = 'committed'
+                "UPDATE activation_recovery SET state = 'committed', payload_json = ?4
                  WHERE id = ?1 AND target = ?2 AND action_id = ?3 AND state = 'pending'",
-                params![recovery_id.to_string(), target.as_str(), action_id.to_string()],
+                params![
+                    recovery_id.to_string(),
+                    target.as_str(),
+                    action_id.to_string(),
+                    committed_payload_json
+                ],
             )?;
             if changed != 1 {
                 return Err(StateError::MissingRecoveryIntent);
@@ -893,6 +942,18 @@ impl StateStore {
     }
 
     pub(crate) fn publish_target_view(&self, view: TargetView) {
+        let index = match view.target {
+            Target::Codex => 0,
+            Target::Claude => 1,
+        };
+        let mut published = self
+            .published_view_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if published[index].is_some_and(|sequence| view.view_sequence <= sequence) {
+            return;
+        }
+        published[index] = Some(view.view_sequence);
         let _ = self.target_views.send(view);
     }
 

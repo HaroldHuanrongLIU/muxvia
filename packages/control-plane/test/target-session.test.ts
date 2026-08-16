@@ -504,24 +504,88 @@ test("compatibility probe and resolution use the public target-scoped workflow",
     },
   }
   server.replyCompatibilityProbe(1, probe)
-  expect(await inspecting).toEqual(probe)
+  const capturedProbe = await inspecting
+  expect(capturedProbe).toEqual(probe)
 
-  const resolving = session.resolveCompatibility("codex-unknown-8.1")
+  server.push(viewAtRevision(2, 2))
+  await Bun.sleep(10)
+  expect(session.get().managementRevision).toBe(2)
+
+  const resolving = session.resolveCompatibility({
+    version: "codex-unknown-8.1",
+    managementRevision: capturedProbe.managementRevision,
+  })
+  await server.waitForRequests(3)
+  server.replyStale(viewAtRevision(2, 2))
+  await expect(resolving).rejects.toMatchObject({ code: "stale-revision" })
+
+  const freshInspection = session.probeCompatibility()
+  await server.waitForRequests(4)
+  const freshProbe = { ...probe, managementRevision: 2 }
+  server.replyCompatibilityProbe(3, freshProbe)
+  const fresh = await freshInspection
+  const succeeding = session.resolveCompatibility({
+    version: fresh.compatibility.version,
+    managementRevision: fresh.managementRevision,
+  })
+  await server.waitForRequests(5)
+  const acknowledged = viewAtRevision(3, 3)
+  server.replyApplied(acknowledged)
+  expect((await succeeding).view).toEqual(acknowledged)
+  expect(session.get()).toEqual(acknowledged)
+
+  const operations = server.requests().filter((request) => request.operation.kind === "act")
+  expect(operations.map((request) => request.operation)).toMatchObject([
+    {
+      kind: "act",
+      target: "codex",
+      expectedRevision: 1,
+      action: { kind: "resolve-compatibility", version: "codex-unknown-8.1" },
+    },
+    {
+      kind: "act",
+      target: "codex",
+      expectedRevision: 2,
+      action: { kind: "resolve-compatibility", version: "codex-unknown-8.1" },
+    },
+  ])
+
+  await session.close()
+  await server.close()
+})
+
+test("compatibility Probe rejects a mismatched response with the canonical fixed diagnostic", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  const pending = session.probeCompatibility()
+  await server.waitForRequests(2)
+  server.replyPreview(1, reconciliationPreview())
+  await expect(pending).rejects.toMatchObject({
+    code: "invalid-response",
+    message: "Compatibility probe response did not match request",
+  })
+  await session.close()
+  await server.close()
+})
+
+test("a queued compatibility resolution retains the Probe revision after an earlier action commits", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  const earlier = session.act({ kind: "activate-provider", providerId: "provider-1", mode: "direct" })
+  const resolving = session.resolveCompatibility({
+    version: "codex-unknown-queued",
+    managementRevision: 1,
+  })
+  await server.waitForRequests(2)
+  expect(server.receivedActionCount()).toBe(1)
+  server.replyApplied(viewAtRevision(2, 2))
+  await earlier
   await server.waitForRequests(3)
   expect(server.requests()[2]!.operation).toMatchObject({
     kind: "act",
-    target: "codex",
     expectedRevision: 1,
-    action: {
-      kind: "resolve-compatibility",
-      version: "codex-unknown-8.1",
-    },
+    action: { kind: "resolve-compatibility", version: "codex-unknown-queued" },
   })
-  const acknowledged = viewAtRevision(1, 2)
-  server.replyApplied(acknowledged)
-  expect((await resolving).view).toEqual(acknowledged)
-  expect(session.get()).toEqual(acknowledged)
-
+  server.replyStale(viewAtRevision(2, 2))
+  await expect(resolving).rejects.toMatchObject({ code: "stale-revision" })
   await session.close()
   await server.close()
 })
@@ -644,6 +708,11 @@ test("reconciliation methods reject after close", async () => {
   await expect(session.applyReconciliation({
     strategy: "restore",
     observationToken: "00000000-0000-4000-8000-000000000701",
+  })).rejects.toMatchObject({ code: "connection-closed" })
+  await expect(session.probeCompatibility()).rejects.toMatchObject({ code: "connection-closed" })
+  await expect(session.resolveCompatibility({
+    version: "codex-unknown-closed",
+    managementRevision: 1,
   })).rejects.toMatchObject({ code: "connection-closed" })
   expect(server.requests()).toHaveLength(1)
   await server.close()

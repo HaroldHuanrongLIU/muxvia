@@ -3,7 +3,7 @@ import type { InputRenderable } from "@opentui/core"
 import { testRender } from "@opentui/solid"
 
 import { MuxviaKeymapProvider, useMuxviaKeymap } from "../src/commands/keymap"
-import type { TargetSession } from "../src/control/target-session"
+import type { CompatibilityResolution, TargetSession } from "../src/control/target-session"
 import type {
   ActionOutcome,
   CompatibilityProbe,
@@ -32,9 +32,11 @@ import {
 
 const credentialSecret = "provider-secret-must-not-render"
 const credentialUuid = "00000000-0000-4000-8000-000000000099"
+const configSecret = "config-compatibility-secret-must-not-render"
 const backendSecret = "backend-claude-direct-secret-must-not-render"
 const settingsSecret = "settings-claude-direct-secret-must-not-render"
 const claudeDirectSecrets = [credentialSecret, backendSecret, settingsSecret] as const
+const compatibilitySecrets = [credentialSecret, configSecret, backendSecret, settingsSecret] as const
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -116,6 +118,7 @@ class MemoryTargetSession implements TargetSession {
     acknowledgeVersion?: string
   }> = []
   readonly compatibilityProbes: CompatibilityProbe[] = []
+  readonly compatibilityResolutions: CompatibilityResolution[] = []
   readonly reachabilityChecks: string[] = []
   readonly discoveryRequests: DiscoverySource[] = []
   lastError: unknown
@@ -124,6 +127,7 @@ class MemoryTargetSession implements TargetSession {
   #handler: (action: TargetAction) => Promise<ActionOutcome>
   previewHandler?: (strategy: ReconciliationStrategy, signal?: AbortSignal) => Promise<ReconciliationPreview>
   compatibilityProbeHandler?: (signal?: AbortSignal) => Promise<CompatibilityProbe>
+  compatibilityResolutionHandler?: (input: CompatibilityResolution) => Promise<ActionOutcome>
   reconciliationHandler?: (input: {
     strategy: ReconciliationStrategy
     observationToken: string
@@ -180,8 +184,14 @@ class MemoryTargetSession implements TargetSession {
     this.compatibilityProbes.push(probe)
     return probe
   }
-  async resolveCompatibility(version: string): Promise<ActionOutcome> {
-    return await this.act({ kind: "resolve-compatibility", version })
+  async resolveCompatibility(input: CompatibilityResolution): Promise<ActionOutcome> {
+    this.compatibilityResolutions.push(structuredClone(input))
+    if (this.compatibilityResolutionHandler) {
+      const outcome = await this.compatibilityResolutionHandler(input)
+      this.#view = outcome.view
+      return outcome
+    }
+    return await this.act({ kind: "resolve-compatibility", version: input.version })
   }
   async applyReconciliation(input: {
     strategy: ReconciliationStrategy
@@ -232,6 +242,16 @@ function controlledClaudeDirectSources(): unknown {
     backend: new Error(backendSecret),
     settings: { raw: settingsSecret },
   }
+}
+
+function controlledCompatibilityProblem(code: string): TargetView["problems"][number] {
+  return {
+    code,
+    message: backendSecret,
+    credentialDiagnostic: credentialSecret,
+    configDiagnostic: configSecret,
+    settingsDiagnostic: settingsSecret,
+  } as TargetView["problems"][number]
 }
 
 async function waitForClaudeDirectFrame(
@@ -293,6 +313,7 @@ function auditReconciliationSessions(sessions: readonly MemoryTargetSession[], l
   for (const [index, session] of sessions.entries()) {
     auditSecretFreeActions({
       actions: session.actions,
+      compatibilityResolutions: session.compatibilityResolutions,
       applies: session.reconciliationApplies,
       discovery: session.discoveryRequests,
       reachability: session.reachabilityChecks,
@@ -301,6 +322,14 @@ function auditReconciliationSessions(sessions: readonly MemoryTargetSession[], l
     auditSecretFreePreview(session.compatibilityProbes, claudeDirectSecrets, `${label}-${index}`)
     auditSecretFreeView(session.get(), claudeDirectSecrets, `${label}-${index}`)
   }
+}
+
+function auditCompatibilityOutputs(session: MemoryTargetSession, label: string): void {
+  auditSecretFreeActions({
+    actions: session.actions,
+    resolutions: session.compatibilityResolutions,
+  }, compatibilitySecrets, label)
+  auditSecretFreePreview(session.compatibilityProbes, compatibilitySecrets, label)
 }
 
 async function waitForReconciliationFrame(
@@ -1729,16 +1758,37 @@ test("authoritative takeover-required preserves the pending picker and restores 
   }
 })
 
+test("compatibility renderer scanner rejects a raw ControlProblem message and extension with a fixed diagnostic", async () => {
+  const source = controlledCompatibilityProblem("compatibility-acknowledgement-required")
+  assertControlledSecretSource(source, compatibilitySecrets, "compatibility-renderer-mutation-source")
+  const setup = await testRender(() => <box flexDirection="column">
+    <text>{source.message}</text>
+    <text>{String((source as unknown as { configDiagnostic: string }).configDiagnostic)}</text>
+  </box>, { width: 80, height: 24, useThread: false })
+  let diagnostic = ""
+  try {
+    await waitForSecretFreeFrame(
+      setup,
+      () => true,
+      compatibilitySecrets,
+      "compatibility-renderer-mutation",
+    )
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  } finally {
+    setup.renderer.destroy()
+  }
+  expect(diagnostic).toBe("secret-scan-failed:compatibility-renderer-mutation-frame")
+  for (const secret of compatibilitySecrets) expect(diagnostic).not.toContain(secret)
+})
+
 test.each(["codex", "claude"] as const)(
   "First unmanaged unknown-compatible %s uses compatibility-only preview and public exact acknowledgement",
   async (target) => {
     const initial = view({
       target,
       managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
-      problems: [{
-        code: "compatibility-acknowledgement-required",
-        message: "Compatibility acknowledgement required",
-      }],
+      problems: [controlledCompatibilityProblem("compatibility-acknowledgement-required")],
     })
     const acknowledged = view({
       ...initial,
@@ -1755,7 +1805,7 @@ test.each(["codex", "claude"] as const)(
         acknowledgementRequired: true,
       },
     })
-    assertControlledSecretSource(controlledClaudeDirectSources(), claudeDirectSecrets, `unmanaged-compatibility-source-${target}`)
+    assertControlledSecretSource(initial.problems, compatibilitySecrets, `unmanaged-compatibility-source-${target}`)
     const setup = await testRender(() => <App sessions={{ [target]: session }} />, {
       width: 80,
       height: 30,
@@ -1767,12 +1817,17 @@ test.each(["codex", "claude"] as const)(
       setup.mockInput.pressKey(target === "codex" ? "1" : "2")
       await setup.mockInput.typeText("/reconcile")
       setup.mockInput.pressEnter()
-      const previewFrame = await waitForReconciliationFrame(
+      const previewFrame = await waitForSecretFreeFrame(
         setup,
-        [session],
         (frame) => frame.includes(`Untested but compatible · ${target}-unknown-8.1`),
+        compatibilitySecrets,
         `unmanaged-compatibility-probe-${target}`,
       )
+      auditSecretFreeActions({
+        actions: session.actions,
+        probes: session.compatibilityProbes,
+        resolutions: session.compatibilityResolutions,
+      }, compatibilitySecrets, `unmanaged-compatibility-probe-${target}`)
       expect(session.compatibilityProbes).toHaveLength(1)
       expect(session.reconciliationPreviews).toHaveLength(0)
       expect(previewFrame).not.toContain("Adopt observed configuration")
@@ -1783,25 +1838,30 @@ test.each(["codex", "claude"] as const)(
 
       setup.mockInput.pressKey("y")
       setup.mockInput.pressKey("y")
-      await waitForReconciliationState(
+      await waitForSecretFreeCondition(
         setup,
-        [session],
         () => session.actions.length === 1,
+        () => auditSecretFreeActions({
+          actions: session.actions,
+          probes: session.compatibilityProbes,
+          resolutions: session.compatibilityResolutions,
+        }, compatibilitySecrets, `unmanaged-compatibility-action-${target}`),
+        `secret-scan-failed:unmanaged-compatibility-action-${target}-action`,
         `unmanaged-compatibility-acknowledgement-${target}`,
       )
-      assertSecretFreeStructured("action", session.actions, claudeDirectSecrets, `unmanaged-compatibility-action-${target}`, (safeActions) => {
+      assertSecretFreeStructured("action", session.actions, compatibilitySecrets, `unmanaged-compatibility-action-${target}`, (safeActions) => {
         expect(safeActions).toEqual([{
           kind: "resolve-compatibility",
           version: `${target}-unknown-8.1`,
         }])
       })
-      expect(session.get().problems).toEqual([])
       const completed = await waitForReconciliationFrame(
         setup,
         [session],
         (frame) => frame.includes(`Compatibility acknowledgement recorded: ${target}-unknown-8.1`),
         `unmanaged-compatibility-resolution-activity-${target}`,
       )
+      expect(session.get().problems).toEqual([])
       expect(completed.match(/Compatibility acknowledgement recorded:/g)).toHaveLength(1)
       const restoredFocus = setup.renderer.currentFocusedRenderable as InputRenderable
       expect(restoredFocus.placeholder).toBe("Run a target action…")
@@ -1817,7 +1877,7 @@ test.each(["codex", "claude"] as const)(
   async (target) => {
     const initial = view({
       target,
-      problems: [{ code: "incompatible-target-cli", message: "Target CLI compatibility changed" }],
+      problems: [controlledCompatibilityProblem("incompatible-target-cli")],
     })
     const resolved = view({
       ...initial,
@@ -1834,7 +1894,7 @@ test.each(["codex", "claude"] as const)(
         acknowledgementRequired: false,
       },
     })
-    assertControlledSecretSource(controlledClaudeDirectSources(), claudeDirectSecrets, `tested-compatibility-source-${target}`)
+    assertControlledSecretSource(initial.problems, compatibilitySecrets, `tested-compatibility-source-${target}`)
     const setup = await testRender(() => <App sessions={{ [target]: session }} />, {
       width: 80,
       height: 30,
@@ -1846,12 +1906,13 @@ test.each(["codex", "claude"] as const)(
       setup.mockInput.pressKey(target === "codex" ? "1" : "2")
       await setup.mockInput.typeText("/reconcile")
       setup.mockInput.pressEnter()
-      const probeFrame = await waitForReconciliationFrame(
+      const probeFrame = await waitForSecretFreeFrame(
         setup,
-        [session],
         (frame) => frame.includes(`Tested · ${target}-tested-8.2`),
+        compatibilitySecrets,
         `tested-compatibility-probe-${target}`,
       )
+      auditCompatibilityOutputs(session, `tested-compatibility-probe-${target}`)
       expect(probeFrame).toContain("Command-line flags and resumed sessions may still")
       expect(probeFrame).toContain("override this configuration.")
       expect(probeFrame).toContain("Y resolve tested version")
@@ -1860,13 +1921,14 @@ test.each(["codex", "claude"] as const)(
 
       setup.mockInput.pressKey("y")
       setup.mockInput.pressKey("y")
-      await waitForReconciliationState(
+      await waitForSecretFreeCondition(
         setup,
-        [session],
         () => session.actions.length === 1,
+        () => auditCompatibilityOutputs(session, `tested-compatibility-resolution-${target}`),
+        `secret-scan-failed:tested-compatibility-resolution-${target}-action`,
         `tested-compatibility-resolution-${target}`,
       )
-      assertSecretFreeStructured("action", session.actions, claudeDirectSecrets, `tested-compatibility-action-${target}`, (safeActions) => {
+      assertSecretFreeStructured("action", session.actions, compatibilitySecrets, `tested-compatibility-action-${target}`, (safeActions) => {
         expect(safeActions).toEqual([{
           kind: "resolve-compatibility",
           version: `${target}-tested-8.2`,
@@ -1894,7 +1956,7 @@ test.each(["codex", "claude"] as const)(
     const initial = view({
       target,
       managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
-      problems: [{ code: "incompatible-target-cli", message: "backend text must not render" }],
+      problems: [controlledCompatibilityProblem("incompatible-target-cli")],
     })
     const session = new MemoryTargetSession(initial)
     session.compatibilityProbeHandler = async () => ({
@@ -1906,7 +1968,7 @@ test.each(["codex", "claude"] as const)(
         acknowledgementRequired: false,
       },
     })
-    assertControlledSecretSource(controlledClaudeDirectSources(), claudeDirectSecrets, `incompatible-compatibility-source-${target}`)
+    assertControlledSecretSource(initial.problems, compatibilitySecrets, `incompatible-compatibility-source-${target}`)
     const setup = await testRender(() => <App sessions={{ [target]: session }} />, {
       width: 80,
       height: 30,
@@ -1918,12 +1980,13 @@ test.each(["codex", "claude"] as const)(
       setup.mockInput.pressKey(target === "codex" ? "1" : "2")
       await setup.mockInput.typeText("/reconcile")
       setup.mockInput.pressEnter()
-      const frame = await waitForReconciliationFrame(
+      const frame = await waitForSecretFreeFrame(
         setup,
-        [session],
         (current) => current.includes(`Incompatible · ${target}-incompatible-8.1`),
+        compatibilitySecrets,
         `unmanaged-incompatible-preview-${target}`,
       )
+      auditCompatibilityOutputs(session, `unmanaged-incompatible-preview-${target}`)
       expect(frame).toContain("Read-only inspection · Esc cancel")
       expect(frame).not.toContain("Adopt observed configuration")
       expect(frame).not.toContain("Reapply committed configuration")
@@ -1932,6 +1995,8 @@ test.each(["codex", "claude"] as const)(
       setup.mockInput.pressEnter()
       await Promise.resolve()
       await setup.renderOnce()
+      auditSecretFreeFrame(setup.captureCharFrame(), compatibilitySecrets, `unmanaged-incompatible-actions-${target}`)
+      auditCompatibilityOutputs(session, `unmanaged-incompatible-actions-${target}`)
       expect(session.actions).toHaveLength(0)
       expect(session.reconciliationPreviews).toHaveLength(0)
     } finally {
@@ -1942,7 +2007,7 @@ test.each(["codex", "claude"] as const)(
 
 test("A replayed compatibility resolution closes the overlay without duplicate activity", async () => {
   const initial = view({
-    problems: [{ code: "compatibility-acknowledgement-required", message: "Compatibility acknowledgement required" }],
+    problems: [controlledCompatibilityProblem("compatibility-acknowledgement-required")],
   })
   const resolved = view({ ...initial, viewSequence: 2, problems: [] })
   const session = new MemoryTargetSession(initial, async () => ({ status: "replayed", view: resolved }))
@@ -1955,7 +2020,85 @@ test("A replayed compatibility resolution closes the overlay without duplicate a
       acknowledgementRequired: true,
     },
   })
-  assertControlledSecretSource(controlledClaudeDirectSources(), claudeDirectSecrets, "compatibility-replay-source")
+  assertControlledSecretSource(initial.problems, compatibilitySecrets, "compatibility-replay-source")
+  const setup = await testRender(() => <App session={session} />, {
+    width: 80,
+    height: 30,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/reconcile")
+    setup.mockInput.pressEnter()
+    await waitForSecretFreeFrame(
+      setup,
+      (frame) => frame.includes("codex-unknown-replayed"),
+      compatibilitySecrets,
+      "compatibility-replay-probe",
+    )
+    auditCompatibilityOutputs(session, "compatibility-replay-probe")
+    setup.mockInput.pressKey("y")
+    await waitForSecretFreeCondition(
+      setup,
+      () => session.get().problems.length === 0,
+      () => auditCompatibilityOutputs(session, "compatibility-replay-resolution"),
+      "secret-scan-failed:compatibility-replay-resolution-action",
+      "compatibility-replay-resolution",
+    )
+    auditSecretFreeView(session.get(), compatibilitySecrets, "compatibility-replay-resolved-view")
+    const completed = await waitForSecretFreeFrame(
+      setup,
+      (frame) => session.actions.length === 1 && !frame.includes("codex-unknown-replayed"),
+      compatibilitySecrets,
+      "compatibility-replay-completed",
+    )
+    expect(completed).not.toContain("Compatibility acknowledgement recorded")
+    expect(completed).not.toContain("Compatibility status resolved")
+    expect(session.actions).toHaveLength(1)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Compatibility resolution stays bound to its Probe revision across a peer-session push", async () => {
+  const initial = view({
+    managementRevision: 1,
+    viewSequence: 1,
+    problems: [{ code: "compatibility-acknowledgement-required", message: "Compatibility acknowledgement required" }],
+  })
+  const raced = view({ ...initial, managementRevision: 2, viewSequence: 2 })
+  const resolved = view({ ...raced, managementRevision: 3, viewSequence: 3, problems: [] })
+  const staleError = Object.assign(
+    new AggregateError([new Error(backendSecret)], "Target state changed"),
+    {
+      code: "stale-revision",
+      credentialDiagnostic: credentialSecret,
+      configDiagnostic: configSecret,
+      settingsDiagnostic: settingsSecret,
+    },
+  )
+  assertControlledSecretSource(staleError, compatibilitySecrets, "compatibility-revision-error-source")
+  const session = new MemoryTargetSession(initial)
+  session.compatibilityProbeHandler = async () => {
+    const managementRevision = session.compatibilityProbes.length + 1
+    return {
+      target: "codex",
+      managementRevision,
+      compatibility: {
+        version: `codex-unknown-r${managementRevision}`,
+        classification: "unknown-compatible",
+        acknowledgementRequired: true,
+      },
+    }
+  }
+  session.compatibilityResolutionHandler = async () => {
+    if (session.compatibilityResolutions.length === 1) {
+      throw staleError
+    }
+    return { status: "applied", view: resolved }
+  }
   const setup = await testRender(() => <App session={session} />, {
     width: 80,
     height: 30,
@@ -1970,19 +2113,56 @@ test("A replayed compatibility resolution closes the overlay without duplicate a
     await waitForReconciliationFrame(
       setup,
       [session],
-      (frame) => frame.includes("codex-unknown-replayed"),
-      "compatibility-replay-probe",
+      (frame) => frame.includes("codex-unknown-r1"),
+      "compatibility-revision-first-probe",
     )
+    session.pushView(raced)
     setup.mockInput.pressKey("y")
-    const completed = await waitForReconciliationFrame(
+    await waitForReconciliationState(
       setup,
       [session],
-      (frame) => session.actions.length === 1 && !frame.includes("codex-unknown-replayed"),
-      "compatibility-replay-completed",
+      () => session.compatibilityResolutions.length === 1,
+      "compatibility-revision-stale-resolution",
     )
-    expect(completed).not.toContain("Compatibility acknowledgement recorded")
-    expect(completed).not.toContain("Compatibility status resolved")
-    expect(session.actions).toHaveLength(1)
+    assertSecretFreeStructured("action", session.compatibilityResolutions, compatibilitySecrets, "compatibility-revision-stale-input", (safe) => {
+      expect(safe).toEqual([{ version: "codex-unknown-r1", managementRevision: 1 }])
+    })
+    for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+    await setup.renderOnce()
+    const stale = setup.captureCharFrame()
+    auditSecretFreeFrame(stale, compatibilitySecrets, "compatibility-revision-stale-guidance")
+    auditCompatibilityOutputs(session, "compatibility-revision-stale-guidance")
+    auditSecretFreeView(session.get(), compatibilitySecrets, "compatibility-revision-stale-guidance")
+    expect(stale).toContain("Target state changed")
+    expect(stale).toContain("R probe again")
+    expect(stale).not.toContain("Compatibility acknowledgement recorded")
+    expect(session.get().problems).toHaveLength(1)
+
+    setup.mockInput.pressKey("r")
+    await waitForSecretFreeFrame(
+      setup,
+      (frame) => frame.includes("codex-unknown-r2"),
+      compatibilitySecrets,
+      "compatibility-revision-fresh-probe",
+    )
+    auditCompatibilityOutputs(session, "compatibility-revision-fresh-probe")
+    auditSecretFreeView(session.get(), compatibilitySecrets, "compatibility-revision-fresh-probe")
+    setup.mockInput.pressKey("y")
+    const complete = await waitForSecretFreeFrame(
+      setup,
+      (frame) => frame.includes("Compatibility acknowledgement recorded: codex-unknown-r2"),
+      compatibilitySecrets,
+      "compatibility-revision-fresh-resolution",
+    )
+    auditCompatibilityOutputs(session, "compatibility-revision-fresh-resolution")
+    auditSecretFreeView(session.get(), compatibilitySecrets, "compatibility-revision-fresh-resolution")
+    assertSecretFreeStructured("action", session.compatibilityResolutions, compatibilitySecrets, "compatibility-revision-resolution-inputs", (safe) => {
+      expect(safe).toEqual([
+        { version: "codex-unknown-r1", managementRevision: 1 },
+        { version: "codex-unknown-r2", managementRevision: 2 },
+      ])
+    })
+    expect(complete.match(/Compatibility acknowledgement recorded:/g)).toHaveLength(1)
   } finally {
     setup.renderer.destroy()
   }

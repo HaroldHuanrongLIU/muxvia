@@ -253,6 +253,7 @@ export const zhCN = {
   "reconciliation.help": "A 采用 · R 重新应用 · S 恢复 · Enter 应用 · Y 确认 · Esc 取消",
   "reconciliation.compatibility.help": "Y 确认精确版本 · Esc 取消",
   "reconciliation.compatibility.tested-help": "Y 解决已测试版本状态 · Esc 取消",
+  "reconciliation.compatibility.stale-help": "R 重新探测 · Esc 取消",
   "reconciliation.compatibility.read-only-help": "只读检查 · Esc 取消",
   "reconciliation.compatibility.resolving": "正在解决兼容性状态…",
   "takeover-required.title": "启用 Target Takeover？",

@@ -74,7 +74,9 @@ function safeReconciliationProblem(error: unknown): string {
     case "incompatible-target-cli":
     case "recovery-required":
     case "shadowing-configuration":
+    case "stale-compatibility-probe":
     case "stale-reconciliation-preview":
+    case "stale-revision":
     case "target-busy":
     case "untested-target-cli":
       return code
@@ -456,7 +458,10 @@ function Shell(props: {
     const generation = current.generation
     updateReconciliation(target, token, (state) => ({ ...state, pending: "apply", errorCode: undefined }))
     try {
-      const outcome = await originSession.resolveCompatibility(version)
+      const outcome = await originSession.resolveCompatibility({
+        version,
+        managementRevision: current.compatibilityProbe.managementRevision,
+      })
       const latest = reconciliationByTarget()[target]
       if (
         disposed
@@ -486,10 +491,12 @@ function Shell(props: {
       installView(originSession.get() as TargetViewProjection, "action")
       const latest = reconciliationByTarget()[target]
       if (!latest || latest.overlayToken !== token || latest.generation !== generation) return
+      const code = safeReconciliationProblem(error)
       updateReconciliation(target, token, (state) => ({
         ...state,
         pending: undefined,
-        errorCode: safeReconciliationProblem(error),
+        errorCode: code,
+        ...(code === "stale-revision" ? { compatibilityProbe: undefined } : {}),
       }))
     }
   }
@@ -596,6 +603,7 @@ function Shell(props: {
           state={() => reconciliationByTarget()[target] ?? initial}
           t={props.t}
           onPreview={(strategy) => { void previewReconciliation(target, token, strategy) }}
+          onProbe={() => { void probeCompatibility(target, token) }}
           onResolve={(version) => { void resolveReconciliationCompatibility(target, token, version) }}
           onApply={() => { void applyReconciliation(target, token) }}
           onCancel={() => closeReconciliation(target, token)}

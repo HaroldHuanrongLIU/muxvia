@@ -251,6 +251,7 @@ export const en = {
   "reconciliation.help": "A Adopt · R Reapply · S Restore · Enter apply · Y acknowledge · Esc cancel",
   "reconciliation.compatibility.help": "Y acknowledge exact version · Esc cancel",
   "reconciliation.compatibility.tested-help": "Y resolve tested version · Esc cancel",
+  "reconciliation.compatibility.stale-help": "R probe again · Esc cancel",
   "reconciliation.compatibility.read-only-help": "Read-only inspection · Esc cancel",
   "reconciliation.compatibility.resolving": "Resolving compatibility status…",
   "takeover-required.title": "Enable Target Takeover?",

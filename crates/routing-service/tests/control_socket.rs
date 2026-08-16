@@ -5036,6 +5036,205 @@ async fn tested_probe_resolves_stale_unknown_and_incompatible_blockers_for_both_
 }
 
 #[tokio::test]
+async fn compatibility_resolution_binds_the_probed_revision_across_two_real_sessions() {
+    const SECRETS: &[&str] = &[
+        "REVISION_RACE_CODEX_CREDENTIAL_98801",
+        "REVISION_RACE_CLAUDE_CREDENTIAL_98802",
+        "REVISION_RACE_CONFIG_SENTINEL_98803",
+        "REVISION_RACE_BACKEND_SENTINEL_98804",
+        "REVISION_RACE_SETTINGS_SENTINEL_98805",
+    ];
+    for (target, target_name) in [(Target::Codex, "codex"), (Target::Claude, "claude")] {
+        let root = short_temp_root(&format!("mx-compatibility-revision-{target_name}"));
+        let user_home = root.join("home");
+        fs::create_dir_all(&user_home).unwrap();
+        let home = MuxviaHome::from_user_home(&user_home);
+        let store = Arc::new(StateStore::open(&home).await.unwrap());
+        let probe_state = Arc::new(AtomicUsize::new(0));
+        let activation = Arc::new(
+            ActivationService::new(
+                Arc::clone(&store),
+                home.clone(),
+                Arc::new(ChangingCodexProbe {
+                    state: Arc::clone(&probe_state),
+                }),
+                "/usr/bin/codex".into(),
+                Arc::new(ControlNoopUpstream),
+            )
+            .with_claude_runtime(
+                Arc::new(ChangingClaudeProbe {
+                    state: Arc::clone(&probe_state),
+                }),
+                "/usr/bin/claude".into(),
+            ),
+        );
+        let handle = ControlServer::bind_with_activation(
+            &home,
+            Arc::clone(&store),
+            "routing-test",
+            activation,
+        )
+        .await
+        .unwrap();
+        let mut first = UnixStream::connect(handle.socket_path()).await.unwrap();
+        let mut second = UnixStream::connect(handle.socket_path()).await.unwrap();
+        hello(&mut first).await;
+        hello(&mut second).await;
+        let claude_context = (target == Target::Claude).then(|| {
+            json!({
+                "claudeConfigDir": null, "selectorState": "unset",
+                "blockingSelector": null, "hostManagedState": "unmanaged", "cwd": user_home
+            })
+        });
+        for (stream, request_id) in [(&mut first, "open-first"), (&mut second, "open-second")] {
+            let opened = request(
+                stream,
+                request_id,
+                json!({
+                    "kind": "open-target", "target": target_name,
+                    "claudeContext": claude_context
+                }),
+            )
+            .await;
+            assert_compatibility_wire_is_secret_free(&opened, SECRETS, "revision-race-open");
+            assert_eq!(opened["result"]["view"]["managementRevision"], 0);
+        }
+
+        let first_probe = request(
+            &mut first,
+            "probe-at-zero",
+            json!({"kind": "probe-compatibility", "target": target_name}),
+        )
+        .await;
+        assert_compatibility_wire_is_secret_free(
+            &first_probe,
+            SECRETS,
+            "revision-race-first-probe",
+        );
+        assert_eq!(first_probe["result"]["probe"]["managementRevision"], 0);
+        let unknown_version = format!("{target_name}-stale-unknown");
+        assert_eq!(
+            first_probe["result"]["probe"]["compatibility"]["version"],
+            unknown_version
+        );
+
+        probe_state.store(2, Ordering::SeqCst);
+        let committed = request(
+            &mut second,
+            "peer-commit",
+            json!({
+                "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
+                "expectedRevision": 0,
+                "action": match target {
+                    Target::Codex => json!({
+                        "kind": "create-provider", "name": "Codex peer", "baseUrl": "https://api.openai.test/v1",
+                        "model": "gpt-test", "credential": {"kind": "replace", "value": "REVISION_RACE_CODEX_CREDENTIAL_98801"},
+                        "authentication": "openai-bearer", "presetKey": null,
+                        "configDiagnostic": "REVISION_RACE_CONFIG_SENTINEL_98803",
+                        "backendDiagnostic": "REVISION_RACE_BACKEND_SENTINEL_98804",
+                        "settingsDiagnostic": "REVISION_RACE_SETTINGS_SENTINEL_98805"
+                    }),
+                    Target::Claude => json!({
+                        "kind": "create-provider", "name": "Claude peer", "baseUrl": "https://api.anthropic.test",
+                        "model": "claude-test", "credential": {"kind": "replace", "value": "REVISION_RACE_CLAUDE_CREDENTIAL_98802"},
+                        "authentication": "anthropic-api-key", "presetKey": null,
+                        "configDiagnostic": "REVISION_RACE_CONFIG_SENTINEL_98803",
+                        "backendDiagnostic": "REVISION_RACE_BACKEND_SENTINEL_98804",
+                        "settingsDiagnostic": "REVISION_RACE_SETTINGS_SENTINEL_98805"
+                    }),
+                }
+            }),
+        )
+        .await;
+        assert_compatibility_wire_is_secret_free(&committed, SECRETS, "revision-race-peer-commit");
+        assert_eq!(
+            committed["result"]["outcome"]["view"]["managementRevision"],
+            1
+        );
+        for (stream, label) in [
+            (&mut first, "revision-race-first-peer-push"),
+            (&mut second, "revision-race-second-peer-push"),
+        ] {
+            let push = read_frame(stream).await.unwrap();
+            assert_compatibility_wire_is_secret_free(&push, SECRETS, label);
+            assert_eq!(push["view"]["managementRevision"], 1);
+        }
+        probe_state.store(0, Ordering::SeqCst);
+        let before_stale =
+            serde_json::to_value(store.target_view_for(target).await.unwrap()).unwrap();
+        let compatibility_before_missing = store.compatibility_for(target).await.is_err();
+
+        let stale = request(
+            &mut first,
+            "resolve-stale-probe",
+            json!({
+                "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
+                "expectedRevision": 0,
+                "action": {"kind": "resolve-compatibility", "version": unknown_version}
+            }),
+        )
+        .await;
+        assert_compatibility_wire_is_secret_free(&stale, SECRETS, "revision-race-stale-response");
+        assert_eq!(stale["problem"]["code"], "stale-revision");
+        let after_stale =
+            serde_json::to_value(store.target_view_for(target).await.unwrap()).unwrap();
+        let compatibility_after_missing = store.compatibility_for(target).await.is_err();
+        assert_eq!(after_stale, before_stale);
+        assert!(compatibility_before_missing && compatibility_after_missing);
+        for stream in [&mut first, &mut second] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), read_frame(stream))
+                    .await
+                    .is_err(),
+                "stale compatibility resolution published a Target View"
+            );
+        }
+
+        let fresh_probe = request(
+            &mut first,
+            "probe-at-one",
+            json!({"kind": "probe-compatibility", "target": target_name}),
+        )
+        .await;
+        assert_compatibility_wire_is_secret_free(
+            &fresh_probe,
+            SECRETS,
+            "revision-race-fresh-probe",
+        );
+        assert_eq!(fresh_probe["result"]["probe"]["managementRevision"], 1);
+        let resolved = request(
+            &mut first,
+            "resolve-fresh-probe",
+            json!({
+                "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
+                "expectedRevision": 1,
+                "action": {"kind": "resolve-compatibility", "version": unknown_version}
+            }),
+        )
+        .await;
+        assert_compatibility_wire_is_secret_free(&resolved, SECRETS, "revision-race-resolved");
+        assert_eq!(resolved["result"]["outcome"]["status"], "applied");
+        for (stream, label) in [
+            (&mut first, "revision-race-first-resolution-push"),
+            (&mut second, "revision-race-second-resolution-push"),
+        ] {
+            let push = read_frame(stream).await.unwrap();
+            assert_compatibility_wire_is_secret_free(&push, SECRETS, label);
+        }
+        let compatibility = store.compatibility_for(target).await.unwrap();
+        assert_eq!(compatibility.version, unknown_version);
+        assert_eq!(
+            compatibility.classification,
+            CompatibilityClassification::UnknownCompatible
+        );
+        assert!(!compatibility.acknowledgement_required);
+
+        handle.shutdown().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn unmanaged_incompatible_activation_exposes_only_public_read_only_guidance() {
     const SECRETS: &[&str] = &[
         "INCOMPATIBLE_CODEX_SECRET_98501",

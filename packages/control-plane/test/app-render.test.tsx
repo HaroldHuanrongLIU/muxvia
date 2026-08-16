@@ -16,9 +16,11 @@ const serviceEpoch = "00000000-0000-4000-8000-000000000001"
 const snapshotId = "00000000-0000-4000-8000-000000000002"
 const snapshotEpoch = "00000000-0000-4000-8000-000000000003"
 const credentialSentinel = "provider-secret-must-not-render"
+const configSentinel = "claude-config-secret-must-not-render"
 const problemMessageSentinel = "backend-problem-secret-must-not-render"
 const settingsSentinel = "claude-settings-secret-must-not-render"
 const claudeDirectSecrets = [credentialSentinel, problemMessageSentinel, settingsSentinel] as const
+const selectorSecrets = [credentialSentinel, configSentinel, problemMessageSentinel, settingsSentinel] as const
 
 type CreateProviderAction = Extract<TargetAction, { kind: "create-provider" }>
 type RecordedAction =
@@ -768,7 +770,16 @@ test("Claude localizes incomplete and unknown Takeover failures without backend 
 })
 
 test("Claude renders a closed blocking selector without undefined or backend text", async () => {
-  assertControlledSecretSource(controlledClaudeDirectSources(), claudeDirectSecrets, "closed-selector-source")
+  const problem = {
+    code: "provider-mode-active",
+    message: problemMessageSentinel,
+    source: "control-plane-context",
+    selector: "CLAUDE_CODE_USE_VERTEX",
+    credentialDiagnostic: credentialSentinel,
+    configDiagnostic: configSentinel,
+    settingsDiagnostic: settingsSentinel,
+  }
+  assertControlledSecretSource(problem, selectorSecrets, "closed-selector-source")
   const claudeProvider = provider({
     id: "claude-provider",
     protocol: "anthropic-messages",
@@ -779,12 +790,7 @@ test("Claude renders a closed blocking selector without undefined or backend tex
   const claude = new MemoryTargetSession(
     view({ target: "claude", providers: [claudeProvider], currentProviderId: claudeProvider.id }),
     async () => {
-      throw {
-        code: "provider-mode-active",
-        message: problemMessageSentinel,
-        source: "control-plane-context",
-        selector: "CLAUDE_CODE_USE_VERTEX",
-      }
+      throw problem
     },
   )
   const setup = await testRender(() => <App sessions={{ codex, claude }} />, { width: 100, height: 24, useThread: false })
@@ -793,9 +799,10 @@ test("Claude renders a closed blocking selector without undefined or backend tex
     setup.mockInput.pressKey("2")
     await setup.mockInput.typeText("/takeover")
     setup.mockInput.pressEnter()
-    const frame = await waitForClaudeDirectFrame(
+    const frame = await waitForSecretFreeFrame(
       setup,
       (value) => value.includes("CLAUDE_CODE_USE_VERTEX"),
+      selectorSecrets,
       "closed-selector-frame",
     )
     expect(frame).toContain("control-plane-context")
@@ -907,24 +914,29 @@ test.each([
   ["CLAUDE_CODE_USE_ANTHROPIC_AWS", "claude-selector"],
   ["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "claude-host-managed"],
 ] as const)("renders the exact durable Claude selector %s without backend text", async (selector, source) => {
-  assertControlledSecretSource(controlledClaudeDirectSources(), claudeDirectSecrets, `durable-selector-source-${selector}`)
+  const problem = {
+    code: "shadowing-configuration",
+    message: problemMessageSentinel,
+    source,
+    selector,
+    credentialDiagnostic: credentialSentinel,
+    configDiagnostic: configSentinel,
+    settingsDiagnostic: settingsSentinel,
+  }
+  assertControlledSecretSource(problem, selectorSecrets, `durable-selector-source-${selector}`)
   const session = new MemoryTargetSession(view({
     target: "claude",
-    problems: [{
-      code: "shadowing-configuration",
-      message: problemMessageSentinel,
-      source,
-      selector,
-    }],
+    problems: [problem],
   }))
   const codex = new MemoryTargetSession(view())
   const setup = await testRender(() => <App sessions={{ codex, claude: session }} />, { width: 100, height: 24, useThread: false })
   try {
     await setup.renderOnce()
     setup.mockInput.pressKey("2")
-    const frame = await waitForClaudeDirectFrame(
+    const frame = await waitForSecretFreeFrame(
       setup,
       (next) => next.includes(selector),
+      selectorSecrets,
       `durable-selector-frame-${selector}`,
     )
     expect(frame).toContain(source)

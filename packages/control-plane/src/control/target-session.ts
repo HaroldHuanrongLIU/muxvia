@@ -19,6 +19,11 @@ export interface MuxviaControl {
   openTarget(target: Target): Promise<TargetSession>
 }
 
+export interface CompatibilityResolution {
+  version: string
+  managementRevision: number
+}
+
 export interface TargetSession {
   get(): Readonly<TargetView>
   act(action: TargetAction): Promise<ActionOutcome>
@@ -33,7 +38,7 @@ export interface TargetSession {
     signal?: AbortSignal,
   ): Promise<ReconciliationPreview>
   probeCompatibility(signal?: AbortSignal): Promise<CompatibilityProbe>
-  resolveCompatibility(version: string): Promise<ActionOutcome>
+  resolveCompatibility(input: CompatibilityResolution): Promise<ActionOutcome>
   applyReconciliation(input: {
     strategy: ReconciliationStrategy
     observationToken: string
@@ -74,6 +79,10 @@ class TargetSessionImpl implements TargetSession {
   }
 
   act(action: TargetAction): Promise<ActionOutcome> {
+    return this.#enqueueAction(action)
+  }
+
+  #enqueueAction(action: TargetAction, expectedRevision?: number): Promise<ActionOutcome> {
     if (this.#closed) {
       return Promise.reject(new ControlError("connection-closed", "Target session is closed"))
     }
@@ -84,7 +93,7 @@ class TargetSessionImpl implements TargetSession {
           kind: "act",
           target: this.#target,
           actionId,
-          expectedRevision: this.#view.managementRevision,
+          expectedRevision: expectedRevision ?? this.#view.managementRevision,
           action,
         })
         if (response.kind !== "action-outcome") {
@@ -176,14 +185,17 @@ class TargetSessionImpl implements TargetSession {
       response.kind !== "compatibility-probe"
       || response.probe.target !== this.#target
     ) {
-      throw new ControlError("invalid-response", "Compatibility preview response did not match request")
+      throw new ControlError("invalid-response", "Compatibility probe response did not match request")
     }
     Object.freeze(response.probe.compatibility)
     return Object.freeze(response.probe)
   }
 
-  resolveCompatibility(version: string): Promise<ActionOutcome> {
-    return this.act({ kind: "resolve-compatibility", version })
+  resolveCompatibility(input: CompatibilityResolution): Promise<ActionOutcome> {
+    return this.#enqueueAction(
+      { kind: "resolve-compatibility", version: input.version },
+      input.managementRevision,
+    )
   }
 
   applyReconciliation(input: {

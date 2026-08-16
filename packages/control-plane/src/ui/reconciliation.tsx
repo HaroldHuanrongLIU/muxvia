@@ -22,6 +22,7 @@ export interface ReconciliationProps {
   state: Accessor<ReconciliationUiState>
   t: Translator
   onPreview: (strategy: ReconciliationStrategy) => void
+  onProbe: () => void
   onResolve: (version: string) => void
   onApply: () => void
   onCancel: () => void
@@ -101,7 +102,10 @@ export function Reconciliation(props: ReconciliationProps) {
     priority: 400,
     handlers: {
       "target.reconciliation.preview.adopt": () => { if (!props.state().compatibilityOnly) props.onPreview("adopt") },
-      "target.reconciliation.preview.reapply": () => { if (!props.state().compatibilityOnly) props.onPreview("reapply") },
+      "target.reconciliation.preview.reapply": () => {
+        if (props.state().compatibilityOnly) props.onProbe()
+        else props.onPreview("reapply")
+      },
       "target.reconciliation.preview.restore": () => { if (!props.state().compatibilityOnly) props.onPreview("restore") },
       "target.reconciliation.apply": () => { if (!props.state().compatibilityOnly) props.onApply() },
       "target.reconciliation.cancel": props.onCancel,
@@ -219,7 +223,9 @@ export function Reconciliation(props: ReconciliationProps) {
         : "reconciliation.applying")}</text>
     </Show>
     <text fg={theme.muted}>{props.t(props.state().compatibilityOnly
-      ? props.state().compatibilityProbe?.compatibility.classification === "incompatible"
+      ? props.state().errorCode === "stale-revision"
+        ? "reconciliation.compatibility.stale-help"
+        : props.state().compatibilityProbe?.compatibility.classification === "incompatible"
         ? "reconciliation.compatibility.read-only-help"
         : props.state().compatibilityProbe?.compatibility.classification === "tested"
           ? "reconciliation.compatibility.tested-help"

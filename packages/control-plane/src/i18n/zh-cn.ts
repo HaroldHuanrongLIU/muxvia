@@ -227,6 +227,7 @@ export const zhCN = {
   "reconciliation.shadow.claude-host-managed": "Claude 主机管理设置",
   "reconciliation.shadow.claude-selector": "Claude 环境选择器 · {selector}",
   "reconciliation.shadow.none": "没有可观测的遮蔽源",
+  "reconciliation.error.shadowing-configuration": "遮蔽配置阻止协调。请移除或停用遮蔽来源，然后重新预览。",
   "reconciliation.boundary": "命令行标志和恢复的会话仍可能覆盖此配置。",
   "reconciliation.field.provider": "Target Provider",
   "reconciliation.field.credential": "凭据引用",

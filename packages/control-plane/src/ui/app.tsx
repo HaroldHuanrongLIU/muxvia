@@ -401,6 +401,10 @@ function Shell(props: {
       updateReconciliation(target, token, (state) => ({ ...state, errorCode: "incompatible-target-cli" }))
       return
     }
+    if (preview.shadowSources.length > 0) {
+      updateReconciliation(target, token, (state) => ({ ...state, errorCode: "shadowing-configuration" }))
+      return
+    }
     if (
       preview.compatibility.acknowledgementRequired
       && current.acknowledgedVersion !== preview.compatibility.version

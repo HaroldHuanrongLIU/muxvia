@@ -156,7 +156,9 @@ export function Reconciliation(props: ReconciliationProps) {
       <text fg={theme.warning}>{props.t("reconciliation.previewing")}</text>
     </Show>
     <Show when={props.state().errorCode}>
-      <text fg={theme.error}>{props.t(messageKeyForProblem(props.state().errorCode!))}</text>
+      <text fg={theme.error}>{props.t(props.state().errorCode === "shadowing-configuration"
+        ? "reconciliation.error.shadowing-configuration"
+        : messageKeyForProblem(props.state().errorCode!))}</text>
     </Show>
     <For each={props.state().preview ? [props.state().preview!] : []}>{(preview) => <box flexDirection="column">
       <text fg={preview.compatibility.classification === "incompatible" ? theme.error : theme.text}>

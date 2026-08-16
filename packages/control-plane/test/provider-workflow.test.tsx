@@ -1736,7 +1736,6 @@ test.each(["codex", "claude"] as const)(
     const session = new MemoryTargetSession(initial)
     session.previewHandler = async (strategy) => reconciliationPreview(target, strategy, {
       compatibility: { version: "9.9.9", classification: "unknown-compatible", acknowledgementRequired: true },
-      shadowSources: target === "codex" ? ["codex-profile"] : ["claude-shared"],
     })
     session.reconciliationHandler = async () => ({ status: "applied", view: applied })
     assertControlledSecretSource(controlledClaudeDirectSources(), claudeDirectSecrets, `reconciliation-${target}`)
@@ -1771,7 +1770,7 @@ test.each(["codex", "claude"] as const)(
         (frame) => frame.includes("Untested but compatible · 9.9.9") && frame.includes("Changed"),
         `reconciliation-preview-${target}`,
       )
-      expect(previewFrame).toContain(target === "codex" ? "Codex profile" : "Claude shared settings")
+      expect(previewFrame).toContain("No observable shadow source")
       expect(previewFrame).toContain("Command-line flags and resumed sessions")
       expect(previewFrame).toContain(target === "codex"
         ? "Restart Codex after applying this reconciliation."
@@ -1796,6 +1795,167 @@ test.each(["codex", "claude"] as const)(
         : "Restart Claude Code to use the managed configuration.")
       expect(appliedFrame.match(/Reconciliation applied: Adopt/g)).toHaveLength(1)
       expect(setup.renderer.currentFocusedRenderable).toBe(originFocus)
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)
+
+test.each([
+  { target: "codex" as const, strategy: "adopt" as const, key: "a", source: "codex-profile" as const },
+  { target: "codex" as const, strategy: "reapply" as const, key: "r", source: "codex-profile" as const },
+  { target: "codex" as const, strategy: "restore" as const, key: "s", source: "codex-profile" as const },
+  { target: "claude" as const, strategy: "adopt" as const, key: "a", source: "claude-shared" as const },
+  { target: "claude" as const, strategy: "reapply" as const, key: "r", source: "claude-shared" as const },
+  { target: "claude" as const, strategy: "restore" as const, key: "s", source: "claude-shared" as const },
+])(
+  "Reconciliation blocks $target $strategy apply for a shadowing preview and restores exact origin focus on cancel",
+  async ({ target, strategy, key, source }) => {
+    const initial = view({
+      target,
+      problems: [{ code: "shadowing-configuration", message: "safe" }],
+    })
+    const session = new MemoryTargetSession(initial)
+    session.previewHandler = async (requested) => reconciliationPreview(target, requested, {
+      shadowSources: [source],
+    })
+    session.reconciliationHandler = async () => ({
+      status: "applied",
+      view: view({ target, managementRevision: 2, viewSequence: 2 }),
+    })
+    const setup = await testRender(() => <App sessions={{ [target]: session }} />, {
+      width: 80,
+      height: 30,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey(target === "codex" ? "1" : "2")
+      const shell = await waitForReconciliationFrame(
+        setup,
+        [session],
+        (frame) => frame.includes("Reconcile Managed Configuration"),
+        `reconciliation-shadow-shell-${target}-${strategy}`,
+      )
+      expect(shell).not.toContain(backendSecret)
+      const originFocus = setup.renderer.currentFocusedRenderable as InputRenderable
+
+      await setup.mockInput.typeText("/reconcile")
+      setup.mockInput.pressEnter()
+      await waitForReconciliationFrame(
+        setup,
+        [session],
+        (frame) => frame.includes("Adopt observed configuration"),
+        `reconciliation-shadow-open-${target}-${strategy}`,
+      )
+      setup.mockInput.pressKey(key)
+      const previewFrame = await waitForReconciliationFrame(
+        setup,
+        [session],
+        (frame) => frame.includes(source === "codex-profile" ? "Codex profile" : "Claude shared settings"),
+        `reconciliation-shadow-preview-${target}-${strategy}`,
+      )
+      expect(previewFrame).toContain("Shadowing Configuration")
+      expect(previewFrame).toContain("Command-line flags and resumed sessions")
+      expect(setup.renderer.currentFocusedRenderable).not.toBe(originFocus)
+
+      setup.mockInput.pressEnter()
+      for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+      await setup.renderOnce()
+      const blockedFrame = setup.captureCharFrame()
+      auditSecretFreeFrame(blockedFrame, claudeDirectSecrets, `reconciliation-shadow-blocked-${target}-${strategy}`)
+      auditReconciliationSessions([session], `reconciliation-shadow-blocked-${target}-${strategy}`)
+      expect(session.reconciliationApplies).toHaveLength(0)
+      expect(blockedFrame.replace(/\s+/g, " ")).toContain("Shadowing configuration blocks reconciliation. Remove or disable the shadow source, then preview again.")
+      expect(blockedFrame).toContain(source === "codex-profile" ? "Codex profile" : "Claude shared settings")
+      expect(blockedFrame).toContain(strategy === "adopt"
+        ? "Adopt observed configuration"
+        : strategy === "reapply"
+          ? "Reapply committed configuration"
+          : "Restore pre-Muxvia configuration")
+
+      setup.mockInput.pressEscape()
+      await waitForReconciliationFrame(
+        setup,
+        [session],
+        (frame) => frame.includes(target === "codex" ? "Codex · Control Plane" : "Claude · Control Plane")
+          && !frame.includes("Adopt observed configuration"),
+        `reconciliation-shadow-cancel-${target}-${strategy}`,
+      )
+      expect(setup.renderer.currentFocusedRenderable).toBe(originFocus)
+      expect(originFocus.isDestroyed).toBeFalse()
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)
+
+test.each([
+  {
+    target: "codex" as const,
+    locale: "en" as const,
+    expected: "Shadowing configuration blocks reconciliation. Remove or disable the shadow source, then preview again.",
+    legacyPrefix: "Managed routing values are shadowed by",
+  },
+  {
+    target: "claude" as const,
+    locale: "zh-CN" as const,
+    expected: "遮蔽配置阻止协调。请移除或停用遮蔽来源，然后重新预览。",
+    legacyPrefix: "受管理的路由值被",
+  },
+])(
+  "Reconciliation $locale race maps a source-free shadowing apply failure to exact localized copy",
+  async ({ target, locale, expected, legacyPrefix }) => {
+    const initial = view({
+      target,
+      problems: [{ code: "configuration-drift", message: "safe" }],
+    })
+    const session = new MemoryTargetSession(initial)
+    session.previewHandler = async (strategy) => reconciliationPreview(target, strategy)
+    const raceError = Object.assign(
+      new AggregateError([new Error(backendSecret)], "safe"),
+      { code: "shadowing-configuration", settings: settingsSecret },
+    )
+    raceError.stack = `at reconciliation (${credentialSecret})`
+    assertControlledSecretSource(raceError, claudeDirectSecrets, `reconciliation-shadow-race-source-${locale}`)
+    session.reconciliationHandler = async () => { throw raceError }
+    const setup = await testRender(() => <App sessions={{ [target]: session }} locale={locale} />, {
+      width: 80,
+      height: 30,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey(target === "codex" ? "1" : "2")
+      await setup.mockInput.typeText("/reconcile")
+      setup.mockInput.pressEnter()
+      await waitForReconciliationFrame(
+        setup,
+        [session],
+        (frame) => frame.includes(locale === "en" ? "Adopt observed configuration" : "采用观测到的配置"),
+        `reconciliation-shadow-race-open-${locale}`,
+      )
+      setup.mockInput.pressKey("r")
+      await waitForReconciliationFrame(
+        setup,
+        [session],
+        (frame) => frame.includes(locale === "en" ? "No observable shadow source" : "没有可观测的遮蔽源"),
+        `reconciliation-shadow-race-clean-preview-${locale}`,
+      )
+      setup.mockInput.pressEnter()
+      const failureFrame = await waitForReconciliationFrame(
+        setup,
+        [session],
+        (frame) => frame.replace(/\s+/g, " ").includes(expected) || frame.includes(legacyPrefix),
+        `reconciliation-shadow-race-error-${locale}`,
+      )
+      expect(session.reconciliationApplies).toHaveLength(1)
+      expect(failureFrame.replace(/\s+/g, " ")).toContain(expected)
+      expect(failureFrame).not.toContain("{source}")
+      expect(failureFrame).not.toContain(legacyPrefix)
+      expect(failureFrame).toContain(locale === "en" ? "Reapply committed configuration" : "重新应用已提交配置")
     } finally {
       setup.renderer.destroy()
     }

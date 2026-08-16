@@ -225,6 +225,7 @@ export const en = {
   "reconciliation.shadow.claude-host-managed": "Claude host-managed settings",
   "reconciliation.shadow.claude-selector": "Claude environment selector · {selector}",
   "reconciliation.shadow.none": "No observable shadow source",
+  "reconciliation.error.shadowing-configuration": "Shadowing configuration blocks reconciliation. Remove or disable the shadow source, then preview again.",
   "reconciliation.boundary": "Command-line flags and resumed sessions may still override this configuration.",
   "reconciliation.field.provider": "Target Provider",
   "reconciliation.field.credential": "Credential Reference",

@@ -78,6 +78,25 @@ test("reconciliation contracts are closed, validated, and secret-free", async ()
   })).toThrow()
 })
 
+test("round-trips target-scoped reconciliation preview requests with Claude context", () => {
+  const frame = {
+    type: "request",
+    requestId: "reconciliation-preview",
+    operation: {
+      kind: "preview-reconciliation",
+      target: "claude",
+      strategy: "adopt",
+      claudeContext: {
+        claudeConfigDir: "/tmp/claude-home",
+        selectorState: "disabled",
+        hostManagedState: "unmanaged",
+        cwd: "/tmp/project",
+      },
+    },
+  } as const
+  expect(parseClientFrame(frame)).toEqual(frame)
+})
+
 test("round-trips draft discovery sources and view-free inspection results", () => {
   const sources = [
     { kind: "missing" },

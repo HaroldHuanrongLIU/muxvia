@@ -23,7 +23,7 @@ type Pending = {
 export type RequestOptions = { signal?: AbortSignal }
 export type InspectionOperation = Extract<
   ControlOperation,
-  { kind: "discover-models" | "check-reachability" }
+  { kind: "discover-models" | "check-reachability" | "preview-reconciliation" }
 >
 type NonInspectionOperation = Exclude<ControlOperation, InspectionOperation>
 
@@ -277,7 +277,9 @@ export class RpcClient implements RpcTransport, MuxviaControl {
 }
 
 function isInspectionOperation(operation: ControlOperation): operation is InspectionOperation {
-  return operation.kind === "discover-models" || operation.kind === "check-reachability"
+  return operation.kind === "discover-models"
+    || operation.kind === "check-reachability"
+    || operation.kind === "preview-reconciliation"
 }
 
 function asControlError(error: unknown): ControlError {

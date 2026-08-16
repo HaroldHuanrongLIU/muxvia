@@ -358,3 +358,84 @@ test("aborting a request sends one cancel frame, rejects locally, and ignores a 
   expect(received.filter((frame) => frame.type === "cancel")).toHaveLength(1)
   await client.close()
 })
+
+test("aborting a reconciliation preview sends one cancel frame and keeps the socket usable", async () => {
+  const received: Array<Record<string, unknown>> = []
+  let wake: (() => void) | undefined
+  const path = await listen((socket) => {
+    const decoder = new FrameDecoder()
+    socket.on("data", (chunk) => {
+      if (typeof chunk === "string") throw new Error("unexpected text chunk")
+      for (const value of decoder.push(chunk)) {
+        const frame = value as Record<string, unknown>
+        received.push(frame)
+        if (frame.type === "hello") {
+          socket.write(encodeFrame({
+            type: "hello-ack",
+            rpc: { major: 1, minor: 0 },
+            release: "routing-test",
+            serviceEpoch: "00000000-0000-4000-8000-000000000001",
+            frameLimit: 1_048_576,
+          }))
+        } else if (
+          frame.type === "request"
+          && (frame.operation as { kind?: string } | undefined)?.kind === "check-reachability"
+        ) {
+          socket.write(encodeFrame({
+            type: "response",
+            requestId: frame.requestId,
+            result: {
+              kind: "reachability",
+              result: {
+                status: "reachable",
+                httpStatus: 204,
+                ttfbMs: 1,
+                checkedAtUnixMs: 1_775_000_000_000,
+                retryCount: 0,
+                slow: false,
+                endpointOrigin: "https://provider.example",
+              },
+            },
+          }))
+        }
+        wake?.()
+        wake = undefined
+      }
+    })
+  })
+  const waitUntil = async (predicate: () => boolean) => {
+    while (!predicate()) await new Promise<void>((resolve) => { wake = resolve })
+  }
+
+  const client = await RpcClient.connect(path, "control-test")
+  const controller = new AbortController()
+  const pending = client.request({
+    kind: "preview-reconciliation",
+    target: "claude",
+    strategy: "restore",
+    claudeContext: {
+      claudeConfigDir: null,
+      selectorState: "disabled",
+      hostManagedState: "unmanaged",
+      cwd: "/tmp/project",
+    },
+  }, { signal: controller.signal })
+  await waitUntil(() => received.some((frame) => frame.type === "request"))
+  const request = received.find((frame) => frame.type === "request")!
+  controller.abort()
+
+  await expect(pending).rejects.toMatchObject({ code: "cancelled" })
+  await waitUntil(() => received.some((frame) => frame.type === "cancel"))
+  expect(received.filter((frame) => frame.type === "cancel")).toEqual([
+    { type: "cancel", requestId: request.requestId },
+  ])
+
+  const followUp = await client.request({
+    kind: "check-reachability",
+    target: "codex",
+    providerId: "00000000-0000-4000-8000-000000000101",
+    providerRevision: 7,
+  })
+  expect(followUp.kind).toBe("reachability")
+  await client.close()
+})

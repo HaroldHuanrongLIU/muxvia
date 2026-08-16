@@ -171,6 +171,8 @@ class InspectionTargetSession implements TargetSession {
     if (signal) this.reachabilitySignals.push(signal)
     return await this.#reachability(providerId, providerRevision, signal)
   }
+  async previewReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
+  async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
   subscribe(listener: (next: TargetView) => void): () => void {
     this.#listeners.add(listener)
     return () => this.#listeners.delete(listener)

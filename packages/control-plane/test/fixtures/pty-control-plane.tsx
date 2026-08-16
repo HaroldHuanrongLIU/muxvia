@@ -50,6 +50,8 @@ class FixtureSession implements TargetSession {
   get(): Readonly<TargetView> { return initialView }
   async discoverModels(): Promise<never> { throw new Error("not used by this fixture") }
   async checkReachability(): Promise<never> { throw new Error("not used by this fixture") }
+  async previewReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
+  async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
   async act(_action: TargetAction): Promise<ActionOutcome> {
     return { status: "applied", view: initialView }
   }

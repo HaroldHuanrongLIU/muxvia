@@ -40,6 +40,8 @@ class StaticTargetSession implements TargetSession {
 
   async discoverModels(): Promise<never> { throw new Error("not used by this fixture") }
   async checkReachability(): Promise<never> { throw new Error("not used by this fixture") }
+  async previewReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
+  async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
 
   async act(_action: TargetAction): Promise<ActionOutcome> {
     return { status: "applied", view: this.#view }

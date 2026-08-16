@@ -7,6 +7,8 @@ import type {
   ClaudePreflightContext,
   ModelDiscoveryResult,
   ReachabilityResult,
+  ReconciliationPreview,
+  ReconciliationStrategy,
   TargetAction,
   Target,
   TargetView,
@@ -25,6 +27,15 @@ export interface TargetSession {
     providerRevision: number,
     signal?: AbortSignal,
   ): Promise<ReachabilityResult>
+  previewReconciliation(
+    strategy: ReconciliationStrategy,
+    signal?: AbortSignal,
+  ): Promise<ReconciliationPreview>
+  applyReconciliation(input: {
+    strategy: ReconciliationStrategy
+    observationToken: string
+    acknowledgeVersion?: string
+  }): Promise<ActionOutcome>
   subscribe(listener: (next: TargetView) => void): () => void
   whenClosed(): Promise<void>
   close(): Promise<void>
@@ -127,6 +138,38 @@ class TargetSessionImpl implements TargetSession {
     return response.result
   }
 
+  async previewReconciliation(
+    strategy: ReconciliationStrategy,
+    signal?: AbortSignal,
+  ): Promise<ReconciliationPreview> {
+    if (this.#closed) {
+      throw new ControlError("connection-closed", "Target session is closed")
+    }
+    const response = await this.#rpc.request({
+      kind: "preview-reconciliation",
+      target: this.#target,
+      strategy,
+      claudeContext: this.#claudeContext,
+    }, { signal })
+    if (response.kind !== "reconciliation-preview") {
+      throw new ControlError("invalid-response", "Expected a reconciliation preview")
+    }
+    return freezeReconciliationPreview(response.preview)
+  }
+
+  applyReconciliation(input: {
+    strategy: ReconciliationStrategy
+    observationToken: string
+    acknowledgeVersion?: string
+  }): Promise<ActionOutcome> {
+    return this.act({
+      kind: "reconcile",
+      strategy: input.strategy,
+      observationToken: input.observationToken,
+      acknowledgeVersion: input.acknowledgeVersion,
+    })
+  }
+
   subscribe(listener: (next: TargetView) => void): () => void {
     if (this.#closed) return () => {}
     this.#listeners.add(listener)
@@ -183,6 +226,17 @@ class TargetSessionImpl implements TargetSession {
     this.#lastNotifiedSequence = view.viewSequence
     for (const listener of this.#listeners) listener(view)
   }
+}
+
+function freezeReconciliationPreview(preview: ReconciliationPreview): ReconciliationPreview {
+  Object.freeze(preview.compatibility)
+  for (const source of preview.shadowSources) {
+    if (typeof source === "object") Object.freeze(source)
+  }
+  for (const change of preview.changes) Object.freeze(change)
+  Object.freeze(preview.shadowSources)
+  Object.freeze(preview.changes)
+  return Object.freeze(preview)
 }
 
 export function createTargetSession(

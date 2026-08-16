@@ -111,6 +111,8 @@ class MemoryTargetSession implements TargetSession {
 
   async discoverModels(): Promise<never> { throw new Error("not used by this fixture") }
   async checkReachability(): Promise<never> { throw new Error("not used by this fixture") }
+  async previewReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
+  async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
 
   async act(action: TargetAction): Promise<ActionOutcome> {
     this.actions.push(projectAction(action))

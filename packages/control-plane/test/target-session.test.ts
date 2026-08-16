@@ -6,7 +6,12 @@ import { createServer, type Server, type Socket } from "node:net"
 
 import { encodeFrame, FrameDecoder } from "../src/control/framing"
 import { RpcClient } from "../src/control/rpc-client"
-import type { ClientFrame, ServerFrame, TargetView } from "../src/control/types"
+import type {
+  ClientFrame,
+  ReconciliationPreview,
+  ServerFrame,
+  TargetView,
+} from "../src/control/types"
 
 const roots: string[] = []
 
@@ -49,6 +54,28 @@ function viewAtRevision(revision: number, sequence = revision, target: TargetVie
     recovery: { intentId: null, state: "clean" },
     activatedSnapshot: null,
     problems: [],
+  }
+}
+
+function reconciliationPreview(
+  target: TargetView["target"] = "codex",
+  strategy: ReconciliationPreview["strategy"] = "reapply",
+): ReconciliationPreview {
+  return {
+    observationToken: "00000000-0000-4000-8000-000000000701",
+    target,
+    strategy,
+    managementRevision: 1,
+    compatibility: {
+      version: target === "claude" ? "2.1.0" : "1.2.0",
+      classification: "tested",
+      acknowledgementRequired: false,
+    },
+    shadowSources: [],
+    changes: [{ field: "provider", state: "changed" }],
+    providerEffect: "keep-current",
+    restartRequired: true,
+    unobservableRuntimeBoundary: true,
   }
 }
 
@@ -139,12 +166,12 @@ class ScriptedServer {
     this.push(view)
   }
 
-  replyStale(view: TargetView): void {
+  replyStale(view: TargetView, code = "stale-revision"): void {
     const frame = this.requests().filter((request) => request.operation.kind === "act").at(-1)!
     this.send({
       type: "error",
       requestId: frame.requestId,
-      problem: { code: "stale-revision", message: "Target state changed" },
+      problem: { code, message: "Target state changed" },
       authoritativeView: view,
     })
   }
@@ -165,6 +192,20 @@ class ScriptedServer {
         },
       },
     })
+  }
+
+  replyPreview(index: number, preview: ReconciliationPreview): void {
+    const frame = this.requests()[index]!
+    this.send({
+      type: "response",
+      requestId: frame.requestId,
+      result: { kind: "reconciliation-preview", preview },
+    })
+  }
+
+  replyWithTargetView(index: number, view: TargetView): void {
+    const frame = this.requests()[index]!
+    this.send({ type: "response", requestId: frame.requestId, result: { kind: "target-view", view } })
   }
 
   push(view: TargetView): void {
@@ -384,6 +425,175 @@ test("explicit refresh accepts unsaved Blank and Preset drafts without Provider 
   expect((await blank).status).toBe("success")
   expect((await preset).status).toBe("success")
   expect(session.get()).toEqual(viewAtRevision(0))
+
+  await session.close()
+  await server.close()
+})
+
+test("reconciliation preview captures target and Claude context without waiting for queued actions", async () => {
+  const { server, path } = await ScriptedServer.start()
+  const client = await RpcClient.connect(path, "control-test")
+  const claudeContext = {
+    claudeConfigDir: "/tmp/claude-home",
+    selectorState: "disabled" as const,
+    hostManagedState: "unmanaged" as const,
+    cwd: "/tmp/project",
+  }
+  const opening = client.openTarget("claude", claudeContext)
+  await server.waitForRequests(1)
+  server.replyOpen(0, viewAtRevision(1, 1, "claude"))
+  const session = await opening
+
+  const action = session.act({ kind: "activate-provider", providerId: "provider-1", mode: "direct" })
+  const preview = session.previewReconciliation("reapply")
+  await server.waitForRequests(3)
+  const previewIndex = server.requests().findIndex(
+    (request) => request.operation.kind === "preview-reconciliation",
+  )
+  expect(server.requests()[previewIndex]!.operation).toEqual({
+    kind: "preview-reconciliation",
+    target: "claude",
+    strategy: "reapply",
+    claudeContext,
+  })
+
+  const expected = reconciliationPreview("claude")
+  server.replyPreview(previewIndex, expected)
+  expect(await preview).toEqual(expected)
+  server.replyApplied(viewAtRevision(2, 2, "claude"))
+  await action
+  await session.close()
+  await server.close()
+})
+
+test("reconciliation preview supports abort and validates its response kind", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  const controller = new AbortController()
+  const aborted = session.previewReconciliation("adopt", controller.signal)
+  await server.waitForRequests(2)
+  const request = server.requests()[1]!
+  controller.abort()
+  await expect(aborted).rejects.toMatchObject({ code: "cancelled" })
+  await server.waitForFrames(4)
+  expect(server.cancels()).toContainEqual({ type: "cancel", requestId: request.requestId })
+
+  const invalid = session.previewReconciliation("restore")
+  await server.waitForRequests(3)
+  server.replyWithTargetView(2, viewAtRevision(2))
+  await expect(invalid).rejects.toMatchObject({ code: "invalid-response" })
+  expect(session.get().managementRevision).toBe(1)
+
+  await session.close()
+  await server.close()
+})
+
+test("reconciliation preview is immutable and independent from later authoritative views", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  const pending = session.previewReconciliation("reapply")
+  await server.waitForRequests(2)
+  server.replyPreview(1, reconciliationPreview())
+  const preview = await pending
+
+  expect(Object.isFrozen(preview)).toBe(true)
+  expect(Object.isFrozen(preview.compatibility)).toBe(true)
+  expect(Object.isFrozen(preview.changes)).toBe(true)
+  expect(Object.isFrozen(preview.changes[0]!)).toBe(true)
+  server.push(viewAtRevision(2, 2))
+  await Bun.sleep(10)
+  expect(preview.managementRevision).toBe(1)
+  expect(preview.changes).toEqual([{ field: "provider", state: "changed" }])
+
+  await session.close()
+  await server.close()
+})
+
+test("reconciliation apply shares action serialization and replaces an authoritative stale view", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  const first = session.act({ kind: "activate-provider", providerId: "provider-1", mode: "direct" })
+  const apply = session.applyReconciliation({
+    strategy: "reapply",
+    observationToken: "00000000-0000-4000-8000-000000000701",
+  })
+  await server.waitForRequests(2)
+  expect(server.receivedActionCount()).toBe(1)
+
+  server.replyApplied(viewAtRevision(2, 2))
+  await first
+  await server.waitForRequests(3)
+  const actions = server.requests().filter((request) => request.operation.kind === "act")
+  expect(actions[1]!.operation).toMatchObject({
+    target: "codex",
+    expectedRevision: 2,
+    action: {
+      kind: "reconcile",
+      strategy: "reapply",
+      observationToken: "00000000-0000-4000-8000-000000000701",
+    },
+  })
+  expect((actions[1]!.operation as { actionId: string }).actionId).not.toBe(
+    (actions[0]!.operation as { actionId: string }).actionId,
+  )
+  server.replyStale(viewAtRevision(3, 3), "stale-reconciliation-preview")
+  await expect(apply).rejects.toMatchObject({ code: "stale-reconciliation-preview" })
+  expect(session.get().managementRevision).toBe(3)
+
+  await session.close()
+  await server.close()
+})
+
+test("reconciliation methods reject after close", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  await session.close()
+
+  await expect(session.previewReconciliation("restore")).rejects.toMatchObject({ code: "connection-closed" })
+  await expect(session.applyReconciliation({
+    strategy: "restore",
+    observationToken: "00000000-0000-4000-8000-000000000701",
+  })).rejects.toMatchObject({ code: "connection-closed" })
+  expect(server.requests()).toHaveLength(1)
+  await server.close()
+})
+
+test("a Claude reconciliation push gap refresh retains its captured context", async () => {
+  const { server, path } = await ScriptedServer.start()
+  const client = await RpcClient.connect(path, "control-test")
+  const claudeContext = {
+    claudeConfigDir: null,
+    selectorState: "disabled" as const,
+    hostManagedState: "unmanaged" as const,
+    cwd: "/tmp/reconciliation-project",
+  }
+  const opening = client.openTarget("claude", claudeContext)
+  await server.waitForRequests(1)
+  server.replyOpen(0, viewAtRevision(1, 1, "claude"))
+  const session = await opening
+
+  const apply = session.applyReconciliation({
+    strategy: "adopt",
+    observationToken: "00000000-0000-4000-8000-000000000701",
+    acknowledgeVersion: "2.1.0",
+  })
+  await server.waitForRequests(2)
+  expect(server.requests()[1]!.operation).toMatchObject({
+    target: "claude",
+    expectedRevision: 1,
+    action: {
+      kind: "reconcile",
+      strategy: "adopt",
+      observationToken: "00000000-0000-4000-8000-000000000701",
+      acknowledgeVersion: "2.1.0",
+    },
+  })
+  server.replyApplied(viewAtRevision(2, 2, "claude"))
+  await apply
+  server.push(viewAtRevision(4, 4, "claude"))
+  await server.waitForRequests(3)
+  expect(server.requests()[2]!.operation).toEqual({
+    kind: "open-target",
+    target: "claude",
+    claudeContext,
+  })
+  server.replyOpen(2, viewAtRevision(4, 4, "claude"))
 
   await session.close()
   await server.close()

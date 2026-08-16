@@ -127,6 +127,8 @@ class MemoryTargetSession implements TargetSession {
   }
   async discoverModels(): Promise<never> { throw new Error("not used") }
   async checkReachability(): Promise<never> { throw new Error("not used") }
+  async previewReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
+  async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
   subscribe(listener: (next: TargetView) => void): () => void {
     this.#listeners.add(listener)
     return () => this.#listeners.delete(listener)

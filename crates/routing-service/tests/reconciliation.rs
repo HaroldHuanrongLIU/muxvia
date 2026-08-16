@@ -139,6 +139,58 @@ fn raw_frame_exposes(raw: &[u8], sentinel: &str) -> bool {
     text.contains(sentinel) || text.contains(&numeric)
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct SecretFileFingerprint {
+    length: usize,
+    sha256: [u8; 32],
+}
+
+fn secret_file_fingerprint(path: &Path) -> SecretFileFingerprint {
+    let bytes = fs::read(path).unwrap();
+    SecretFileFingerprint {
+        length: bytes.len(),
+        sha256: ring::digest::digest(&ring::digest::SHA256, &bytes)
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    }
+}
+
+fn assert_secret_file_unchanged(path: &Path, expected: &SecretFileFingerprint) {
+    assert!(
+        secret_file_fingerprint(path) == *expected,
+        "secret-bearing artifact changed unexpectedly"
+    );
+}
+
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic".to_owned())
+}
+
+#[test]
+fn secret_file_comparison_uses_fixed_redacted_diagnostics_on_both_branches() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("managed-config");
+    let before_secret = "BEFORE_COMPARISON_SECRET_98402";
+    let after_secret = "AFTER_COMPARISON_SECRET_98403";
+    fs::write(&path, before_secret).unwrap();
+    let expected = secret_file_fingerprint(&path);
+    assert_secret_file_unchanged(&path, &expected);
+    fs::write(&path, after_secret).unwrap();
+    let diagnostic = panic_text(
+        std::panic::catch_unwind(|| assert_secret_file_unchanged(&path, &expected)).unwrap_err(),
+    );
+    for sentinel in [before_secret, after_secret] {
+        assert!(!diagnostic.contains(sentinel));
+        assert!(!diagnostic.contains(&format!("{:?}", sentinel.as_bytes())));
+    }
+    assert_eq!(diagnostic, "secret-bearing artifact changed unexpectedly");
+}
+
 #[test]
 fn raw_frame_scan_rejects_embedded_compact_numeric_sentinel_bytes() {
     let sentinel = "RAW_NUMERIC_SCAN_SENTINEL_95701";
@@ -224,7 +276,7 @@ async fn activate_takeover(
         .as_u64()
         .unwrap();
     let _push = read_frame(&mut stream).await.unwrap();
-    let activated = request(
+    let mut activated = request(
         &mut stream,
         "activate",
         json!({
@@ -240,6 +292,37 @@ async fn activate_takeover(
         }),
     )
     .await;
+    if activated["type"] == "error" {
+        assert_eq!(
+            activated["problem"]["code"],
+            "compatibility-acknowledgement-required"
+        );
+        let _blocker_push = read_frame(&mut stream).await.unwrap();
+        let store = StateStore::open(&MuxviaHome::from_user_home(user_home))
+            .await
+            .unwrap();
+        let compatibility = store.compatibility_for(target).await.unwrap();
+        store
+            .acknowledge_compatibility(target, &compatibility.version)
+            .await
+            .unwrap();
+        activated = request(
+            &mut stream,
+            "acknowledged-activate",
+            json!({
+                "kind": "act",
+                "target": target.as_str(),
+                "actionId": Uuid::new_v4(),
+                "expectedRevision": revision,
+                "action": {
+                    "kind": "activate-provider",
+                    "providerId": provider_id,
+                    "mode": "takeover"
+                }
+            }),
+        )
+        .await;
+    }
     assert_eq!(activated["type"], "response");
     let _push = read_frame(&mut stream).await.unwrap();
 }
@@ -662,9 +745,9 @@ async fn preview_all_targets_and_strategies_preserves_every_durable_surface_and_
     )
     .unwrap();
 
-    let before_database = fs::read(home.database_path()).unwrap();
-    let before_codex = fs::read(user_home.join(".codex/config.toml")).unwrap();
-    let before_claude = fs::read(user_home.join(".claude/settings.json")).unwrap();
+    let before_database = secret_file_fingerprint(home.database_path());
+    let before_codex = secret_file_fingerprint(&user_home.join(".codex/config.toml"));
+    let before_claude = secret_file_fingerprint(&user_home.join(".claude/settings.json"));
     let before_codex_view = store.target_view_for(Target::Codex).await.unwrap();
     let before_claude_view = store.target_view_for(Target::Claude).await.unwrap();
     let mut published = store.subscribe_target_views();
@@ -755,15 +838,9 @@ async fn preview_all_targets_and_strategies_preserves_every_durable_surface_and_
             assert_held_connection_is_alive(&claude_connection).await;
             assert!(TcpStream::connect(codex_endpoint).await.is_ok());
             assert!(TcpStream::connect(claude_endpoint).await.is_ok());
-            assert_eq!(fs::read(home.database_path()).unwrap(), before_database);
-            assert_eq!(
-                fs::read(user_home.join(".codex/config.toml")).unwrap(),
-                before_codex
-            );
-            assert_eq!(
-                fs::read(user_home.join(".claude/settings.json")).unwrap(),
-                before_claude
-            );
+            assert_secret_file_unchanged(home.database_path(), &before_database);
+            assert_secret_file_unchanged(&user_home.join(".codex/config.toml"), &before_codex);
+            assert_secret_file_unchanged(&user_home.join(".claude/settings.json"), &before_claude);
             assert_eq!(
                 store.target_view_for(Target::Codex).await.unwrap(),
                 before_codex_view
@@ -813,15 +890,9 @@ async fn preview_all_targets_and_strategies_preserves_every_durable_surface_and_
     );
     assert_eq!(handle.tracked_reconciliation_tokens().await, 6);
 
-    assert_eq!(fs::read(home.database_path()).unwrap(), before_database);
-    assert_eq!(
-        fs::read(user_home.join(".codex/config.toml")).unwrap(),
-        before_codex
-    );
-    assert_eq!(
-        fs::read(user_home.join(".claude/settings.json")).unwrap(),
-        before_claude
-    );
+    assert_secret_file_unchanged(home.database_path(), &before_database);
+    assert_secret_file_unchanged(&user_home.join(".codex/config.toml"), &before_codex);
+    assert_secret_file_unchanged(&user_home.join(".claude/settings.json"), &before_claude);
     assert_eq!(
         store.target_view_for(Target::Codex).await.unwrap(),
         before_codex_view
@@ -1399,9 +1470,10 @@ operator_note = "preserve-this-unrelated-field"
             .await
             .is_some()
     );
-    assert_eq!(
-        fs::read_to_string(user_home.join(".codex/config.toml")).unwrap(),
-        activated_configuration
+    assert!(
+        fs::read_to_string(user_home.join(".codex/config.toml"))
+            .is_ok_and(|current| current == activated_configuration),
+        "restart changed the secret-bearing managed configuration"
     );
 
     let restore_drift = activated_configuration.replacen(
@@ -1936,7 +2008,7 @@ async fn restore_returns_target_busy_without_mutation_while_real_request_is_pinn
         .await
         .unwrap();
     let before_view = store.target_view_for(Target::Codex).await.unwrap();
-    let before_file = fs::read(user_home.join(".codex/config.toml")).unwrap();
+    let before_file = secret_file_fingerprint(&user_home.join(".codex/config.toml"));
 
     let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
     hello(&mut stream).await;
@@ -1974,10 +2046,7 @@ async fn restore_returns_target_busy_without_mutation_while_real_request_is_pinn
         store.target_view_for(Target::Codex).await.unwrap(),
         before_view
     );
-    assert_eq!(
-        fs::read(user_home.join(".codex/config.toml")).unwrap(),
-        before_file
-    );
+    assert_secret_file_unchanged(&user_home.join(".codex/config.toml"), &before_file);
     let preview = request(
         &mut stream,
         "preview",
@@ -2001,10 +2070,7 @@ async fn restore_returns_target_busy_without_mutation_while_real_request_is_pinn
         store.target_view_for(Target::Codex).await.unwrap(),
         before_view
     );
-    assert_eq!(
-        fs::read(user_home.join(".codex/config.toml")).unwrap(),
-        before_file
-    );
+    assert_secret_file_unchanged(&user_home.join(".codex/config.toml"), &before_file);
     assert!(
         store
             .receipt_for(Target::Codex, action_id)
@@ -2561,6 +2627,10 @@ async fn ordinary_write_gates_are_target_local_while_read_only_operations_remain
     let claude_revision = opened["result"]["view"]["managementRevision"]
         .as_u64()
         .unwrap();
+    let next_unknown_probe = fs::read_to_string(&claude_executable)
+        .unwrap()
+        .replace("77.1.0", "77.2.0");
+    fs::write(&claude_executable, next_unknown_probe).unwrap();
     let unacknowledged = request(
         &mut claude,
         "peer-unacknowledged",
@@ -2579,16 +2649,25 @@ async fn ordinary_write_gates_are_target_local_while_read_only_operations_remain
         unacknowledged["problem"]["code"],
         "compatibility-acknowledgement-required"
     );
+    let compatibility_push = read_frame(&mut claude).await.unwrap();
+    assert_eq!(compatibility_push["type"], "target-view");
+    assert!(
+        compatibility_push["view"]["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|problem| problem["code"] == "compatibility-acknowledgement-required")
+    );
     store
         .record_compatibility(
             Target::Claude,
-            "77.1.0 (Claude Code)".into(),
+            "77.2.0 (Claude Code)".into(),
             muxvia_routing::control::protocol::CompatibilityClassification::UnknownCompatible,
         )
         .await
         .unwrap();
     store
-        .acknowledge_compatibility(Target::Claude, "77.1.0 (Claude Code)")
+        .acknowledge_compatibility(Target::Claude, "77.2.0 (Claude Code)")
         .await
         .unwrap();
     let peer_saved = request(
@@ -2611,7 +2690,7 @@ async fn ordinary_write_gates_are_target_local_while_read_only_operations_remain
     rewrite_probe_as_incompatible(&claude_executable, Target::Claude);
     let claude_view = store.target_view_for(Target::Claude).await.unwrap();
     let claude_provider_id = claude_view.providers[0].id;
-    for (request_id, action) in [
+    for (index, (request_id, action)) in [
         (
             "incompatible-save",
             json!({
@@ -2627,7 +2706,10 @@ async fn ordinary_write_gates_are_target_local_while_read_only_operations_remain
                 "mode":"direct"
             }),
         ),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let blocked = request(
             &mut claude,
             request_id,
@@ -2638,6 +2720,10 @@ async fn ordinary_write_gates_are_target_local_while_read_only_operations_remain
         )
         .await;
         assert_eq!(blocked["problem"]["code"], "incompatible-target-cli");
+        if index == 0 {
+            let incompatible_push = read_frame(&mut claude).await.unwrap();
+            assert_eq!(incompatible_push["type"], "target-view");
+        }
     }
     let incompatible_preview = request(
         &mut claude,

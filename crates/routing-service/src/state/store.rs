@@ -814,7 +814,9 @@ impl StateStore {
             )?;
             transaction.execute(
                 "DELETE FROM target_problems
-                 WHERE target = ?1 AND code = 'untested-target-cli'",
+                 WHERE target = ?1 AND code IN
+                   ('untested-target-cli', 'compatibility-acknowledgement-required',
+                    'incompatible-target-cli', 'shadowing-configuration')",
                 [target.as_str()],
             )?;
             if let Some(problem) = capability_problem {
@@ -941,41 +943,42 @@ impl StateStore {
             .map_err(map_state_call_error)
     }
 
-    pub(crate) async fn publish_target_view(&self, view: TargetView) {
-        self.publish_target_view_inner(view, None).await;
+    pub(crate) async fn publish_target_view(&self, view: TargetView) -> Result<(), StateError> {
+        self.publish_target_view_inner(view, None).await
     }
 
     #[cfg(test)]
     pub(crate) async fn publish_target_view_with_authoritative_read_hook(
         &self,
         view: TargetView,
-        hook: Arc<dyn Fn() + Send + Sync>,
-    ) {
-        self.publish_target_view_inner(view, Some(hook)).await;
+        hook: Arc<dyn Fn() -> tokio_rusqlite::rusqlite::Result<()> + Send + Sync>,
+    ) -> Result<(), StateError> {
+        self.publish_target_view_inner(view, Some(hook)).await
     }
 
     async fn publish_target_view_inner(
         &self,
         view: TargetView,
-        authoritative_read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
-    ) {
+        authoritative_read_hook: Option<
+            Arc<dyn Fn() -> tokio_rusqlite::rusqlite::Result<()> + Send + Sync>,
+        >,
+    ) -> Result<(), StateError> {
         let index = match view.target {
             Target::Codex => 0,
             Target::Claude => 1,
         };
         let published = Arc::clone(&self.published_view_sequences[index]);
         let sender = self.target_views.clone();
-        let _ = self
-            .connection
+        self.connection
             .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                if let Some(hook) = authoritative_read_hook {
+                    hook()?;
+                }
                 let authoritative: u64 = connection.query_row(
                     "SELECT view_sequence FROM target_route_state WHERE target = ?1",
                     [view.target.as_str()],
                     |row| row.get(0),
                 )?;
-                if let Some(hook) = authoritative_read_hook {
-                    hook();
-                }
                 let mut last = published
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -987,7 +990,8 @@ impl StateStore {
                 }
                 Ok(())
             })
-            .await;
+            .await
+            .map_err(map_call_error)
     }
 
     pub async fn mark_configuration_drift_for(&self, target: Target) -> Result<(), StateError> {
@@ -1228,7 +1232,7 @@ impl StateStore {
             })
             .await
             .map_err(map_state_call_error)?;
-        self.publish_target_view(view.clone()).await;
+        self.publish_target_view(view.clone()).await?;
         Ok(view)
     }
 

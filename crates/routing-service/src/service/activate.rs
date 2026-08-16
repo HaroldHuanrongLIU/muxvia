@@ -18,8 +18,8 @@ use crate::{
     codex::{CodexCapability, CodexConfigCodec, CodexProbe, ConfigSnapshot, DesiredCodexState},
     control::protocol::{
         ActionOutcome, ActionStatus, ActivationMode, ClaudeBlockingSelector,
-        ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState, ControlProblem,
-        Target, TargetAction,
+        ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState,
+        CompatibilityClassification, CompatibilityView, ControlProblem, Target, TargetAction,
     },
     domain::activation::ActivatedSnapshot,
     home::MuxviaHome,
@@ -472,8 +472,14 @@ impl ActivationService {
                     .store
                     .apply_provider_action_for(target, action_id, expected_revision, raw_action)
                     .await?;
-                if outcome.status == ActionStatus::Applied {
-                    self.store.publish_target_view(outcome.view.clone()).await;
+                if outcome.status == ActionStatus::Applied
+                    && self
+                        .store
+                        .publish_target_view(outcome.view.clone())
+                        .await
+                        .is_err()
+                {
+                    return Err(self.target_failure(target, "state-store-error").await);
                 }
                 Ok(outcome)
             }
@@ -917,8 +923,14 @@ impl ActivationService {
                     }
                     *self.model_for(target).lock().await = Some(handle);
                 }
-                if self.hooks.reached(ActivationStep::PublishView).is_ok() {
-                    self.store.publish_target_view(outcome.view.clone()).await;
+                if self.hooks.reached(ActivationStep::PublishView).is_ok()
+                    && self
+                        .store
+                        .publish_target_view(outcome.view.clone())
+                        .await
+                        .is_err()
+                {
+                    return Err(self.target_failure(target, "state-store-error").await);
                 }
                 Ok(outcome)
             }
@@ -1242,15 +1254,29 @@ impl ActivationService {
             Target::Codex => {
                 let capability_problem = match self.codex_probe.probe(&self.codex_executable) {
                     Ok(CodexCapability::Tested { .. }) => None,
-                    Ok(CodexCapability::UnknownCompatible { warning, .. }) => {
+                    Ok(CodexCapability::UnknownCompatible { version, .. }) => {
+                        self.enforce_activation_compatibility(
+                            target,
+                            version,
+                            CompatibilityClassification::UnknownCompatible,
+                        )
+                        .await?;
                         Some(ControlProblem {
                             code: "untested-target-cli".into(),
-                            message: warning,
+                            message: "Target CLI version is untested".into(),
                             source: None,
                             selector: None,
                         })
                     }
-                    Err(_) => return Err(PreflightFailure::new("incompatible-target-cli")),
+                    Err(problem) => {
+                        self.enforce_activation_compatibility(
+                            target,
+                            problem.version().unwrap_or("unavailable").to_owned(),
+                            CompatibilityClassification::Incompatible,
+                        )
+                        .await?;
+                        unreachable!("incompatible activation compatibility never proceeds")
+                    }
                 };
                 let codec = CodexConfigCodec::for_user_home(self.home.user_home())
                     .map_err(|problem| PreflightFailure::new(problem.code()))?;
@@ -1388,15 +1414,29 @@ impl ActivationService {
                 };
                 let capability_problem = match self.claude_probe.probe(&self.claude_executable) {
                     Ok(ClaudeCapability::Tested { .. }) => None,
-                    Ok(ClaudeCapability::UnknownCompatible { warning, .. }) => {
+                    Ok(ClaudeCapability::UnknownCompatible { version, .. }) => {
+                        self.enforce_activation_compatibility(
+                            target,
+                            version,
+                            CompatibilityClassification::UnknownCompatible,
+                        )
+                        .await?;
                         Some(ControlProblem {
                             code: "untested-target-cli".into(),
-                            message: warning,
+                            message: "Target CLI version is untested".into(),
                             source: None,
                             selector: None,
                         })
                     }
-                    Err(_) => return Err(PreflightFailure::new("incompatible-target-cli")),
+                    Err(problem) => {
+                        self.enforce_activation_compatibility(
+                            target,
+                            problem.version().unwrap_or("unavailable").to_owned(),
+                            CompatibilityClassification::Incompatible,
+                        )
+                        .await?;
+                        unreachable!("incompatible activation compatibility never proceeds")
+                    }
                 };
                 Ok((
                     ConfigurationPreflight::Claude {
@@ -1407,6 +1447,49 @@ impl ActivationService {
                 ))
             }
         }
+    }
+
+    async fn enforce_activation_compatibility(
+        &self,
+        target: Target,
+        version: String,
+        classification: CompatibilityClassification,
+    ) -> Result<(), PreflightFailure> {
+        let acknowledgement_required = if classification
+            == CompatibilityClassification::UnknownCompatible
+        {
+            match self.store.compatibility_for(target).await {
+                Ok(saved) => {
+                    saved.version != version
+                        || saved.classification != CompatibilityClassification::UnknownCompatible
+                        || saved.acknowledgement_required
+                }
+                Err(StateError::MissingCompatibility) => true,
+                Err(_) => return Err(PreflightFailure::new("state-store-error")),
+            }
+        } else {
+            false
+        };
+        let compatibility = CompatibilityView {
+            version,
+            classification,
+            acknowledgement_required,
+        };
+        let code = match classification {
+            CompatibilityClassification::Tested => return Ok(()),
+            CompatibilityClassification::UnknownCompatible if !acknowledgement_required => {
+                return Ok(());
+            }
+            CompatibilityClassification::UnknownCompatible => {
+                "compatibility-acknowledgement-required"
+            }
+            CompatibilityClassification::Incompatible => "incompatible-target-cli",
+        };
+        self.store
+            .project_managed_write_problem(target, code, None, compatibility)
+            .await
+            .map_err(|_| PreflightFailure::new("state-store-error"))?;
+        Err(PreflightFailure::new(code))
     }
 
     fn inspect_config(
@@ -1586,7 +1669,16 @@ impl ActivationService {
                     .await);
             }
         };
-        self.store.publish_target_view(outcome.view.clone()).await;
+        if self
+            .store
+            .publish_target_view(outcome.view.clone())
+            .await
+            .is_err()
+        {
+            return Err(self
+                .target_failure(intent.target(), "state-store-error")
+                .await);
+        }
         Ok(outcome)
     }
 
@@ -1625,6 +1717,7 @@ impl ActivationService {
         let stable = match code {
             "stale-revision"
             | "incomplete-provider"
+            | "compatibility-acknowledgement-required"
             | "incompatible-target-cli"
             | "unsupported-configuration-home"
             | "preflight-context-required"

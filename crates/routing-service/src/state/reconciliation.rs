@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     control::protocol::{
         ActionOutcome, ActionStatus, CompatibilityClassification, CompatibilityView,
-        ReconciliationStrategy, Target,
+        ReconciliationStrategy, ShadowSource, Target, TargetView,
     },
     domain::{
         activation::ActivatedSnapshot, provider::normalize_provider_base_url,
@@ -82,6 +82,94 @@ impl fmt::Debug for PendingReconciliationIntent {
 }
 
 impl StateStore {
+    pub(crate) async fn project_managed_write_problem(
+        &self,
+        target: Target,
+        code: &'static str,
+        source: Option<ShadowSource>,
+        compatibility: CompatibilityView,
+    ) -> Result<Option<TargetView>, StateError> {
+        let service_epoch = self.service_epoch().to_string();
+        let source = source.as_ref().map(shadow_source_code);
+        let message = match code {
+            "shadowing-configuration" => "A higher-priority configuration source is active",
+            "compatibility-acknowledgement-required" => {
+                "Acknowledge this exact untested Target CLI version"
+            }
+            "incompatible-target-cli" => "Target CLI is incompatible",
+            _ => return Err(StateError::InvalidCompatibilityState),
+        };
+        self.connection
+            .call(
+                move |connection| -> Result<Option<TargetView>, StateError> {
+                    let transaction =
+                        connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let prior_compatibility = match read_compatibility(&transaction, target) {
+                        Ok(compatibility) => Some(compatibility),
+                        Err(StateError::MissingCompatibility) => None,
+                        Err(error) => return Err(error),
+                    };
+                    let compatibility_changed =
+                        prior_compatibility.as_ref() != Some(&compatibility);
+                    if compatibility_changed {
+                        let classification = compatibility.classification.as_str();
+                        let acknowledged_version = (!compatibility.acknowledgement_required
+                            && compatibility.classification
+                                == CompatibilityClassification::UnknownCompatible)
+                            .then(|| compatibility.version.clone());
+                        transaction.execute(
+                            "INSERT INTO target_compatibility
+                           (target, observed_version, classification, acknowledged_version)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(target) DO UPDATE SET
+                           observed_version = excluded.observed_version,
+                           classification = excluded.classification,
+                           acknowledged_version = excluded.acknowledged_version",
+                            params![
+                                target.as_str(),
+                                compatibility.version,
+                                classification,
+                                acknowledged_version
+                            ],
+                        )?;
+                    }
+                    let removed = transaction.execute(
+                        "DELETE FROM target_problems
+                     WHERE target = ?1
+                       AND code IN ('shadowing-configuration',
+                                    'compatibility-acknowledgement-required',
+                                    'incompatible-target-cli')
+                       AND code != ?2",
+                        params![target.as_str(), code],
+                    )?;
+                    let problem_changed = transaction.execute(
+                        "INSERT INTO target_problems (target, code, message, source)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(target, code) DO UPDATE SET
+                       message = excluded.message, source = excluded.source
+                     WHERE target_problems.message != excluded.message
+                        OR target_problems.source IS NOT excluded.source",
+                        params![target.as_str(), code, message, source],
+                    )?;
+                    if compatibility_changed || removed > 0 || problem_changed > 0 {
+                        transaction.execute(
+                            "UPDATE target_route_state SET view_sequence = view_sequence + 1
+                         WHERE target = ?1",
+                            [target.as_str()],
+                        )?;
+                        let view = project_target_view_for(&transaction, &service_epoch, target)?;
+                        transaction.commit()?;
+                        Ok(Some(view))
+                    } else {
+                        transaction.commit()?;
+                        Ok(None)
+                    }
+                },
+            )
+            .await
+            .map_err(super::store::map_state_call_error)
+    }
+
     pub(crate) async fn pending_reconciliation_intents(
         &self,
     ) -> Result<Vec<PendingReconciliationIntent>, StateError> {
@@ -647,6 +735,18 @@ impl CompatibilityClassification {
             "incompatible" => Some(Self::Incompatible),
             _ => None,
         }
+    }
+}
+
+fn shadow_source_code(source: &ShadowSource) -> &'static str {
+    match source {
+        ShadowSource::CodexProfile => "codex-profile",
+        ShadowSource::ClaudeManaged => "claude-managed",
+        ShadowSource::ClaudeShared => "claude-shared",
+        ShadowSource::ClaudeProject => "claude-project",
+        ShadowSource::ClaudeLocal => "claude-local",
+        ShadowSource::ClaudeSelector(_) => "claude-selector",
+        ShadowSource::ClaudeHostManaged => "claude-host-managed",
     }
 }
 

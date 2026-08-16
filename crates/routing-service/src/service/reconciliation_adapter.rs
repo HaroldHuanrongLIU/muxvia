@@ -717,6 +717,7 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use secrecy::ExposeSecret;
+    use subtle::ConstantTimeEq;
     use tempfile::TempDir;
 
     use super::{
@@ -1061,7 +1062,7 @@ supports_websockets = false
         let mut bytes = b"profile = \"operator-profile-sentinel\"\n".to_vec();
         bytes.extend_from_slice(&fs::read(codec.config_path()).unwrap());
         fs::write(codec.config_path(), &bytes).unwrap();
-        let before = fs::read(codec.config_path()).unwrap();
+        let before = shadow_fingerprint(codec.config_path());
 
         let result = TargetReconciliationAdapter::Codex(codec)
             .observe(
@@ -1076,9 +1077,9 @@ supports_websockets = false
             .unwrap();
 
         assert_eq!(result.observation.shadows, vec![ShadowSource::CodexProfile]);
-        assert_eq!(
-            fs::read(home.path().join(".codex/config.toml")).unwrap(),
-            before
+        assert!(
+            shadow_fingerprint(&home.path().join(".codex/config.toml")) == before,
+            "Codex shadow observation changed the secret-bearing managed configuration"
         );
     }
 
@@ -1165,7 +1166,16 @@ supports_websockets = false
                 let adopted = adopted.unwrap();
                 assert_eq!(adopted.model, "selected-model");
                 assert_eq!(adopted.base_url, "https://selected.example/v1");
-                assert_eq!(adopted.credential.expose_secret(), "SELECTED_SECRET_97102");
+                assert!(
+                    bool::from(
+                        adopted
+                            .credential
+                            .expose_secret()
+                            .as_bytes()
+                            .ct_eq(b"SELECTED_SECRET_97102")
+                    ),
+                    "adopted credential did not match the observed credential"
+                );
                 assert_eq!(
                     observed.observation.changes[1].state,
                     ReconciliationFieldState::Changed
@@ -2255,7 +2265,7 @@ supports_websockets = false
         )
         .unwrap();
         let path = home.path().join(".codex/config.toml");
-        let file_before = fs::read(&path).unwrap();
+        let file_before = shadow_fingerprint(&path);
         let identity_before = codec
             .reconciliation_snapshot()
             .unwrap()
@@ -2333,7 +2343,10 @@ supports_websockets = false
             assert!(!diagnostic.contains(sentinel));
             assert!(!diagnostic.contains(&format!("{:?}", sentinel.as_bytes())));
         }
-        assert_eq!(fs::read(path).unwrap(), file_before);
+        assert!(
+            shadow_fingerprint(&path) == file_before,
+            "incompatible observation changed the secret-bearing managed configuration"
+        );
         assert_eq!(
             CodexConfigCodec::for_user_home(home.path())
                 .unwrap()
@@ -2505,7 +2518,7 @@ supports_websockets = false
                 serde_json::to_vec(&document).unwrap(),
             )
             .unwrap();
-            let before = fs::read(codec.settings_path()).unwrap();
+            let before = shadow_fingerprint(codec.settings_path());
 
             let result = TargetReconciliationAdapter::Claude(codec)
                 .observe(
@@ -2523,9 +2536,9 @@ supports_websockets = false
                 result.observation.shadows,
                 vec![ShadowSource::ClaudeSelector(selector)]
             );
-            assert_eq!(
-                fs::read(home.path().join(".claude/settings.json")).unwrap(),
-                before
+            assert!(
+                shadow_fingerprint(&home.path().join(".claude/settings.json")) == before,
+                "Claude shadow observation changed the secret-bearing managed configuration"
             );
         }
 

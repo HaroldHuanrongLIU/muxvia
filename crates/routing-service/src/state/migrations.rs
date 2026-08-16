@@ -88,7 +88,12 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
 fn migrate_v7(connection: &mut Connection) -> Result<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
-        "CREATE TABLE target_compatibility (
+        "ALTER TABLE target_problems ADD COLUMN source TEXT
+           CHECK (source IS NULL OR source IN (
+             'codex-profile', 'claude-managed', 'claude-shared', 'claude-project',
+             'claude-local', 'claude-selector', 'claude-host-managed'
+           ));
+         CREATE TABLE target_compatibility (
            target TEXT PRIMARY KEY CHECK (target IN ('codex', 'claude')),
            observed_version TEXT NOT NULL,
            classification TEXT NOT NULL CHECK (classification IN ('tested', 'unknown-compatible', 'incompatible')),

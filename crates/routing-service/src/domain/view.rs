@@ -205,14 +205,15 @@ pub(crate) fn project_target_view_for(
         Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => None,
         Err(error) => return Err(error),
     };
-    let mut problem_statement = connection
-        .prepare("SELECT code, message FROM target_problems WHERE target = ?1 ORDER BY code")?;
+    let mut problem_statement = connection.prepare(
+        "SELECT code, message, source FROM target_problems WHERE target = ?1 ORDER BY code",
+    )?;
     let problems = problem_statement
         .query_map([target_name], |row| {
             Ok(ControlProblem {
                 code: row.get(0)?,
                 message: row.get(1)?,
-                source: None,
+                source: row.get(2)?,
                 selector: None,
             })
         })?

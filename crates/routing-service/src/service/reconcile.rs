@@ -224,6 +224,7 @@ pub(crate) struct ValidatedReconciliation {
     pub(crate) prepared: PreparedConfiguration,
     compatibility: CompatibilityView,
     management_revision: u64,
+    managed_config_path: PathBuf,
 }
 
 pub(crate) struct ReconciliationService {
@@ -510,6 +511,10 @@ impl ReconciliationService {
             prepared: observed.prepared,
             compatibility: expected.compatibility,
             management_revision: expected.management_revision,
+            managed_config_path: expected.canonical_home.join(match target {
+                Target::Codex => "config.toml",
+                Target::Claude => "settings.json",
+            }),
         })
     }
 
@@ -688,12 +693,7 @@ impl ReconciliationService {
                 recovery_id: Uuid::new_v4(),
                 recovery_payload_json,
                 file_identity_json,
-                config_path: match target {
-                    Target::Codex => self.codex.user_home.join(".codex/config.toml"),
-                    Target::Claude => self.claude.user_home.join(".claude/settings.json"),
-                }
-                .to_string_lossy()
-                .into_owned(),
+                config_path: validated.managed_config_path.to_string_lossy().into_owned(),
                 managed_config_version: validated.prepared.managed_config_version(),
                 exit_takeover: adopt_takeover,
             })
@@ -978,10 +978,21 @@ impl ReconciliationService {
                     return DeferredPublication::none(Err(failure));
                 }
             };
-            return DeferredPublication::none(
-                self.ensure_compatibility_allowed(target, &compatibility, false)
-                    .await,
-            );
+            return match self
+                .ensure_compatibility_allowed(target, &compatibility, false)
+                .await
+            {
+                Ok(()) => DeferredPublication::none(Ok(())),
+                Err(failure) => {
+                    self.project_ordinary_problem(
+                        target,
+                        failure.problem.code.as_str(),
+                        None,
+                        compatibility,
+                    )
+                    .await
+                }
+            };
         }
         let Some(context) = context else {
             return DeferredPublication::none(Err(self
@@ -999,6 +1010,16 @@ impl ReconciliationService {
                 return DeferredPublication::none(Err(failure));
             }
         };
+        if let Some(source) = record.shadows.first().cloned() {
+            return self
+                .project_ordinary_problem(
+                    target,
+                    "shadowing-configuration",
+                    Some(source),
+                    record.compatibility,
+                )
+                .await;
+        }
         if observed.observation.owned_drifted {
             if self
                 .state
@@ -1016,15 +1037,59 @@ impl ReconciliationService {
                 result: Err(failure),
             };
         }
-        if !record.shadows.is_empty() {
-            return DeferredPublication::none(Err(self
-                .failure(target, "shadowing-configuration")
-                .await));
+        match self
+            .ensure_compatibility_allowed(target, &record.compatibility, true)
+            .await
+        {
+            Ok(()) => DeferredPublication::none(Ok(())),
+            Err(failure) => {
+                self.project_ordinary_problem(
+                    target,
+                    failure.problem.code.as_str(),
+                    None,
+                    record.compatibility,
+                )
+                .await
+            }
         }
-        DeferredPublication::none(
-            self.ensure_compatibility_allowed(target, &record.compatibility, true)
-                .await,
-        )
+    }
+
+    async fn project_ordinary_problem(
+        &self,
+        target: Target,
+        code: &str,
+        source: Option<ShadowSource>,
+        compatibility: CompatibilityView,
+    ) -> DeferredPublication<Result<(), ActionFailure>> {
+        let stable_code = match code {
+            "shadowing-configuration" => "shadowing-configuration",
+            "compatibility-acknowledgement-required" => "compatibility-acknowledgement-required",
+            "incompatible-target-cli" => "incompatible-target-cli",
+            _ => return DeferredPublication::none(Err(self.failure(target, code).await)),
+        };
+        let publication = match self
+            .state
+            .project_managed_write_problem(target, stable_code, source, compatibility)
+            .await
+        {
+            Ok(publication) => publication,
+            Err(_) => {
+                return DeferredPublication::none(Err(self
+                    .failure(target, "state-store-error")
+                    .await));
+            }
+        };
+        let mut failure = self.failure(target, stable_code).await;
+        failure.problem.source = failure
+            .authoritative_view
+            .problems
+            .iter()
+            .find(|problem| problem.code == stable_code)
+            .and_then(|problem| problem.source.clone());
+        DeferredPublication {
+            result: Err(failure),
+            publication,
+        }
     }
 
     async fn ensure_compatibility_allowed(
@@ -1720,12 +1785,14 @@ mod tests {
             while !*released {
                 released = signal.wait(released).unwrap();
             }
+            Ok(())
         });
         let publishing_store = Arc::clone(&fixture.store);
         let publishing = tokio::spawn(async move {
             publishing_store
                 .publish_target_view_with_authoritative_read_hook(candidate, hook)
-                .await;
+                .await
+                .unwrap();
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), reached.notified())
             .await
@@ -1759,6 +1826,27 @@ mod tests {
         );
         let served_publication = updates.recv().await.unwrap();
         assert_eq!(served_publication.view_sequence, served.view_sequence);
+    }
+
+    #[tokio::test]
+    async fn authoritative_publication_propagates_database_read_failure_without_a_push() {
+        let fixture = Fixture::new().await;
+        let candidate = fixture.store.target_view_for(Target::Codex).await.unwrap();
+        let mut updates = fixture.store.subscribe_target_views();
+        let failure = fixture
+            .store
+            .publish_target_view_with_authoritative_read_hook(
+                candidate,
+                Arc::new(|| Err(tokio_rusqlite::rusqlite::Error::InvalidQuery)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(failure, crate::state::StateError::Sqlite(_)));
+        assert!(matches!(
+            updates.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(!format!("{failure:?}").contains("SQLITE_SECRET_98301"));
     }
 
     fn rewrite_same_file_preserving_identity(path: &Path, before: &str, after: &str) {
@@ -1803,7 +1891,7 @@ mod tests {
             .unwrap()
     }
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(PartialEq, Eq)]
     struct FileFingerprint {
         device: u64,
         inode: u64,
@@ -1812,6 +1900,32 @@ mod tests {
         modified_nanoseconds: i64,
         length: u64,
         bytes: Vec<u8>,
+    }
+
+    impl std::fmt::Debug for FileFingerprint {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("FileFingerprint")
+                .field("device", &self.device)
+                .field("inode", &self.inode)
+                .field("mode", &self.mode)
+                .field("modified_seconds", &self.modified_seconds)
+                .field("modified_nanoseconds", &self.modified_nanoseconds)
+                .field("length", &self.length)
+                .field("bytes", &"<redacted>")
+                .finish()
+        }
+    }
+
+    #[test]
+    fn file_fingerprint_diagnostic_redacts_raw_and_numeric_secret_bytes() {
+        let home = TempDir::new().unwrap();
+        let path = home.path().join("secret-config");
+        let sentinel = "FINGERPRINT_SECRET_98401";
+        fs::write(&path, sentinel).unwrap();
+        let diagnostic = format!("{:?}", file_fingerprint(&path));
+        assert!(!diagnostic.contains(sentinel));
+        assert!(!diagnostic.contains(&format!("{:?}", sentinel.as_bytes())));
     }
 
     fn file_fingerprint(path: &Path) -> FileFingerprint {
@@ -1824,6 +1938,23 @@ mod tests {
             modified_nanoseconds: metadata.mtime_nsec(),
             length: metadata.len(),
             bytes: fs::read(path).unwrap(),
+        }
+    }
+
+    #[derive(PartialEq, Eq)]
+    struct SecretContentFingerprint {
+        length: usize,
+        sha256: [u8; 32],
+    }
+
+    fn secret_content_fingerprint(path: &Path) -> SecretContentFingerprint {
+        let bytes = fs::read(path).unwrap();
+        SecretContentFingerprint {
+            length: bytes.len(),
+            sha256: ring::digest::digest(&ring::digest::SHA256, &bytes)
+                .as_ref()
+                .try_into()
+                .unwrap(),
         }
     }
 
@@ -2028,7 +2159,8 @@ mod tests {
                 failpoint,
                 ..Default::default()
             });
-            let before = fs::read(fixture.home.user_home().join(".codex/config.toml")).unwrap();
+            let config_path = fixture.home.user_home().join(".codex/config.toml");
+            let before = secret_content_fingerprint(&config_path);
             let preview = service
                 .preview(
                     Target::Codex,
@@ -2100,9 +2232,9 @@ mod tests {
             } else {
                 let failure = result.unwrap_err();
                 assert_eq!(failure.problem.code, "configuration-write-failed");
-                assert_eq!(
-                    fs::read(fixture.home.user_home().join(".codex/config.toml")).unwrap(),
-                    before
+                assert!(
+                    secret_content_fingerprint(&config_path) == before,
+                    "rollback changed the secret-bearing managed configuration"
                 );
                 assert!(
                     fixture
@@ -2147,7 +2279,7 @@ supports_websockets = false
                 .mark_configuration_drift_for(Target::Codex)
                 .await
                 .unwrap();
-            let before_bytes = fs::read(&config_path).unwrap();
+            let before_file = secret_content_fingerprint(&config_path);
             let before_counts = reconciliation_row_counts(&fixture.home);
             let before_view =
                 serde_json::to_value(fixture.store.target_view_for(Target::Codex).await.unwrap())
@@ -2186,7 +2318,10 @@ supports_websockets = false
                 .unwrap_err();
 
             assert_eq!(failure.problem.code, "configuration-write-failed");
-            assert_eq!(fs::read(&config_path).unwrap(), before_bytes);
+            assert!(
+                secret_content_fingerprint(&config_path) == before_file,
+                "failed Adopt changed the secret-bearing managed configuration"
+            );
             assert_eq!(reconciliation_row_counts(&fixture.home), before_counts);
             assert_eq!(
                 serde_json::to_value(fixture.store.target_view_for(Target::Codex).await.unwrap())
@@ -2252,7 +2387,7 @@ supports_websockets = false
             .mark_configuration_drift_for(Target::Codex)
             .await
             .unwrap();
-        let before_bytes = fs::read(&config_path).unwrap();
+        let before_file = secret_content_fingerprint(&config_path);
         let before_counts = reconciliation_row_counts(&fixture.home);
         let before_view =
             serde_json::to_value(fixture.store.target_view_for(Target::Codex).await.unwrap())
@@ -2290,7 +2425,10 @@ supports_websockets = false
             .unwrap_err();
 
         assert_eq!(failure.problem.code, "configuration-write-failed");
-        assert_eq!(fs::read(&config_path).unwrap(), before_bytes);
+        assert!(
+            secret_content_fingerprint(&config_path) == before_file,
+            "listener-stop failure changed the secret-bearing managed configuration"
+        );
         assert_eq!(reconciliation_row_counts(&fixture.home), before_counts);
         assert_eq!(
             serde_json::to_value(fixture.store.target_view_for(Target::Codex).await.unwrap())
@@ -2820,7 +2958,7 @@ supports_websockets = false
 "#,
         )
         .unwrap();
-        let before_file = fs::read(&config_path).unwrap();
+        let before_file = secret_content_fingerprint(&config_path);
         let before_view = fixture.store.target_view_for(Target::Codex).await.unwrap();
         let service = ReconciliationService::from_runtime(
             Arc::clone(&fixture.store),
@@ -2852,7 +2990,10 @@ supports_websockets = false
             .await
             .unwrap_err();
         assert_eq!(failed.problem.code, "configuration-write-failed");
-        assert_eq!(fs::read(&config_path).unwrap(), before_file);
+        assert!(
+            secret_content_fingerprint(&config_path) == before_file,
+            "final-transaction failure changed the secret-bearing managed configuration"
+        );
         assert_eq!(
             fixture.store.target_view_for(Target::Codex).await.unwrap(),
             before_view
@@ -2974,6 +3115,81 @@ supports_websockets = false
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_managed_write_projects_shadow_source_once_and_persists_it() {
+        let fixture = Fixture::new().await;
+        let config_path = fixture.home.user_home().join(".codex/config.toml");
+        let document = format!(
+            "profile = \"operator-profile\"\n{}",
+            fs::read_to_string(&config_path).unwrap()
+        );
+        fs::write(&config_path, document).unwrap();
+
+        let first = fixture
+            .service
+            .ensure_ordinary_write_allowed(Target::Codex, Some(ReconciliationContext::Codex), true)
+            .await;
+        let failure = first.result.unwrap_err();
+        assert_eq!(failure.problem.code, "shadowing-configuration");
+        assert_eq!(failure.problem.source.as_deref(), Some("codex-profile"));
+        let publication = first.publication.expect("new shadow must publish once");
+        assert!(publication.problems.iter().any(|problem| {
+            problem.code == "shadowing-configuration"
+                && problem.source.as_deref() == Some("codex-profile")
+        }));
+        let persisted = fixture.store.target_view_for(Target::Codex).await.unwrap();
+        assert_eq!(persisted, publication);
+
+        let duplicate = fixture
+            .service
+            .ensure_ordinary_write_allowed(Target::Codex, Some(ReconciliationContext::Codex), true)
+            .await;
+        assert_eq!(
+            duplicate.result.unwrap_err().problem.code,
+            "shadowing-configuration"
+        );
+        assert!(duplicate.publication.is_none());
+    }
+
+    #[tokio::test]
+    async fn ordinary_managed_write_projects_exact_incompatible_version_target_locally() {
+        let fixture = Fixture::new().await;
+        let peer_before = fixture.store.target_view_for(Target::Claude).await.unwrap();
+        fixture.probe.set(ProbeState::Incompatible);
+
+        let blocked = fixture
+            .service
+            .ensure_ordinary_write_allowed(Target::Codex, Some(ReconciliationContext::Codex), true)
+            .await;
+        assert_eq!(
+            blocked.result.unwrap_err().problem.code,
+            "incompatible-target-cli"
+        );
+        let publication = blocked
+            .publication
+            .expect("new incompatible classification must publish once");
+        assert!(
+            publication
+                .problems
+                .iter()
+                .any(|problem| problem.code == "incompatible-target-cli")
+        );
+        let compatibility = fixture
+            .store
+            .compatibility_for(Target::Codex)
+            .await
+            .unwrap();
+        assert_eq!(compatibility.version, "unavailable");
+        assert_eq!(
+            compatibility.classification,
+            CompatibilityClassification::Incompatible
+        );
+        assert_eq!(
+            fixture.store.target_view_for(Target::Claude).await.unwrap(),
+            peer_before
         );
     }
 

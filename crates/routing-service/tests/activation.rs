@@ -22,8 +22,8 @@ use muxvia_routing::{
         framing::{read_frame, write_frame},
         protocol::{
             ActionOutcome, ActionStatus, ActivationMode, ClaudeBlockingSelector,
-            ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState, ControlProblem,
-            Target, TargetView,
+            ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState,
+            CompatibilityClassification, ControlProblem, Target, TargetView,
         },
         server::{ControlServer, ControlServerError},
     },
@@ -2577,7 +2577,7 @@ async fn claude_direct_accepts_existing_absolute_and_canonical_symlink_cwd() {
 }
 
 #[tokio::test]
-async fn claude_direct_provider_and_context_failures_are_pre_mutation() {
+async fn claude_direct_validation_failures_are_pre_write_and_persist_incompatibility() {
     for case in [
         "routing-required",
         "incomplete",
@@ -3674,13 +3674,40 @@ async fn assert_claude_direct_pre_mutation_failure(
     );
     assert_eq!(failure.problem.code, expected_problem.0);
     assert_eq!(failure.problem.selector, expected_problem.1);
-    assert_eq!(
-        fixture
-            .mutation_fingerprint_with_files(additional_files)
-            .await,
-        before,
-        "Claude fail-closed activation changed protected state"
-    );
+    let after = fixture
+        .mutation_fingerprint_with_files(additional_files)
+        .await;
+    if expected_problem.0 == "incompatible-target-cli" {
+        assert!(
+            after.files == before.files,
+            "incompatible Claude activation changed a protected file"
+        );
+        assert!(
+            after.sqlite != before.sqlite,
+            "incompatible Claude activation did not persist its blocker"
+        );
+        let compatibility = fixture
+            .store
+            .compatibility_for(Target::Claude)
+            .await
+            .unwrap();
+        assert_eq!(
+            compatibility.classification,
+            CompatibilityClassification::Incompatible
+        );
+        assert!(
+            failure
+                .authoritative_view
+                .problems
+                .iter()
+                .any(|problem| { problem.code == "incompatible-target-cli" })
+        );
+    } else {
+        assert_eq!(
+            after, before,
+            "Claude fail-closed activation changed protected state"
+        );
+    }
     let codex_after = fixture.store.target_view().await.unwrap();
     assert!(
         public_surface_is_secret_free(&codex_before, &["codex-provider-secret"]).is_ok()
@@ -3717,11 +3744,38 @@ async fn assert_activation_pre_mutation_failure(
         .unwrap_err();
 
     assert_eq!(failure.problem.code, expected_code);
-    assert_eq!(
-        fixture.mutation_fingerprint().await,
-        before,
-        "pre-mutation Direct failure changed protected state"
-    );
+    let after = fixture.mutation_fingerprint().await;
+    if expected_code == "incompatible-target-cli" {
+        assert!(
+            after.files == before.files,
+            "incompatible Direct activation changed a protected file"
+        );
+        assert!(
+            after.sqlite != before.sqlite,
+            "incompatible Direct activation did not persist its blocker"
+        );
+        let compatibility = fixture
+            .store
+            .compatibility_for(Target::Codex)
+            .await
+            .unwrap();
+        assert_eq!(
+            compatibility.classification,
+            CompatibilityClassification::Incompatible
+        );
+        assert!(
+            failure
+                .authoritative_view
+                .problems
+                .iter()
+                .any(|problem| { problem.code == "incompatible-target-cli" })
+        );
+    } else {
+        assert_eq!(
+            after, before,
+            "pre-mutation Direct failure changed protected state"
+        );
+    }
     assert_eq!(service.model_endpoint().await, endpoint_before);
     assert!(fixture.store.receipt(action_id).await.unwrap().is_none());
     assert!(updates.try_recv().is_err());
@@ -3995,7 +4049,7 @@ async fn direct_activation_commits_config_snapshot_and_receipt_without_model_rou
 }
 
 #[tokio::test]
-async fn direct_activation_validation_failures_are_authoritative_and_pre_mutation() {
+async fn direct_activation_validation_failures_are_pre_write_and_persist_incompatibility() {
     for case in [
         "takeover-required",
         "incomplete",
@@ -4528,7 +4582,7 @@ async fn activation_commits_one_complete_view_in_exact_observer_order_and_replay
 }
 
 #[tokio::test]
-async fn unknown_compatible_warning_is_committed_replayed_and_projected_after_reopen() {
+async fn unknown_compatible_requires_exact_ack_then_commits_replays_and_reopens() {
     let fixture = Fixture::new().await;
     let provider_secret = "provider-secret-must-not-appear-in-warning";
     let (provider_id, revision) = fixture.save("First", "gpt", provider_secret).await;
@@ -4541,6 +4595,34 @@ async fn unknown_compatible_warning_is_committed_replayed_and_projected_after_re
     );
     let action_id = Uuid::new_v4();
 
+    let blocked = service
+        .activate(command(provider_id, revision, action_id))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        blocked.problem.code,
+        "compatibility-acknowledgement-required"
+    );
+    assert!(
+        blocked
+            .authoritative_view
+            .problems
+            .iter()
+            .any(|problem| { problem.code == "compatibility-acknowledgement-required" })
+    );
+    let compatibility = fixture
+        .store
+        .compatibility_for(Target::Codex)
+        .await
+        .unwrap();
+    assert_eq!(compatibility.version, "99.0.0");
+    assert!(compatibility.acknowledgement_required);
+    fixture
+        .store
+        .acknowledge_compatibility(Target::Codex, "99.0.0")
+        .await
+        .unwrap();
+
     let applied = service
         .activate(command(provider_id, revision, action_id))
         .await
@@ -4548,7 +4630,10 @@ async fn unknown_compatible_warning_is_committed_replayed_and_projected_after_re
 
     assert_eq!(applied.view.problems.len(), 1);
     assert_eq!(applied.view.problems[0].code, "untested-target-cli");
-    assert!(applied.view.problems[0].message.contains("99.0.0"));
+    assert_eq!(
+        applied.view.problems[0].message,
+        "Target CLI version is untested"
+    );
     assert!(
         !serde_json::to_string(&applied)
             .unwrap()

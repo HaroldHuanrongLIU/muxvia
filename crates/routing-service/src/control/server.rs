@@ -700,7 +700,7 @@ async fn serve_session(
                                 _ => None,
                             });
                         let probe_unmanaged_provider_write = matches!(
-                            parsed_action,
+                            parsed_action.as_ref(),
                             Some(
                                 TargetAction::CreateProvider { .. }
                                     | TargetAction::UpdateProvider { .. }
@@ -767,15 +767,26 @@ async fn serve_session(
                                         )
                                         .await;
                                     match allowed.result {
-                                        Ok(()) => (activation
-                                            .apply_raw_for_with_context_already_held(
+                                        Ok(()) => {
+                                            let result = activation
+                                                .apply_raw_for_with_context_already_held(
                                                 target,
                                                 action_id,
                                                 expected_revision,
                                                 action,
                                                 opened_claude_context.as_ref(),
                                             )
-                                            .await, None),
+                                            .await;
+                                            let publication = result.as_ref().err().and_then(|failure| {
+                                                matches!(
+                                                    failure.problem.code.as_str(),
+                                                    "compatibility-acknowledgement-required"
+                                                        | "incompatible-target-cli"
+                                                )
+                                                .then(|| failure.authoritative_view.clone())
+                                            });
+                                            (result, publication)
+                                        }
                                         Err(failure) => (Err(failure), allowed.publication),
                                     }
                                 }
@@ -1102,8 +1113,10 @@ async fn enqueue_action_response(
     if acknowledged.await.is_err() {
         return false;
     }
-    if let Some(view) = publication {
-        store.publish_target_view(view).await;
+    if let Some(view) = publication
+        && store.publish_target_view(view).await.is_err()
+    {
+        return false;
     }
     true
 }

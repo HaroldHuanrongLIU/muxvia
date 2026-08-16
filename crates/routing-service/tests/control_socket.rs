@@ -3,7 +3,7 @@
 use std::{
     fs,
     future::Future,
-    os::unix::fs::{FileTypeExt, PermissionsExt},
+    os::unix::fs::{FileTypeExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -21,7 +21,7 @@ use muxvia_routing::{
         framing::{FrameError, read_frame, write_frame},
         protocol::{
             ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState,
-            ReconciliationStrategy, Target,
+            CompatibilityClassification, ReconciliationStrategy, Target,
         },
         server::{ControlServer, ControlServerHandle, peer_uid_matches},
     },
@@ -59,6 +59,31 @@ impl CodexProbe for ControlCodexProbe {
                 biased;
                 _ = cancellation.cancelled() => CommandCodexProbe.probe(Path::new("relative-codex")),
                 result = async { Ok(CodexCapability::Tested { version: "test".into() }) } => result,
+            }
+        })
+    }
+}
+
+struct UnknownCodexProbe(&'static str);
+
+impl CodexProbe for UnknownCodexProbe {
+    fn probe(&self, _: &Path) -> Result<CodexCapability, CodexProblem> {
+        Ok(CodexCapability::UnknownCompatible {
+            version: self.0.into(),
+            warning: "untested".into(),
+        })
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<CodexCapability, CodexProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandCodexProbe.probe(Path::new("relative-codex")),
+                result = async { self.probe(Path::new("/usr/bin/codex")) } => result,
             }
         })
     }
@@ -148,6 +173,31 @@ impl ClaudeProbe for ControlClaudeProbe {
     }
 }
 
+struct UnknownClaudeProbe(&'static str);
+
+impl ClaudeProbe for UnknownClaudeProbe {
+    fn probe(&self, _: &Path) -> Result<ClaudeCapability, ClaudeProblem> {
+        Ok(ClaudeCapability::UnknownCompatible {
+            version: self.0.into(),
+            warning: "untested".into(),
+        })
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeCapability, ClaudeProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandClaudeProbe.probe(Path::new("relative-claude")),
+                result = async { self.probe(Path::new("/usr/bin/claude")) } => result,
+            }
+        })
+    }
+}
+
 struct CountingClaudeProbe(AtomicUsize);
 
 impl ClaudeProbe for CountingClaudeProbe {
@@ -191,6 +241,30 @@ fn assert_claude_direct_wire_is_secret_free(value: &Value) {
             "Claude Direct wire surface exposed a credential or setting"
         );
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SecretFileFingerprint {
+    length: usize,
+    sha256: [u8; 32],
+}
+
+fn secret_file_fingerprint(path: &Path) -> SecretFileFingerprint {
+    let bytes = fs::read(path).unwrap();
+    SecretFileFingerprint {
+        length: bytes.len(),
+        sha256: ring::digest::digest(&ring::digest::SHA256, &bytes)
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    }
+}
+
+fn assert_secret_file_unchanged(path: &Path, expected: &SecretFileFingerprint) {
+    assert!(
+        secret_file_fingerprint(path) == *expected,
+        "secret-bearing artifact changed unexpectedly"
+    );
 }
 
 #[async_trait]
@@ -1243,9 +1317,9 @@ async fn reconciliation_preview_codex_direct_is_read_only_and_emits_no_target_vi
         .as_u64()
         .unwrap();
     let _activated_push = read_frame(&mut stream).await.unwrap();
-    let before_database = fs::read(home.database_path()).unwrap();
+    let before_database = secret_file_fingerprint(home.database_path());
     let runtime_config = user_home.join(".codex/config.toml");
-    let before_config = fs::read(&runtime_config).unwrap();
+    let before_config = secret_file_fingerprint(&runtime_config);
 
     let preview = request(
         &mut stream,
@@ -1271,8 +1345,8 @@ async fn reconciliation_preview_codex_direct_is_read_only_and_emits_no_target_vi
     assert_eq!(runtime_probe.calls.load(Ordering::SeqCst), 3);
     assert_eq!(preview["result"]["preview"]["managementRevision"], revision);
     assert!(!preview.to_string().contains("preview-secret"));
-    assert_eq!(fs::read(home.database_path()).unwrap(), before_database);
-    assert_eq!(fs::read(runtime_config).unwrap(), before_config);
+    assert_secret_file_unchanged(home.database_path(), &before_database);
+    assert_secret_file_unchanged(&runtime_config, &before_config);
     assert!(
         tokio::time::timeout(Duration::from_millis(100), read_frame(&mut stream))
             .await
@@ -1344,9 +1418,9 @@ async fn reconciliation_preview_uses_activation_codex_home_override_and_mutates_
     )
     .await
     .unwrap();
-    let before_database = fs::read(home.database_path()).unwrap();
+    let before_database = secret_file_fingerprint(home.database_path());
     let config = user_home.join(".codex/config.toml");
-    let before_config = fs::read(&config).unwrap();
+    let before_config = secret_file_fingerprint(&config);
     let before_view = store.target_view_for(Target::Codex).await.unwrap();
     let mut published = store.subscribe_target_views();
     assert_eq!(activation.model_endpoint_for(Target::Codex).await, None);
@@ -1377,8 +1451,8 @@ async fn reconciliation_preview_uses_activation_codex_home_override_and_mutates_
         })
     );
     assert_eq!(handle.tracked_reconciliation_tokens().await, 0);
-    assert_eq!(fs::read(home.database_path()).unwrap(), before_database);
-    assert_eq!(fs::read(config).unwrap(), before_config);
+    assert_secret_file_unchanged(home.database_path(), &before_database);
+    assert_secret_file_unchanged(&config, &before_config);
     assert_eq!(
         store.target_view_for(Target::Codex).await.unwrap(),
         before_view
@@ -1426,9 +1500,9 @@ async fn reconciliation_preview_uses_claude_home_context_and_mutates_nothing() {
     )
     .await
     .unwrap();
-    let before_database = fs::read(home.database_path()).unwrap();
+    let before_database = secret_file_fingerprint(home.database_path());
     let config = user_home.join(".claude/settings.json");
-    let before_config = fs::read(&config).unwrap();
+    let before_config = secret_file_fingerprint(&config);
     let before_view = store.target_view_for(Target::Claude).await.unwrap();
     let mut published = store.subscribe_target_views();
     assert_eq!(activation.model_endpoint_for(Target::Claude).await, None);
@@ -1468,8 +1542,8 @@ async fn reconciliation_preview_uses_claude_home_context_and_mutates_nothing() {
         })
     );
     assert_eq!(handle.tracked_reconciliation_tokens().await, 0);
-    assert_eq!(fs::read(home.database_path()).unwrap(), before_database);
-    assert_eq!(fs::read(config).unwrap(), before_config);
+    assert_secret_file_unchanged(home.database_path(), &before_database);
+    assert_secret_file_unchanged(&config, &before_config);
     assert_eq!(
         store.target_view_for(Target::Claude).await.unwrap(),
         before_view
@@ -4329,6 +4403,350 @@ async fn claude_unknown_nonempty_session_opens_read_only_but_takeover_has_no_sid
         "a pre-side-effect blocker published a Target View"
     );
     handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_targets_and_modes() {
+    for (target, target_name, mode) in [
+        (Target::Codex, "codex", "direct"),
+        (Target::Codex, "codex", "takeover"),
+        (Target::Claude, "claude", "direct"),
+        (Target::Claude, "claude", "takeover"),
+    ] {
+        let root = short_temp_root(&format!("mx-unknown-{target_name}-{mode}"));
+        let user_home = root.join("home");
+        fs::create_dir_all(&user_home).unwrap();
+        let home = MuxviaHome::from_user_home(&user_home);
+        let store = Arc::new(StateStore::open(&home).await.unwrap());
+        let saved = store
+            .apply_provider_action_for(
+                target,
+                Uuid::new_v4(),
+                0,
+                match target {
+                    Target::Codex => json!({
+                        "kind": "create-provider", "name": "Codex unknown",
+                        "baseUrl": "https://api.openai.test/v1", "model": "gpt-test",
+                        "credential": {"kind": "replace", "value": "UNKNOWN_CODEX_SECRET_98101"},
+                        "authentication": "openai-bearer", "presetKey": null
+                    }),
+                    Target::Claude => json!({
+                        "kind": "create-provider", "name": "Claude unknown",
+                        "baseUrl": "https://api.anthropic.test", "model": "claude-test",
+                        "credential": {"kind": "replace", "value": "UNKNOWN_CLAUDE_SECRET_98102"},
+                        "authentication": "anthropic-api-key", "presetKey": null
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let provider_id = saved.view.providers[0].id;
+        let peer_target = match target {
+            Target::Codex => Target::Claude,
+            Target::Claude => Target::Codex,
+        };
+        let peer_before =
+            serde_json::to_vec(&store.target_view_for(peer_target).await.unwrap()).unwrap();
+        assert!(
+            !peer_before
+                .windows(b"UNKNOWN_CODEX_SECRET_98101".len())
+                .any(|bytes| { bytes == b"UNKNOWN_CODEX_SECRET_98101" })
+        );
+        assert!(
+            !peer_before
+                .windows(b"UNKNOWN_CLAUDE_SECRET_98102".len())
+                .any(|bytes| { bytes == b"UNKNOWN_CLAUDE_SECRET_98102" })
+        );
+        let activation = Arc::new(
+            ActivationService::new(
+                Arc::clone(&store),
+                home.clone(),
+                Arc::new(UnknownCodexProbe("codex-unknown-8.1")),
+                "/usr/bin/codex".into(),
+                Arc::new(ControlNoopUpstream),
+            )
+            .with_claude_runtime(
+                Arc::new(UnknownClaudeProbe("claude-unknown-8.1")),
+                "/usr/bin/claude".into(),
+            ),
+        );
+        let handle = ControlServer::bind_with_activation(
+            &home,
+            Arc::clone(&store),
+            "routing-test",
+            activation,
+        )
+        .await
+        .unwrap();
+        let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+        hello(&mut stream).await;
+        let claude_context = (target == Target::Claude).then(|| {
+            json!({
+                "claudeConfigDir": null,
+                "selectorState": "unset",
+                "blockingSelector": null,
+                "hostManagedState": "unmanaged",
+                "cwd": user_home
+            })
+        });
+        let opened = request(
+            &mut stream,
+            "open",
+            json!({
+                "kind": "open-target", "target": target_name,
+                "claudeContext": claude_context
+            }),
+        )
+        .await;
+        let revision = opened["result"]["view"]["managementRevision"]
+            .as_u64()
+            .unwrap();
+
+        let blocked = request(
+            &mut stream,
+            "blocked-activation",
+            json!({
+                "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
+                "expectedRevision": revision,
+                "action": {
+                    "kind": "activate-provider", "providerId": provider_id, "mode": mode
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            blocked["problem"]["code"],
+            "compatibility-acknowledgement-required"
+        );
+        let blocked_wire = blocked.to_string();
+        assert!(!blocked_wire.contains("UNKNOWN_CODEX_SECRET_98101"));
+        assert!(!blocked_wire.contains("UNKNOWN_CLAUDE_SECRET_98102"));
+        let projected = read_frame(&mut stream).await.unwrap();
+        assert_eq!(projected["type"], "target-view");
+        assert!(
+            projected["view"]["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|problem| { problem["code"] == "compatibility-acknowledgement-required" })
+        );
+        let version = format!("{target_name}-unknown-8.1");
+        let compatibility = store.compatibility_for(target).await.unwrap();
+        assert_eq!(compatibility.version, version);
+        assert_eq!(
+            compatibility.classification,
+            CompatibilityClassification::UnknownCompatible
+        );
+        assert!(compatibility.acknowledgement_required);
+        let peer_after =
+            serde_json::to_vec(&store.target_view_for(peer_target).await.unwrap()).unwrap();
+        assert!(
+            peer_after == peer_before,
+            "compatibility blocking changed the peer Target view"
+        );
+        assert!(
+            !user_home
+                .join(format!(
+                    ".{target_name}/{}",
+                    if target == Target::Codex {
+                        "config.toml"
+                    } else {
+                        "settings.json"
+                    }
+                ))
+                .exists()
+        );
+
+        store
+            .acknowledge_compatibility(target, &version)
+            .await
+            .unwrap();
+        let activated = request(
+            &mut stream,
+            "acknowledged-activation",
+            json!({
+                "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
+                "expectedRevision": revision,
+                "action": {
+                    "kind": "activate-provider", "providerId": provider_id, "mode": mode
+                }
+            }),
+        )
+        .await;
+        assert_eq!(activated["type"], "response");
+        assert_eq!(activated["result"]["outcome"]["status"], "applied");
+        assert!(
+            !activated["result"]["outcome"]["view"]["problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|problem| problem["code"] == "compatibility-acknowledgement-required")
+        );
+        let _activation_push = read_frame(&mut stream).await.unwrap();
+        handle.shutdown().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn reconciliation_adopt_persists_codec_canonical_path_for_directory_symlinks() {
+    for (target, target_name, directory, file_name) in [
+        (Target::Codex, "codex", ".codex", "config.toml"),
+        (Target::Claude, "claude", ".claude", "settings.json"),
+    ] {
+        let root = short_temp_root(&format!("mx-canonical-{target_name}"));
+        let user_home = root.join("home");
+        let canonical_home = root.join(format!("canonical-{target_name}"));
+        fs::create_dir_all(&user_home).unwrap();
+        fs::create_dir(&canonical_home).unwrap();
+        symlink(&canonical_home, user_home.join(directory)).unwrap();
+        let home = MuxviaHome::from_user_home(&user_home);
+        let store = Arc::new(StateStore::open(&home).await.unwrap());
+        let activation = Arc::new(
+            ActivationService::new(
+                Arc::clone(&store),
+                home.clone(),
+                Arc::new(ControlCodexProbe),
+                "/usr/bin/codex".into(),
+                Arc::new(ControlNoopUpstream),
+            )
+            .with_claude_runtime(Arc::new(ControlClaudeProbe), "/usr/bin/claude".into()),
+        );
+        let handle = ControlServer::bind_with_activation(
+            &home,
+            Arc::clone(&store),
+            "routing-test",
+            activation,
+        )
+        .await
+        .unwrap();
+        let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+        hello(&mut stream).await;
+        let claude_context = (target == Target::Claude).then(|| {
+            json!({
+                "claudeConfigDir": null,
+                "selectorState": "unset",
+                "blockingSelector": null,
+                "hostManagedState": "unmanaged",
+                "cwd": user_home
+            })
+        });
+        let opened = request(
+            &mut stream,
+            "open",
+            json!({
+                "kind": "open-target", "target": target_name,
+                "claudeContext": claude_context
+            }),
+        )
+        .await;
+        let saved = request(
+            &mut stream,
+            "save",
+            json!({
+                "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
+                "expectedRevision": opened["result"]["view"]["managementRevision"],
+                "action": match target {
+                    Target::Codex => json!({
+                        "kind": "create-provider", "name": "Canonical Codex",
+                        "baseUrl": "https://api.openai.test/v1", "model": "gpt-test",
+                        "credential": {"kind": "replace", "value": "CANONICAL_CODEX_SECRET_98201"},
+                        "authentication": "openai-bearer", "presetKey": null
+                    }),
+                    Target::Claude => json!({
+                        "kind": "create-provider", "name": "Canonical Claude",
+                        "baseUrl": "https://api.anthropic.test", "model": "claude-test",
+                        "credential": {"kind": "replace", "value": "CANONICAL_CLAUDE_SECRET_98202"},
+                        "authentication": "anthropic-api-key", "presetKey": null
+                    }),
+                }
+            }),
+        )
+        .await;
+        let _save_push = read_frame(&mut stream).await.unwrap();
+        let activated = request(
+            &mut stream,
+            "activate",
+            json!({
+                "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
+                "expectedRevision": saved["result"]["outcome"]["view"]["managementRevision"],
+                "action": {
+                    "kind": "activate-provider",
+                    "providerId": saved["result"]["outcome"]["view"]["providers"][0]["id"],
+                    "mode": "direct"
+                }
+            }),
+        )
+        .await;
+        let _activation_push = read_frame(&mut stream).await.unwrap();
+        assert_eq!(activated["type"], "response");
+        let canonical_path = fs::canonicalize(&canonical_home).unwrap().join(file_name);
+        match target {
+            Target::Codex => fs::write(
+                &canonical_path,
+                r#"model = "external-model"
+model_provider = "external"
+[model_providers.external]
+name = "External"
+base_url = "https://external.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer EXTERNAL_CODEX_SECRET_98203" }
+supports_websockets = false
+"#,
+            )
+            .unwrap(),
+            Target::Claude => fs::write(
+                &canonical_path,
+                serde_json::to_vec_pretty(&json!({
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://external.example",
+                        "ANTHROPIC_MODEL": "external-model",
+                        "ANTHROPIC_API_KEY": "EXTERNAL_CLAUDE_SECRET_98204"
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+        }
+        let preview = request(
+            &mut stream,
+            "preview",
+            json!({
+                "kind": "preview-reconciliation", "target": target_name, "strategy": "adopt"
+            }),
+        )
+        .await;
+        let adopted = request(
+            &mut stream,
+            "adopt",
+            json!({
+                "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
+                "expectedRevision": preview["result"]["preview"]["managementRevision"],
+                "action": {
+                    "kind": "reconcile", "strategy": "adopt",
+                    "observationToken": preview["result"]["preview"]["observationToken"]
+                }
+            }),
+        )
+        .await;
+        assert_eq!(adopted["type"], "response");
+        assert_eq!(
+            adopted["result"]["outcome"]["view"]["managedConfiguration"]["path"],
+            canonical_path.to_string_lossy().as_ref()
+        );
+        let recovery_id = Uuid::parse_str(
+            adopted["result"]["outcome"]["view"]["recovery"]["intentId"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let recovery = store.recovery_intent(recovery_id).await.unwrap().unwrap();
+        assert_eq!(recovery.config_path(), canonical_path);
+        let push = read_frame(&mut stream).await.unwrap();
+        assert_eq!(push["view"], adopted["result"]["outcome"]["view"]);
+        handle.shutdown().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[test]

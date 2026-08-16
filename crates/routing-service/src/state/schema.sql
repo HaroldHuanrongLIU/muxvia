@@ -53,6 +53,10 @@ CREATE TABLE IF NOT EXISTS target_problems (
   target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
   code TEXT NOT NULL,
   message TEXT NOT NULL,
+  source TEXT CHECK (source IS NULL OR source IN (
+    'codex-profile', 'claude-managed', 'claude-shared', 'claude-project',
+    'claude-local', 'claude-selector', 'claude-host-managed'
+  )),
   PRIMARY KEY (target, code)
 );
 

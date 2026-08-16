@@ -65,6 +65,9 @@ impl ReservedListener {
 
 pub struct ModelServer;
 
+const RESERVED_BIT: usize = 1;
+const ACTIVE_REQUEST_INCREMENT: usize = 2;
+
 pub struct ModelServerHandle {
     endpoint: SocketAddr,
     activate: Option<oneshot::Sender<()>>,
@@ -73,8 +76,9 @@ pub struct ModelServerHandle {
     task: Option<JoinHandle<Result<(), io::Error>>>,
     status: Arc<AtomicU8>,
     shutdown_requested: Arc<AtomicBool>,
-    active_requests: Arc<AtomicUsize>,
-    accepting_requests: Arc<AtomicBool>,
+    admission: Arc<AtomicUsize>,
+    #[cfg(test)]
+    reservation_attempt_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,8 +113,7 @@ pub(crate) struct RouteState {
     pub(crate) target: Target,
     pub(crate) store: Arc<StateStore>,
     pub(crate) upstream: Arc<dyn UpstreamTransport>,
-    pub(crate) active_requests: Arc<AtomicUsize>,
-    pub(crate) accepting_requests: Arc<AtomicBool>,
+    pub(crate) admission: Arc<AtomicUsize>,
 }
 
 impl Clone for RouteState {
@@ -119,8 +122,7 @@ impl Clone for RouteState {
             target: self.target,
             store: Arc::clone(&self.store),
             upstream: Arc::clone(&self.upstream),
-            active_requests: Arc::clone(&self.active_requests),
-            accepting_requests: Arc::clone(&self.accepting_requests),
+            admission: Arc::clone(&self.admission),
         }
     }
 }
@@ -156,11 +158,9 @@ impl ModelServer {
             target,
             store,
             upstream,
-            active_requests: Arc::new(AtomicUsize::new(0)),
-            accepting_requests: Arc::new(AtomicBool::new(true)),
+            admission: Arc::new(AtomicUsize::new(0)),
         };
-        let active_requests = Arc::clone(&state.active_requests);
-        let accepting_requests = Arc::clone(&state.accepting_requests);
+        let admission = Arc::clone(&state.admission);
         let router = match target {
             Target::Codex => Router::new().route("/v1/responses", post(route_responses)),
             Target::Claude => Router::new()
@@ -215,8 +215,9 @@ impl ModelServer {
             task: Some(task),
             status,
             shutdown_requested,
-            active_requests,
-            accepting_requests,
+            admission,
+            #[cfg(test)]
+            reservation_attempt_hook: None,
         };
         if handle.task.as_ref().is_none_or(JoinHandle::is_finished) {
             return Err(ModelServerError::Task);
@@ -251,27 +252,31 @@ impl ModelServerHandle {
     }
 
     pub fn active_request_count(&self) -> usize {
-        self.active_requests.load(Ordering::Acquire)
+        self.admission.load(Ordering::Acquire) / ACTIVE_REQUEST_INCREMENT
     }
 
     pub(crate) fn try_reserve_idle(&self) -> bool {
-        if self
-            .accepting_requests
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return false;
+        let reserved = self
+            .admission
+            .compare_exchange(0, RESERVED_BIT, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        #[cfg(test)]
+        if let Some(hook) = &self.reservation_attempt_hook {
+            hook();
         }
-        if self.active_request_count() == 0 {
-            true
-        } else {
-            self.accepting_requests.store(true, Ordering::Release);
-            false
-        }
+        reserved
     }
 
     pub(crate) fn release_idle_reservation(&self) {
-        self.accepting_requests.store(true, Ordering::Release);
+        let released =
+            self.admission
+                .compare_exchange(RESERVED_BIT, 0, Ordering::AcqRel, Ordering::Acquire);
+        debug_assert!(released.is_ok());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reservation_attempt_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.reservation_attempt_hook = Some(hook);
     }
 
     pub async fn activate(&mut self) -> Result<(), ModelServerError> {
@@ -353,10 +358,7 @@ async fn route_responses(
         Ok(Some(snapshot)) => snapshot,
         Ok(None) | Err(_) => return local_response(StatusCode::SERVICE_UNAVAILABLE),
     };
-    let Some(active_request) = ActiveRequestGuard::try_begin(
-        Arc::clone(&state.active_requests),
-        Arc::clone(&state.accepting_requests),
-    ) else {
+    let Some(active_request) = ActiveRequestGuard::try_begin(Arc::clone(&state.admission)) else {
         return local_response(StatusCode::SERVICE_UNAVAILABLE);
     };
     let url = match responses_url(snapshot.base_url()) {
@@ -395,27 +397,34 @@ async fn route_responses(
 }
 
 pub(crate) struct ActiveRequestGuard {
-    count: Arc<AtomicUsize>,
+    admission: Arc<AtomicUsize>,
 }
 
 impl ActiveRequestGuard {
-    pub(crate) fn try_begin(count: Arc<AtomicUsize>, accepting: Arc<AtomicBool>) -> Option<Self> {
-        if !accepting.load(Ordering::Acquire) {
-            return None;
-        }
-        count.fetch_add(1, Ordering::AcqRel);
-        if accepting.load(Ordering::Acquire) {
-            Some(Self { count })
-        } else {
-            count.fetch_sub(1, Ordering::AcqRel);
-            None
+    pub(crate) fn try_begin(admission: Arc<AtomicUsize>) -> Option<Self> {
+        let mut observed = admission.load(Ordering::Acquire);
+        loop {
+            if observed & RESERVED_BIT != 0 {
+                return None;
+            }
+            let next = observed.checked_add(ACTIVE_REQUEST_INCREMENT)?;
+            match admission.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self { admission }),
+                Err(actual) => observed = actual,
+            }
         }
     }
 }
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
-        self.count.fetch_sub(1, Ordering::AcqRel);
+        self.admission
+            .fetch_sub(ACTIVE_REQUEST_INCREMENT, Ordering::AcqRel);
     }
 }
 

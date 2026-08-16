@@ -528,11 +528,8 @@ impl StateStore {
                 } else {
                     None
                 };
-                let prior_recovery_payload = if target == Target::Claude {
-                    committed_recovery.map(|expectation| expectation.payload)
-                } else {
-                    None
-                };
+                let prior_recovery_payload =
+                    committed_recovery.map(|expectation| expectation.payload);
                 let provider = connection.query_row(
                     "SELECT p.base_url, p.model, c.bearer_token, p.protocol, p.authentication, p.routing_requirement
                      FROM providers p LEFT JOIN credentials c ON c.id = p.credential_id
@@ -984,6 +981,8 @@ impl StateStore {
                        WHERE takeover_state = 'active' OR recovery_state = 'recovery-required'
                        UNION ALL
                        SELECT 1 FROM activation_recovery WHERE state = 'pending'
+                       UNION ALL
+                       SELECT 1 FROM reconciliation_intents WHERE state = 'pending'
                        UNION ALL
                        SELECT 1 FROM target_problems WHERE code = 'configuration-drift'
                      )",

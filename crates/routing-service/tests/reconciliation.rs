@@ -11,8 +11,8 @@ use std::{
 use async_trait::async_trait;
 use futures_util::stream;
 use muxvia_routing::{
-    claude::CommandClaudeProbe,
-    codex::CommandCodexProbe,
+    claude::{ClaudeConfigCodec, ClaudeConfigSnapshot, CommandClaudeProbe, DesiredClaudeState},
+    codex::{CodexConfigCodec, CommandCodexProbe, ConfigSnapshot, DesiredCodexState},
     control::{
         framing::{read_frame, write_frame},
         protocol::Target,
@@ -270,6 +270,309 @@ fn rewrite_probe_as_incompatible(executable: &Path, target: Target) {
     };
     fs::write(executable, script).unwrap();
     fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+async fn managed_config_version_for(home: &MuxviaHome, target: Target) -> u32 {
+    tokio_rusqlite::Connection::open(home.database_path())
+        .await
+        .unwrap()
+        .call(move |connection| {
+            connection.query_row(
+                "SELECT managed_config_version FROM target_route_state WHERE target = ?1",
+                [target.as_str()],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .unwrap()
+}
+
+async fn seed_pending_reconciliation_intent(
+    home: &MuxviaHome,
+    target: Target,
+    action_id: Uuid,
+    before_json: String,
+    desired_json: String,
+) {
+    tokio_rusqlite::Connection::open(home.database_path())
+        .await
+        .unwrap()
+        .call(move |connection| {
+            connection.execute(
+                "INSERT INTO reconciliation_intents
+                 (action_id, target, strategy, state, created_revision, before_json, desired_json)
+                 VALUES (?1, ?2, 'reapply', 'pending',
+                   (SELECT management_revision FROM target_route_state WHERE target = ?2), ?3, ?4)",
+                tokio_rusqlite::rusqlite::params![
+                    action_id.to_string(),
+                    target.as_str(),
+                    before_json,
+                    desired_json
+                ],
+            )?;
+            Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+}
+
+async fn committed_recovery_desired_json(home: &MuxviaHome, target: Target) -> String {
+    let payload = tokio_rusqlite::Connection::open(home.database_path())
+        .await
+        .unwrap()
+        .call(move |connection| {
+            connection.query_row(
+                "SELECT a.payload_json FROM target_route_state r
+                 JOIN activation_recovery a ON a.id = r.recovery_intent_id
+                 WHERE r.target = ?1",
+                [target.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+        })
+        .await
+        .unwrap();
+    serde_json::from_str::<Value>(&payload).unwrap()["desired"].to_string()
+}
+
+#[tokio::test]
+async fn startup_recovers_pending_reconciliation_intents_for_both_targets_and_crash_boundaries() {
+    for (target, after_write) in [
+        (Target::Codex, false),
+        (Target::Codex, true),
+        (Target::Claude, false),
+        (Target::Claude, true),
+    ] {
+        let root = PathBuf::from("/tmp").join(format!(
+            "mx-reconcile-restart-{}-{}-{}",
+            target.as_str(),
+            if after_write { "write" } else { "intent" },
+            &Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let user_home = root.join("home");
+        fs::create_dir_all(&user_home).unwrap();
+        let home = MuxviaHome::from_user_home(&user_home);
+        let store = Arc::new(StateStore::open(&home).await.unwrap());
+        let activation = Arc::new(
+            ActivationService::new(
+                Arc::clone(&store),
+                home.clone(),
+                Arc::new(CommandCodexProbe),
+                probe_executable(&root, Target::Codex),
+                Arc::new(NoopUpstream),
+            )
+            .with_claude_runtime(
+                Arc::new(CommandClaudeProbe),
+                probe_executable(&root, Target::Claude),
+            ),
+        );
+        let handle = ControlServer::bind_with_activation(
+            &home,
+            Arc::clone(&store),
+            "test",
+            Arc::clone(&activation),
+        )
+        .await
+        .unwrap();
+        activate_takeover(
+            handle.socket_path(),
+            target,
+            &user_home,
+            ProviderFixture {
+                name: "Restart provider",
+                base_url: match target {
+                    Target::Codex => "https://restart-codex.example/v1",
+                    Target::Claude => "https://restart-claude.example/v1",
+                },
+                model: "restart-model",
+                authentication: match target {
+                    Target::Codex => "openai-bearer",
+                    Target::Claude => "anthropic-api-key",
+                },
+                secret: "RESTART_PROVIDER_SECRET_97106",
+            },
+        )
+        .await;
+        let desired_json = committed_recovery_desired_json(&home, target).await;
+        let before_json = match target {
+            Target::Codex => {
+                let codec = CodexConfigCodec::for_user_home(&user_home).unwrap();
+                fs::write(
+                    codec.config_path(),
+                    r#"model = "restart-drift-model"
+model_provider = "restart_external"
+[model_providers.restart_external]
+name = "Restart external"
+base_url = "https://restart-drift.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer RESTART_DRIFT_SECRET_97107" }
+supports_websockets = false
+"#,
+                )
+                .unwrap();
+                let before = codec.inspect().unwrap();
+                let json = serde_json::to_string(&before).unwrap();
+                if after_write {
+                    let desired: DesiredCodexState = serde_json::from_str(&desired_json).unwrap();
+                    codec.atomic_apply(&before, &desired).unwrap();
+                }
+                json
+            }
+            Target::Claude => {
+                let codec = ClaudeConfigCodec::for_user_home(&user_home).unwrap();
+                fs::write(
+                    codec.settings_path(),
+                    serde_json::to_vec_pretty(&json!({
+                        "env": {
+                            "ANTHROPIC_BASE_URL": "https://restart-drift.example/v1",
+                            "ANTHROPIC_MODEL": "restart-drift-model",
+                            "ANTHROPIC_AUTH_TOKEN": "RESTART_DRIFT_SECRET_97108",
+                            "OPERATOR_SETTING": "preserve"
+                        }
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                let before = codec.inspect().unwrap();
+                let json = serde_json::to_string(&before).unwrap();
+                if after_write {
+                    let desired: DesiredClaudeState = serde_json::from_str(&desired_json).unwrap();
+                    codec.atomic_apply(&before, &desired).unwrap();
+                }
+                json
+            }
+        };
+        let action_id = Uuid::new_v4();
+        seed_pending_reconciliation_intent(
+            &home,
+            target,
+            action_id,
+            before_json.clone(),
+            desired_json.clone(),
+        )
+        .await;
+        let provider_count = store.target_view_for(target).await.unwrap().providers.len();
+
+        handle.shutdown().await.unwrap();
+        activation.shutdown_models().await.unwrap();
+        drop(activation);
+        drop(store);
+
+        let reopened = Arc::new(StateStore::open(&home).await.unwrap());
+        let restarted_activation = Arc::new(
+            ActivationService::new(
+                Arc::clone(&reopened),
+                home.clone(),
+                Arc::new(CommandCodexProbe),
+                probe_executable(&root, Target::Codex),
+                Arc::new(NoopUpstream),
+            )
+            .with_claude_runtime(
+                Arc::new(CommandClaudeProbe),
+                probe_executable(&root, Target::Claude),
+            ),
+        );
+        let restarted = ControlServer::bind_with_activation(
+            &home,
+            Arc::clone(&reopened),
+            "test",
+            Arc::clone(&restarted_activation),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.managed_write_status_for(target).await.unwrap(),
+            muxvia_routing::state::ManagedWriteStatus::ConfigurationDrift
+        );
+        let intent_state = tokio_rusqlite::Connection::open(home.database_path())
+            .await
+            .unwrap()
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT state FROM reconciliation_intents
+                     WHERE target = ?1 AND action_id = ?2",
+                    tokio_rusqlite::rusqlite::params![target.as_str(), action_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(intent_state, "rolled-back");
+        assert!(
+            reopened
+                .receipt_for(target, action_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        match target {
+            Target::Codex => {
+                let before: ConfigSnapshot = serde_json::from_str(&before_json).unwrap();
+                let desired: DesiredCodexState = serde_json::from_str(&desired_json).unwrap();
+                CodexConfigCodec::for_user_home(&user_home)
+                    .unwrap()
+                    .restore_or_confirm_before(&before, &desired)
+                    .unwrap();
+            }
+            Target::Claude => {
+                let before: ClaudeConfigSnapshot = serde_json::from_str(&before_json).unwrap();
+                let desired: DesiredClaudeState = serde_json::from_str(&desired_json).unwrap();
+                ClaudeConfigCodec::for_user_home(&user_home)
+                    .unwrap()
+                    .restore_or_confirm_before(&before, &desired)
+                    .unwrap();
+            }
+        }
+
+        let mut stream = UnixStream::connect(restarted.socket_path()).await.unwrap();
+        hello(&mut stream).await;
+        let opened = request(
+            &mut stream,
+            "restart-open",
+            open_operation(target, &user_home),
+        )
+        .await;
+        let preview = request(
+            &mut stream,
+            "restart-preview",
+            json!({"kind":"preview-reconciliation","target":target,"strategy":"reapply"}),
+        )
+        .await;
+        let applied = request(
+            &mut stream,
+            "restart-retry",
+            json!({
+                "kind":"act","target":target,"actionId":action_id,
+                "expectedRevision":opened["result"]["view"]["managementRevision"],
+                "action":{"kind":"reconcile","strategy":"reapply",
+                    "observationToken":preview["result"]["preview"]["observationToken"],
+                    "acknowledgeVersion": match target {
+                        Target::Codex => "codex-cli 77.1.0",
+                        Target::Claude => "77.1.0 (Claude Code)",
+                    }}
+            }),
+        )
+        .await;
+        assert_eq!(applied["type"], "response", "{applied}");
+        assert_eq!(
+            applied["result"]["outcome"]["view"]["providers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            provider_count
+        );
+        let _push = read_frame(&mut stream).await.unwrap();
+        assert!(
+            reopened
+                .receipt_for(target, action_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        restarted.shutdown().await.unwrap();
+        restarted_activation.shutdown_models().await.unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[tokio::test]
@@ -741,9 +1044,33 @@ async fn adopt_reconciliation_creates_immutable_history_and_receipt_first_replay
     .await;
     let peer_endpoint = activation.model_endpoint_for(Target::Claude).await.unwrap();
     let historical = store.target_view_for(Target::Codex).await.unwrap();
+    let route_credential = store
+        .routing_credential_for(Target::Codex)
+        .await
+        .unwrap()
+        .unwrap();
     let historical_provider_id = historical.current_provider_id.clone().unwrap();
     let historical_snapshot = historical.activated_snapshot.clone().unwrap();
-    let managed_bytes = fs::read(user_home.join(".codex/config.toml")).unwrap();
+    let route_secret_configuration = format!(
+        r#"model = "must-not-adopt-route-secret"
+model_provider = "external_route"
+
+[model_providers.external_route]
+name = "External route"
+base_url = "https://externally-changed.example/v1"
+wire_api = "responses"
+http_headers = {{ "X-Muxvia-Routing-Credential" = {} }}
+supports_websockets = false
+"#,
+        serde_json::to_string(route_credential.expose_secret()).unwrap()
+    );
+    fs::write(
+        user_home.join(".codex/config.toml"),
+        &route_secret_configuration,
+    )
+    .unwrap();
+    let route_secret_bytes = fs::read(user_home.join(".codex/config.toml")).unwrap();
+    let route_secret_view = store.target_view_for(Target::Codex).await.unwrap();
     let mut recursive = UnixStream::connect(handle.socket_path()).await.unwrap();
     hello(&mut recursive).await;
     let _opened = request(
@@ -758,7 +1085,7 @@ async fn adopt_reconciliation_creates_immutable_history_and_receipt_first_replay
         json!({"kind":"preview-reconciliation","target":"codex","strategy":"adopt"}),
     )
     .await;
-    let recursive_rejected = request(
+    let recursive_rejected_raw = request_raw(
         &mut recursive,
         "recursive-apply",
         json!({
@@ -772,23 +1099,36 @@ async fn adopt_reconciliation_creates_immutable_history_and_receipt_first_replay
         }),
     )
     .await;
+    assert_raw_frame_is_safe(&recursive_rejected_raw, &[route_credential.expose_secret()]);
+    let recursive_rejected: Value = serde_json::from_slice(&recursive_rejected_raw).unwrap();
     assert_eq!(
         recursive_rejected["problem"]["code"],
-        "stale-reconciliation-preview"
+        "invalid-provider-credential"
+    );
+    assert!(
+        fs::read(user_home.join(".codex/config.toml")).unwrap() == route_secret_bytes,
+        "rejected Codex Adopt changed the Managed Configuration"
     );
     assert_eq!(
-        fs::read(user_home.join(".codex/config.toml")).unwrap(),
-        managed_bytes
+        store.target_view_for(Target::Codex).await.unwrap(),
+        route_secret_view
     );
     assert!(activation.model_endpoint_for(Target::Codex).await.is_some());
     drop(recursive);
     fs::write(
         user_home.join(".codex/config.toml"),
         r#"model = "adopted-model"
-model_provider = "muxvia_codex"
+model_provider = "operator_openai"
 operator_setting = "preserved"
 
 [model_providers.muxvia_codex]
+name = "Stale Muxvia"
+base_url = "https://stale-muxvia.invalid/v1"
+wire_api = "chat"
+http_headers = { Authorization = "Bearer STALE_MUXVIA_SECRET_96204" }
+supports_websockets = true
+
+[model_providers.operator_openai]
 name = "Externally adopted"
 base_url = "https://adopted.example/v1"
 wire_api = "responses"
@@ -834,7 +1174,14 @@ supports_websockets = false
             "acknowledgeVersion":"codex-cli 77.1.0"}
     });
     let raw = request_raw(&mut stream, "apply", operation.clone()).await;
-    assert_raw_frame_is_safe(&raw, &["HISTORICAL_SECRET_96201", "ADOPTED_SECRET_96202"]);
+    assert_raw_frame_is_safe(
+        &raw,
+        &[
+            "HISTORICAL_SECRET_96201",
+            "ADOPTED_SECRET_96202",
+            "STALE_MUXVIA_SECRET_96204",
+        ],
+    );
     let applied: Value = serde_json::from_slice(&raw).unwrap();
     assert_eq!(applied["type"], "response");
     let view = &applied["result"]["outcome"]["view"];
@@ -842,6 +1189,15 @@ supports_websockets = false
     assert_eq!(view["providers"].as_array().unwrap().len(), 2);
     assert_eq!(view["providers"][0]["id"], historical_provider_id);
     assert_ne!(view["currentProviderId"], historical_provider_id);
+    let adopted_provider = view["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == view["currentProviderId"])
+        .unwrap();
+    assert_eq!(adopted_provider["name"], "Externally adopted");
+    assert_eq!(adopted_provider["baseUrl"], "https://adopted.example/v1");
+    assert_eq!(adopted_provider["model"], "adopted-model");
     assert_ne!(
         view["activatedSnapshot"]["id"],
         historical_snapshot.id.to_string()
@@ -869,8 +1225,87 @@ supports_websockets = false
         "receipt replay published a second Target View"
     );
 
+    drop(stream);
+    handle.shutdown().await.unwrap();
+    let handle = ControlServer::bind_with_activation(
+        &home,
+        Arc::clone(&store),
+        "test",
+        Arc::clone(&activation),
+    )
+    .await
+    .unwrap();
+    let mut after_restart = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut after_restart).await;
+    let reopened = request(
+        &mut after_restart,
+        "open-after-adopt-restart",
+        open_operation(Target::Codex, &user_home),
+    )
+    .await;
+    let activated = request(
+        &mut after_restart,
+        "activate-after-adopt",
+        json!({
+            "kind":"act","target":"codex","actionId":Uuid::new_v4(),
+            "expectedRevision":reopened["result"]["view"]["managementRevision"],
+            "action":{"kind":"activate-provider","providerId":historical_provider_id,
+                "mode":"takeover"}
+        }),
+    )
+    .await;
+    assert_eq!(
+        activated["type"], "response",
+        "post-Adopt activation failed with {:?}",
+        activated["problem"]["code"]
+    );
+    let _push = read_frame(&mut after_restart).await.unwrap();
+    let activated_configuration = fs::read_to_string(user_home.join(".codex/config.toml")).unwrap();
+    assert!(activated_configuration.contains("model_provider = \"operator_openai\""));
+    assert!(activated_configuration.contains("[model_providers.operator_openai]"));
+    assert!(activated_configuration.contains("[model_providers.muxvia_codex]"));
+    assert!(activated_configuration.contains("STALE_MUXVIA_SECRET_96204"));
+
+    drop(after_restart);
     handle.shutdown().await.unwrap();
     activation.shutdown_models().await.unwrap();
+    drop(activation);
+    drop(store);
+    let restarted_store = Arc::new(StateStore::open(&home).await.unwrap());
+    let restarted_activation = Arc::new(
+        ActivationService::new(
+            Arc::clone(&restarted_store),
+            home.clone(),
+            Arc::new(CommandCodexProbe),
+            probe_executable(&root, Target::Codex),
+            Arc::new(NoopUpstream),
+        )
+        .with_claude_runtime(
+            Arc::new(CommandClaudeProbe),
+            probe_executable(&root, Target::Claude),
+        ),
+    );
+    let restarted = ControlServer::bind_with_activation(
+        &home,
+        Arc::clone(&restarted_store),
+        "test",
+        Arc::clone(&restarted_activation),
+    )
+    .await
+    .unwrap();
+    assert!(
+        restarted_activation
+            .model_endpoint_for(Target::Codex)
+            .await
+            .is_some()
+    );
+    assert_eq!(
+        fs::read_to_string(user_home.join(".codex/config.toml")).unwrap(),
+        activated_configuration
+    );
+
+    restarted.shutdown().await.unwrap();
+    restarted_activation.shutdown_models().await.unwrap();
     let _ = fs::remove_dir_all(root);
 }
 
@@ -1005,6 +1440,238 @@ async fn restore_reconciliation_exits_only_the_idle_target_and_retains_provider_
 }
 
 #[tokio::test]
+async fn claude_restore_reopens_as_valid_unmanaged_v1_without_changing_the_peer() {
+    let root = std::path::PathBuf::from("/tmp").join(format!(
+        "mx-claude-restore-reopen-{}",
+        &Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let codex_executable = probe_executable(&root, Target::Codex);
+    let claude_executable = probe_executable(&root, Target::Claude);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    let activation = Arc::new(
+        ActivationService::new(
+            Arc::clone(&store),
+            home.clone(),
+            Arc::new(CommandCodexProbe),
+            codex_executable.clone(),
+            Arc::new(NoopUpstream),
+        )
+        .with_claude_runtime(Arc::new(CommandClaudeProbe), claude_executable.clone()),
+    );
+    let handle = ControlServer::bind_with_activation(
+        &home,
+        Arc::clone(&store),
+        "test",
+        Arc::clone(&activation),
+    )
+    .await
+    .unwrap();
+    activate_takeover(
+        handle.socket_path(),
+        Target::Codex,
+        &user_home,
+        ProviderFixture {
+            name: "Restore peer",
+            base_url: "https://restore-peer.example/v1",
+            model: "restore-peer-model",
+            authentication: "openai-bearer",
+            secret: "RESTORE_PEER_SECRET_96311",
+        },
+    )
+    .await;
+    activate_takeover(
+        handle.socket_path(),
+        Target::Claude,
+        &user_home,
+        ProviderFixture {
+            name: "Claude restored target",
+            base_url: "https://claude-restored.example/v1",
+            model: "claude-restored-model",
+            authentication: "anthropic-api-key",
+            secret: "CLAUDE_RESTORED_SECRET_96312",
+        },
+    )
+    .await;
+    assert_eq!(managed_config_version_for(&home, Target::Claude).await, 2);
+
+    let peer_endpoint = activation.model_endpoint_for(Target::Codex).await.unwrap();
+    let peer_configuration = fs::read(user_home.join(".codex/config.toml")).unwrap();
+    let mut peer_view = store.target_view_for(Target::Codex).await.unwrap();
+    let peer_credential = store
+        .routing_credential_for(Target::Codex)
+        .await
+        .unwrap()
+        .unwrap();
+    let peer_snapshot = store
+        .activated_snapshot_for(Target::Codex)
+        .await
+        .unwrap()
+        .unwrap();
+    let peer_snapshot_identity = (
+        peer_snapshot.id(),
+        peer_snapshot.provider_id(),
+        peer_snapshot.base_url().to_owned(),
+        peer_snapshot.model().to_owned(),
+        peer_snapshot.protocol(),
+        peer_snapshot.authentication(),
+        peer_snapshot.epoch(),
+    );
+    let peer_provider_credential = peer_snapshot
+        .provider_credential()
+        .expose_secret()
+        .to_owned();
+
+    let settings_path = user_home.join(".claude/settings.json");
+    let mut drifted: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    drifted["env"]["ANTHROPIC_MODEL"] = json!("claude-restore-external-model");
+    drifted["restoreUnrelated"] = json!({"preserve": true});
+    fs::write(&settings_path, serde_json::to_vec_pretty(&drifted).unwrap()).unwrap();
+    store
+        .mark_configuration_drift_for(Target::Claude)
+        .await
+        .unwrap();
+
+    let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut stream).await;
+    let opened = request(
+        &mut stream,
+        "open",
+        open_operation(Target::Claude, &user_home),
+    )
+    .await;
+    let revision = opened["result"]["view"]["managementRevision"]
+        .as_u64()
+        .unwrap();
+    let preview = request(
+        &mut stream,
+        "preview",
+        json!({"kind":"preview-reconciliation","target":"claude","strategy":"restore"}),
+    )
+    .await;
+    let restored = request(
+        &mut stream,
+        "apply",
+        json!({
+            "kind":"act","target":"claude","actionId":Uuid::new_v4(),
+            "expectedRevision":revision,
+            "action":{
+                "kind":"reconcile","strategy":"restore",
+                "observationToken":preview["result"]["preview"]["observationToken"],
+                "acknowledgeVersion":"77.1.0 (Claude Code)"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(restored["type"], "response", "{restored}");
+    assert_eq!(restored["result"]["outcome"]["view"]["mode"], "unmanaged");
+    let _push = read_frame(&mut stream).await.unwrap();
+    assert_eq!(
+        store.target_view_for(Target::Codex).await.unwrap(),
+        peer_view
+    );
+    assert_eq!(
+        activation.model_endpoint_for(Target::Codex).await,
+        Some(peer_endpoint)
+    );
+    assert!(
+        fs::read(user_home.join(".codex/config.toml")).unwrap() == peer_configuration,
+        "Claude Restore changed the peer Managed Configuration"
+    );
+
+    drop(stream);
+    handle.shutdown().await.unwrap();
+    activation.shutdown_models().await.unwrap();
+    drop(activation);
+    drop(store);
+
+    let reopened_store = Arc::new(StateStore::open(&home).await.unwrap());
+    let reopened_activation = Arc::new(
+        ActivationService::new(
+            Arc::clone(&reopened_store),
+            home.clone(),
+            Arc::new(CommandCodexProbe),
+            codex_executable,
+            Arc::new(NoopUpstream),
+        )
+        .with_claude_runtime(Arc::new(CommandClaudeProbe), claude_executable),
+    );
+    let reopened_handle = ControlServer::bind_with_activation(
+        &home,
+        Arc::clone(&reopened_store),
+        "test",
+        Arc::clone(&reopened_activation),
+    )
+    .await
+    .unwrap();
+
+    let reopened_claude = reopened_store
+        .target_view_for(Target::Claude)
+        .await
+        .unwrap();
+    assert_eq!(managed_config_version_for(&home, Target::Claude).await, 1);
+    assert_eq!(reopened_claude.mode, "unmanaged");
+    assert_eq!(reopened_claude.recovery.state, "clean");
+    assert!(!reopened_claude.problems.iter().any(|problem| {
+        matches!(
+            problem.code.as_str(),
+            "recovery-required" | "startup-reconciliation-failed" | "model-route-unavailable"
+        )
+    }));
+
+    peer_view.service.epoch = reopened_store.service_epoch().to_string();
+    assert_eq!(
+        reopened_store.target_view_for(Target::Codex).await.unwrap(),
+        peer_view
+    );
+    assert_eq!(
+        reopened_activation.model_endpoint_for(Target::Codex).await,
+        Some(peer_endpoint)
+    );
+    assert!(
+        fs::read(user_home.join(".codex/config.toml")).unwrap() == peer_configuration,
+        "Claude Restore changed the peer Managed Configuration after restart"
+    );
+    let reopened_peer_credential = reopened_store
+        .routing_credential_for(Target::Codex)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        reopened_peer_credential.expose_secret() == peer_credential.expose_secret(),
+        "Claude Restore changed the peer Routing Credential"
+    );
+    let reopened_peer_snapshot = reopened_store
+        .activated_snapshot_for(Target::Codex)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            reopened_peer_snapshot.id(),
+            reopened_peer_snapshot.provider_id(),
+            reopened_peer_snapshot.base_url().to_owned(),
+            reopened_peer_snapshot.model().to_owned(),
+            reopened_peer_snapshot.protocol(),
+            reopened_peer_snapshot.authentication(),
+            reopened_peer_snapshot.epoch(),
+        ),
+        peer_snapshot_identity
+    );
+    assert!(
+        reopened_peer_snapshot.provider_credential().expose_secret()
+            == peer_provider_credential.as_str(),
+        "Claude Restore changed the peer Provider Credential"
+    );
+
+    reopened_handle.shutdown().await.unwrap();
+    reopened_activation.shutdown_models().await.unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn restore_returns_target_busy_without_mutation_while_real_request_is_pinned() {
     let root = std::path::PathBuf::from("/tmp").join(format!(
         "mx-busy-{}",
@@ -1116,7 +1783,10 @@ async fn restore_returns_target_busy_without_mutation_while_real_request_is_pinn
         }),
     )
     .await;
-    assert_eq!(busy_adopt["problem"]["code"], "target-busy");
+    assert_eq!(
+        busy_adopt["problem"]["code"],
+        "stale-reconciliation-preview"
+    );
     assert_eq!(
         store.target_view_for(Target::Codex).await.unwrap(),
         before_view
@@ -1229,6 +1899,73 @@ async fn adopt_claude_supports_api_key_and_bearer_authentication_shapes() {
             },
         )
         .await;
+        let route_credential = store
+            .routing_credential_for(Target::Claude)
+            .await
+            .unwrap()
+            .unwrap();
+        let route_secret_configuration = serde_json::to_vec_pretty(&json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://externally-changed-claude.example/v1",
+                "ANTHROPIC_MODEL": "must-not-adopt-route-secret",
+                "ANTHROPIC_AUTH_TOKEN": route_credential.expose_secret(),
+                "UNRELATED": "preserved"
+            }
+        }))
+        .unwrap();
+        fs::write(
+            user_home.join(".claude/settings.json"),
+            &route_secret_configuration,
+        )
+        .unwrap();
+        let route_secret_view = store.target_view_for(Target::Claude).await.unwrap();
+        let route_endpoint = activation.model_endpoint_for(Target::Claude).await.unwrap();
+        let mut route_stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+        hello(&mut route_stream).await;
+        let route_open = request(
+            &mut route_stream,
+            "route-open",
+            open_operation(Target::Claude, &user_home),
+        )
+        .await;
+        let route_preview = request(
+            &mut route_stream,
+            "route-preview",
+            json!({"kind":"preview-reconciliation","target":"claude","strategy":"adopt"}),
+        )
+        .await;
+        let route_rejection = request_raw(
+            &mut route_stream,
+            "route-apply",
+            json!({
+                "kind":"act","target":"claude","actionId":Uuid::new_v4(),
+                "expectedRevision":route_open["result"]["view"]["managementRevision"],
+                "action":{"kind":"reconcile","strategy":"adopt",
+                    "observationToken":route_preview["result"]["preview"]["observationToken"],
+                    "acknowledgeVersion":"77.1.0 (Claude Code)"}
+            }),
+        )
+        .await;
+        assert_raw_frame_is_safe(&route_rejection, &[route_credential.expose_secret()]);
+        let route_rejection: Value = serde_json::from_slice(&route_rejection).unwrap();
+        assert_eq!(
+            route_rejection["problem"]["code"],
+            "invalid-provider-credential"
+        );
+        assert!(
+            fs::read(user_home.join(".claude/settings.json")).unwrap()
+                == route_secret_configuration,
+            "rejected Claude Adopt changed the Managed Configuration"
+        );
+        assert_eq!(
+            store.target_view_for(Target::Claude).await.unwrap(),
+            route_secret_view
+        );
+        assert_eq!(
+            activation.model_endpoint_for(Target::Claude).await,
+            Some(route_endpoint)
+        );
+        drop(route_stream);
         fs::write(
             user_home.join(".claude/settings.json"),
             serde_json::to_vec_pretty(&json!({

@@ -49,6 +49,23 @@ pub fn bearer_routing_credential_matches(headers: &HeaderMap, expected: &SecretS
     bool::from(padded_candidate.ct_eq(&padded_expected) & shape_is_valid)
 }
 
+pub(crate) fn routing_credential_value_matches(
+    candidate: &SecretString,
+    expected: &SecretString,
+) -> bool {
+    let candidate_bytes = candidate.expose_secret().as_bytes();
+    let expected_bytes = expected.expose_secret().as_bytes();
+    let padded_candidate = normalize_credential(candidate_bytes, |_| {});
+    let padded_expected = normalize_credential(expected_bytes, |_| {});
+    let shape_is_valid = Choice::from(
+        (candidate_bytes.len() == ROUTING_CREDENTIAL_LEN
+            && expected_bytes.len() == ROUTING_CREDENTIAL_LEN
+            && padded_candidate.is_ascii()
+            && padded_expected.is_ascii()) as u8,
+    );
+    bool::from(padded_candidate.ct_eq(&padded_expected) & shape_is_valid)
+}
+
 fn normalize_credential(
     bytes: &[u8],
     mut observe_index: impl FnMut(usize),

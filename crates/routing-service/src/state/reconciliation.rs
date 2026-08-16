@@ -1,3 +1,5 @@
+use std::fmt;
+
 use secrecy::ExposeSecret;
 use tokio_rusqlite::rusqlite::{OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
@@ -57,7 +59,68 @@ pub(crate) enum ReconciliationCommit {
     Stale,
 }
 
+#[derive(Clone)]
+pub(crate) struct PendingReconciliationIntent {
+    pub(crate) action_id: Uuid,
+    pub(crate) target: Target,
+    pub(crate) strategy: ReconciliationStrategy,
+    pub(crate) before_json: String,
+    pub(crate) desired_json: String,
+}
+
+impl fmt::Debug for PendingReconciliationIntent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingReconciliationIntent")
+            .field("action_id", &self.action_id)
+            .field("target", &self.target)
+            .field("strategy", &self.strategy)
+            .field("before_json", &"<redacted>")
+            .field("desired_json", &"<redacted>")
+            .finish()
+    }
+}
+
 impl StateStore {
+    pub(crate) async fn pending_reconciliation_intents(
+        &self,
+    ) -> Result<Vec<PendingReconciliationIntent>, StateError> {
+        self.connection
+            .call(|connection| -> Result<Vec<_>, StateError> {
+                let mut statement = connection.prepare(
+                    "SELECT action_id, target, strategy, before_json, desired_json
+                     FROM reconciliation_intents WHERE state = 'pending'
+                     ORDER BY target, action_id",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    let action_id = Uuid::parse_str(&row.get::<_, String>(0)?)
+                        .map_err(|_| tokio_rusqlite::rusqlite::Error::InvalidQuery)?;
+                    let target = match row.get::<_, String>(1)?.as_str() {
+                        "codex" => Target::Codex,
+                        "claude" => Target::Claude,
+                        _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+                    };
+                    let strategy = match row.get::<_, String>(2)?.as_str() {
+                        "adopt" => ReconciliationStrategy::Adopt,
+                        "reapply" => ReconciliationStrategy::Reapply,
+                        "restore" => ReconciliationStrategy::Restore,
+                        _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+                    };
+                    Ok(PendingReconciliationIntent {
+                        action_id,
+                        target,
+                        strategy,
+                        before_json: row.get(3)?,
+                        desired_json: row.get(4)?,
+                    })
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(StateError::from)
+            })
+            .await
+            .map_err(super::store::map_state_call_error)
+    }
+
     pub(crate) async fn insert_reconciliation_intent(
         &self,
         target: Target,
@@ -276,7 +339,8 @@ impl StateStore {
                                serving_provider_id = NULL, takeover_state = 'inactive',
                                route_port = NULL, routing_credential = NULL,
                                activated_snapshot_id = NULL, managed_config_path = NULL,
-                               recovery_intent_id = NULL, recovery_state = 'clean'
+                               managed_config_version = 1, recovery_intent_id = NULL,
+                               recovery_state = 'clean'
                              WHERE target = ?1",
                             [input.target.as_str()],
                         )?;
@@ -582,6 +646,81 @@ impl CompatibilityClassification {
             "unknown-compatible" => Some(Self::UnknownCompatible),
             "incompatible" => Some(Self::Incompatible),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    use crate::{
+        control::protocol::{ActionStatus, ReconciliationStrategy, Target},
+        home::MuxviaHome,
+        state::{ManagedWriteStatus, StateStore},
+    };
+
+    #[tokio::test]
+    async fn ambiguous_startup_intent_marks_only_its_target_and_leaves_a_replay_receipt() {
+        let temp = TempDir::new().unwrap();
+        let home = MuxviaHome::from_user_home(temp.path());
+        let store = StateStore::open(&home).await.unwrap();
+        let action_id = Uuid::new_v4();
+        store
+            .insert_reconciliation_intent(
+                Target::Codex,
+                action_id,
+                ReconciliationStrategy::Reapply,
+                0,
+                "CORRUPT_BEFORE_SENTINEL_97109".to_owned(),
+                "CORRUPT_DESIRED_SENTINEL_97110".to_owned(),
+            )
+            .await
+            .unwrap();
+        let pending_debug = format!(
+            "{:?}",
+            store.pending_reconciliation_intents().await.unwrap()[0]
+        );
+        for sentinel in [
+            "CORRUPT_BEFORE_SENTINEL_97109",
+            "CORRUPT_DESIRED_SENTINEL_97110",
+        ] {
+            assert!(!pending_debug.contains(sentinel));
+            assert!(!pending_debug.contains(&format!("{:?}", sentinel.as_bytes())));
+        }
+
+        let outcome = store
+            .mark_reconciliation_recovery_required(Target::Codex, action_id)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.view.recovery.state, "recovery-required");
+        assert_eq!(
+            store.managed_write_status_for(Target::Codex).await.unwrap(),
+            ManagedWriteStatus::RecoveryRequired
+        );
+        assert_eq!(
+            store
+                .managed_write_status_for(Target::Claude)
+                .await
+                .unwrap(),
+            ManagedWriteStatus::Allowed
+        );
+        let replay = store
+            .receipt_for(Target::Codex, action_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.status, ActionStatus::Replayed);
+        assert_eq!(replay.view, outcome.view);
+        let diagnostic = format!("{outcome:?}\n{replay:?}");
+        for sentinel in [
+            "CORRUPT_BEFORE_SENTINEL_97109",
+            "CORRUPT_DESIRED_SENTINEL_97110",
+        ] {
+            assert!(!diagnostic.contains(sentinel));
+            assert!(!diagnostic.contains(&format!("{:?}", sentinel.as_bytes())));
         }
     }
 }

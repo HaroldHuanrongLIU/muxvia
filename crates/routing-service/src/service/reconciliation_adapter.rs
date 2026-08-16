@@ -17,6 +17,7 @@ use crate::{
         ProviderProtocol, ReconciliationField, ReconciliationFieldChange, ReconciliationFieldState,
         ReconciliationStrategy, ShadowSource, Target,
     },
+    domain::provider::normalize_provider_base_url,
     state::RecoveryPayload,
 };
 
@@ -104,6 +105,7 @@ pub(crate) enum PreparedConfiguration {
         before: ConfigSnapshot,
         desired: DesiredCodexState,
         recovery_before: ConfigSnapshot,
+        adopted: Option<(ConfigSnapshot, DesiredCodexState)>,
     },
     Claude {
         before: ClaudeConfigSnapshot,
@@ -123,6 +125,7 @@ impl fmt::Debug for PreparedConfiguration {
 
 pub(crate) struct AdoptedProvider {
     pub(crate) target: Target,
+    pub(crate) name: String,
     pub(crate) model: String,
     pub(crate) base_url: String,
     pub(crate) protocol: ProviderProtocol,
@@ -135,6 +138,7 @@ impl fmt::Debug for AdoptedProvider {
         formatter
             .debug_struct("AdoptedProvider")
             .field("target", &self.target)
+            .field("name", &"<redacted>")
             .field("model", &"<redacted>")
             .field("base_url", &"<redacted>")
             .field("protocol", &self.protocol)
@@ -203,12 +207,21 @@ impl PreparedConfiguration {
 
     pub(crate) fn adopted_provider(&self) -> Result<AdoptedProvider, ReconciliationProblem> {
         match self {
-            Self::Codex { desired, .. } => {
-                let (model, base_url, credential) = desired
+            Self::Codex {
+                desired, adopted, ..
+            } => {
+                let desired = adopted
+                    .as_ref()
+                    .map(|(_, desired)| desired)
+                    .unwrap_or(desired);
+                let (name, model, base_url, credential) = desired
                     .reconciliation_provider()
                     .ok_or_else(|| ReconciliationProblem::new("invalid-configuration"))?;
+                let base_url = normalize_provider_base_url(&base_url)
+                    .map_err(|_| ReconciliationProblem::new("invalid-configuration"))?;
                 Ok(AdoptedProvider {
                     target: Target::Codex,
+                    name,
                     model,
                     base_url,
                     protocol: ProviderProtocol::OpenaiResponses,
@@ -220,8 +233,11 @@ impl PreparedConfiguration {
                 let (model, base_url, authentication, credential) = desired
                     .reconciliation_provider()
                     .ok_or_else(|| ReconciliationProblem::new("invalid-configuration"))?;
+                let base_url = normalize_provider_base_url(&base_url)
+                    .map_err(|_| ReconciliationProblem::new("invalid-configuration"))?;
                 Ok(AdoptedProvider {
                     target: Target::Claude,
+                    name: "Adopted Claude configuration".to_owned(),
                     model,
                     base_url,
                     protocol: ProviderProtocol::AnthropicMessages,
@@ -238,11 +254,18 @@ impl PreparedConfiguration {
                 before,
                 desired,
                 recovery_before,
+                adopted,
                 ..
-            } => RecoveryPayload::Codex {
-                before: Box::new(before.recovery_before_with_latest_unrelated(recovery_before)),
-                desired: Box::new(desired.clone()),
-            },
+            } => {
+                let (before, desired) = adopted
+                    .as_ref()
+                    .map(|(before, desired)| (before, desired))
+                    .unwrap_or((before, desired));
+                RecoveryPayload::Codex {
+                    before: Box::new(before.recovery_before_with_latest_unrelated(recovery_before)),
+                    desired: Box::new(desired.clone()),
+                }
+            }
             Self::Claude {
                 before,
                 desired,
@@ -284,6 +307,34 @@ fn serialize_material(
         serde_json::to_string(desired)
             .map_err(|_| ReconciliationProblem::new("recovery-required"))?,
     ))
+}
+
+pub(crate) fn recover_pending_material(
+    target: Target,
+    user_home: &Path,
+    before_json: &str,
+    desired_json: &str,
+) -> Result<(), ReconciliationProblem> {
+    match target {
+        Target::Codex => {
+            let before: ConfigSnapshot = serde_json::from_str(before_json)
+                .map_err(|_| ReconciliationProblem::new("recovery-required"))?;
+            let desired: DesiredCodexState = serde_json::from_str(desired_json)
+                .map_err(|_| ReconciliationProblem::new("recovery-required"))?;
+            CodexConfigCodec::for_user_home(user_home)
+                .and_then(|codec| codec.restore_or_confirm_before(&before, &desired))
+                .map_err(map_codex_problem)
+        }
+        Target::Claude => {
+            let before: ClaudeConfigSnapshot = serde_json::from_str(before_json)
+                .map_err(|_| ReconciliationProblem::new("recovery-required"))?;
+            let desired: DesiredClaudeState = serde_json::from_str(desired_json)
+                .map_err(|_| ReconciliationProblem::new("recovery-required"))?;
+            ClaudeConfigCodec::for_user_home(user_home)
+                .and_then(|codec| codec.restore_or_confirm_before(&before, &desired))
+                .map_err(map_claude_problem)
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -378,15 +429,24 @@ fn observe_codex(
     recovery_before: &ConfigSnapshot,
     compatibility: ProbedCompatibility,
 ) -> Result<ObservedReconciliation, ReconciliationProblem> {
-    let (current, profile_shadow) = codec.reconciliation_snapshot().map_err(map_codex_problem)?;
-    let provider_changed = !current.provider_matches(committed);
-    let credential_changed = !current.credential_matches(committed);
+    let (current, selected, profile_shadow) = codec
+        .reconciliation_snapshots_for(committed)
+        .map_err(map_codex_problem)?;
+    let compared = if strategy == ReconciliationStrategy::Adopt {
+        &selected
+    } else {
+        &current
+    };
+    let provider_changed = !compared.provider_matches(committed);
+    let credential_changed = !compared.credential_matches(committed);
     let before = current.clone();
     let desired = match strategy {
         ReconciliationStrategy::Adopt => current.as_desired_like(committed),
         ReconciliationStrategy::Reapply => committed.clone(),
         ReconciliationStrategy::Restore => recovery_before.as_desired_like(committed),
     };
+    let adopted = (strategy == ReconciliationStrategy::Adopt)
+        .then(|| (selected.clone(), selected.as_adopted_direct()));
     Ok(ObservedReconciliation {
         observation: ReconciliationObservation {
             file_identity: current.identity().clone(),
@@ -404,6 +464,7 @@ fn observe_codex(
             before,
             desired,
             recovery_before: recovery_before.clone(),
+            adopted,
         },
     })
 }
@@ -527,6 +588,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    use secrecy::ExposeSecret;
     use tempfile::TempDir;
 
     use super::{
@@ -890,6 +952,324 @@ supports_websockets = false
             fs::read(home.path().join(".codex/config.toml")).unwrap(),
             before
         );
+    }
+
+    #[test]
+    fn codex_adopt_uses_and_validates_the_selected_provider_table() {
+        let valid = r#"model = "selected-model"
+model_provider = "operator_openai"
+
+[model_providers.muxvia_codex]
+name = "Stale Muxvia"
+base_url = "https://stale.invalid/v1"
+wire_api = "chat"
+http_headers = { Authorization = "Bearer STALE_SECRET_97101" }
+supports_websockets = true
+
+[model_providers.operator_openai]
+name = "Operator OpenAI"
+base_url = "https://selected.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer SELECTED_SECRET_97102" }
+supports_websockets = false
+"#;
+        let invalid = [
+            valid.replace(
+                "operator_openai\"\n\n[model_providers.muxvia_codex]",
+                "missing\"\n\n[model_providers.muxvia_codex]",
+            ),
+            valid.replace("wire_api = \"responses\"", "wire_api = \"chat\""),
+            valid.replace("supports_websockets = false", "supports_websockets = true"),
+            valid.replace("name = \"Operator OpenAI\"\n", ""),
+            valid.replace("name = \"Operator OpenAI\"", "name = \"   \""),
+            valid.replace("model = \"selected-model\"", "model = \"   \""),
+            valid.replace(
+                "Authorization = \"Bearer SELECTED_SECRET_97102\"",
+                "Authorization = \"Bearer    \"",
+            ),
+            valid.replace("model = \"selected-model\"", "model = 7"),
+            valid.replace(
+                "base_url = \"https://selected.example/v1\"",
+                "base_url = false",
+            ),
+            valid.replace(
+                "https://selected.example/v1",
+                "http://non-loopback.example/v1",
+            ),
+        ];
+
+        for (configuration, accepted) in std::iter::once((valid.to_owned(), true)).chain(
+            invalid
+                .into_iter()
+                .map(|configuration| (configuration, false)),
+        ) {
+            let home = TempDir::new().unwrap();
+            let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+            fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+            let recovery_before = codec.inspect().unwrap();
+            fs::write(codec.config_path(), configuration).unwrap();
+            let committed = codec.desired_direct(
+                "committed-model",
+                "https://committed.example/v1",
+                "COMMITTED_SECRET_97103",
+            );
+            let observed = TargetReconciliationAdapter::Codex(codec)
+                .observe(
+                    ReconciliationStrategy::Adopt,
+                    &CommittedConfiguration::Codex {
+                        desired: committed,
+                        recovery_before,
+                    },
+                    &ReconciliationContext::Codex,
+                    compatibility(),
+                )
+                .unwrap();
+            let adopted = observed.prepared.adopted_provider();
+            if accepted {
+                let adopted = adopted.unwrap();
+                assert_eq!(adopted.model, "selected-model");
+                assert_eq!(adopted.base_url, "https://selected.example/v1");
+                assert_eq!(adopted.credential.expose_secret(), "SELECTED_SECRET_97102");
+                assert_eq!(
+                    observed.observation.changes[1].state,
+                    ReconciliationFieldState::Changed
+                );
+                let diagnostic = format!("{observed:?}\n{adopted:?}");
+                for secret in ["STALE_SECRET_97101", "SELECTED_SECRET_97102"] {
+                    assert!(!diagnostic.contains(secret));
+                    assert!(!diagnostic.contains(&format!("{:?}", secret.as_bytes())));
+                }
+            } else {
+                assert_eq!(adopted.unwrap_err().code(), "invalid-configuration");
+            }
+        }
+    }
+
+    #[test]
+    fn codex_reapply_preserves_an_externally_selected_provider_table_and_rolls_back() {
+        let home = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+        let recovery_before = codec.inspect().unwrap();
+        let committed = codec.desired_direct(
+            "committed-model",
+            "https://committed.example/v1",
+            "COMMITTED_SECRET_97201",
+        );
+        codec.atomic_apply(&recovery_before, &committed).unwrap();
+        let managed = fs::read_to_string(codec.config_path()).unwrap();
+        let drifted = managed
+            .replace("model = \"committed-model\"", "model = \"external-model\"")
+            .replace(
+                "model_provider = \"muxvia_codex\"",
+                "model_provider = \"external\"",
+            )
+            + r#"
+[model_providers.external]
+name = "External"
+base_url = "https://external.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer EXTERNAL_SECRET_97202" }
+supports_websockets = false
+operator_note = "preserve-me"
+"#;
+        fs::write(codec.config_path(), &drifted).unwrap();
+
+        let observed = TargetReconciliationAdapter::Codex(codec)
+            .observe(
+                ReconciliationStrategy::Reapply,
+                &CommittedConfiguration::Codex {
+                    desired: committed,
+                    recovery_before,
+                },
+                &ReconciliationContext::Codex,
+                compatibility(),
+            )
+            .unwrap();
+        observed.prepared.atomic_apply(home.path()).unwrap();
+        observed.prepared.verify(home.path()).unwrap();
+        let reapplied = fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+        assert!(reapplied.contains("model_provider = \"muxvia_codex\""));
+        assert!(reapplied.contains("[model_providers.external]"));
+        assert!(reapplied.contains("operator_note = \"preserve-me\""));
+
+        observed.prepared.exact_rollback(home.path()).unwrap();
+        let rolled_back = fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+        assert!(rolled_back.contains("model_provider = \"external\""));
+        assert!(rolled_back.contains("EXTERNAL_SECRET_97202"));
+        assert!(rolled_back.contains("operator_note = \"preserve-me\""));
+    }
+
+    #[test]
+    fn codex_adopt_then_restore_uses_stable_selected_provider_ownership() {
+        let home = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+        let recovery_before = codec.inspect().unwrap();
+        let committed = codec.desired_direct(
+            "committed-model",
+            "https://committed.example/v1",
+            "COMMITTED_SECRET_97203",
+        );
+        codec.atomic_apply(&recovery_before, &committed).unwrap();
+        let managed = fs::read_to_string(codec.config_path()).unwrap();
+        let external = managed
+            .replace("model = \"committed-model\"", "model = \"external-model\"")
+            .replace(
+                "model_provider = \"muxvia_codex\"",
+                "model_provider = \"external\"",
+            )
+            + r#"
+[model_providers.external]
+name = "External"
+base_url = "https://external.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer EXTERNAL_SECRET_97204" }
+supports_websockets = false
+"#;
+        fs::write(codec.config_path(), external).unwrap();
+
+        let adopted = TargetReconciliationAdapter::Codex(codec)
+            .observe(
+                ReconciliationStrategy::Adopt,
+                &CommittedConfiguration::Codex {
+                    desired: committed,
+                    recovery_before,
+                },
+                &ReconciliationContext::Codex,
+                compatibility(),
+            )
+            .unwrap();
+        let crate::state::RecoveryPayload::Codex { before, desired } =
+            adopted.prepared.adopted_recovery_payload()
+        else {
+            panic!("Codex Adopt must retain Codex recovery material")
+        };
+        let restored = TargetReconciliationAdapter::Codex(
+            CodexConfigCodec::for_user_home(home.path()).unwrap(),
+        )
+        .observe(
+            ReconciliationStrategy::Restore,
+            &CommittedConfiguration::Codex {
+                desired: (*desired).clone(),
+                recovery_before: (*before).clone(),
+            },
+            &ReconciliationContext::Codex,
+            compatibility(),
+        )
+        .unwrap();
+        restored.prepared.atomic_apply(home.path()).unwrap();
+        restored.prepared.verify(home.path()).unwrap();
+        let historical = fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+        assert!(!historical.contains("[model_providers.external]"));
+        assert!(historical.contains("[model_providers.muxvia_codex]"));
+
+        restored.prepared.exact_rollback(home.path()).unwrap();
+        let rolled_back = fs::read_to_string(home.path().join(".codex/config.toml")).unwrap();
+        assert!(rolled_back.contains("model_provider = \"external\""));
+        assert!(rolled_back.contains("EXTERNAL_SECRET_97204"));
+        assert!(rolled_back.contains("[model_providers.muxvia_codex]"));
+    }
+
+    #[test]
+    fn startup_recovery_exactly_restores_a_pending_codex_reconciliation_write() {
+        let home = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+        let recovery_before = codec.inspect().unwrap();
+        let committed = codec.desired_direct(
+            "committed-model",
+            "https://committed.example/v1",
+            "COMMITTED_SECRET_97104",
+        );
+        codec.atomic_apply(&recovery_before, &committed).unwrap();
+        fs::write(
+            codec.config_path(),
+            r#"model = "drifted-model"
+model_provider = "operator"
+[model_providers.operator]
+name = "Operator"
+base_url = "https://drifted.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer DRIFTED_SECRET_97105" }
+supports_websockets = false
+"#,
+        )
+        .unwrap();
+        let before = codec.reconciliation_snapshot().unwrap().0;
+        let before_json = serde_json::to_string(&before).unwrap();
+        codec.atomic_apply(&before, &committed).unwrap();
+
+        super::recover_pending_material(
+            crate::control::protocol::Target::Codex,
+            home.path(),
+            &before_json,
+            &serde_json::to_string(&committed).unwrap(),
+        )
+        .unwrap();
+
+        let restored = CodexConfigCodec::for_user_home(home.path())
+            .unwrap()
+            .reconciliation_snapshot()
+            .unwrap()
+            .0;
+        assert_eq!(restored.owned_fingerprint(), before.owned_fingerprint());
+        assert_eq!(
+            restored.unrelated_fingerprint(),
+            before.unrelated_fingerprint()
+        );
+        for secret in ["COMMITTED_SECRET_97104", "DRIFTED_SECRET_97105"] {
+            assert!(!format!("{restored:?}").contains(secret));
+            assert!(!format!("{restored:?}").contains(&format!("{:?}", secret.as_bytes())));
+        }
+    }
+
+    #[test]
+    fn startup_recovery_rejects_corrupt_or_ambiguous_material_with_fixed_diagnostics() {
+        let home = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
+        let before = codec.inspect().unwrap();
+        let desired = codec.desired_direct(
+            "desired-model",
+            "https://desired.example/v1",
+            "DESIRED_SECRET_97111",
+        );
+        let before_json = serde_json::to_string(&before).unwrap();
+        let desired_json = serde_json::to_string(&desired).unwrap();
+        fs::create_dir_all(codec.config_path().parent().unwrap()).unwrap();
+        fs::write(
+            codec.config_path(),
+            r#"model = "third-state"
+model_provider = "third"
+[model_providers.third]
+name = "Third"
+base_url = "https://third.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer THIRD_SECRET_97112" }
+supports_websockets = false
+"#,
+        )
+        .unwrap();
+
+        for (before_material, desired_material) in [
+            (before_json.as_str(), "CORRUPT_DESIRED_SENTINEL_97113"),
+            (before_json.as_str(), desired_json.as_str()),
+        ] {
+            let problem = super::recover_pending_material(
+                crate::control::protocol::Target::Codex,
+                home.path(),
+                before_material,
+                desired_material,
+            )
+            .unwrap_err();
+            assert_eq!(problem.code(), "recovery-required");
+            let diagnostic = format!("{problem:?}\n{problem}");
+            for sentinel in [
+                "CORRUPT_DESIRED_SENTINEL_97113",
+                "DESIRED_SECRET_97111",
+                "THIRD_SECRET_97112",
+            ] {
+                assert!(!diagnostic.contains(sentinel));
+                assert!(!diagnostic.contains(&format!("{:?}", sentinel.as_bytes())));
+            }
+        }
     }
 
     #[cfg(unix)]

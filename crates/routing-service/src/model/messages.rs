@@ -41,10 +41,7 @@ pub(crate) async fn route_messages(
         Ok(Some(snapshot)) => snapshot,
         Ok(None) | Err(_) => return local_response(StatusCode::SERVICE_UNAVAILABLE),
     };
-    let Some(active_request) = ActiveRequestGuard::try_begin(
-        Arc::clone(&state.active_requests),
-        Arc::clone(&state.accepting_requests),
-    ) else {
+    let Some(active_request) = ActiveRequestGuard::try_begin(Arc::clone(&state.admission)) else {
         return local_response(StatusCode::SERVICE_UNAVAILABLE);
     };
     if snapshot.protocol() != ProviderProtocol::AnthropicMessages {

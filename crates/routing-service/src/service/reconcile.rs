@@ -14,13 +14,13 @@ use crate::{
     claude::{ClaudeConfigCodec, ClaudeProbe},
     codex::{CodexConfigCodec, CodexProbe, FileIdentity},
     control::protocol::{
-        ActionOutcome, CompatibilityClassification, CompatibilityView, ControlProblem,
-        ProviderEffect, ReconciliationField, ReconciliationFieldState, ReconciliationPreview,
-        ReconciliationStrategy, ShadowSource, Target,
+        ActionOutcome, ActionStatus, CompatibilityClassification, CompatibilityView,
+        ControlProblem, ProviderEffect, ReconciliationField, ReconciliationFieldState,
+        ReconciliationPreview, ReconciliationStrategy, ShadowSource, Target,
     },
     domain::activation::ActivatedSnapshot,
     home::MuxviaHome,
-    model::{ModelServerError, ModelServerHandle},
+    model::{ModelServerError, ModelServerHandle, auth::routing_credential_value_matches},
     state::{
         ActionFailure, AdoptReconciliation, ManagedWriteStatus, ReconciliationCommit,
         ReconciliationCommitFailpoint, ReconciliationCommitInput, StateError, StateStore,
@@ -29,7 +29,7 @@ use crate::{
 
 use super::reconciliation_adapter::{
     CommittedConfiguration, ObservedReconciliation, PreparedConfiguration, ProbedCompatibility,
-    ReconciliationContext, TargetReconciliationAdapter,
+    ReconciliationContext, TargetReconciliationAdapter, recover_pending_material,
 };
 
 pub(crate) struct CodexRuntimeContext {
@@ -104,12 +104,24 @@ impl ReconciliationTargetRuntime {
         }
     }
 
-    pub(crate) async fn active_request_count(&self, target: Target) -> usize {
+    #[cfg(test)]
+    async fn active_request_count(&self, target: Target) -> usize {
         self.slot(target)
             .lock()
             .await
             .as_ref()
             .map_or(0, ModelServerHandle::active_request_count)
+    }
+
+    #[cfg(test)]
+    async fn set_reservation_attempt_hook(
+        &self,
+        target: Target,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        if let Some(handle) = self.slot(target).lock().await.as_mut() {
+            handle.set_reservation_attempt_hook(hook);
+        }
     }
 
     pub(crate) async fn reserve_if_idle(
@@ -248,6 +260,8 @@ pub(crate) struct ReconciliationHooks {
     pause_after_verify: Option<Arc<ReconciliationPause>>,
     #[cfg(test)]
     pause_after_reserve: Option<Arc<ReconciliationPause>>,
+    #[cfg(test)]
+    pause_before_reserve: Option<Arc<ReconciliationPause>>,
 }
 
 #[cfg(test)]
@@ -265,7 +279,61 @@ pub(crate) struct PreviewRegistration {
     _guard: OwnedMutexGuard<()>,
 }
 
+pub(crate) struct DeferredPublication<T> {
+    pub(crate) result: T,
+    pub(crate) publication: Option<crate::control::protocol::TargetView>,
+}
+
+impl<T> DeferredPublication<T> {
+    fn none(result: T) -> Self {
+        Self {
+            result,
+            publication: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl<T, E> DeferredPublication<Result<T, E>> {
+    fn unwrap(self) -> T
+    where
+        E: std::fmt::Debug,
+    {
+        self.result.unwrap()
+    }
+
+    fn unwrap_err(self) -> E
+    where
+        T: std::fmt::Debug,
+    {
+        self.result.unwrap_err()
+    }
+}
+
 impl ReconciliationService {
+    pub(crate) async fn recover_pending_intents(&self) -> Result<(), StateError> {
+        for intent in self.state.pending_reconciliation_intents().await? {
+            let _strategy = intent.strategy;
+            if recover_pending_material(
+                intent.target,
+                &self.codex.user_home,
+                &intent.before_json,
+                &intent.desired_json,
+            )
+            .is_ok()
+            {
+                self.state
+                    .set_reconciliation_intent_state(intent.target, intent.action_id, "rolled-back")
+                    .await?;
+            } else {
+                self.state
+                    .mark_reconciliation_recovery_required(intent.target, intent.action_id)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn lock_target_mutation(&self, target: Target) -> OwnedMutexGuard<()> {
         self.target_runtime.gate_arc(target).lock_owned().await
     }
@@ -455,6 +523,37 @@ impl ReconciliationService {
         observation_token: Uuid,
         acknowledge_version: Option<String>,
         context: ReconciliationContext,
+    ) -> DeferredPublication<Result<ActionOutcome, ActionFailure>> {
+        let result = self
+            .apply_result(
+                target,
+                action_id,
+                expected_revision,
+                strategy,
+                observation_token,
+                acknowledge_version,
+                context,
+            )
+            .await;
+        let publication = result.as_ref().ok().and_then(|outcome| {
+            (outcome.status == ActionStatus::Applied).then(|| outcome.view.clone())
+        });
+        DeferredPublication {
+            result,
+            publication,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_result(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        expected_revision: u64,
+        strategy: ReconciliationStrategy,
+        observation_token: Uuid,
+        acknowledge_version: Option<String>,
+        context: ReconciliationContext,
     ) -> Result<ActionOutcome, ActionFailure> {
         match self.state.receipt_for(target, action_id).await {
             Ok(Some(outcome)) => return Ok(outcome),
@@ -532,11 +631,6 @@ impl ReconciliationService {
         if !expected.shadows.is_empty() {
             return Err(self.failure(target, "shadowing-configuration").await);
         }
-        if (strategy == ReconciliationStrategy::Restore || adopt_takeover)
-            && self.target_runtime.active_request_count(target).await != 0
-        {
-            return Err(self.failure(target, "target-busy").await);
-        }
         let adopt = if strategy == ReconciliationStrategy::Adopt {
             let provider = validated
                 .prepared
@@ -556,6 +650,15 @@ impl ReconciliationService {
                     })
             {
                 return Err(self.failure(target, "stale-reconciliation-preview").await);
+            }
+            let route_credential = match self.state.routing_credential_for(target).await {
+                Ok(credential) => credential,
+                Err(_) => return Err(self.failure(target, "state-store-error").await),
+            };
+            if route_credential.as_ref().is_some_and(|route_credential| {
+                routing_credential_value_matches(&provider.credential, route_credential)
+            }) {
+                return Err(self.failure(target, "invalid-provider-credential").await);
             }
             let recovery_payload_json =
                 match serde_json::to_string(&validated.prepared.adopted_recovery_payload()) {
@@ -581,10 +684,7 @@ impl ReconciliationService {
                     provider_credential: provider.credential,
                     epoch: self.state.service_epoch(),
                 },
-                name: match target {
-                    Target::Codex => "Adopted Codex configuration".to_owned(),
-                    Target::Claude => "Adopted Claude configuration".to_owned(),
-                },
+                name: provider.name,
                 recovery_id: Uuid::new_v4(),
                 recovery_payload_json,
                 file_identity_json,
@@ -620,6 +720,23 @@ impl ReconciliationService {
             Ok(material) => material,
             Err(problem) => return Err(self.failure(target, problem.code()).await),
         };
+        #[cfg(test)]
+        if let Some(pause) = &self.hooks.pause_before_reserve {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+        let mut reserved_runtime = None;
+        if strategy == ReconciliationStrategy::Restore || adopt_takeover {
+            reserved_runtime = match self.target_runtime.reserve_if_idle(target).await {
+                Ok(runtime) => runtime,
+                Err(_) => return Err(self.failure(target, "target-busy").await),
+            };
+            #[cfg(test)]
+            if let Some(pause) = &self.hooks.pause_after_reserve {
+                pause.reached.notify_one();
+                pause.release.notified().await;
+            }
+        }
         if self
             .state
             .insert_reconciliation_intent(
@@ -633,11 +750,14 @@ impl ReconciliationService {
             .await
             .is_err()
         {
+            self.target_runtime
+                .restore_reserved(target, reserved_runtime.take())
+                .await;
             return Err(self.failure(target, "state-store-error").await);
         }
 
         if self.hooks.failpoint == ReconciliationFailpoint::AfterIntent {
-            return self
+            let failure = self
                 .rollback_after_intent(
                     target,
                     action_id,
@@ -646,6 +766,10 @@ impl ReconciliationService {
                     observation_token,
                 )
                 .await;
+            self.target_runtime
+                .restore_reserved(target, reserved_runtime.take())
+                .await;
+            return failure;
         }
 
         let applied = if self.hooks.failpoint == ReconciliationFailpoint::AtomicWrite {
@@ -665,7 +789,7 @@ impl ReconciliationService {
             }
         });
         if verified.is_err() {
-            return self
+            let failure = self
                 .rollback_after_intent(
                     target,
                     action_id,
@@ -674,9 +798,13 @@ impl ReconciliationService {
                     observation_token,
                 )
                 .await;
+            self.target_runtime
+                .restore_reserved(target, reserved_runtime.take())
+                .await;
+            return failure;
         }
         if self.hooks.failpoint == ReconciliationFailpoint::RollbackVerify {
-            return self
+            let failure = self
                 .rollback_after_intent(
                     target,
                     action_id,
@@ -685,45 +813,32 @@ impl ReconciliationService {
                     observation_token,
                 )
                 .await;
+            self.target_runtime
+                .restore_reserved(target, reserved_runtime.take())
+                .await;
+            return failure;
         }
         #[cfg(test)]
         if let Some(pause) = &self.hooks.pause_after_verify {
             pause.reached.notify_one();
             pause.release.notified().await;
         }
-        let mut reserved_runtime = None;
-        if strategy == ReconciliationStrategy::Restore || adopt_takeover {
-            if self.hooks.failpoint == ReconciliationFailpoint::ListenerStop {
-                return self
-                    .rollback_after_intent(
-                        target,
-                        action_id,
-                        &validated.prepared,
-                        key,
-                        observation_token,
-                    )
-                    .await;
-            }
-            reserved_runtime = match self.target_runtime.reserve_if_idle(target).await {
-                Ok(runtime) => runtime,
-                Err(_) => {
-                    return self
-                        .rollback_after_intent_with_code(
-                            target,
-                            action_id,
-                            &validated.prepared,
-                            "target-busy",
-                            key,
-                            observation_token,
-                        )
-                        .await;
-                }
-            };
-            #[cfg(test)]
-            if let Some(pause) = &self.hooks.pause_after_reserve {
-                pause.reached.notify_one();
-                pause.release.notified().await;
-            }
+        if (strategy == ReconciliationStrategy::Restore || adopt_takeover)
+            && self.hooks.failpoint == ReconciliationFailpoint::ListenerStop
+        {
+            let failure = self
+                .rollback_after_intent(
+                    target,
+                    action_id,
+                    &validated.prepared,
+                    key,
+                    observation_token,
+                )
+                .await;
+            self.target_runtime
+                .restore_reserved(target, reserved_runtime.take())
+                .await;
+            return failure;
         }
         let commit = self
             .state
@@ -773,11 +888,9 @@ impl ReconciliationService {
                         Err(_) => return Err(self.failure(target, "state-store-error").await),
                     };
                     self.consume_token(key, observation_token).await;
-                    self.state.publish_target_view(recovery.view.clone());
                     return Ok(recovery);
                 }
                 self.consume_token(key, observation_token).await;
-                self.state.publish_target_view(outcome.view.clone());
                 Ok(outcome)
             }
             Ok(ReconciliationCommit::Replayed(outcome)) => {
@@ -788,31 +901,35 @@ impl ReconciliationService {
                 Ok(outcome)
             }
             Ok(ReconciliationCommit::Stale) => {
+                let failure = self
+                    .rollback_after_intent_with_code(
+                        target,
+                        action_id,
+                        &validated.prepared,
+                        "stale-revision",
+                        key,
+                        observation_token,
+                    )
+                    .await;
                 self.target_runtime
                     .restore_reserved(target, reserved_runtime.take())
                     .await;
-                self.rollback_after_intent_with_code(
-                    target,
-                    action_id,
-                    &validated.prepared,
-                    "stale-revision",
-                    key,
-                    observation_token,
-                )
-                .await
+                failure
             }
             Err(_) => {
+                let failure = self
+                    .rollback_after_intent(
+                        target,
+                        action_id,
+                        &validated.prepared,
+                        key,
+                        observation_token,
+                    )
+                    .await;
                 self.target_runtime
                     .restore_reserved(target, reserved_runtime.take())
                     .await;
-                self.rollback_after_intent(
-                    target,
-                    action_id,
-                    &validated.prepared,
-                    key,
-                    observation_token,
-                )
-                .await
+                failure
             }
         }
     }
@@ -822,39 +939,54 @@ impl ReconciliationService {
         target: Target,
         context: Option<ReconciliationContext>,
         probe_unmanaged_provider_write: bool,
-    ) -> Result<(), ActionFailure> {
+    ) -> DeferredPublication<Result<(), ActionFailure>> {
         match self.state.managed_write_status_for(target).await {
             Ok(ManagedWriteStatus::Allowed) => {}
             Ok(ManagedWriteStatus::ConfigurationDrift) => {
-                return Err(self.failure(target, "configuration-drift").await);
+                return DeferredPublication::none(Err(self
+                    .failure(target, "configuration-drift")
+                    .await));
             }
             Ok(ManagedWriteStatus::RecoveryRequired) => {
-                return Err(self.failure(target, "recovery-required").await);
+                return DeferredPublication::none(Err(self
+                    .failure(target, "recovery-required")
+                    .await));
             }
-            Err(_) => return Err(self.failure(target, "state-store-error").await),
+            Err(_) => {
+                return DeferredPublication::none(Err(self
+                    .failure(target, "state-store-error")
+                    .await));
+            }
         }
         let view = match self.state.target_view_for(target).await {
             Ok(view) => view,
-            Err(_) => return Err(self.failure(target, "state-store-error").await),
+            Err(_) => {
+                return DeferredPublication::none(Err(self
+                    .failure(target, "state-store-error")
+                    .await));
+            }
         };
         if view.managed_configuration.state == "unmanaged" {
             if !probe_unmanaged_provider_write {
-                return Ok(());
+                return DeferredPublication::none(Ok(()));
             }
             let compatibility = match self.probe_compatibility(target).await {
                 Ok(compatibility) => compatibility,
                 Err(problem) => {
                     let mut failure = self.failure(target, &problem.code).await;
                     failure.problem = problem;
-                    return Err(failure);
+                    return DeferredPublication::none(Err(failure));
                 }
             };
-            return self
-                .ensure_compatibility_allowed(target, &compatibility, false)
-                .await;
+            return DeferredPublication::none(
+                self.ensure_compatibility_allowed(target, &compatibility, false)
+                    .await,
+            );
         }
         let Some(context) = context else {
-            return Err(self.failure(target, "preflight-context-required").await);
+            return DeferredPublication::none(Err(self
+                .failure(target, "preflight-context-required")
+                .await));
         };
         let (record, observed) = match self
             .observe(target, ReconciliationStrategy::Reapply, &context)
@@ -864,7 +996,7 @@ impl ReconciliationService {
             Err(problem) => {
                 let mut failure = self.failure(target, &problem.code).await;
                 failure.problem = problem;
-                return Err(failure);
+                return DeferredPublication::none(Err(failure));
             }
         };
         if observed.observation.owned_drifted {
@@ -874,18 +1006,25 @@ impl ReconciliationService {
                 .await
                 .is_err()
             {
-                return Err(self.failure(target, "state-store-error").await);
+                return DeferredPublication::none(Err(self
+                    .failure(target, "state-store-error")
+                    .await));
             }
             let failure = self.failure(target, "configuration-drift").await;
-            self.state
-                .publish_target_view(failure.authoritative_view.clone());
-            return Err(failure);
+            return DeferredPublication {
+                publication: Some(failure.authoritative_view.clone()),
+                result: Err(failure),
+            };
         }
         if !record.shadows.is_empty() {
-            return Err(self.failure(target, "shadowing-configuration").await);
+            return DeferredPublication::none(Err(self
+                .failure(target, "shadowing-configuration")
+                .await));
         }
-        self.ensure_compatibility_allowed(target, &record.compatibility, true)
-            .await
+        DeferredPublication::none(
+            self.ensure_compatibility_allowed(target, &record.compatibility, true)
+                .await,
+        )
     }
 
     async fn ensure_compatibility_allowed(
@@ -989,7 +1128,6 @@ impl ReconciliationService {
         {
             Ok(outcome) => {
                 self.consume_token(key, observation_token).await;
-                self.state.publish_target_view(outcome.view.clone());
                 Ok(outcome)
             }
             Err(_) => Err(self.failure(target, "state-store-error").await),
@@ -1266,6 +1404,7 @@ fn stable_message(code: &str) -> &'static str {
         }
         "incompatible-target-cli" => "Target CLI is incompatible",
         "target-busy" => "Target has an active model request",
+        "invalid-provider-credential" => "Observed Provider credential is not adoptable",
         "configuration-write-failed" => "Reconciliation preview failed",
         _ => "Reconciliation preview failed",
     }
@@ -1276,10 +1415,10 @@ mod tests {
     use std::{
         fs,
         future::Future,
-        os::unix::fs::symlink,
+        os::unix::fs::{MetadataExt, symlink},
         path::Path,
         pin::Pin,
-        sync::{Arc, Mutex as StdMutex},
+        sync::{Arc, Condvar, Mutex as StdMutex, mpsc},
     };
 
     use async_trait::async_trait;
@@ -1385,6 +1524,33 @@ mod tests {
                 status: StatusCode::OK,
                 headers: Default::default(),
                 body: Box::pin(stream::once(async { Ok(Bytes::new()) })),
+            })
+        }
+    }
+
+    struct HeldUpstream {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl HeldUpstream {
+        fn new() -> Self {
+            Self {
+                started: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl UpstreamTransport for HeldUpstream {
+        async fn send(&self, _: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(UpstreamResponse {
+                status: StatusCode::OK,
+                headers: Default::default(),
+                body: Box::pin(stream::once(async { Ok(Bytes::from_static(b"{}")) })),
             })
         }
     }
@@ -1563,6 +1729,39 @@ mod tests {
                 })
                 .unwrap()
         })
+    }
+
+    fn reconciliation_intent_count(home: &MuxviaHome) -> u64 {
+        Connection::open(home.database_path())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM reconciliation_intents", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FileFingerprint {
+        device: u64,
+        inode: u64,
+        mode: u32,
+        modified_seconds: i64,
+        modified_nanoseconds: i64,
+        length: u64,
+        bytes: Vec<u8>,
+    }
+
+    fn file_fingerprint(path: &Path) -> FileFingerprint {
+        let metadata = fs::metadata(path).unwrap();
+        FileFingerprint {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            length: metadata.len(),
+            bytes: fs::read(path).unwrap(),
+        }
     }
 
     #[tokio::test]
@@ -2176,6 +2375,250 @@ supports_websockets = false
         let rendered = fs::read_to_string(config_path).unwrap();
         assert!(rendered.contains("gpt-test"));
         assert!(!rendered.contains("shared-gate-drift"));
+    }
+
+    #[tokio::test]
+    async fn restore_busy_in_the_old_admission_window_has_zero_durable_file_or_runtime_mutation() {
+        let fixture = Fixture::new().await;
+        let view = fixture.store.target_view_for(Target::Codex).await.unwrap();
+        let provider_id = view.current_provider_id.clone().unwrap();
+        let upstream = Arc::new(HeldUpstream::new());
+        let activation = Arc::new(ActivationService::new(
+            Arc::clone(&fixture.store),
+            fixture.home.clone(),
+            fixture.probe.clone(),
+            "/usr/bin/codex".into(),
+            upstream.clone(),
+        ));
+        activation
+            .apply_raw_for(
+                Target::Codex,
+                Uuid::new_v4(),
+                view.management_revision,
+                serde_json::json!({
+                    "kind":"activate-provider","providerId":provider_id,"mode":"takeover"
+                }),
+            )
+            .await
+            .unwrap();
+        let endpoint = activation.model_endpoint_for(Target::Codex).await.unwrap();
+        let routing_credential = fixture
+            .store
+            .routing_credential_for(Target::Codex)
+            .await
+            .unwrap()
+            .unwrap();
+        let config_path = fixture.home.user_home().join(".codex/config.toml");
+        fs::write(
+            &config_path,
+            fs::read_to_string(&config_path)
+                .unwrap()
+                .replace("gpt-test", "old-admission-window-drift"),
+        )
+        .unwrap();
+        let pause = Arc::new(super::ReconciliationPause::default());
+        let service = Arc::new(
+            ReconciliationService::from_runtime(
+                Arc::clone(&fixture.store),
+                activation.reconciliation_runtime(),
+            )
+            .with_hooks(super::ReconciliationHooks {
+                pause_before_reserve: Some(Arc::clone(&pause)),
+                ..Default::default()
+            }),
+        );
+        let preview = service
+            .preview(
+                Target::Codex,
+                ReconciliationStrategy::Restore,
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap();
+        let restore = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .apply(
+                        Target::Codex,
+                        Uuid::new_v4(),
+                        preview.management_revision,
+                        ReconciliationStrategy::Restore,
+                        preview.observation_token,
+                        None,
+                        ReconciliationContext::Codex,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), pause.reached.notified())
+            .await
+            .expect("Restore did not reach the pre-intent admission window");
+        let held_request = tokio::spawn({
+            let routing_credential = routing_credential.expose_secret().to_owned();
+            async move {
+                reqwest::Client::new()
+                    .post(format!("http://{endpoint}/v1/responses"))
+                    .header("X-Muxvia-Routing-Credential", routing_credential)
+                    .body("{}")
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.started.notified(),
+        )
+        .await
+        .expect("real model request did not enter the active-request set");
+
+        let before_intents = reconciliation_intent_count(&fixture.home);
+        let before_rows = reconciliation_row_counts(&fixture.home);
+        let before_view = fixture.store.target_view_for(Target::Codex).await.unwrap();
+        let before_file = file_fingerprint(&config_path);
+        let before_endpoint = activation.model_endpoint_for(Target::Codex).await;
+        let before_active = service
+            .target_runtime
+            .active_request_count(Target::Codex)
+            .await;
+
+        pause.release.notify_one();
+        let failure = restore.await.unwrap().unwrap_err();
+        assert_eq!(failure.problem.code, "target-busy");
+        assert_eq!(reconciliation_intent_count(&fixture.home), before_intents);
+        assert_eq!(reconciliation_row_counts(&fixture.home), before_rows);
+        assert_eq!(
+            fixture.store.target_view_for(Target::Codex).await.unwrap(),
+            before_view
+        );
+        assert_eq!(file_fingerprint(&config_path), before_file);
+        assert_eq!(
+            activation.model_endpoint_for(Target::Codex).await,
+            before_endpoint
+        );
+        assert_eq!(
+            service
+                .target_runtime
+                .active_request_count(Target::Codex)
+                .await,
+            before_active
+        );
+
+        upstream.release.notify_one();
+        assert_eq!(held_request.await.unwrap().status(), StatusCode::OK);
+        activation.shutdown_models().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_busy_reservation_does_not_transiently_reject_a_second_real_request() {
+        let fixture = Fixture::new().await;
+        let view = fixture.store.target_view_for(Target::Codex).await.unwrap();
+        let provider_id = view.current_provider_id.clone().unwrap();
+        let upstream = Arc::new(HeldUpstream::new());
+        let activation = Arc::new(ActivationService::new(
+            Arc::clone(&fixture.store),
+            fixture.home.clone(),
+            fixture.probe.clone(),
+            "/usr/bin/codex".into(),
+            upstream.clone(),
+        ));
+        activation
+            .apply_raw_for(
+                Target::Codex,
+                Uuid::new_v4(),
+                view.management_revision,
+                serde_json::json!({
+                    "kind":"activate-provider","providerId":provider_id,"mode":"takeover"
+                }),
+            )
+            .await
+            .unwrap();
+        let endpoint = activation.model_endpoint_for(Target::Codex).await.unwrap();
+        let routing_credential = fixture
+            .store
+            .routing_credential_for(Target::Codex)
+            .await
+            .unwrap()
+            .unwrap()
+            .expose_secret()
+            .to_owned();
+        let first = tokio::spawn({
+            let routing_credential = routing_credential.clone();
+            async move {
+                reqwest::Client::new()
+                    .post(format!("http://{endpoint}/v1/responses"))
+                    .header("X-Muxvia-Routing-Credential", routing_credential)
+                    .body("{}")
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.started.notified(),
+        )
+        .await
+        .expect("first request did not enter the active-request set");
+
+        let runtime = activation.reconciliation_runtime().target_runtime;
+        let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+        let release_reservation = Arc::new((StdMutex::new(false), Condvar::new()));
+        runtime
+            .set_reservation_attempt_hook(Target::Codex, {
+                let release_reservation = Arc::clone(&release_reservation);
+                Arc::new(move || {
+                    reached_tx.send(()).unwrap();
+                    let (released, condition) = &*release_reservation;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = condition.wait(released).unwrap();
+                    }
+                })
+            })
+            .await;
+        let reserve = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.reserve_if_idle(Target::Codex).await }
+        });
+        tokio::task::spawn_blocking(move || {
+            reached_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("busy reservation did not reach its atomic admission attempt");
+        })
+        .await
+        .unwrap();
+
+        let second = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("http://{endpoint}/v1/responses"))
+                .header("X-Muxvia-Routing-Credential", routing_credential)
+                .body("{}")
+                .send()
+                .await
+                .unwrap()
+        });
+        let second_started = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            upstream.started.notified(),
+        )
+        .await;
+        {
+            let (released, condition) = &*release_reservation;
+            *released.lock().unwrap() = true;
+            condition.notify_one();
+        }
+        assert!(reserve.await.unwrap().is_err());
+        upstream.release.notify_one();
+        upstream.release.notify_one();
+        assert!(
+            second_started.is_ok(),
+            "busy reservation transiently rejected the concurrent request"
+        );
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+        activation.shutdown_models().await.unwrap();
     }
 
     #[tokio::test]

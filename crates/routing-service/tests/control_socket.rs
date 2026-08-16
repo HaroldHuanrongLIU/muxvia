@@ -521,6 +521,46 @@ async fn seed_codex_direct(home: &MuxviaHome, store: Arc<StateStore>) {
         .unwrap();
 }
 
+async fn inflate_codex_target_view(store: &Arc<StateStore>) {
+    let revision = store
+        .target_view_for(Target::Codex)
+        .await
+        .unwrap()
+        .management_revision;
+    store
+        .apply_provider_action_for(
+            Target::Codex,
+            Uuid::new_v4(),
+            revision,
+            json!({
+                "kind": "create-provider",
+                "name": "Writer backpressure",
+                "baseUrl": "https://writer-backpressure.test/v1",
+                "model": "m".repeat(128 * 1024),
+                "credential": { "kind": "replace", "value": "writer-backpressure-secret" },
+                "authentication": "openai-bearer",
+                "presetKey": null
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+async fn queue_writer_backpressure(stream: &mut UnixStream, prefix: &str) {
+    for index in 0..8 {
+        write_frame(
+            stream,
+            &json!({
+                "type": "request",
+                "requestId": format!("{prefix}-{index}"),
+                "operation": { "kind": "open-target", "target": "codex" }
+            }),
+        )
+        .await
+        .unwrap();
+    }
+}
+
 async fn seed_claude_direct(home: &MuxviaHome, store: Arc<StateStore>) {
     let created = store
         .apply_provider_action_for(
@@ -2736,6 +2776,304 @@ async fn open_target_subscribes_and_action_responds_before_complete_push() {
     assert_eq!(push["type"], "target-view");
     assert_eq!(push["view"], response["result"]["outcome"]["view"]);
     assert!(!format!("{response}{push}").contains("server-secret-must-not-escape"));
+}
+
+#[tokio::test]
+async fn reconciliation_publication_waits_for_the_initiating_action_response_writer_ack() {
+    let mut fixture = ControlFixture::start().await;
+    let home = MuxviaHome::from_user_home(&fixture.root.join("home"));
+    seed_codex_direct(&home, Arc::clone(&fixture.store)).await;
+    inflate_codex_target_view(&fixture.store).await;
+    let config_path = fixture.root.join("home/.codex/config.toml");
+    fs::write(
+        &config_path,
+        fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("seed-model", "writer-ack-reapply-drift"),
+    )
+    .unwrap();
+
+    let mut initiator = fixture.connect().await;
+    hello(&mut initiator).await;
+    let opened = request(
+        &mut initiator,
+        "initiator-open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    let preview = request(
+        &mut initiator,
+        "writer-ack-preview",
+        json!({ "kind": "preview-reconciliation", "target": "codex", "strategy": "reapply" }),
+    )
+    .await;
+    let mut subscriber = fixture.connect().await;
+    hello(&mut subscriber).await;
+    request(
+        &mut subscriber,
+        "subscriber-open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+
+    queue_writer_backpressure(&mut initiator, "reconcile-fill").await;
+    let action_id = Uuid::new_v4();
+    write_frame(
+        &mut initiator,
+        &json!({
+            "type": "request", "requestId": "writer-ack-reconcile",
+            "operation": {
+                "kind": "act", "target": "codex", "actionId": action_id,
+                "expectedRevision": opened["result"]["view"]["managementRevision"],
+                "action": {
+                    "kind": "reconcile", "strategy": "reapply",
+                    "observationToken": preview["result"]["preview"]["observationToken"]
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_millis(150), async {
+        while fixture
+            .store
+            .receipt_for(Target::Codex, action_id)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reconciliation did not durably commit behind the blocked writer");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), read_frame(&mut subscriber))
+            .await
+            .is_err(),
+        "subscriber received reconciliation publication before action response writer ack"
+    );
+
+    let mut response = None;
+    for _ in 0..9 {
+        let frame = read_frame(&mut initiator).await.unwrap();
+        if frame["requestId"] == "writer-ack-reconcile" {
+            response = Some(frame);
+        }
+    }
+    let response = response.expect("initiating reconciliation response was not written");
+    assert_eq!(response["type"], "response");
+    let pushed = read_frame(&mut subscriber).await.unwrap();
+    assert_eq!(pushed["type"], "target-view");
+    assert_eq!(pushed["view"], response["result"]["outcome"]["view"]);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_live_drift_publication_waits_for_the_initiating_error_writer_ack() {
+    let mut fixture = ControlFixture::start().await;
+    let home = MuxviaHome::from_user_home(&fixture.root.join("home"));
+    seed_codex_direct(&home, Arc::clone(&fixture.store)).await;
+    inflate_codex_target_view(&fixture.store).await;
+    let config_path = fixture.root.join("home/.codex/config.toml");
+    fs::write(
+        &config_path,
+        fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("seed-model", "writer-ack-live-drift"),
+    )
+    .unwrap();
+
+    let mut initiator = fixture.connect().await;
+    hello(&mut initiator).await;
+    let opened = request(
+        &mut initiator,
+        "drift-initiator-open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    let mut subscriber = fixture.connect().await;
+    hello(&mut subscriber).await;
+    request(
+        &mut subscriber,
+        "drift-subscriber-open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+
+    queue_writer_backpressure(&mut initiator, "drift-fill").await;
+    write_frame(
+        &mut initiator,
+        &json!({
+            "type": "request", "requestId": "writer-ack-drift",
+            "operation": {
+                "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
+                "expectedRevision": opened["result"]["view"]["managementRevision"],
+                "action": {
+                    "kind": "create-provider", "name": "must-not-create",
+                    "baseUrl": "https://must-not-create.test/v1", "model": "none",
+                    "credential": { "kind": "replace", "value": "must-not-create-secret" },
+                    "authentication": "openai-bearer", "presetKey": null
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_millis(150), async {
+        loop {
+            let view = fixture.store.target_view_for(Target::Codex).await.unwrap();
+            if view
+                .problems
+                .iter()
+                .any(|problem| problem.code == "configuration-drift")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("live drift was not durably recorded behind the blocked writer");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), read_frame(&mut subscriber))
+            .await
+            .is_err(),
+        "subscriber received live-drift publication before error writer ack"
+    );
+
+    let mut error = None;
+    for _ in 0..9 {
+        let frame = read_frame(&mut initiator).await.unwrap();
+        if frame["requestId"] == "writer-ack-drift" {
+            error = Some(frame);
+        }
+    }
+    let error = error.expect("initiating live-drift error was not written");
+    assert_eq!(error["problem"]["code"], "configuration-drift");
+    let pushed = read_frame(&mut subscriber).await.unwrap();
+    assert_eq!(pushed["type"], "target-view");
+    assert_eq!(pushed["view"], error["authoritativeView"]);
+    let initiating_push = read_frame(&mut initiator).await.unwrap();
+    assert_eq!(initiating_push["type"], "target-view");
+    let repeated = request(
+        &mut initiator,
+        "already-durable-drift",
+        json!({
+            "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
+            "expectedRevision": opened["result"]["view"]["managementRevision"],
+            "action": {
+                "kind": "create-provider", "name": "still-must-not-create",
+                "baseUrl": "https://still-must-not-create.test/v1", "model": "none",
+                "credential": { "kind": "replace", "value": "still-must-not-create-secret" },
+                "authentication": "openai-bearer", "presetKey": null
+            }
+        }),
+    )
+    .await;
+    assert_eq!(repeated["problem"]["code"], "configuration-drift");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut subscriber))
+            .await
+            .is_err(),
+        "already-durable drift was published a second time"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconciliation_writer_failure_suppresses_publication_but_next_open_reads_durable_state() {
+    let mut fixture = ControlFixture::start().await;
+    let home = MuxviaHome::from_user_home(&fixture.root.join("home"));
+    seed_codex_direct(&home, Arc::clone(&fixture.store)).await;
+    inflate_codex_target_view(&fixture.store).await;
+    let config_path = fixture.root.join("home/.codex/config.toml");
+    fs::write(
+        &config_path,
+        fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("seed-model", "writer-failure-reapply-drift"),
+    )
+    .unwrap();
+
+    let mut initiator = fixture.connect().await;
+    hello(&mut initiator).await;
+    let opened = request(
+        &mut initiator,
+        "failure-initiator-open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    let preview = request(
+        &mut initiator,
+        "failure-preview",
+        json!({ "kind": "preview-reconciliation", "target": "codex", "strategy": "reapply" }),
+    )
+    .await;
+    let mut subscriber = fixture.connect().await;
+    hello(&mut subscriber).await;
+    request(
+        &mut subscriber,
+        "failure-subscriber-open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+
+    queue_writer_backpressure(&mut initiator, "failure-fill").await;
+    let action_id = Uuid::new_v4();
+    write_frame(
+        &mut initiator,
+        &json!({
+            "type": "request", "requestId": "writer-failure-reconcile",
+            "operation": {
+                "kind": "act", "target": "codex", "actionId": action_id,
+                "expectedRevision": opened["result"]["view"]["managementRevision"],
+                "action": {
+                    "kind": "reconcile", "strategy": "reapply",
+                    "observationToken": preview["result"]["preview"]["observationToken"]
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let durable = tokio::time::timeout(Duration::from_millis(150), async {
+        loop {
+            if let Some(outcome) = fixture
+                .store
+                .receipt_for(Target::Codex, action_id)
+                .await
+                .unwrap()
+            {
+                break outcome;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reconciliation did not durably commit behind the failing writer");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), read_frame(&mut subscriber))
+            .await
+            .is_err(),
+        "writer failure emitted a misleading reconciliation publication"
+    );
+
+    let mut reopened = fixture.connect().await;
+    hello(&mut reopened).await;
+    let visible = request(
+        &mut reopened,
+        "open-after-writer-failure",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    assert_eq!(
+        visible["result"]["view"],
+        serde_json::to_value(durable.view).unwrap()
+    );
+    drop(initiator);
+    fixture.shutdown().await;
 }
 
 #[tokio::test]

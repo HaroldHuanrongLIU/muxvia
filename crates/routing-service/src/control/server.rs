@@ -216,6 +216,10 @@ impl ControlServer {
             Arc::clone(&store),
             reconciliation_runtime,
         ));
+        reconciliation
+            .recover_pending_intents()
+            .await
+            .map_err(|_| ControlServerError::State)?;
         for target in [Target::Codex, Target::Claude] {
             let reconciled = match target {
                 Target::Codex => match CodexConfigCodec::for_user_home(home.user_home()) {
@@ -705,9 +709,9 @@ async fn serve_session(
                                     | TargetAction::DuplicateProvider { .. }
                             )
                         );
-                        let result = if let Some((strategy, observation_token, acknowledge_version)) = reconcile_action {
+                        let (result, publication) = if let Some((strategy, observation_token, acknowledge_version)) = reconcile_action {
                             match store.receipt_for(target, action_id).await {
-                                Ok(Some(outcome)) => Ok(outcome),
+                                Ok(Some(outcome)) => (Ok(outcome), None),
                                 Ok(None) => {
                                     let context = match target {
                                         Target::Codex => Some(ReconciliationContext::Codex),
@@ -716,8 +720,8 @@ async fn serve_session(
                                             .map(ReconciliationContext::Claude),
                                     };
                                     match context {
-                                        Some(context) => reconciliation
-                                            .apply(
+                                        Some(context) => {
+                                            let deferred = reconciliation.apply(
                                                 target,
                                                 action_id,
                                                 expected_revision,
@@ -726,23 +730,25 @@ async fn serve_session(
                                                 acknowledge_version,
                                                 context,
                                             )
-                                            .await,
-                                        None => Err(store.failure_for(
+                                            .await;
+                                            (deferred.result, deferred.publication)
+                                        }
+                                        None => (Err(store.failure_for(
                                             target,
                                             "preflight-context-required",
                                             "Claude preflight context is required",
-                                        ).await),
+                                        ).await), None),
                                     }
                                 }
-                                Err(_) => Err(store.failure_for(
+                                Err(_) => (Err(store.failure_for(
                                     target,
                                     "state-store-error",
                                     "State store unavailable",
-                                ).await),
+                                ).await), None),
                             }
                         } else {
                             match store.receipt_for(target, action_id).await {
-                                Ok(Some(outcome)) => Ok(outcome),
+                                Ok(Some(outcome)) => (Ok(outcome), None),
                                 Ok(None) => {
                                     let context = match target {
                                         Target::Codex => Some(ReconciliationContext::Codex),
@@ -753,15 +759,15 @@ async fn serve_session(
                                     let _gate = reconciliation
                                         .lock_target_mutation(target)
                                         .await;
-                                    match reconciliation
+                                    let allowed = reconciliation
                                         .ensure_ordinary_write_allowed(
                                             target,
                                             context,
                                             probe_unmanaged_provider_write,
                                         )
-                                        .await
-                                    {
-                                        Ok(()) => activation
+                                        .await;
+                                    match allowed.result {
+                                        Ok(()) => (activation
                                             .apply_raw_for_with_context_already_held(
                                                 target,
                                                 action_id,
@@ -769,34 +775,36 @@ async fn serve_session(
                                                 action,
                                                 opened_claude_context.as_ref(),
                                             )
-                                            .await,
-                                        Err(failure) => Err(failure),
+                                            .await, None),
+                                        Err(failure) => (Err(failure), allowed.publication),
                                     }
                                 }
-                                Err(_) => Err(store
+                                Err(_) => (Err(store
                                     .failure_for(
                                         target,
                                         "state-store-error",
                                         "State store unavailable",
                                     )
-                                    .await),
+                                    .await), None),
                             }
                         };
-                        match result {
+                        let frame = match result {
                             Ok(outcome) => {
-                                let response = ServerFrame::Response {
+                                ServerFrame::Response {
                                     request_id,
                                     result: ControlResult::ActionOutcome { outcome },
-                                };
-                                if !enqueue_response(&responses, response) { break 'session; }
+                                }
                             }
                             Err(failure) => {
-                                if !enqueue_response(&responses, ServerFrame::Error {
+                                ServerFrame::Error {
                                     request_id: Some(request_id),
                                     problem: failure.problem,
                                     authoritative_view: Some(failure.authoritative_view),
-                                }) { break 'session; }
+                                }
                             }
+                        };
+                        if !enqueue_action_response(&responses, frame, publication, &store).await {
+                            break 'session;
                         }
                     }
                     operation @ (ControlOperation::DiscoverModels { .. }
@@ -1073,6 +1081,31 @@ fn enqueue_response(responses: &mpsc::Sender<QueuedResponse>, frame: ServerFrame
             written: None,
         })
         .is_ok()
+}
+
+async fn enqueue_action_response(
+    responses: &mpsc::Sender<QueuedResponse>,
+    frame: ServerFrame,
+    publication: Option<TargetView>,
+    store: &StateStore,
+) -> bool {
+    let (written, acknowledged) = oneshot::channel();
+    if responses
+        .try_send(QueuedResponse {
+            frame,
+            written: Some(written),
+        })
+        .is_err()
+    {
+        return false;
+    }
+    if acknowledged.await.is_err() {
+        return false;
+    }
+    if let Some(view) = publication {
+        store.publish_target_view(view);
+    }
+    true
 }
 
 async fn write_responses(

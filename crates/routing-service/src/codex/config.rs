@@ -12,8 +12,10 @@ use crate::{
 
 pub use crate::config::managed_file::FileIdentity;
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OwnedCodexState {
+    #[serde(default = "default_owned_provider_key")]
+    owned_provider_key: String,
     model: Option<OwnedItem>,
     model_provider: Option<OwnedItem>,
     provider_name: Option<OwnedItem>,
@@ -33,6 +35,7 @@ impl fmt::Debug for OwnedCodexState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OwnedCodexState")
+            .field("owned_provider_key", &"<redacted>")
             .field("model_present", &self.model.is_some())
             .field("model_provider_present", &self.model_provider.is_some())
             .field("provider_name_present", &self.provider_name.is_some())
@@ -84,8 +87,33 @@ impl DesiredCodexState {
         self.mode
     }
 
-    pub(crate) fn reconciliation_provider(&self) -> Option<(String, String, SecretString)> {
+    pub(crate) fn reconciliation_provider(&self) -> Option<(String, String, String, SecretString)> {
         let model = self.owned.model.as_ref()?.semantic.as_str()?.to_owned();
+        if model.trim().is_empty() {
+            return None;
+        }
+        let provider_key = self.owned.model_provider.as_ref()?.semantic.as_str()?;
+        if provider_key.trim().is_empty() {
+            return None;
+        }
+        let name = self
+            .owned
+            .provider_name
+            .as_ref()?
+            .semantic
+            .as_str()?
+            .to_owned();
+        if name.trim().is_empty()
+            || self.owned.provider_wire_api.as_ref()?.semantic.as_str()? != "responses"
+            || self
+                .owned
+                .provider_supports_websockets
+                .as_ref()?
+                .semantic
+                .as_bool()?
+        {
+            return None;
+        }
         let base_url = self
             .owned
             .provider_base_url
@@ -93,12 +121,18 @@ impl DesiredCodexState {
             .semantic
             .as_str()?
             .to_owned();
+        if base_url.trim().is_empty() {
+            return None;
+        }
         let headers = self
             .owned
             .provider_http_headers
             .as_ref()?
             .semantic
             .as_object()?;
+        if headers.len() != 1 {
+            return None;
+        }
         let credential = headers
             .get("Authorization")
             .and_then(serde_json::Value::as_str)
@@ -108,9 +142,61 @@ impl DesiredCodexState {
                     .get("X-Muxvia-Routing-Credential")
                     .and_then(serde_json::Value::as_str)
             })?;
-        Some((model, base_url, SecretString::from(credential.to_owned())))
+        if credential.trim().is_empty() {
+            return None;
+        }
+        Some((
+            name,
+            model,
+            base_url,
+            SecretString::from(credential.to_owned()),
+        ))
+    }
+
+    fn with_provider_ownership(mut self, ownership: &Self) -> Self {
+        let provider_key = ownership.owned.effective_provider_key();
+        if !provider_key.is_empty() {
+            self.owned.owned_provider_key = provider_key.to_owned();
+            self.owned.model_provider = desired_item(value(provider_key));
+            self.owned.provider_name = ownership.owned.provider_name.clone();
+        }
+        self
     }
 }
+
+fn default_owned_provider_key() -> String {
+    "muxvia_codex".to_owned()
+}
+
+impl OwnedCodexState {
+    fn effective_provider_key(&self) -> &str {
+        if self
+            .model_provider
+            .as_ref()
+            .and_then(|item| item.semantic.as_str())
+            .is_some()
+        {
+            &self.owned_provider_key
+        } else {
+            ""
+        }
+    }
+}
+
+impl PartialEq for OwnedCodexState {
+    fn eq(&self, other: &Self) -> bool {
+        self.effective_provider_key() == other.effective_provider_key()
+            && self.model == other.model
+            && self.model_provider == other.model_provider
+            && self.provider_name == other.provider_name
+            && self.provider_base_url == other.provider_base_url
+            && self.provider_wire_api == other.provider_wire_api
+            && self.provider_http_headers == other.provider_http_headers
+            && self.provider_supports_websockets == other.provider_supports_websockets
+    }
+}
+
+impl Eq for OwnedCodexState {}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigSnapshot {
@@ -173,6 +259,13 @@ impl ConfigSnapshot {
         DesiredCodexState {
             owned: self.owned.clone(),
             mode: committed.mode,
+        }
+    }
+
+    pub(crate) fn as_adopted_direct(&self) -> DesiredCodexState {
+        DesiredCodexState {
+            owned: self.owned.clone(),
+            mode: Some(ManagedCodexMode::Direct),
         }
     }
 
@@ -259,11 +352,44 @@ impl CodexConfigCodec {
         Ok((snapshot, profile_shadow))
     }
 
+    pub(crate) fn reconciliation_snapshots_for(
+        &self,
+        committed: &DesiredCodexState,
+    ) -> Result<(ConfigSnapshot, ConfigSnapshot, bool), CodexProblem> {
+        let contents = self
+            .file
+            .read()
+            .map_err(|error| map_file_error(error, Some(self.config_path())))?;
+        let source = String::from_utf8(contents.bytes).map_err(|_| {
+            CodexProblem::new("configuration-write-failed", Some(self.config_path()))
+        })?;
+        let document = source.parse::<DocumentMut>().map_err(|_| {
+            CodexProblem::new("configuration-write-failed", Some(self.config_path()))
+        })?;
+        let selected_provider_key = selected_provider_key(&document).unwrap_or_default();
+        let managed = snapshot_from_document(
+            contents.identity.clone(),
+            &document,
+            committed.owned.effective_provider_key(),
+        )?;
+        let selected =
+            snapshot_from_document(contents.identity, &document, selected_provider_key.as_str())?;
+        let profile_shadow = document
+            .get("profile")
+            .is_some_and(|profile| !profile.is_none());
+        Ok((managed, selected, profile_shadow))
+    }
+
     fn inspect_state(
         &self,
         committed: Option<(ManagedCodexMode, &DesiredCodexState)>,
     ) -> Result<ManagedCodexState, CodexProblem> {
-        let (snapshot, document) = self.read_snapshot()?;
+        let (snapshot, document) = match committed {
+            Some((_, expected)) => {
+                self.read_snapshot_for_key(expected.owned.effective_provider_key())?
+            }
+            None => self.read_snapshot()?,
+        };
         match committed {
             None => {
                 if document
@@ -323,6 +449,7 @@ impl CodexConfigCodec {
             .expect("serializing a routing credential string cannot fail");
         DesiredCodexState {
             owned: OwnedCodexState {
+                owned_provider_key: default_owned_provider_key(),
                 model: desired_item(value(model)),
                 model_provider: desired_item(value("muxvia_codex")),
                 provider_name: desired_item(value("Muxvia")),
@@ -337,6 +464,17 @@ impl CodexConfigCodec {
         }
     }
 
+    pub(crate) fn desired_takeover_with_ownership(
+        &self,
+        model: &str,
+        base_url: &str,
+        routing_credential: &str,
+        ownership: &DesiredCodexState,
+    ) -> DesiredCodexState {
+        self.desired_takeover(model, base_url, routing_credential)
+            .with_provider_ownership(ownership)
+    }
+
     pub fn desired_direct(
         &self,
         model: &str,
@@ -347,6 +485,7 @@ impl CodexConfigCodec {
             .expect("serializing a Provider credential string cannot fail");
         DesiredCodexState {
             owned: OwnedCodexState {
+                owned_provider_key: default_owned_provider_key(),
                 model: desired_item(value(model)),
                 model_provider: desired_item(value("muxvia_codex")),
                 provider_name: desired_item(value("Muxvia Direct")),
@@ -359,6 +498,17 @@ impl CodexConfigCodec {
             },
             mode: Some(ManagedCodexMode::Direct),
         }
+    }
+
+    pub(crate) fn desired_direct_with_ownership(
+        &self,
+        model: &str,
+        base_url: &str,
+        provider_credential: &str,
+        ownership: &DesiredCodexState,
+    ) -> DesiredCodexState {
+        self.desired_direct(model, base_url, provider_credential)
+            .with_provider_ownership(ownership)
     }
 
     pub fn atomic_apply(
@@ -375,7 +525,9 @@ impl CodexConfigCodec {
         before: &ConfigSnapshot,
         expected_current: &DesiredCodexState,
     ) -> Result<(), CodexProblem> {
-        let current = self.read_snapshot()?.0;
+        let current = self
+            .read_snapshot_for_key(expected_current.owned.effective_provider_key())?
+            .0;
         if !owned_semantically_matches(&current.owned, &expected_current.owned) {
             return Err(CodexProblem::new(
                 "recovery-required",
@@ -388,7 +540,9 @@ impl CodexConfigCodec {
                 .as_object()
                 .is_some_and(serde_json::Map::is_empty);
         self.write_owned(&current, &before.owned, remove_file, false)?;
-        let restored = self.read_snapshot()?.0;
+        let restored = self
+            .read_snapshot_for_key(before.owned.effective_provider_key())?
+            .0;
         if restored.owned != before.owned || restored.unrelated != current.unrelated {
             return Err(CodexProblem::new(
                 "recovery-required",
@@ -422,7 +576,9 @@ impl CodexConfigCodec {
         before: &ConfigSnapshot,
         desired: &DesiredCodexState,
     ) -> Result<(), CodexProblem> {
-        let current = self.read_snapshot()?.0;
+        let current = self
+            .read_snapshot_for_key(desired.owned.effective_provider_key())?
+            .0;
         if !owned_semantically_matches(&current.owned, &desired.owned)
             || current.unrelated != before.unrelated
         {
@@ -463,25 +619,38 @@ impl CodexConfigCodec {
                 Some(self.config_path()),
             ));
         }
-        let current = match self.read_snapshot() {
-            Ok((snapshot, _)) => snapshot,
-            Err(_) => {
-                self.mark_recovery_required(store, intent).await?;
-                return Err(CodexProblem::new(
-                    "recovery-required",
-                    Some(self.config_path()),
-                ));
-            }
-        };
-        if current.owned == intent.before().owned && current.unrelated == intent.before().unrelated
+        let before_current =
+            match self.read_snapshot_for_key(intent.before().owned.effective_provider_key()) {
+                Ok((snapshot, _)) => snapshot,
+                Err(_) => {
+                    self.mark_recovery_required(store, intent).await?;
+                    return Err(CodexProblem::new(
+                        "recovery-required",
+                        Some(self.config_path()),
+                    ));
+                }
+            };
+        if before_current.owned == intent.before().owned
+            && before_current.unrelated == intent.before().unrelated
         {
             return store
                 .set_recovery_state(intent.id(), RecoveryState::RolledBack)
                 .await
                 .map_err(|_| CodexProblem::new("recovery-required", Some(self.config_path())));
         }
-        if owned_semantically_matches(&current.owned, &intent.desired().owned)
-            && current.unrelated == intent.before().unrelated
+        let desired_current =
+            match self.read_snapshot_for_key(intent.desired().owned.effective_provider_key()) {
+                Ok((snapshot, _)) => snapshot,
+                Err(_) => {
+                    self.mark_recovery_required(store, intent).await?;
+                    return Err(CodexProblem::new(
+                        "recovery-required",
+                        Some(self.config_path()),
+                    ));
+                }
+            };
+        if owned_semantically_matches(&desired_current.owned, &intent.desired().owned)
+            && desired_current.unrelated == intent.before().unrelated
             && self.restore(intent.before(), intent.desired()).is_ok()
             && self.matches_before(intent.before())
         {
@@ -509,7 +678,7 @@ impl CodexConfigCodec {
     }
 
     fn matches_before(&self, before: &ConfigSnapshot) -> bool {
-        match self.read_snapshot() {
+        match self.read_snapshot_for_key(before.owned.effective_provider_key()) {
             Ok((current, _)) => {
                 current.owned == before.owned && current.unrelated == before.unrelated
             }
@@ -524,16 +693,21 @@ impl CodexConfigCodec {
         remove_file: bool,
         preserve_decor: bool,
     ) -> Result<(), CodexProblem> {
-        let (current, mut document) = self.read_snapshot()?;
+        let (current, mut document) =
+            self.read_snapshot_for_key(expected.owned.effective_provider_key())?;
         if current != *expected {
             return Err(CodexProblem::new(
                 "configuration-write-failed",
                 Some(self.config_path()),
             ));
         }
-        apply_owned(&mut document, owned, preserve_decor).map_err(|_| {
-            CodexProblem::new("configuration-write-failed", Some(self.config_path()))
-        })?;
+        apply_owned(
+            &mut document,
+            expected.owned.effective_provider_key(),
+            owned,
+            preserve_decor,
+        )
+        .map_err(|_| CodexProblem::new("configuration-write-failed", Some(self.config_path())))?;
         self.file
             .replace(
                 &expected.identity,
@@ -544,6 +718,13 @@ impl CodexConfigCodec {
     }
 
     fn read_snapshot(&self) -> Result<(ConfigSnapshot, DocumentMut), CodexProblem> {
+        self.read_snapshot_for_key("muxvia_codex")
+    }
+
+    fn read_snapshot_for_key(
+        &self,
+        provider_key: &str,
+    ) -> Result<(ConfigSnapshot, DocumentMut), CodexProblem> {
         let contents = self
             .file
             .read()
@@ -554,17 +735,21 @@ impl CodexConfigCodec {
         let document = source.parse::<DocumentMut>().map_err(|_| {
             CodexProblem::new("configuration-write-failed", Some(self.config_path()))
         })?;
-        let owned = capture_owned(&document)?;
-        let unrelated = unrelated_projection(&document)?;
-        Ok((
-            ConfigSnapshot {
-                identity: contents.identity,
-                owned,
-                unrelated,
-            },
-            document,
-        ))
+        let snapshot = snapshot_from_document(contents.identity, &document, provider_key)?;
+        Ok((snapshot, document))
     }
+}
+
+fn snapshot_from_document(
+    identity: FileIdentity,
+    document: &DocumentMut,
+    provider_key: &str,
+) -> Result<ConfigSnapshot, CodexProblem> {
+    Ok(ConfigSnapshot {
+        identity,
+        owned: capture_owned_for_key(document, provider_key)?,
+        unrelated: unrelated_projection_for_key(document, provider_key)?,
+    })
 }
 
 fn map_file_error(error: ManagedFileError, path: Option<&Path>) -> CodexProblem {
@@ -575,20 +760,36 @@ fn map_file_error(error: ManagedFileError, path: Option<&Path>) -> CodexProblem 
     CodexProblem::new(code, path)
 }
 
-fn capture_owned(document: &DocumentMut) -> Result<OwnedCodexState, CodexProblem> {
+fn selected_provider_key(document: &DocumentMut) -> Option<String> {
+    document
+        .get("model_provider")
+        .and_then(Item::as_value)
+        .and_then(value_semantic)
+        .and_then(|value| value.as_str().map(str::to_owned))
+}
+
+fn capture_owned_for_key(
+    document: &DocumentMut,
+    provider_key: &str,
+) -> Result<OwnedCodexState, CodexProblem> {
     for key in ["model", "model_provider"] {
         if document.get(key).is_some_and(|item| !item.is_value()) {
             return Err(CodexProblem::new("configuration-collision", None));
         }
     }
     Ok(OwnedCodexState {
+        owned_provider_key: provider_key.to_owned(),
         model: item_text(document.get("model")),
         model_provider: item_text(document.get("model_provider")),
-        provider_name: nested_item_text(document, "name"),
-        provider_base_url: nested_item_text(document, "base_url"),
-        provider_wire_api: nested_item_text(document, "wire_api"),
-        provider_http_headers: nested_item_text(document, "http_headers"),
-        provider_supports_websockets: nested_item_text(document, "supports_websockets"),
+        provider_name: nested_item_text(document, provider_key, "name"),
+        provider_base_url: nested_item_text(document, provider_key, "base_url"),
+        provider_wire_api: nested_item_text(document, provider_key, "wire_api"),
+        provider_http_headers: nested_item_text(document, provider_key, "http_headers"),
+        provider_supports_websockets: nested_item_text(
+            document,
+            provider_key,
+            "supports_websockets",
+        ),
     })
 }
 
@@ -603,10 +804,10 @@ fn item_text(item: Option<&Item>) -> Option<OwnedItem> {
         })
 }
 
-fn nested_item_text(document: &DocumentMut, key: &str) -> Option<OwnedItem> {
+fn nested_item_text(document: &DocumentMut, provider_key: &str, key: &str) -> Option<OwnedItem> {
     document
         .get("model_providers")?
-        .get("muxvia_codex")?
+        .get(provider_key)?
         .get(key)
         .filter(|item| !item.is_none())
         .and_then(Item::as_value)
@@ -645,7 +846,8 @@ fn value_to_owned_rendered(value: &toml_edit::Value) -> String {
 }
 
 fn owned_semantically_matches(left: &OwnedCodexState, right: &OwnedCodexState) -> bool {
-    item_semantically_matches(&left.model, &right.model)
+    left.effective_provider_key() == right.effective_provider_key()
+        && item_semantically_matches(&left.model, &right.model)
         && item_semantically_matches(&left.model_provider, &right.model_provider)
         && item_semantically_matches(&left.provider_name, &right.provider_name)
         && item_semantically_matches(&left.provider_base_url, &right.provider_base_url)
@@ -659,7 +861,8 @@ fn owned_semantically_matches(left: &OwnedCodexState, right: &OwnedCodexState) -
 
 #[allow(dead_code)]
 fn provider_semantically_matches(left: &OwnedCodexState, right: &OwnedCodexState) -> bool {
-    item_semantically_matches(&left.model, &right.model)
+    left.effective_provider_key() == right.effective_provider_key()
+        && item_semantically_matches(&left.model, &right.model)
         && item_semantically_matches(&left.model_provider, &right.model_provider)
         && item_semantically_matches(&left.provider_name, &right.provider_name)
         && item_semantically_matches(&left.provider_base_url, &right.provider_base_url)
@@ -693,6 +896,7 @@ fn owned_semantic_fingerprint(owned: &OwnedCodexState) -> String {
         item.as_ref().map(|item| &item.semantic)
     }
     semantic_fingerprint(&(
+        owned.effective_provider_key(),
         semantic(&owned.model),
         semantic(&owned.model_provider),
         semantic(&owned.provider_name),
@@ -703,7 +907,10 @@ fn owned_semantic_fingerprint(owned: &OwnedCodexState) -> String {
     ))
 }
 
-fn unrelated_projection(document: &DocumentMut) -> Result<serde_json::Value, CodexProblem> {
+fn unrelated_projection_for_key(
+    document: &DocumentMut,
+    provider_key: &str,
+) -> Result<serde_json::Value, CodexProblem> {
     let mut clone = document.clone();
     clone.remove("model");
     clone.remove("model_provider");
@@ -712,7 +919,7 @@ fn unrelated_projection(document: &DocumentMut) -> Result<serde_json::Value, Cod
         .and_then(Item::as_table_like_mut)
     {
         if let Some(provider) = providers
-            .get_mut("muxvia_codex")
+            .get_mut(provider_key)
             .and_then(Item::as_table_like_mut)
         {
             for key in [
@@ -726,11 +933,11 @@ fn unrelated_projection(document: &DocumentMut) -> Result<serde_json::Value, Cod
             }
         }
         if providers
-            .get("muxvia_codex")
+            .get(provider_key)
             .and_then(Item::as_table_like)
             .is_some_and(|provider| provider.is_empty())
         {
-            providers.remove("muxvia_codex");
+            providers.remove(provider_key);
         }
     }
     if clone
@@ -746,9 +953,33 @@ fn unrelated_projection(document: &DocumentMut) -> Result<serde_json::Value, Cod
 
 fn apply_owned(
     document: &mut DocumentMut,
+    current_provider_key: &str,
     owned: &OwnedCodexState,
     preserve_decor: bool,
 ) -> Result<(), ()> {
+    let provider_key = owned.effective_provider_key();
+    if current_provider_key != provider_key
+        && !current_provider_key.is_empty()
+        && let Some(providers) = document
+            .get_mut("model_providers")
+            .and_then(Item::as_table_like_mut)
+        && let Some(prior) = providers
+            .get_mut(current_provider_key)
+            .and_then(Item::as_table_like_mut)
+    {
+        for key in [
+            "name",
+            "base_url",
+            "wire_api",
+            "http_headers",
+            "supports_websockets",
+        ] {
+            prior.remove(key);
+        }
+        if prior.is_empty() {
+            providers.remove(current_provider_key);
+        }
+    }
     set_top_level(document, "model", owned.model.as_ref(), preserve_decor)?;
     set_top_level(
         document,
@@ -766,15 +997,15 @@ fn apply_owned(
             owned.provider_supports_websockets.as_ref(),
         ),
     ];
-    if fields.iter().any(|(_, value)| value.is_some()) {
+    if fields.iter().any(|(_, value)| value.is_some()) && !provider_key.is_empty() {
         if document.get("model_providers").is_none() {
             document["model_providers"] = Item::Table(Table::new());
         }
         let providers = document["model_providers"].as_table_mut().ok_or(())?;
-        if providers.get("muxvia_codex").is_none() {
-            providers["muxvia_codex"] = Item::Table(Table::new());
+        if providers.get(provider_key).is_none() {
+            providers[provider_key] = Item::Table(Table::new());
         }
-        let provider = providers["muxvia_codex"].as_table_mut().ok_or(())?;
+        let provider = providers[provider_key].as_table_mut().ok_or(())?;
         for (key, encoded) in fields {
             if let Some(encoded) = encoded {
                 set_table_item(provider, key, encoded, preserve_decor)?;
@@ -782,14 +1013,34 @@ fn apply_owned(
                 provider.remove(key);
             }
         }
-    } else if let Some(providers) = document
-        .get_mut("model_providers")
-        .and_then(Item::as_table_like_mut)
+    } else if current_provider_key == provider_key
+        && !provider_key.is_empty()
+        && let Some(providers) = document
+            .get_mut("model_providers")
+            .and_then(Item::as_table_like_mut)
+        && let Some(provider) = providers
+            .get_mut(provider_key)
+            .and_then(Item::as_table_like_mut)
     {
-        providers.remove("muxvia_codex");
-        if providers.is_empty() {
-            document.remove("model_providers");
+        for key in [
+            "name",
+            "base_url",
+            "wire_api",
+            "http_headers",
+            "supports_websockets",
+        ] {
+            provider.remove(key);
         }
+        if provider.is_empty() {
+            providers.remove(provider_key);
+        }
+    }
+    if document
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .is_some_and(|providers| providers.is_empty())
+    {
+        document.remove("model_providers");
     }
     Ok(())
 }
@@ -855,8 +1106,13 @@ fn restore_decor(item: Option<&mut Item>, decor: Option<OwnedDecor>) {
 #[cfg(test)]
 mod tests {
     use super::{CodexConfigCodec, ManagedCodexMode, ManagedCodexState};
+    use crate::{
+        home::MuxviaHome,
+        state::{RecoveryIntent, RecoveryState, StateStore},
+    };
     use std::fs;
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     #[test]
     fn managed_state_is_typed_only_by_the_callers_committed_expectation() {
@@ -902,5 +1158,66 @@ mod tests {
         ));
 
         assert!(!format!("{direct_snapshot:?}").contains("provider-secret"));
+    }
+
+    #[tokio::test]
+    async fn pending_cross_key_activation_before_write_recovers_as_rolled_back() {
+        let root = TempDir::new().unwrap();
+        let codec = CodexConfigCodec::for_user_home(root.path()).unwrap();
+        let historical = codec.inspect().unwrap();
+        let committed = codec.desired_direct(
+            "committed-model",
+            "https://committed.example/v1",
+            "COMMITTED_SECRET_97205",
+        );
+        codec.atomic_apply(&historical, &committed).unwrap();
+        let managed = fs::read_to_string(codec.config_path()).unwrap();
+        fs::write(
+            codec.config_path(),
+            managed.replace(
+                "model_provider = \"muxvia_codex\"",
+                "model_provider = \"external\"",
+            ) + r#"
+[model_providers.external]
+name = "External"
+base_url = "https://external.example/v1"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer EXTERNAL_SECRET_97206" }
+supports_websockets = false
+"#,
+        )
+        .unwrap();
+        let (_, external, _) = codec.reconciliation_snapshots_for(&committed).unwrap();
+        let external_desired = external.as_adopted_direct();
+        let candidate = codec.desired_takeover_with_ownership(
+            "candidate-model",
+            "http://127.0.0.1:43123/v1",
+            "candidate-route-secret",
+            &external_desired,
+        );
+        let recovery = RecoveryIntent::pending(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            codec.config_path().to_owned(),
+            external,
+            candidate,
+            0,
+        );
+        let store = StateStore::open(&MuxviaHome::from_user_home(root.path()))
+            .await
+            .unwrap();
+        store.insert_recovery_intent(&recovery).await.unwrap();
+
+        codec.reconcile_pending(&store).await.unwrap();
+
+        assert_eq!(
+            store
+                .recovery_intent(recovery.id())
+                .await
+                .unwrap()
+                .unwrap()
+                .state(),
+            RecoveryState::RolledBack
+        );
     }
 }

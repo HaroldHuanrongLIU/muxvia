@@ -38,6 +38,7 @@ enum ConfigurationPreflight {
     Codex {
         codec: CodexConfigCodec,
         before: Box<ConfigSnapshot>,
+        ownership: Option<Box<DesiredCodexState>>,
     },
     Claude {
         codec: ClaudeConfigCodec,
@@ -660,12 +661,24 @@ impl ActivationService {
 
         let (runtime, configuration, mut candidate) = match command.mode {
             ActivationMode::Direct => match configuration {
-                ConfigurationPreflight::Codex { codec, before } => {
-                    let desired = codec.desired_direct(
-                        &preparation.model,
-                        &preparation.base_url,
-                        preparation.provider_credential.expose_secret(),
-                    );
+                ConfigurationPreflight::Codex {
+                    codec,
+                    before,
+                    ownership,
+                } => {
+                    let desired = match ownership.as_deref() {
+                        Some(ownership) => codec.desired_direct_with_ownership(
+                            &preparation.model,
+                            &preparation.base_url,
+                            preparation.provider_credential.expose_secret(),
+                            ownership,
+                        ),
+                        None => codec.desired_direct(
+                            &preparation.model,
+                            &preparation.base_url,
+                            preparation.provider_credential.expose_secret(),
+                        ),
+                    };
                     (
                         ActivationRuntime::Direct,
                         ActivationConfiguration::Codex {
@@ -746,12 +759,24 @@ impl ActivationService {
                     return Err(self.target_failure(target, "internal-failure").await);
                 }
                 let configuration = match configuration {
-                    ConfigurationPreflight::Codex { codec, before } => {
-                        let desired = codec.desired_takeover(
-                            &preparation.model,
-                            &format!("http://127.0.0.1:{route_port}/v1"),
-                            routing_credential.expose_secret(),
-                        );
+                    ConfigurationPreflight::Codex {
+                        codec,
+                        before,
+                        ownership,
+                    } => {
+                        let desired = match ownership.as_deref() {
+                            Some(ownership) => codec.desired_takeover_with_ownership(
+                                &preparation.model,
+                                &format!("http://127.0.0.1:{route_port}/v1"),
+                                routing_credential.expose_secret(),
+                                ownership,
+                            ),
+                            None => codec.desired_takeover(
+                                &preparation.model,
+                                &format!("http://127.0.0.1:{route_port}/v1"),
+                                routing_credential.expose_secret(),
+                            ),
+                        };
                         ActivationConfiguration::Codex {
                             codec,
                             before,
@@ -1074,11 +1099,28 @@ impl ActivationService {
             Target::Codex => {
                 let codec = CodexConfigCodec::for_user_home(self.home.user_home())
                     .map_err(|_| ModelServerError::TargetConfiguration)?;
-                let expected = codec.desired_takeover(
-                    snapshot.model(),
-                    &format!("http://127.0.0.1:{}/v1", takeover.route_port),
-                    routing_credential.expose_secret(),
-                );
+                let expected = match takeover.recovery_expectation.as_ref() {
+                    Some(recovery) => {
+                        let RecoveryPayload::Codex { desired, .. } = &recovery.payload else {
+                            return Ok(CommittedConfigurationStatus::RecoveryRequired(recovery.id));
+                        };
+                        let expected = codec.desired_takeover_with_ownership(
+                            snapshot.model(),
+                            &format!("http://127.0.0.1:{}/v1", takeover.route_port),
+                            routing_credential.expose_secret(),
+                            desired,
+                        );
+                        if expected != **desired {
+                            return Ok(CommittedConfigurationStatus::RecoveryRequired(recovery.id));
+                        }
+                        expected
+                    }
+                    None => codec.desired_takeover(
+                        snapshot.model(),
+                        &format!("http://127.0.0.1:{}/v1", takeover.route_port),
+                        routing_credential.expose_secret(),
+                    ),
+                };
                 Ok(
                     if matches!(
                         codec.inspect_managed_state(&expected),
@@ -1183,13 +1225,14 @@ impl ActivationService {
                 };
                 let codec = CodexConfigCodec::for_user_home(self.home.user_home())
                     .map_err(|problem| PreflightFailure::new(problem.code()))?;
-                let before = self
+                let (before, ownership) = self
                     .inspect_config(&codec, preparation)
                     .map_err(PreflightFailure::new)?;
                 Ok((
                     ConfigurationPreflight::Codex {
                         codec,
                         before: Box::new(before),
+                        ownership: ownership.map(Box::new),
                     },
                     capability_problem,
                 ))
@@ -1335,44 +1378,84 @@ impl ActivationService {
         &self,
         codec: &CodexConfigCodec,
         preparation: &ActivationPreparation,
-    ) -> Result<crate::codex::ConfigSnapshot, &'static str> {
+    ) -> Result<(crate::codex::ConfigSnapshot, Option<DesiredCodexState>), &'static str> {
         match (
             &preparation.prior_snapshot,
             &preparation.prior_route_runtime,
         ) {
             (Some(snapshot), Some(runtime)) => {
-                let expected = codec.desired_takeover(
-                    &snapshot.model,
-                    &format!("http://127.0.0.1:{}/v1", runtime.route_port),
-                    runtime.routing_credential.expose_secret(),
-                );
+                let ownership = match preparation.prior_recovery_payload.as_ref() {
+                    Some(RecoveryPayload::Codex { desired, .. }) => Some(desired.as_ref()),
+                    Some(_) => return Err("recovery-required"),
+                    None => None,
+                };
+                let expected = match ownership {
+                    Some(ownership) => codec.desired_takeover_with_ownership(
+                        &snapshot.model,
+                        &format!("http://127.0.0.1:{}/v1", runtime.route_port),
+                        runtime.routing_credential.expose_secret(),
+                        ownership,
+                    ),
+                    None => codec.desired_takeover(
+                        &snapshot.model,
+                        &format!("http://127.0.0.1:{}/v1", runtime.route_port),
+                        runtime.routing_credential.expose_secret(),
+                    ),
+                };
+                if ownership.is_some_and(|ownership| expected != *ownership) {
+                    return Err("recovery-required");
+                }
                 match codec.inspect_managed_state(&expected).map_err(|problem| {
                     match problem.code() {
                         "configuration-collision" => "recovery-required",
                         code => code,
                     }
                 })? {
-                    ManagedCodexState::Takeover { snapshot } => Ok(snapshot),
+                    ManagedCodexState::Takeover { snapshot } => {
+                        Ok((snapshot, ownership.map(|_| expected)))
+                    }
                     _ => Err("recovery-required"),
                 }
             }
             (Some(snapshot), None) => {
-                let expected = codec.desired_direct(
-                    &snapshot.model,
-                    &snapshot.base_url,
-                    snapshot.provider_credential.expose_secret(),
-                );
+                let ownership = match preparation.prior_recovery_payload.as_ref() {
+                    Some(RecoveryPayload::Codex { desired, .. }) => Some(desired.as_ref()),
+                    Some(_) => return Err("recovery-required"),
+                    None => None,
+                };
+                let expected = match ownership {
+                    Some(ownership) => codec.desired_direct_with_ownership(
+                        &snapshot.model,
+                        &snapshot.base_url,
+                        snapshot.provider_credential.expose_secret(),
+                        ownership,
+                    ),
+                    None => codec.desired_direct(
+                        &snapshot.model,
+                        &snapshot.base_url,
+                        snapshot.provider_credential.expose_secret(),
+                    ),
+                };
+                if ownership.is_some_and(|ownership| expected != *ownership) {
+                    return Err("recovery-required");
+                }
                 match codec.inspect_managed_state(&expected).map_err(|problem| {
                     match problem.code() {
                         "configuration-collision" => "recovery-required",
                         code => code,
                     }
                 })? {
-                    ManagedCodexState::Direct { snapshot } => Ok(snapshot),
+                    ManagedCodexState::Direct { snapshot } => {
+                        Ok((snapshot, ownership.map(|_| expected)))
+                    }
                     _ => Err("recovery-required"),
                 }
             }
-            (None, None) => codec.inspect().map_err(|problem| problem.code()),
+            (None, None) if preparation.prior_recovery_payload.is_none() => codec
+                .inspect()
+                .map(|snapshot| (snapshot, None))
+                .map_err(|problem| problem.code()),
+            (None, None) => Err("recovery-required"),
             (None, Some(_)) => Err("recovery-required"),
         }
     }

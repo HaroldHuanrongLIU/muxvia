@@ -602,6 +602,11 @@ fn reconciliation_probe_rejects_malformed_missing_contradictory_and_non_utf8_out
             "printf 'Usage: claude [OPTIONS]\\n--config <key=value>\\n'",
         ),
         (
+            "missing --config capability",
+            "printf 'codex-cli 0.106.0\\n'",
+            "printf 'Usage: codex [OPTIONS]\\nmissing-config-probe-output-sentinel\\n'",
+        ),
+        (
             "multiline raw version",
             "printf 'codex-cli 0.106.0\\nraw-probe-output-sentinel\\n'",
             "printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n'",
@@ -628,7 +633,13 @@ fn reconciliation_probe_rejects_malformed_missing_contradictory_and_non_utf8_out
             Err(error) => error,
         };
         assert_eq!(error.code(), "incompatible-target-cli", "{case}");
-        assert!(!format!("{error:?}\n{error}").contains("raw-probe-output-sentinel"));
+        let diagnostic = format!("{error:?}\n{error}");
+        for sentinel in [
+            "raw-probe-output-sentinel",
+            "missing-config-probe-output-sentinel",
+        ] {
+            assert!(!diagnostic.contains(sentinel));
+        }
     }
 }
 

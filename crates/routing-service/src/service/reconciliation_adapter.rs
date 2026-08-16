@@ -348,7 +348,7 @@ mod tests {
     };
     use crate::{
         claude::{ClaudeConfigCodec, ClaudeConfigOwnership},
-        codex::CodexConfigCodec,
+        codex::{CodexConfigCodec, config::ManagedCodexMode},
         control::protocol::{
             ClaudeBlockingSelector, ClaudeHostManagedState, ClaudePreflightContext,
             ClaudeSelectorState, CompatibilityClassification, ReconciliationField,
@@ -560,11 +560,19 @@ supports_websockets = false
             match &result.prepared {
                 PreparedConfiguration::Codex { before, desired } => {
                     assert_eq!(before, &observed);
+                    assert_eq!(before.mode(), Some(ManagedCodexMode::Takeover));
                     match strategy {
-                        ReconciliationStrategy::Adopt => assert_eq!(desired, &observed),
-                        ReconciliationStrategy::Reapply => assert_eq!(desired, &committed),
+                        ReconciliationStrategy::Adopt => {
+                            assert_eq!(desired, &observed);
+                            assert_eq!(desired.mode(), Some(ManagedCodexMode::Takeover));
+                        }
+                        ReconciliationStrategy::Reapply => {
+                            assert_eq!(desired, &committed);
+                            assert_eq!(desired.mode(), Some(ManagedCodexMode::Takeover));
+                        }
                         ReconciliationStrategy::Restore => {
-                            assert_eq!(desired, &recovery_desired)
+                            assert_eq!(desired, &recovery_desired);
+                            assert_eq!(desired.mode(), Some(ManagedCodexMode::Takeover));
                         }
                     }
                 }
@@ -1131,6 +1139,56 @@ supports_websockets = false
 
         assert_eq!(result.observation.shadows, Vec::<ShadowSource>::new());
         assert_eq!(shadow_fingerprint(&settings_path), file_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconciliation_claude_project_file_symlink_to_managed_file_is_shared_shadow() {
+        let home = TempDir::new().unwrap();
+        let project = home.path().join("project");
+        fs::create_dir_all(project.join(".claude")).unwrap();
+        let codec = ClaudeConfigCodec::for_user_home(home.path()).unwrap();
+        let recovery_before = codec.inspect().unwrap();
+        let committed = codec.desired_takeover(
+            "model-sentinel",
+            "http://127.0.0.1:43124/url-sentinel",
+            "credential-sentinel",
+        );
+        codec.atomic_apply(&recovery_before, &committed).unwrap();
+        let settings_path = codec.settings_path().to_owned();
+        let project_settings = project.join(".claude/settings.json");
+        symlink(&settings_path, &project_settings).unwrap();
+        let file_before = shadow_fingerprint(&settings_path);
+        let link_before = fs::symlink_metadata(&project_settings).unwrap();
+        let link_target_before = fs::read_link(&project_settings).unwrap();
+
+        let result = TargetReconciliationAdapter::Claude(codec)
+            .observe(
+                ReconciliationStrategy::Reapply,
+                &CommittedConfiguration::Claude {
+                    desired: committed,
+                    recovery_before,
+                },
+                &ReconciliationContext::Claude(claude_context(&project)),
+                claude_compatibility(),
+            )
+            .unwrap();
+
+        assert_eq!(result.observation.shadows, vec![ShadowSource::ClaudeShared]);
+        assert_eq!(shadow_fingerprint(&settings_path), file_before);
+        let link_after = fs::symlink_metadata(&project_settings).unwrap();
+        assert_eq!(
+            fs::read_link(&project_settings).unwrap(),
+            link_target_before
+        );
+        assert_eq!(
+            link_after.permissions().mode() & 0o777,
+            link_before.permissions().mode() & 0o777
+        );
+        assert_eq!(
+            link_after.modified().unwrap(),
+            link_before.modified().unwrap()
+        );
     }
 
     fn codec_desired_for_host(home: &std::path::Path) -> crate::claude::DesiredClaudeState {

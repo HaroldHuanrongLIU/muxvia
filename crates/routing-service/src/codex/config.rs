@@ -77,6 +77,13 @@ impl fmt::Debug for DesiredCodexState {
     }
 }
 
+impl DesiredCodexState {
+    #[allow(dead_code)]
+    pub(crate) fn mode(&self) -> Option<ManagedCodexMode> {
+        self.mode
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConfigSnapshot {
     identity: FileIdentity,

@@ -386,14 +386,6 @@ impl ClaudeConfigCodec {
             .join("settings.json");
         let mut seen = BTreeSet::new();
         for path in shadow_paths {
-            let path = std::fs::canonicalize(&path).unwrap_or(path);
-            if path == self.settings_path() || path == canonical_settings_path {
-                continue;
-            }
-            if !seen.insert(path.clone()) || !path.exists() {
-                continue;
-            }
-            let document = fs_read_json(&path)?;
             let source = if path.ends_with(".claude/settings.local.json") {
                 ShadowSource::ClaudeLocal
             } else if path.ends_with(".claude/settings.json") && path.starts_with(&cwd) {
@@ -401,6 +393,22 @@ impl ClaudeConfigCodec {
             } else {
                 ShadowSource::ClaudeManaged
             };
+            let explicit_file_symlink = std::fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink());
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            if path == self.settings_path() || path == canonical_settings_path {
+                if explicit_file_symlink {
+                    if has_owned_shadow(&user_document, ownership) && !shadows.contains(&source) {
+                        shadows.push(source);
+                    }
+                    collect_provider_mode_shadows(&user_document, &mut shadows);
+                }
+                continue;
+            }
+            if !seen.insert(path.clone()) || !path.exists() {
+                continue;
+            }
+            let document = fs_read_json(&path)?;
             if has_owned_shadow(&document, ownership) && !shadows.contains(&source) {
                 shadows.push(source);
             }

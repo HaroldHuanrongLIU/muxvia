@@ -526,6 +526,21 @@ fn reconciliation_probe_rejects_malformed_missing_contradictory_and_non_utf8_out
             "printf 'Usage: codex [options]\\n--settings <file>\\n--model <model>\\n'",
         ),
         (
+            "missing --settings capability",
+            "printf '2.1.37 (Claude Code)\\n'",
+            "printf 'Usage: claude [options]\\n--model <model>\\nmissing-settings-probe-output-sentinel\\n'",
+        ),
+        (
+            "missing --model capability",
+            "printf '2.1.37 (Claude Code)\\n'",
+            "printf 'Usage: claude [options]\\n--settings <file>\\nmissing-model-probe-output-sentinel\\n'",
+        ),
+        (
+            "missing both capability markers",
+            "printf '2.1.37 (Claude Code)\\n'",
+            "printf 'Usage: claude [options]\\nmissing-markers-probe-output-sentinel\\n'",
+        ),
+        (
             "multiline raw version",
             "printf '2.1.37 (Claude Code)\\nraw-probe-output-sentinel\\n'",
             "printf 'Usage: claude [options]\\n--settings <file>\\n--model <model>\\n'",
@@ -552,7 +567,15 @@ fn reconciliation_probe_rejects_malformed_missing_contradictory_and_non_utf8_out
             Err(error) => error,
         };
         assert_eq!(error.code(), "incompatible-target-cli", "{case}");
-        assert!(!format!("{error:?}\n{error}").contains("raw-probe-output-sentinel"));
+        let diagnostic = format!("{error:?}\n{error}");
+        for sentinel in [
+            "raw-probe-output-sentinel",
+            "missing-settings-probe-output-sentinel",
+            "missing-model-probe-output-sentinel",
+            "missing-markers-probe-output-sentinel",
+        ] {
+            assert!(!diagnostic.contains(sentinel));
+        }
     }
 }
 

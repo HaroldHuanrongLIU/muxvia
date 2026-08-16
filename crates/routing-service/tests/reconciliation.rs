@@ -2200,6 +2200,11 @@ async fn adopt_claude_supports_api_key_and_bearer_authentication_shapes() {
         let view = &applied["result"]["outcome"]["view"];
         assert_eq!(view["providers"].as_array().unwrap().len(), 2);
         let current_id = view["currentProviderId"].as_str().unwrap();
+        assert_eq!(view["mode"], "direct");
+        assert_eq!(view["takeover"]["state"], "inactive");
+        assert!(view["takeover"]["endpoint"].is_null());
+        assert!(view["servingProviderId"].is_null());
+        assert_eq!(view["activatedSnapshot"]["providerId"], current_id);
         let current = view["providers"]
             .as_array()
             .unwrap()

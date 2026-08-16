@@ -97,6 +97,10 @@ async function eventBarrier<T>(event: Promise<T>, label: string): Promise<T> {
       resolveEvent(value)
     }, (error) => {
       clearTimeout(timeout)
+      if (error && typeof error === "object" && "code" in error) {
+        reject(error)
+        return
+      }
       const message = error instanceof Error ? error.message : ""
       reject(new Error(message.startsWith("held-request-completed-before-upstream:")
         ? message
@@ -323,12 +327,12 @@ function auditReconciliationUpstreamRequests(
   }
 }
 
-type SecretOccurrence = { count: number; exact: boolean; path: string }
+type SecretOccurrence = { count: number; exact: boolean; path: string; value: string }
 
 function jsonSecretOccurrences(value: unknown, secret: string, path: string[] = []): SecretOccurrence[] {
   if (typeof value === "string") {
     const count = value.split(secret).length - 1
-    return count > 0 ? [{ count, exact: value === secret, path: path.join(".") }] : []
+    return count > 0 ? [{ count, exact: value === secret, path: path.join("."), value }] : []
   }
   if (Array.isArray(value)) {
     return value.flatMap((entry, index) => jsonSecretOccurrences(entry, secret, [...path, String(index)]))
@@ -680,6 +684,54 @@ async function runClaudeSecurityFinalizer(steps: readonly ClaudeSecurityFinalize
   }
 }
 
+type ReconciliationSecurityFinalizer = {
+  heldRelease: () => void | Promise<void>
+  nativeFrameDrain: () => void | Promise<void>
+  rendererDestroy: () => void | Promise<void>
+  sessionClose: () => void | Promise<void>
+  shutdownSignal: () => void | Promise<void>
+  processKill: () => void | Promise<void>
+  processOutputDrain: () => void | Promise<void>
+  upstreamDrain: () => void | Promise<void>
+  previewAudit: () => void | Promise<void>
+  targetViewAudit: () => void | Promise<void>
+  outcomeAudit: () => void | Promise<void>
+  receiptAudit: () => void | Promise<void>
+  activityAudit: () => void | Promise<void>
+  nativeFrameAudit: () => void | Promise<void>
+  sqliteAudit: () => void | Promise<void>
+  reconciliationRecoveryAudit: () => void | Promise<void>
+  targetSettingsAudit: () => void | Promise<void>
+  rawRpcAudit: () => void | Promise<void>
+  processOutputAudit: () => void | Promise<void>
+  upstreamRequestAudit: () => void | Promise<void>
+}
+
+async function runReconciliationSecurityFinalizer(steps: ReconciliationSecurityFinalizer): Promise<void> {
+  await runClaudeSecurityFinalizer([
+    { name: "held-release", run: steps.heldRelease },
+    { name: "native-frame-drain", run: steps.nativeFrameDrain },
+    { name: "renderer-destroy", run: steps.rendererDestroy },
+    { name: "session-close", run: steps.sessionClose },
+    { name: "shutdown-signal", run: steps.shutdownSignal },
+    { name: "process-kill", run: steps.processKill },
+    { name: "process-output-drain", run: steps.processOutputDrain },
+    { name: "upstream-drain", run: steps.upstreamDrain },
+    { name: "preview", run: steps.previewAudit },
+    { name: "target-view", run: steps.targetViewAudit },
+    { name: "outcome", run: steps.outcomeAudit },
+    { name: "receipt", run: steps.receiptAudit },
+    { name: "activity", run: steps.activityAudit },
+    { name: "native-frame", run: steps.nativeFrameAudit },
+    { name: "sqlite", run: steps.sqliteAudit },
+    { name: "reconciliation-recovery", run: steps.reconciliationRecoveryAudit },
+    { name: "target-settings", run: steps.targetSettingsAudit },
+    { name: "raw-rpc", run: steps.rawRpcAudit },
+    { name: "process-output", run: steps.processOutputAudit },
+    { name: "upstream-request", run: steps.upstreamRequestAudit },
+  ])
+}
+
 function extractManagedConfig(text: string, expectedModel: string): { endpoint: string; credential: string } {
   expect(text.includes("# operator comment survives")).toBeTrue()
   expect(text.includes('unrelated = "keep-me"')).toBeTrue()
@@ -933,17 +985,6 @@ async function assertClaudeDirectResponseAndPush(
   secrets: readonly string[],
   label: string,
 ): Promise<void> {
-  await waitFor(() => {
-    const candidates = frames.slice(start)
-    scanNoSecrets(candidates, secrets, `${label}-raw-frame`)
-    const hasResponse = candidates.some((candidate) => {
-      const frame = candidate as ClaudeDirectFrameEvidence
-      return frame.type === "response" && frame.result?.kind === "action-outcome"
-    })
-    const hasPush = candidates.some((candidate) => (candidate as ClaudeDirectFrameEvidence).type === "target-view")
-    return hasResponse && hasPush
-  }, `${label} response and push`)
-
   const candidates = frames.slice(start)
   scanNoSecrets(candidates, secrets, `${label}-raw-frame`)
   const responses = candidates.filter((candidate) => {
@@ -953,13 +994,48 @@ async function assertClaudeDirectResponseAndPush(
   const pushes = candidates.filter((candidate) => (
     candidate as ClaudeDirectFrameEvidence
   ).type === "target-view") as ClaudeDirectFrameEvidence[]
+  const responseIndex = candidates.indexOf(responses[0])
+  const pushIndex = candidates.indexOf(pushes[0])
+  const responseView = responses[0]?.result?.outcome?.view
+  const pushView = pushes[0]?.view
   if (
     responses.length !== 1
     || pushes.length !== 1
+    || responseIndex < 0
+    || pushIndex !== responseIndex + 1
     || responses[0]!.result?.outcome?.status !== "applied"
-    || !matchesClaudeDirectView(responses[0]!.result?.outcome?.view, expected)
-    || !matchesClaudeDirectView(pushes[0]!.view, expected)
+    || !matchesClaudeDirectView(responseView, expected)
+    || !matchesClaudeDirectView(pushView, expected)
+    || canonicalJson(responseView) !== canonicalJson(pushView)
   ) throw new Error(`claude-direct-response-push-mismatch:${label}`)
+}
+
+function assertReconciliationResponseBeforeSinglePush(
+  frames: readonly unknown[],
+  start: number,
+  target: "codex" | "claude",
+  outcome: unknown,
+  label: string,
+): void {
+  const candidates = frames.slice(start) as ClaudeDirectFrameEvidence[]
+  const responses = candidates.filter((frame) => frame.type === "response" && frame.result?.kind === "action-outcome")
+  const pushes = candidates.filter((frame) => frame.type === "target-view")
+  const responseIndex = candidates.indexOf(responses[0]!)
+  const pushIndex = candidates.indexOf(pushes[0]!)
+  const responseOutcome = responses[0]?.result?.outcome
+  const responseView = responseOutcome?.view as TargetView | undefined
+  const pushView = pushes[0]?.view as TargetView | undefined
+  if (
+    candidates.length !== 2
+    || responses.length !== 1
+    || pushes.length !== 1
+    || responseIndex !== 0
+    || pushIndex !== 1
+    || responseView?.target !== target
+    || pushView?.target !== target
+    || canonicalJson(responseOutcome) !== canonicalJson(outcome)
+    || canonicalJson(responseView) !== canonicalJson(pushView)
+  ) throw new Error(`reconciliation-response-push-mismatch:${label}`)
 }
 
 function scanRawRpcFramesNoSecrets(
@@ -1137,6 +1213,40 @@ async function observeTcpListenerPorts(pid: number): Promise<number[]> {
   if (process.platform === "darwin") return await observeDarwinTcpListenerPorts(pid)
   if (process.platform === "linux") return await observeLinuxTcpListenerPorts(pid)
   throw new Error("tcp-listener-observation-unsupported")
+}
+
+async function waitForTcpListenerObservation(
+  observe: () => Promise<number[]>,
+  predicate: (ports: readonly number[]) => boolean,
+  label: string,
+  timeoutMs = deadlineMs,
+  schedule: (next: () => void) => void = (next) => { setImmediate(next) },
+): Promise<number[]> {
+  return await new Promise<number[]>((resolveObservation, reject) => {
+    let settled = false
+    const timeout = setTimeout(() => {
+      settled = true
+      reject(new Error(`event-barrier-failed:${label}`))
+    }, timeoutMs)
+    const inspect = async () => {
+      if (settled) return
+      try {
+        const ports = await observe()
+        if (predicate(ports)) {
+          settled = true
+          clearTimeout(timeout)
+          resolveObservation(ports)
+          return
+        }
+        schedule(() => { void inspect() })
+      } catch {
+        settled = true
+        clearTimeout(timeout)
+        reject(new Error(`event-barrier-failed:${label}`))
+      }
+    }
+    void inspect()
+  })
 }
 
 async function assertNoTcpListeners(pid: number): Promise<void> {
@@ -1501,16 +1611,29 @@ function approvedRecoveryOccurrence(
 function approvedReconciliationOccurrence(
   target: "codex" | "claude",
   occurrence: SecretOccurrence,
+  secret: string,
 ): boolean {
   if (occurrence.count !== 1) return false
   if (target === "claude") {
     return occurrence.exact && /^(before|desired)\.owned\.(auth_token|api_key)$/.test(occurrence.path)
   }
-  if (
+  const authorizationPath = (
     /^before\.unrelated\.model_providers\.[^.]+\.http_headers\.Authorization$/.test(occurrence.path)
-    || /^(before\.owned|before\.provider_restore|desired|desired\.desired|desired\.provider_restore)\.provider_http_headers\.(rendered|semantic\.Authorization)$/.test(occurrence.path)
-    || /^(before\.owned|before\.provider_restore(?:\.Present)?|desired|desired\.desired|desired\.provider_restore(?:\.Present)?)\.http_headers\.(rendered|semantic\.Authorization)$/.test(occurrence.path)
-  ) return true
+    || /^(before\.owned|before\.provider_restore|desired|desired\.desired|desired\.provider_restore)\.provider_http_headers\.semantic\.Authorization$/.test(occurrence.path)
+    || /^(before\.owned|before\.provider_restore(?:\.Present)?|desired|desired\.desired|desired\.provider_restore(?:\.Present)?)\.http_headers\.semantic\.Authorization$/.test(occurrence.path)
+  )
+  if (authorizationPath) return occurrence.value === `Bearer ${secret}`
+  const renderedAuthorizationPath = (
+    /^(before\.owned|before\.provider_restore|desired|desired\.desired|desired\.provider_restore)\.provider_http_headers\.rendered$/.test(occurrence.path)
+    || /^(before\.owned|before\.provider_restore(?:\.Present)?|desired|desired\.desired|desired\.provider_restore(?:\.Present)?)\.http_headers\.rendered$/.test(occurrence.path)
+  )
+  if (renderedAuthorizationPath) {
+    const escapedSecret = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    return new RegExp(`(?:^|[\\s{,])(?:"Authorization"|Authorization)\\s*=\\s*"Bearer ${escapedSecret}"(?:$|[\\s},])`)
+      .test(occurrence.value)
+      || new RegExp(`(?:^|[\\s{,])"X-Muxvia-Routing-Credential"\\s*=\\s*"${escapedSecret}"(?:$|[\\s},])`)
+        .test(occurrence.value)
+  }
   return occurrence.exact && (
     /^before\.unrelated\.model_providers\.[^.]+\.http_headers\.X-Muxvia-Routing-Credential$/.test(occurrence.path)
     || /^(before\.owned|before\.provider_restore|desired|desired\.desired|desired\.provider_restore)\.provider_http_headers\.semantic\.X-Muxvia-Routing-Credential$/.test(occurrence.path)
@@ -1535,9 +1658,45 @@ function auditReconciliationRecoveryRows(
     }
     for (const secret of secrets) {
       const occurrences = jsonSecretOccurrences(material, secret)
-      if (!occurrences.every((occurrence) => approvedReconciliationOccurrence(target, occurrence))) {
+      if (!occurrences.every((occurrence) => approvedReconciliationOccurrence(target, occurrence, secret))) {
         throw new Error("secret-scan-failed:reconciliation-recovery-secret-location")
       }
+    }
+  }
+}
+
+function auditReconciliationTargetSettings(
+  codexBytes: Buffer | undefined,
+  claudeBytes: Buffer | undefined,
+  providerSettingsSecrets: ReadonlyArray<{ target: HeldReconciliationTarget; secret: string }>,
+  routingSettingsSecrets: ReadonlyArray<{ target: HeldReconciliationTarget; secret: string }>,
+): void {
+  const codexText = codexBytes?.toString("utf8") ?? ""
+  for (const { target, secret } of [...providerSettingsSecrets, ...routingSettingsSecrets]) {
+    if (target !== "codex" || !codexText.includes(secret)) continue
+    const escaped = secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    const provider = providerSettingsSecrets.some((entry) => entry.target === target && entry.secret === secret)
+    const exact = provider
+      ? new RegExp(`(?:"Authorization"|Authorization)\\s*=\\s*"Bearer ${escaped}"`).test(codexText)
+      : new RegExp(`"X-Muxvia-Routing-Credential"\\s*=\\s*"${escaped}"`).test(codexText)
+    if (!exact || codexText.split(secret).length !== 2) {
+      throw new Error("secret-scan-failed:reconciliation-target-settings-location")
+    }
+  }
+  if (!claudeBytes) return
+  let claudeSettings: unknown
+  try { claudeSettings = JSON.parse(claudeBytes.toString("utf8")) } catch {
+    throw new Error("reconciliation-target-settings-json-invalid")
+  }
+  for (const { target, secret } of [...providerSettingsSecrets, ...routingSettingsSecrets]) {
+    if (target !== "claude") continue
+    const occurrences = jsonSecretOccurrences(claudeSettings, secret)
+    const provider = providerSettingsSecrets.some((entry) => entry.target === target && entry.secret === secret)
+    const approved = provider
+      ? /^env\.ANTHROPIC_(AUTH_TOKEN|API_KEY)$/
+      : /^env\.ANTHROPIC_AUTH_TOKEN$/
+    if (!occurrences.every((occurrence) => occurrence.count === 1 && occurrence.exact && approved.test(occurrence.path))) {
+      throw new Error("secret-scan-failed:reconciliation-target-settings-location")
     }
   }
 }
@@ -1665,19 +1824,29 @@ function readTargetDatabaseFingerprint(databasePath: string, target: "codex" | "
   }
 }
 
-function readStableTargetDatabaseFingerprint(databasePath: string, target: "codex" | "claude"): string {
+function readStableTargetDatabaseFingerprint(
+  databasePath: string,
+  target: "codex" | "claude",
+  includeViewSequence = true,
+): string {
   const database = new Database(databasePath, { readonly: true })
   try {
+    const route = database.query(`SELECT target, management_revision, current_provider_id, serving_provider_id,
+      view_sequence, takeover_state, route_port, routing_credential, activated_snapshot_id, managed_config_path,
+      recovery_state FROM target_route_state WHERE target = ?`).get(target) as Record<string, unknown> | null
+    const stableRoute = includeViewSequence || !route
+      ? route
+      : (({ view_sequence: _viewSequence, ...rest }) => rest)(route)
     const state = [
-      database.query(`SELECT target, management_revision, current_provider_id, serving_provider_id,
-        takeover_state, route_port, routing_credential, activated_snapshot_id, managed_config_path,
-        recovery_state FROM target_route_state WHERE target = ?`).get(target),
+      stableRoute,
       database.query("SELECT * FROM target_problems WHERE target = ? ORDER BY code").all(target),
       database.query("SELECT * FROM providers WHERE target = ? ORDER BY position").all(target),
       database.query("SELECT * FROM credentials WHERE target = ? ORDER BY id").all(target),
       database.query("SELECT * FROM activated_snapshots WHERE target = ? ORDER BY id").all(target),
       database.query("SELECT * FROM action_receipts WHERE target = ? ORDER BY committed_revision, action_id").all(target),
       database.query("SELECT * FROM activation_recovery WHERE target = ? ORDER BY created_revision, id").all(target),
+      database.query("SELECT * FROM reconciliation_intents WHERE target = ? ORDER BY created_revision, action_id").all(target),
+      database.query("SELECT * FROM target_compatibility WHERE target = ?").all(target),
     ]
     return sensitiveDigest(JSON.stringify(state))!
   } finally {
@@ -1685,10 +1854,13 @@ function readStableTargetDatabaseFingerprint(databasePath: string, target: "code
   }
 }
 
-function stableTargetViewFingerprint(view: Readonly<TargetView>): string {
-  const { viewSequence: _viewSequence, service, ...stable } = view
+function stableTargetViewFingerprint(view: Readonly<TargetView>, includeViewSequence = true): string {
+  const { service, ...stable } = view
   const { epoch: _epoch, ...stableService } = service
-  return sensitiveDigest(canonicalJson({ ...stable, service: stableService }))!
+  const projected = includeViewSequence
+    ? stable
+    : (({ viewSequence: _viewSequence, ...rest }) => rest)(stable)
+  return sensitiveDigest(canonicalJson({ ...projected, service: stableService }))!
 }
 
 function credentialReferences(databasePath: string): Array<{ name: string; credentialId: string | null }> {
@@ -1702,20 +1874,59 @@ function credentialReferences(databasePath: string): Array<{ name: string; crede
 }
 
 function targetHistory(databasePath: string, target: HeldReconciliationTarget): {
-  providers: unknown[]
-  snapshots: unknown[]
-  credentials: unknown[]
+  providers: Array<Record<string, unknown>>
+  snapshots: Array<Record<string, unknown>>
+  credentials: Array<Record<string, unknown>>
 } {
   const database = new Database(databasePath, { readonly: true })
   try {
+    const snapshots = database.query("SELECT * FROM activated_snapshots WHERE target = ? ORDER BY id")
+      .all(target) as Array<Record<string, unknown>>
+    const credentials = database.query("SELECT * FROM credentials WHERE target = ? ORDER BY id")
+      .all(target) as Array<Record<string, unknown>>
     return {
-      providers: database.query("SELECT * FROM providers WHERE target = ? ORDER BY position").all(target),
-      snapshots: database.query("SELECT * FROM activated_snapshots WHERE target = ? ORDER BY id").all(target),
-      credentials: database.query("SELECT * FROM credentials WHERE target = ? ORDER BY id").all(target),
+      providers: database.query("SELECT * FROM providers WHERE target = ? ORDER BY position")
+        .all(target) as Array<Record<string, unknown>>,
+      snapshots: snapshots.map(({ provider_bearer_token, ...snapshot }) => ({
+        ...snapshot,
+        provider_bearer_token_digest: sensitiveDigest(provider_bearer_token),
+      })),
+      credentials: credentials.map(({ bearer_token, ...credential }) => ({
+        ...credential,
+        bearer_token_digest: sensitiveDigest(bearer_token),
+      })),
     }
   } finally {
     database.close()
   }
+}
+
+function assertAdoptedImmutableHistory(
+  before: ReturnType<typeof targetHistory>,
+  after: ReturnType<typeof targetHistory>,
+  currentProviderId: string,
+  activatedSnapshotId: string,
+): void {
+  expect(after.providers).toHaveLength(before.providers.length + 1)
+  expect(after.credentials).toHaveLength(before.credentials.length + 1)
+  expect(after.snapshots).toHaveLength(before.snapshots.length + 1)
+  for (const [rowsBefore, rowsAfter] of [
+    [before.providers, after.providers],
+    [before.credentials, after.credentials],
+    [before.snapshots, after.snapshots],
+  ] as const) {
+    for (const row of rowsBefore) {
+      expect(rowsAfter.find(({ id }) => id === row.id)).toEqual(row)
+    }
+  }
+  const adoptedProvider = after.providers.find(({ id }) => id === currentProviderId)!
+  const credentialId = adoptedProvider.credential_id
+  expect(typeof credentialId).toBe("string")
+  expect(before.providers.some(({ id }) => id === currentProviderId)).toBeFalse()
+  expect(before.credentials.some(({ id }) => id === credentialId)).toBeFalse()
+  expect(after.credentials.some(({ id }) => id === credentialId)).toBeTrue()
+  expect(before.snapshots.some(({ id }) => id === activatedSnapshotId)).toBeFalse()
+  expect(after.snapshots.find(({ id }) => id === activatedSnapshotId)?.provider_id).toBe(currentProviderId)
 }
 
 async function expectSecretSafeControlCode(
@@ -2635,37 +2846,50 @@ test("Claude tracer finalizer attempts every audit and reports fixed accumulated
 test("reconciliation tracer scans every ordered security surface after an earlier failure", async () => {
   const secret = "controlled-reconciliation-finalizer-secret"
   const attempted: string[] = []
-  const surfaces = [
-    "preview",
-    "target-view",
-    "outcome",
-    "receipt",
-    "activity",
-    "native-frame",
-    "process-output",
-    "sqlite-text",
-    "recovery-payload",
-    "target-settings",
-    "upstream-request",
+  const orderedSteps = [
+    "held-release", "native-frame-drain", "renderer-destroy", "session-close",
+    "shutdown-signal", "process-kill", "process-output-drain", "upstream-drain",
+    "preview", "target-view", "outcome", "receipt", "activity", "native-frame",
+    "sqlite", "reconciliation-recovery", "target-settings", "raw-rpc",
+    "process-output", "upstream-request",
   ] as const
+  const mutation = (name: typeof orderedSteps[number]) => () => {
+    attempted.push(name)
+    scanNoSecrets([{ [name]: secret }], [secret], `controlled-reconciliation-${name}`)
+  }
   let diagnostic = ""
   try {
     try {
       throw new Error("earlier-reconciliation-functional-failure")
     } finally {
-      await runClaudeSecurityFinalizer(surfaces.map((surface) => ({
-        name: surface,
-        run: () => {
-          attempted.push(surface)
-          scanNoSecrets([{ [surface]: secret }], [secret], `controlled-reconciliation-${surface}`)
-        },
-      })))
+      await runReconciliationSecurityFinalizer({
+        heldRelease: mutation("held-release"),
+        nativeFrameDrain: mutation("native-frame-drain"),
+        rendererDestroy: mutation("renderer-destroy"),
+        sessionClose: mutation("session-close"),
+        shutdownSignal: mutation("shutdown-signal"),
+        processKill: mutation("process-kill"),
+        processOutputDrain: mutation("process-output-drain"),
+        upstreamDrain: mutation("upstream-drain"),
+        previewAudit: mutation("preview"),
+        targetViewAudit: mutation("target-view"),
+        outcomeAudit: mutation("outcome"),
+        receiptAudit: mutation("receipt"),
+        activityAudit: mutation("activity"),
+        nativeFrameAudit: mutation("native-frame"),
+        sqliteAudit: mutation("sqlite"),
+        reconciliationRecoveryAudit: mutation("reconciliation-recovery"),
+        targetSettingsAudit: mutation("target-settings"),
+        rawRpcAudit: mutation("raw-rpc"),
+        processOutputAudit: mutation("process-output"),
+        upstreamRequestAudit: mutation("upstream-request"),
+      })
     }
   } catch (error) {
     diagnostic = error instanceof Error ? error.message : String(error)
   }
-  expect(attempted).toEqual([...surfaces])
-  expect(diagnostic).toBe(`claude-security-finalizer-failed:${surfaces.join(",")}`)
+  expect(attempted).toEqual([...orderedSteps])
+  expect(diagnostic).toBe(`claude-security-finalizer-failed:${orderedSteps.join(",")}`)
   expect(diagnostic.includes(secret)).toBeFalse()
   expect(diagnostic.includes("earlier-reconciliation-functional-failure")).toBeFalse()
 })
@@ -2696,6 +2920,184 @@ test("reconciliation recovery audit allows Authorization envelopes but rejects p
   }
   expect(diagnostic).toBe("secret-scan-failed:reconciliation-recovery-secret-location")
   expect(diagnostic.includes(secret)).toBeFalse()
+})
+
+test("reconciliation recovery audit rejects inexact Authorization envelopes in semantic and rendered fields", () => {
+  const secret = "controlled-reconciliation-authorization-secret"
+  const mutations = [
+    { semantic: `Bearer prefix-${secret}`, rendered: `{ Authorization = "Bearer prefix-${secret}" }` },
+    { semantic: `Bearer ${secret}-suffix`, rendered: `{ Authorization = "Bearer ${secret}-suffix" }` },
+    { semantic: `Basic ${secret}`, rendered: `{ Authorization = "Basic ${secret}" }` },
+  ]
+  for (const mutation of mutations) {
+    let diagnostic = ""
+    try {
+      auditReconciliationRecoveryRows([{
+        target: "codex",
+        beforeJson: JSON.stringify({}),
+        desiredJson: JSON.stringify({
+          provider_http_headers: {
+            rendered: mutation.rendered,
+            semantic: { Authorization: mutation.semantic },
+          },
+        }),
+      }], [secret])
+    } catch (error) {
+      diagnostic = error instanceof Error ? error.message : String(error)
+    }
+    expect(diagnostic).toBe("secret-scan-failed:reconciliation-recovery-secret-location")
+    expect(diagnostic.includes(secret)).toBeFalse()
+  }
+})
+
+test("reconciliation target-settings audit requires exact owned credential envelopes", () => {
+  const codexSecret = "controlled-codex-settings-secret"
+  const claudeSecret = "controlled-claude-settings-secret"
+  expect(() => auditReconciliationTargetSettings(
+    Buffer.from(`http_headers = { Authorization = "Bearer ${codexSecret}" }\n`),
+    Buffer.from(JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: claudeSecret } })),
+    [
+      { target: "codex", secret: codexSecret },
+      { target: "claude", secret: claudeSecret },
+    ],
+    [],
+  )).not.toThrow()
+  for (const [codex, claude] of [
+    [`Authorization = "Bearer prefix-${codexSecret}"`, claudeSecret],
+    [`Authorization = "Bearer ${codexSecret}-suffix"`, claudeSecret],
+    [`Authorization = "Basic ${codexSecret}"`, `prefix-${claudeSecret}`],
+  ] as const) {
+    let diagnostic = ""
+    try {
+      auditReconciliationTargetSettings(
+        Buffer.from(codex),
+        Buffer.from(JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: claude } })),
+        [
+          { target: "codex", secret: codexSecret },
+          { target: "claude", secret: claudeSecret },
+        ],
+        [],
+      )
+    } catch (error) {
+      diagnostic = error instanceof Error ? error.message : String(error)
+    }
+    expect(diagnostic).toBe("secret-scan-failed:reconciliation-target-settings-location")
+    expect(diagnostic.includes(codexSecret) || diagnostic.includes(claudeSecret)).toBeFalse()
+  }
+})
+
+async function createStableFingerprintMutationDatabase(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "reconciliation-stable-fingerprint-"))
+  roots.push(root)
+  const path = join(root, "mutation.db")
+  const database = new Database(path, { create: true })
+  database.exec(`
+    CREATE TABLE target_route_state (
+      target TEXT, management_revision INTEGER, view_sequence INTEGER,
+      current_provider_id TEXT, serving_provider_id TEXT, takeover_state TEXT,
+      route_port INTEGER, routing_credential TEXT, activated_snapshot_id TEXT,
+      managed_config_path TEXT, recovery_state TEXT
+    );
+    CREATE TABLE target_problems (target TEXT, code TEXT);
+    CREATE TABLE providers (target TEXT, id TEXT, position INTEGER);
+    CREATE TABLE credentials (target TEXT, id TEXT);
+    CREATE TABLE activated_snapshots (target TEXT, id TEXT);
+    CREATE TABLE action_receipts (target TEXT, committed_revision INTEGER, action_id TEXT);
+    CREATE TABLE activation_recovery (target TEXT, created_revision INTEGER, id TEXT);
+    CREATE TABLE reconciliation_intents (
+      target TEXT, created_revision INTEGER, action_id TEXT, desired_json TEXT
+    );
+    CREATE TABLE target_compatibility (target TEXT, observed_version TEXT);
+    INSERT INTO target_route_state VALUES (
+      'codex', 3, 4, NULL, NULL, 'inactive', NULL, NULL, NULL, '/tmp/config.toml', 'clean'
+    );
+  `)
+  database.close()
+  return path
+}
+
+test("stable target database fingerprint includes reconciliation intents", async () => {
+  const path = await createStableFingerprintMutationDatabase()
+  const before = readStableTargetDatabaseFingerprint(path, "codex")
+  const database = new Database(path)
+  database.query("INSERT INTO reconciliation_intents VALUES ('codex', 5, 'action-1', '{}')").run()
+  database.close()
+  expect(readStableTargetDatabaseFingerprint(path, "codex")).not.toBe(before)
+})
+
+test("stable target database fingerprint includes compatibility and view sequence", async () => {
+  const path = await createStableFingerprintMutationDatabase()
+  const before = readStableTargetDatabaseFingerprint(path, "codex")
+  const database = new Database(path)
+  database.query("INSERT INTO target_compatibility VALUES ('codex', '77.1.0')").run()
+  database.query("UPDATE target_route_state SET view_sequence = 5 WHERE target = 'codex'").run()
+  database.close()
+  expect(readStableTargetDatabaseFingerprint(path, "codex")).not.toBe(before)
+})
+
+test("stable target view fingerprint preserves view sequence", () => {
+  const first = {
+    target: "codex",
+    viewSequence: 10,
+    service: { epoch: "ephemeral", state: "ready" },
+  } as unknown as TargetView
+  const second = { ...first, viewSequence: 11 }
+  expect(stableTargetViewFingerprint(second)).not.toBe(stableTargetViewFingerprint(first))
+})
+
+test("Direct response/push audit rejects a push that precedes its response", async () => {
+  const expected = { providerId: "provider-1", model: "model-1", settingsPath: "/tmp/settings.json" }
+  const view = {
+    target: "claude",
+    mode: "direct",
+    takeover: { state: "inactive", endpoint: null },
+    currentProviderId: expected.providerId,
+    servingProviderId: null,
+    managedConfiguration: { state: "applied", path: expected.settingsPath, restartRequired: true },
+    recovery: { state: "committed" },
+    activatedSnapshot: {
+      providerId: expected.providerId,
+      model: expected.model,
+      protocol: "anthropic-messages",
+    },
+  }
+  let diagnostic = ""
+  try {
+    await assertClaudeDirectResponseAndPush([
+      { type: "target-view", view },
+      { type: "response", result: { kind: "action-outcome", outcome: { status: "applied", view } } },
+    ], 0, expected, [], "controlled-order")
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(diagnostic).toBe("claude-direct-response-push-mismatch:controlled-order")
+})
+
+test("listener observer uses event turns and a bounded negative barrier", async () => {
+  const observations = [[4101, 4102], [4102]]
+  let observed = 0
+  await waitForTcpListenerObservation(
+    async () => observations[Math.min(observed++, observations.length - 1)]!,
+    (ports) => !ports.includes(4101) && ports.includes(4102),
+    "controlled-listener-transition",
+    deadlineMs,
+    (next) => queueMicrotask(next),
+  )
+  expect(observed).toBe(2)
+
+  let diagnostic = ""
+  try {
+    await waitForTcpListenerObservation(
+      async () => [4101],
+      (ports) => !ports.includes(4101),
+      "controlled-listener-negative",
+      1,
+      () => {},
+    )
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(diagnostic).toBe("event-barrier-failed:controlled-listener-negative")
 })
 
 test("Claude SQLite audit rejects a secret in an unrelated state column", async () => {
@@ -2940,7 +3342,11 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
   })
   const services: Array<{ child: ReturnType<typeof spawn>; output: ReturnType<typeof captureProcessOutput> }> = []
   const rpcStreams: Buffer[][] = []
+  const reconciliationFrames: Record<HeldReconciliationTarget, unknown[]> = { codex: [], claude: [] }
   const observed: unknown[] = []
+  const observedPreviews: unknown[] = []
+  const observedTargetViews: unknown[] = []
+  const observedOutcomes: unknown[] = []
   const activitiesAndNativeFrames: string[] = []
   let codexRouting = ""
   let claudeRouting = ""
@@ -3000,11 +3406,11 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
     }, `${label} reconciliation service`)
     return { child, output }
   }
-  const connect = async (release: string) => {
+  const connect = async (target: HeldReconciliationTarget, release: string) => {
     const chunks: Buffer[] = []
     const decoder = new FrameDecoder()
     rpcStreams.push(chunks)
-    return await RpcClient.connect(socketPath, release, undefined, (path) => {
+    return await eventBarrier(RpcClient.connect(socketPath, release, undefined, (path) => {
       const socket = createConnection({ path })
       socket.on("data", (chunk) => {
         const bytes = Buffer.from(chunk)
@@ -3012,24 +3418,26 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
         for (const frame of decoder.push(bytes)) {
           assertSecretSafeStructured(frame, secrets(), "reconciliation-rpc-frame")
           observed.push(frame)
+          reconciliationFrames[target].push(frame)
         }
       })
       return socket
-    })
+    }), `${target}-${release}-connect`)
   }
   const openSessions = async (release: string) => {
-    codexClient = await connect(`${release}-codex`)
-    claudeClient = await connect(`${release}-claude`)
-    codexSession = await codexClient.openTarget("codex")
-    claudeSession = await claudeClient.openTarget("claude", {
+    codexClient = await connect("codex", `${release}-codex`)
+    claudeClient = await connect("claude", `${release}-claude`)
+    codexSession = await eventBarrier(codexClient.openTarget("codex"), `${release}-codex-open`)
+    claudeSession = await eventBarrier(claudeClient.openTarget("claude", {
       claudeConfigDir: null,
       selectorState: "unset",
       hostManagedState: "unmanaged",
       cwd: root,
-    })
+    }), `${release}-claude-open`)
     const collect = (view: TargetView) => {
       assertSecretSafeStructured(view, secrets(), "reconciliation-target-view")
       observed.push(view)
+      observedTargetViews.push(view)
     }
     collect(codexSession.get() as TargetView)
     collect(claudeSession.get() as TargetView)
@@ -3048,9 +3456,10 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
   }
   const safeAct = async (session: TargetSession, action: TargetAction, label: string) => {
     try {
-      const outcome = await session.act(action)
+      const outcome = await eventBarrier(session.act(action), `${label}-rpc-response`)
       assertSecretSafeStructured(outcome, secrets(), `${label}-outcome`)
       observed.push(outcome)
+      observedOutcomes.push(outcome)
       return outcome
     } catch (error) {
       scanNoSecrets([asyncErrorSurface(error)], secrets(), `${label}-error`)
@@ -3063,7 +3472,7 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
   }
   const expectDriftBlock = async (session: TargetSession, target: HeldReconciliationTarget) => {
     const provider = session.get().providers.find(({ id }) => id === session.get().currentProviderId)!
-    await expectSecretSafeControlCode(session.act({
+    await expectSecretSafeControlCode(eventBarrier(session.act({
       kind: "update-provider",
       providerId: provider.id,
       providerRevision: provider.providerRevision,
@@ -3072,13 +3481,17 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
       model: provider.model,
       credential: { kind: "keep" },
       authentication: provider.authentication,
-    }), "configuration-drift", secrets(), `${target}-drift-block`)
+    }), `${target}-drift-block-rpc-response`), "configuration-drift", secrets(), `${target}-drift-block`)
     expect(session.get().managedConfiguration.state).toBe("configuration-drift")
   }
   const preview = async (session: TargetSession, strategy: "adopt" | "reapply" | "restore", label: string) => {
-    const result = await session.previewReconciliation(strategy)
+    const result = await eventBarrier(
+      session.previewReconciliation(strategy),
+      `${label}-rpc-response`,
+    )
     assertSecretSafeStructured(result, secrets(), `${label}-preview`)
     observed.push(result)
+    observedPreviews.push(result)
     return result
   }
   const apply = async (
@@ -3087,14 +3500,41 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
     token: string,
     acknowledgeVersion?: string,
   ) => {
-    const outcome = await session.applyReconciliation({
-      strategy,
-      observationToken: token,
-      ...(acknowledgeVersion ? { acknowledgeVersion } : {}),
+    const target = session.get().target
+    const frameStart = reconciliationFrames[target].length
+    const priorSequence = session.get().viewSequence
+    let unsubscribe = () => {}
+    const pushed = new Promise<Readonly<TargetView>>((resolvePush) => {
+      unsubscribe = session.subscribe((view) => {
+        if (view.viewSequence > priorSequence) resolvePush(view)
+      })
     })
+    let outcome
+    try {
+      outcome = await eventBarrier(session.applyReconciliation({
+        strategy,
+        observationToken: token,
+        ...(acknowledgeVersion ? { acknowledgeVersion } : {}),
+      }), `${target}-${strategy}-rpc-response`)
+      await eventBarrier(pushed, `${target}-${strategy}-single-push`)
+    } finally {
+      unsubscribe()
+    }
     assertSecretSafeStructured(outcome, secrets(), `${strategy}-outcome`)
     observed.push(outcome)
+    observedOutcomes.push(outcome)
+    assertReconciliationResponseBeforeSinglePush(
+      reconciliationFrames[target], frameStart, target, outcome, `${target}-${strategy}`,
+    )
     return outcome
+  }
+  const withSecurityDatabase = async (run: (database: Database) => void): Promise<void> => {
+    try { await stat(databasePath) } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+      throw error
+    }
+    const database = new Database(databasePath, { readonly: true })
+    try { run(database) } finally { database.close() }
   }
 
   try {
@@ -3122,11 +3562,12 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
       await readFile(claudeSettings, "utf8"), "claude-baseline", providerSecrets,
     )
     rememberRouting("claude", initialClaudeRoute.credential)
-    await waitFor(async () => {
-      const ports = await observeTcpListenerPorts(first.child.pid!)
-      return [initialCodexRoute.endpoint, initialClaudeRoute.endpoint]
-        .every((endpoint) => ports.includes(Number(new URL(endpoint).port)))
-    }, "initial target listeners")
+    await waitForTcpListenerObservation(
+      () => observeTcpListenerPorts(first.child.pid!),
+      (ports) => [initialCodexRoute.endpoint, initialClaudeRoute.endpoint]
+        .every((endpoint) => ports.includes(Number(new URL(endpoint).port))),
+      "initial-target-listeners",
+    )
 
     const continuing = claudePost(initialClaudeRoute.endpoint, claudeRouting, "/v1/messages", {
       messages: [], stream: true, fixture_delay: true,
@@ -3185,7 +3626,22 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
     )
     expect(codexAdopt.view.providers).toHaveLength(2)
     expect(codexAdopt.view.currentProviderId).not.toBe(codexSaved.view.providers[0]!.id)
-    expect(targetHistory(databasePath, "codex").providers[0]).toEqual(codexHistory.providers[0])
+    expect(codexAdopt.view).toMatchObject({
+      target: "codex", mode: "direct", takeover: { state: "inactive", endpoint: null },
+      servingProviderId: null,
+    })
+    expect(codexAdopt.view.activatedSnapshot).toMatchObject({
+      providerId: codexAdopt.view.currentProviderId,
+      model: "codex-adopted",
+      protocol: "openai-responses",
+      authentication: "openai-bearer",
+    })
+    assertAdoptedImmutableHistory(
+      codexHistory,
+      targetHistory(databasePath, "codex"),
+      codexAdopt.view.currentProviderId!,
+      codexAdopt.view.activatedSnapshot!.id,
+    )
     await safeAct(codexSession!, {
       kind: "activate-provider", providerId: codexAdopt.view.currentProviderId!, mode: "takeover",
     }, "codex-adopt-takeover")
@@ -3213,7 +3669,22 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
     )
     expect(claudeAdopt.view.providers).toHaveLength(2)
     expect(claudeAdopt.view.currentProviderId).not.toBe(claudeSaved.view.providers[0]!.id)
-    expect(targetHistory(databasePath, "claude").providers[0]).toEqual(claudeHistory.providers[0])
+    expect(claudeAdopt.view).toMatchObject({
+      target: "claude", mode: "direct", takeover: { state: "inactive", endpoint: null },
+      servingProviderId: null,
+    })
+    expect(claudeAdopt.view.activatedSnapshot).toMatchObject({
+      providerId: claudeAdopt.view.currentProviderId,
+      model: "claude-adopted",
+      protocol: "anthropic-messages",
+      authentication: "anthropic-bearer",
+    })
+    assertAdoptedImmutableHistory(
+      claudeHistory,
+      targetHistory(databasePath, "claude"),
+      claudeAdopt.view.currentProviderId!,
+      claudeAdopt.view.activatedSnapshot!.id,
+    )
     await safeAct(claudeSession!, {
       kind: "activate-provider", providerId: claudeAdopt.view.currentProviderId!, mode: "takeover",
     }, "claude-adopt-takeover")
@@ -3237,9 +3708,9 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
     for (const [target, session] of [["codex", codexSession!], ["claude", claudeSession!]] as const) {
       const changed = await preview(session, "reapply", `${target}-changed-version`)
       expect(changed.compatibility.acknowledgementRequired).toBeTrue()
-      await expectSecretSafeControlCode(session.applyReconciliation({
+      await expectSecretSafeControlCode(eventBarrier(session.applyReconciliation({
         strategy: "reapply", observationToken: changed.observationToken,
-      }), "compatibility-acknowledgement-required", secrets(), `${target}-reack-required`)
+      }), `${target}-reack-required-rpc-response`), "compatibility-acknowledgement-required", secrets(), `${target}-reack-required`)
       await apply(session, "reapply", changed.observationToken, changed.compatibility.version)
       expect((await preview(session, "reapply", `${target}-reack-persisted`))
         .compatibility.acknowledgementRequired).toBeFalse()
@@ -3302,9 +3773,9 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
         view: stableTargetViewFingerprint(session.get()),
         ports: await observeTcpListenerPorts(second.child.pid!),
       }
-      await expectSecretSafeControlCode(session.applyReconciliation({
+      await expectSecretSafeControlCode(eventBarrier(session.applyReconciliation({
         strategy: "restore", observationToken: restore.observationToken,
-      }), "target-busy", secrets(), `${target}-restore-busy`)
+      }), `${target}-restore-busy-rpc-response`), "target-busy", secrets(), `${target}-restore-busy`)
       expect(readStableTargetDatabaseFingerprint(databasePath, target)).toBe(before.database)
       expect(await safeFileFingerprint(config)).toEqual(before.file)
       expect(stableTargetViewFingerprint(session.get())).toBe(before.view)
@@ -3317,10 +3788,54 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
       const peerPort = Number(new URL(peer.get().takeover.endpoint!).port)
       const restored = await apply(session, "restore", fresh.observationToken)
       expect(restored.view.mode).toBe("unmanaged")
-      await waitFor(async () => {
-        const ports = await observeTcpListenerPorts(second.child.pid!)
-        return !ports.includes(targetPort) && ports.includes(peerPort)
-      }, `${target} listener stop and peer continuity`)
+      const restoredBytes = await readFile(config)
+      const restoredMode = (await stat(config)).mode & 0o777
+      if (target === "codex") {
+        const restoredText = restoredBytes.toString("utf8")
+        if (restoredMode !== 0o600) throw new Error("codex-restore-mode-mismatch")
+        if (!restoredText.includes('operator_reapply = "codex-preserved"')) {
+          throw new Error("codex-restore-reapply-unrelated-missing")
+        }
+        if (!restoredText.includes('restore_unrelated = "codex-kept"')) {
+          throw new Error("codex-restore-latest-unrelated-missing")
+        }
+        if (/^model\s*=/m.test(restoredText) || /^model_provider\s*=/m.test(restoredText)
+          || restoredText.includes("[model_providers.muxvia_codex]")) {
+          throw new Error("codex-restore-muxvia-owned-fields-present")
+        }
+        if (
+          !restoredText.includes("[model_providers.operator_openai]")
+          || !restoredText.includes('operator_note = "keep"')
+          || /^(name|base_url|wire_api|http_headers|supports_websockets)\s*=/m.test(restoredText)
+          || /Authorization|X-Muxvia-Routing-Credential/.test(restoredText)
+        ) {
+          throw new Error("codex-restore-owned-provider-fields-mismatch")
+        }
+      } else {
+        const restoredSettings = JSON.parse(restoredBytes.toString("utf8")) as {
+          env: Record<string, unknown>
+          operator: Record<string, unknown>
+        }
+        if (restoredMode !== 0o640) throw new Error("claude-restore-mode-mismatch")
+        if (
+          restoredSettings.operator.reapply !== "claude-preserved"
+          || restoredSettings.operator.restore_unrelated !== "claude-kept"
+          || restoredSettings.env.OPERATOR_UNRELATED !== "keep"
+        ) throw new Error("claude-restore-unrelated-fields-mismatch")
+        if (
+          restoredSettings.env.ANTHROPIC_BASE_URL !== adoptedUpstream.baseUrl
+          || restoredSettings.env.ANTHROPIC_MODEL !== "claude-adopted"
+          || restoredSettings.env.ANTHROPIC_AUTH_TOKEN !== adoptedClaudeSecret
+          || "ANTHROPIC_API_KEY" in restoredSettings.env
+        ) {
+          throw new Error("claude-restore-pre-muxvia-owned-fields-mismatch")
+        }
+      }
+      await waitForTcpListenerObservation(
+        () => observeTcpListenerPorts(second.child.pid!),
+        (ports) => !ports.includes(targetPort) && ports.includes(peerPort),
+        `${target}-listener-stop-peer-continuity`,
+      )
     }
     await restoreBusyThenApply("codex")
     const codexRetained = codexSession!.get().providers.find(({ name }) => name === "Codex Adopted")!
@@ -3333,7 +3848,11 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
     await restoreBusyThenApply("claude")
     const finalCodexRestore = await preview(codexSession!, "restore", "codex-final-restore")
     await apply(codexSession!, "restore", finalCodexRestore.observationToken)
-    await waitFor(async () => (await observeTcpListenerPorts(second.child.pid!)).length === 0, "all reconciled listeners stopped")
+    await waitForTcpListenerObservation(
+      () => observeTcpListenerPorts(second.child.pid!),
+      (ports) => ports.length === 0,
+      "all-reconciled-listeners-stopped",
+    )
 
     recorder.stop()
     activitiesAndNativeFrames.push(...recorder.frames())
@@ -3353,7 +3872,18 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
     scanNoSecrets(receipts, secrets(), "reconciliation-receipts")
     scanNoSecrets([observed, activitiesAndNativeFrames], secrets(), "reconciliation-observed-surfaces")
     auditReconciliationRecoveryRows(recovery, secrets())
-    scanNoSecrets([await readFile(codexConfig), await readFile(claudeSettings)], secrets(), "reconciliation-target-settings")
+    auditReconciliationTargetSettings(
+      await readFile(codexConfig),
+      await readFile(claudeSettings),
+      [
+        { target: "codex", secret: providerSecret },
+        { target: "claude", secret: initialClaudeSecret },
+        { target: "codex", secret: adoptedCodexSecret },
+        { target: "claude", secret: adoptedClaudeSecret },
+      ],
+      (["codex", "claude"] as const).flatMap((target) =>
+        [...routingSecrets[target]].map((secret) => ({ target, secret }))),
+    )
     scanRawRpcFramesNoSecrets(rpcStreams, secrets())
     scanProcessOutputNoSecrets(services.flatMap(({ output }) => output.streams), secrets())
     auditReconciliationUpstreamRequests(
@@ -3371,47 +3901,100 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
         [...routingSecrets[target]].map((secret) => ({ target, secret }))),
     })
   } finally {
-    await runClaudeSecurityFinalizer([
-      { name: "held-release", run: () => adoptedUpstream.releaseHeld() },
-      { name: "native-frame-drain", run: () => {
+    await runReconciliationSecurityFinalizer({
+      heldRelease: () => adoptedUpstream.releaseHeld(),
+      nativeFrameDrain: () => {
         if (!recorder) return
         recorder.stop()
         activitiesAndNativeFrames.push(...recorder.frames())
-      } },
-      { name: "renderer-destroy", run: () => {
+      },
+      rendererDestroy: () => {
         if (setup && !setup.renderer.isDestroyed) setup.renderer.destroy()
-      } },
-      { name: "session-close", run: closeSessions },
-      { name: "shutdown-signal", run: async () => {
+      },
+      sessionClose: closeSessions,
+      shutdownSignal: async () => {
         await writeFile(firstShutdown, "shutdown\n", { mode: 0o600 })
         await writeFile(finalShutdown, "shutdown\n", { mode: 0o600 })
-      } },
-      { name: "process-kill", run: () => {
+      },
+      processKill: () => {
         for (const { child } of services) if (child.exitCode === null) child.kill("SIGKILL")
-      } },
-      { name: "process-output-drain", run: async () => {
+      },
+      processOutputDrain: async () => {
         const results = await Promise.allSettled(services.map(({ output }) => output.completed))
         if (results.some(({ status }) => status === "rejected")) throw new Error("reconciliation-output-drain-failed")
-      } },
-      { name: "upstream-drain", run: async () => {
+      },
+      upstreamDrain: async () => {
         await Promise.all([initialUpstream.stop(), adoptedUpstream.stop()])
-      } },
-      { name: "raw-rpc", run: () => {
+      },
+      previewAudit: () => scanNoSecrets(observedPreviews, secrets(), "reconciliation-final-preview"),
+      targetViewAudit: () => scanNoSecrets(observedTargetViews, secrets(), "reconciliation-final-target-view"),
+      outcomeAudit: () => scanNoSecrets(observedOutcomes, secrets(), "reconciliation-final-outcome"),
+      receiptAudit: async () => withSecurityDatabase((database) => {
+        const present = database.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'action_receipts'").get()
+        if (!present) return
+        const receipts = database.query("SELECT outcome_json FROM action_receipts ORDER BY target, committed_revision").all()
+        scanNoSecrets(receipts, secrets(), "reconciliation-final-receipts")
+      }),
+      activityAudit: () => scanNoSecrets(activitiesAndNativeFrames, secrets(), "reconciliation-final-activity"),
+      nativeFrameAudit: () => scanNoSecrets(activitiesAndNativeFrames, secrets(), "reconciliation-final-native-frame"),
+      sqliteAudit: async () => {
+        try { await stat(databasePath) } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+          throw error
+        }
+        auditSqliteSecretLocations(databasePath, {
+          providerSecrets: [
+            { target: "codex", name: "Codex Baseline peer", secret: providerSecret },
+            { target: "claude", name: "Claude Baseline peer", secret: initialClaudeSecret },
+            { target: "codex", name: "Codex Adopted", secret: adoptedCodexSecret },
+            { target: "claude", name: "Adopted Claude configuration", secret: adoptedClaudeSecret },
+          ],
+          routingSecrets: (["codex", "claude"] as const).flatMap((target) =>
+            [...routingSecrets[target]].map((secret) => ({ target, secret }))),
+        })
+      },
+      reconciliationRecoveryAudit: async () => withSecurityDatabase((database) => {
+        const present = database.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'reconciliation_intents'").get()
+        if (!present) return
+        const recovery = database.query(`SELECT target, before_json AS beforeJson, desired_json AS desiredJson
+          FROM reconciliation_intents ORDER BY target, created_revision`).all() as Array<{
+            target: string; beforeJson: string; desiredJson: string
+          }>
+        auditReconciliationRecoveryRows(recovery, secrets())
+      }),
+      targetSettingsAudit: async () => {
+        const readIfPresent = async (path: string) => {
+          try { return await readFile(path) } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
+            throw error
+          }
+        }
+        auditReconciliationTargetSettings(
+          await readIfPresent(codexConfig),
+          await readIfPresent(claudeSettings),
+          [
+            { target: "codex", secret: providerSecret },
+            { target: "claude", secret: initialClaudeSecret },
+            { target: "codex", secret: adoptedCodexSecret },
+            { target: "claude", secret: adoptedClaudeSecret },
+          ],
+          (["codex", "claude"] as const).flatMap((target) =>
+            [...routingSecrets[target]].map((secret) => ({ target, secret }))),
+        )
+      },
+      rawRpcAudit: () => {
         if (rpcStreams.some((stream) => stream.length > 0)) scanRawRpcFramesNoSecrets(rpcStreams, secrets())
-      } },
-      { name: "observed-surfaces", run: () => {
-        scanNoSecrets([observed, activitiesAndNativeFrames], secrets(), "reconciliation-final-observed-surfaces")
-      } },
-      { name: "process-output", run: () => {
+      },
+      processOutputAudit: () => {
         scanProcessOutputNoSecrets(services.flatMap(({ output }) => output.streams), secrets())
-      } },
-      { name: "upstream-requests", run: () => {
+      },
+      upstreamRequestAudit: () => {
         auditReconciliationUpstreamRequests(
           [...initialUpstream.calls, ...adoptedUpstream.calls], providerSecrets,
           [wrongRoutingSecret, ...routingSecrets.codex, ...routingSecrets.claude],
         )
-      } },
-    ])
+      },
+    })
   }
 }, 120_000)
 
@@ -3855,13 +4438,17 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
       [...allStaticSecrets, codexConfig.credential],
       "codex-authenticated-serving-baseline",
     )
+    const codexDatabaseWithoutPublicationSequence = () =>
+      readStableTargetDatabaseFingerprint(databasePath, "codex", false)
+    const codexViewWithoutPublicationSequence = () =>
+      stableTargetViewFingerprint(codexSession!.get(), false)
     const codexBaseline = {
       endpoint: codexApplied.view.takeover.endpoint!,
       credentialDigest: sensitiveDigest(codexConfig.credential),
       snapshotId: codexApplied.view.activatedSnapshot!.id,
       config: await safeFileFingerprint(codexConfigPath),
-      database: readStableTargetDatabaseFingerprint(databasePath, "codex"),
-      view: stableTargetViewFingerprint(codexServing),
+      database: codexDatabaseWithoutPublicationSequence(),
+      view: stableTargetViewFingerprint(codexServing, false),
     }
 
     setup = await testRender(() => <App sessions={{ codex: codexSession!, claude: claudeSession! }} />, {
@@ -3978,9 +4565,15 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     })
     expect(claudeManaged.endpoint).not.toBe(codexBaseline.endpoint)
     expect(sensitiveDigest(claudeManaged.credential)).not.toBe(codexBaseline.credentialDigest)
-    expect(readStableTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
-    expect(stableTargetViewFingerprint(codexSession!.get())).toBe(codexBaseline.view)
-    expect(await safeFileFingerprint(codexConfigPath)).toEqual(codexBaseline.config)
+    if (codexDatabaseWithoutPublicationSequence() !== codexBaseline.database) {
+      throw new Error("claude-tracer-mutated-codex-database")
+    }
+    if (codexViewWithoutPublicationSequence() !== codexBaseline.view) {
+      throw new Error("claude-tracer-published-codex-view")
+    }
+    if (canonicalJson(await safeFileFingerprint(codexConfigPath)) !== canonicalJson(codexBaseline.config)) {
+      throw new Error("claude-tracer-mutated-codex-config")
+    }
 
     const callsBeforeRejected = upstream.calls.length
     expect((await claudePost(claudeManaged.endpoint, wrongClaudeRouting, "/v1/messages", { messages: [] })).status).toBe(401)
@@ -4133,7 +4726,9 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     )
 
     expect(await safeFileFingerprint(codexConfigPath)).toEqual(codexBaseline.config)
-    expect(readStableTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
+    if (codexDatabaseWithoutPublicationSequence() !== codexBaseline.database) {
+      throw new Error("claude-tracer-mutated-codex-database-after-hot-switch")
+    }
     expect(codexSession!.get()).toMatchObject({
       currentProviderId: codexProvider.id,
       servingProviderId: codexProvider.id,
@@ -4150,8 +4745,12 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
       "codex-baseline-serving",
     )
     expect(await safeFileFingerprint(codexConfigPath)).toEqual(codexBaseline.config)
-    expect(readStableTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
-    expect(stableTargetViewFingerprint(codexSession!.get())).toBe(codexBaseline.view)
+    if (codexDatabaseWithoutPublicationSequence() !== codexBaseline.database) {
+      throw new Error("claude-tracer-mutated-codex-database-after-serving")
+    }
+    if (codexViewWithoutPublicationSequence() !== codexBaseline.view) {
+      throw new Error("claude-tracer-published-codex-view-after-serving")
+    }
     expect(codexSession!.get()).toMatchObject({
       currentProviderId: codexProvider.id,
       servingProviderId: codexProvider.id,
@@ -4178,7 +4777,9 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     expect(afterCloseCodex.status).toBe(201)
     expect(firstService.child.exitCode).toBeNull()
     expect(await safeFileFingerprint(codexConfigPath)).toEqual(codexBaseline.config)
-    expect(readStableTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
+    if (codexDatabaseWithoutPublicationSequence() !== codexBaseline.database) {
+      throw new Error("claude-tracer-mutated-codex-database-after-close")
+    }
 
     await stopService(firstService, firstShutdown)
     await expect(claudePost(claudeManaged.endpoint, claudeManaged.credential, "/v1/messages", { messages: [] })).rejects.toBeDefined()
@@ -4191,8 +4792,12 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
       activatedSnapshot: { id: codexBaseline.snapshotId },
       takeover: { endpoint: codexBaseline.endpoint },
     })
-    expect(stableTargetViewFingerprint(codexSession!.get())).toBe(codexBaseline.view)
-    expect(readStableTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
+    if (codexViewWithoutPublicationSequence() !== codexBaseline.view) {
+      throw new Error("claude-tracer-published-codex-view-after-restart")
+    }
+    if (codexDatabaseWithoutPublicationSequence() !== codexBaseline.database) {
+      throw new Error("claude-tracer-mutated-codex-database-after-restart")
+    }
     expect(await safeFileFingerprint(codexConfigPath)).toEqual(codexBaseline.config)
     expect(claudeSession!.get()).toMatchObject({
       currentProviderId: bearerProvider.id,
@@ -4211,8 +4816,12 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     ])
     expect((await claudePost(claudeManaged.endpoint, claudeManaged.credential, "/v1/messages", { messages: [] })).status).toBe(200)
     expect((await chunkedPost(codexConfig.endpoint, codexConfig.credential)).status).toBe(201)
-    expect(stableTargetViewFingerprint(codexSession!.get())).toBe(codexBaseline.view)
-    expect(readStableTargetDatabaseFingerprint(databasePath, "codex")).toBe(codexBaseline.database)
+    if (codexViewWithoutPublicationSequence() !== codexBaseline.view) {
+      throw new Error("claude-tracer-published-codex-view-after-restart-serving")
+    }
+    if (codexDatabaseWithoutPublicationSequence() !== codexBaseline.database) {
+      throw new Error("claude-tracer-mutated-codex-database-after-restart-serving")
+    }
 
     const database = new Database(databasePath, { readonly: true })
     try {

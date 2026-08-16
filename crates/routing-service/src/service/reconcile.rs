@@ -10,8 +10,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    claude::{ClaudeConfigCodec, ClaudeProbe, CommandClaudeProbe},
-    codex::{CodexConfigCodec, CodexProbe, CommandCodexProbe, FileIdentity},
+    claude::{ClaudeConfigCodec, ClaudeProbe},
+    codex::{CodexConfigCodec, CodexProbe, FileIdentity},
     control::protocol::{
         CompatibilityClassification, CompatibilityView, ControlProblem, ProviderEffect,
         ReconciliationPreview, ReconciliationStrategy, ShadowSource, Target,
@@ -29,6 +29,17 @@ pub(crate) struct CodexRuntimeContext {
     probe: Arc<dyn CodexProbe>,
     executable: PathBuf,
     user_home: PathBuf,
+    configuration_home_override: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReconciliationRuntime {
+    pub(crate) home: MuxviaHome,
+    pub(crate) codex_probe: Arc<dyn CodexProbe>,
+    pub(crate) claude_probe: Arc<dyn ClaudeProbe>,
+    pub(crate) codex_executable: PathBuf,
+    pub(crate) claude_executable: PathBuf,
+    pub(crate) configuration_home_override: Option<PathBuf>,
 }
 
 pub(crate) struct ClaudeRuntimeContext {
@@ -108,30 +119,11 @@ pub(crate) struct ReconciliationService {
 }
 
 impl ReconciliationService {
-    pub(crate) fn for_home(
+    pub(crate) fn from_runtime(
         state: Arc<StateStore>,
-        home: &MuxviaHome,
+        runtime: ReconciliationRuntime,
     ) -> Result<Self, ControlProblem> {
-        let codex_executable = find_executable("codex");
-        let claude_executable = find_executable("claude");
-        Self::with_runtimes(
-            state,
-            home,
-            Arc::new(CommandCodexProbe),
-            codex_executable,
-            Arc::new(CommandClaudeProbe),
-            claude_executable,
-        )
-    }
-
-    pub(crate) fn with_runtimes(
-        state: Arc<StateStore>,
-        home: &MuxviaHome,
-        codex_probe: Arc<dyn CodexProbe>,
-        codex_executable: PathBuf,
-        claude_probe: Arc<dyn ClaudeProbe>,
-        claude_executable: PathBuf,
-    ) -> Result<Self, ControlProblem> {
+        let home = &runtime.home;
         let codex_codec = CodexConfigCodec::for_user_home(home.user_home())
             .map_err(|problem| stable_problem(problem.code()))?;
         let claude_codec = ClaudeConfigCodec::for_user_home(home.user_home())
@@ -141,13 +133,14 @@ impl ReconciliationService {
             state,
             tokens: Mutex::new(HashMap::new()),
             codex: CodexRuntimeContext {
-                probe: codex_probe,
-                executable: codex_executable,
+                probe: runtime.codex_probe,
+                executable: runtime.codex_executable,
                 user_home: home.user_home().to_path_buf(),
+                configuration_home_override: runtime.configuration_home_override,
             },
             claude: ClaudeRuntimeContext {
-                probe: claude_probe,
-                executable: claude_executable,
+                probe: runtime.claude_probe,
+                executable: runtime.claude_executable,
                 user_home: home.user_home().to_path_buf(),
             },
         })
@@ -226,6 +219,15 @@ impl ReconciliationService {
         strategy: ReconciliationStrategy,
         context: &ReconciliationContext,
     ) -> Result<(ObservationRecord, ObservedReconciliation), ControlProblem> {
+        if target == Target::Codex
+            && self
+                .codex
+                .configuration_home_override
+                .as_ref()
+                .is_some_and(|configured| configured != &self.codex.user_home.join(".codex"))
+        {
+            return Err(stable_problem("unsupported-configuration-home"));
+        }
         let view = self
             .state
             .target_view_for(target)
@@ -259,10 +261,15 @@ impl ReconciliationService {
                     .parent()
                     .expect("managed Codex configuration has a parent")
                     .to_path_buf();
-                let compatibility = match self.codex.probe.probe(&self.codex.executable) {
+                let compatibility = match self
+                    .codex
+                    .probe
+                    .probe_cancellable(&self.codex.executable)
+                    .await
+                {
                     Ok(capability) => ProbedCompatibility::from(capability),
-                    Err(_) => ProbedCompatibility::new(
-                        "unavailable".to_owned(),
+                    Err(problem) => ProbedCompatibility::new(
+                        problem.version().unwrap_or("unavailable").to_owned(),
                         CompatibilityClassification::Incompatible,
                     ),
                 };
@@ -290,10 +297,15 @@ impl ReconciliationService {
                 let desired = recovery
                     .claude_desired()
                     .ok_or_else(|| stable_problem("recovery-required"))?;
-                let compatibility = match self.claude.probe.probe(&self.claude.executable) {
+                let compatibility = match self
+                    .claude
+                    .probe
+                    .probe_cancellable(&self.claude.executable)
+                    .await
+                {
                     Ok(capability) => ProbedCompatibility::from(capability),
-                    Err(_) => ProbedCompatibility::new(
-                        "unavailable".to_owned(),
+                    Err(problem) => ProbedCompatibility::new(
+                        problem.version().unwrap_or("unavailable").to_owned(),
                         CompatibilityClassification::Incompatible,
                     ),
                 };
@@ -370,17 +382,6 @@ impl ObservationRecord {
     }
 }
 
-fn find_executable(name: &str) -> PathBuf {
-    std::env::var_os("PATH")
-        .and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|directory| directory.join(name))
-                .find(|candidate| candidate.is_file())
-        })
-        .and_then(|path| std::fs::canonicalize(path).ok())
-        .unwrap_or_else(|| PathBuf::from(format!("/usr/bin/{name}")))
-}
-
 fn map_state_problem(_: StateError) -> ControlProblem {
     stable_problem("state-store-error")
 }
@@ -424,11 +425,14 @@ mod tests {
     use tempfile::TempDir;
     use tokio_rusqlite::rusqlite::Connection;
 
-    use super::{ReconciliationService, ReconciliationStrategy, Target};
+    use super::{ReconciliationRuntime, ReconciliationService, ReconciliationStrategy, Target};
     use crate::{
         claude::{ClaudeCapability, ClaudeProbe, ClaudeProblem},
         codex::{CodexCapability, CodexProbe, CodexProblem},
-        control::protocol::{CompatibilityClassification, ProviderAuthentication},
+        control::protocol::{
+            ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState,
+            CompatibilityClassification, ProviderAuthentication,
+        },
         home::MuxviaHome,
         model::{UpstreamError, UpstreamRequest, UpstreamResponse, UpstreamTransport},
         service::{activate::ActivationService, reconciliation_adapter::ReconciliationContext},
@@ -498,6 +502,25 @@ mod tests {
         service: ReconciliationService,
     }
 
+    fn reconciliation_service(
+        store: Arc<StateStore>,
+        home: &MuxviaHome,
+        probe: Arc<MutableCodexProbe>,
+    ) -> ReconciliationService {
+        ReconciliationService::from_runtime(
+            store,
+            ReconciliationRuntime {
+                home: home.clone(),
+                codex_probe: probe,
+                claude_probe: Arc::new(TestedClaude),
+                codex_executable: "/usr/bin/codex".into(),
+                claude_executable: "/usr/bin/claude".into(),
+                configuration_home_override: None,
+            },
+        )
+        .unwrap()
+    }
+
     impl Fixture {
         async fn new() -> Self {
             let temp = TempDir::new().unwrap();
@@ -549,15 +572,7 @@ mod tests {
             let probe = Arc::new(MutableCodexProbe(StdMutex::new(ProbeState::Tested(
                 "codex-test".into(),
             ))));
-            let service = ReconciliationService::with_runtimes(
-                Arc::clone(&store),
-                &home,
-                probe.clone(),
-                "/usr/bin/codex".into(),
-                Arc::new(TestedClaude),
-                "/usr/bin/claude".into(),
-            )
-            .unwrap();
+            let service = reconciliation_service(Arc::clone(&store), &home, probe.clone());
             Self {
                 _temp: temp,
                 home,
@@ -578,6 +593,35 @@ mod tests {
                 .unwrap()
         }
 
+        async fn preview_record(&self) -> (Uuid, super::ObservationRecord) {
+            let preview = self.preview().await;
+            let record = self
+                .service
+                .tokens
+                .lock()
+                .await
+                .get(&super::ObservationKey(
+                    Target::Codex,
+                    ReconciliationStrategy::Reapply,
+                ))
+                .unwrap()
+                .clone();
+            (preview.observation_token, record)
+        }
+
+        async fn reobserved_record(&self, token: Uuid) -> super::ObservationRecord {
+            self.service
+                .observe(
+                    Target::Codex,
+                    ReconciliationStrategy::Reapply,
+                    &ReconciliationContext::Codex,
+                )
+                .await
+                .unwrap()
+                .0
+                .with_token(token)
+        }
+
         async fn assert_stale(&self, token: Uuid) {
             let failure = self
                 .service
@@ -591,6 +635,21 @@ mod tests {
                 .unwrap_err();
             assert_eq!(failure.code, "stale-reconciliation-preview");
         }
+    }
+
+    fn rewrite_same_file_preserving_identity(path: &Path, before: &str, after: &str) {
+        assert_eq!(before.len(), after.len());
+        let metadata = fs::metadata(path).unwrap();
+        let modified = metadata.modified().unwrap();
+        let permissions = metadata.permissions();
+        fs::write(path, after).unwrap();
+        fs::set_permissions(path, permissions).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
     }
 
     #[tokio::test]
@@ -668,37 +727,109 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_reobserves_owned_unrelated_shadow_identity_version_and_acknowledgement() {
+    async fn preview_rejects_the_same_nondefault_codex_home_as_activation() {
         let fixture = Fixture::new().await;
-        let config = fixture.home.user_home().join(".codex/config.toml");
+        let service = ReconciliationService::from_runtime(
+            Arc::clone(&fixture.store),
+            ReconciliationRuntime {
+                home: fixture.home.clone(),
+                codex_probe: fixture.probe.clone(),
+                claude_probe: Arc::new(TestedClaude),
+                codex_executable: "/usr/bin/codex".into(),
+                claude_executable: "/usr/bin/claude".into(),
+                configuration_home_override: Some(
+                    fixture.home.user_home().join("nondefault-codex-home"),
+                ),
+            },
+        )
+        .unwrap();
+        let failure = service
+            .preview(
+                Target::Codex,
+                ReconciliationStrategy::Reapply,
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, "unsupported-configuration-home");
+        assert_eq!(service.token_count().await, 0);
+    }
 
+    #[tokio::test]
+    async fn validation_binds_target_and_strategy_lookup() {
+        let fixture = Fixture::new().await;
         let preview = fixture.preview().await;
-        let original = fs::read_to_string(&config).unwrap();
-        fs::write(&config, original.replace("gpt-test", "gpt-mutated")).unwrap();
-        fixture.assert_stale(preview.observation_token).await;
-        fs::write(&config, &original).unwrap();
+        for (target, strategy) in [
+            (Target::Codex, ReconciliationStrategy::Adopt),
+            (Target::Claude, ReconciliationStrategy::Reapply),
+        ] {
+            let failure = fixture
+                .service
+                .validate_preview(
+                    target,
+                    strategy,
+                    preview.observation_token,
+                    ReconciliationContext::Codex,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(failure.code, "stale-reconciliation-preview");
+        }
+    }
 
-        let preview = fixture.preview().await;
-        fs::write(&config, format!("{original}\nunrelated = true\n")).unwrap();
-        fixture.assert_stale(preview.observation_token).await;
-        fs::write(&config, &original).unwrap();
+    #[tokio::test]
+    async fn validation_binds_management_revision_only() {
+        let fixture = Fixture::new().await;
+        let (token, before) = fixture.preview_record().await;
+        fixture
+            .store
+            .apply_provider_action_for(
+                Target::Codex,
+                Uuid::new_v4(),
+                before.management_revision,
+                serde_json::json!({
+                    "kind": "create-provider", "name": "Revision mutation",
+                    "baseUrl": "https://other.test/v1", "model": "other",
+                    "credential": { "kind": "replace", "value": "other-secret" },
+                    "authentication": "openai-bearer", "presetKey": null
+                }),
+            )
+            .await
+            .unwrap();
+        let after = fixture.reobserved_record(token).await;
+        let mut expected = before.clone();
+        expected.management_revision = after.management_revision;
+        assert_ne!(before.management_revision, after.management_revision);
+        assert_eq!(expected, after);
+        fixture.assert_stale(token).await;
+    }
 
-        let preview = fixture.preview().await;
-        fs::write(&config, format!("profile = \"shadow\"\n{original}")).unwrap();
-        fixture.assert_stale(preview.observation_token).await;
-        fs::write(&config, &original).unwrap();
+    #[tokio::test]
+    async fn validation_binds_exact_version_without_classification_change() {
+        let fixture = Fixture::new().await;
+        fixture.probe.set(ProbeState::Unknown("codex-a".into()));
+        let (token, before) = fixture.preview_record().await;
+        fixture.probe.set(ProbeState::Unknown("codex-b".into()));
+        let after = fixture.reobserved_record(token).await;
+        let mut expected = before.clone();
+        expected
+            .compatibility
+            .version
+            .clone_from(&after.compatibility.version);
+        assert_eq!(
+            before.compatibility.classification,
+            after.compatibility.classification
+        );
+        assert_ne!(before.compatibility.version, after.compatibility.version);
+        assert_eq!(expected, after);
+        fixture.assert_stale(token).await;
+    }
 
-        let preview = fixture.preview().await;
-        let replacement = config.with_extension("replacement");
-        fs::write(&replacement, &original).unwrap();
-        fs::rename(&replacement, &config).unwrap();
-        fixture.assert_stale(preview.observation_token).await;
-
-        let preview = fixture.preview().await;
+    #[tokio::test]
+    async fn validation_binds_acknowledgement_requirement_only() {
+        let fixture = Fixture::new().await;
         fixture.probe.set(ProbeState::Unknown("codex-next".into()));
-        fixture.assert_stale(preview.observation_token).await;
-
-        let preview = fixture.preview().await;
+        let (token, before) = fixture.preview_record().await;
         fixture
             .store
             .record_compatibility(
@@ -713,109 +844,290 @@ mod tests {
             .acknowledge_compatibility(Target::Codex, "codex-next")
             .await
             .unwrap();
-        fixture.assert_stale(preview.observation_token).await;
+        let after = fixture.reobserved_record(token).await;
+        let mut expected = before.clone();
+        expected.compatibility.acknowledgement_required =
+            after.compatibility.acknowledgement_required;
+        assert!(before.compatibility.acknowledgement_required);
+        assert!(!after.compatibility.acknowledgement_required);
+        assert_eq!(expected, after);
+        fixture.assert_stale(token).await;
     }
 
     #[tokio::test]
-    async fn validation_binds_target_strategy_revision_snapshot_recovery_home_and_epoch() {
-        let mut fixture = Fixture::new().await;
-        let preview = fixture.preview().await;
-        let wrong_strategy = fixture
-            .service
-            .validate_preview(
-                Target::Codex,
-                ReconciliationStrategy::Adopt,
-                preview.observation_token,
-                ReconciliationContext::Codex,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(wrong_strategy.code, "stale-reconciliation-preview");
-        let wrong_target = fixture
-            .service
-            .validate_preview(
-                Target::Claude,
-                ReconciliationStrategy::Reapply,
-                preview.observation_token,
-                ReconciliationContext::Codex,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(wrong_target.code, "stale-reconciliation-preview");
-
-        let preview = fixture.preview().await;
+    async fn validation_binds_classification_only() {
+        let fixture = Fixture::new().await;
+        fixture
+            .probe
+            .set(ProbeState::Unknown("same-version".into()));
         fixture
             .store
-            .apply_provider_action_for(
+            .record_compatibility(
                 Target::Codex,
+                "same-version".into(),
+                CompatibilityClassification::UnknownCompatible,
+            )
+            .await
+            .unwrap();
+        fixture
+            .store
+            .acknowledge_compatibility(Target::Codex, "same-version")
+            .await
+            .unwrap();
+        let (token, before) = fixture.preview_record().await;
+        fixture.probe.set(ProbeState::Tested("same-version".into()));
+        let after = fixture.reobserved_record(token).await;
+        let mut expected = before.clone();
+        expected.compatibility.classification = after.compatibility.classification;
+        assert_eq!(before.compatibility.version, after.compatibility.version);
+        assert!(!before.compatibility.acknowledgement_required);
+        assert!(!after.compatibility.acknowledgement_required);
+        assert_ne!(
+            before.compatibility.classification,
+            after.compatibility.classification
+        );
+        assert_eq!(expected, after);
+        fixture.assert_stale(token).await;
+    }
+
+    #[tokio::test]
+    async fn validation_binds_owned_fingerprint_only() {
+        let fixture = Fixture::new().await;
+        let config = fixture.home.user_home().join(".codex/config.toml");
+        let original = fs::read_to_string(&config).unwrap();
+        let (token, before) = fixture.preview_record().await;
+        rewrite_same_file_preserving_identity(
+            &config,
+            &original,
+            &original.replace("gpt-test", "gpt-next"),
+        );
+        let after = fixture.reobserved_record(token).await;
+        let mut expected = before.clone();
+        expected
+            .owned_fingerprint
+            .clone_from(&after.owned_fingerprint);
+        assert_ne!(before.owned_fingerprint, after.owned_fingerprint);
+        assert_eq!(expected, after);
+        fixture.assert_stale(token).await;
+    }
+
+    #[tokio::test]
+    async fn validation_binds_unrelated_fingerprint_only() {
+        let fixture = Fixture::new().await;
+        let config = fixture.home.user_home().join(".codex/config.toml");
+        let original = format!(
+            "{}\nunrelated = \"AAAA\"\n",
+            fs::read_to_string(&config).unwrap()
+        );
+        fs::write(&config, &original).unwrap();
+        let (token, before) = fixture.preview_record().await;
+        rewrite_same_file_preserving_identity(
+            &config,
+            &original,
+            &original.replace("AAAA", "BBBB"),
+        );
+        let after = fixture.reobserved_record(token).await;
+        let mut expected = before.clone();
+        expected
+            .unrelated_fingerprint
+            .clone_from(&after.unrelated_fingerprint);
+        assert_ne!(before.unrelated_fingerprint, after.unrelated_fingerprint);
+        assert_eq!(expected, after);
+        fixture.assert_stale(token).await;
+    }
+
+    #[tokio::test]
+    async fn validation_binds_file_identity_only() {
+        let fixture = Fixture::new().await;
+        let config = fixture.home.user_home().join(".codex/config.toml");
+        let bytes = fs::read(&config).unwrap();
+        let metadata = fs::metadata(&config).unwrap();
+        let (token, before) = fixture.preview_record().await;
+        let replacement = config.with_extension("replacement");
+        fs::write(&replacement, bytes).unwrap();
+        fs::set_permissions(&replacement, metadata.permissions()).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+            .unwrap();
+        fs::rename(replacement, &config).unwrap();
+        let after = fixture.reobserved_record(token).await;
+        let mut expected = before.clone();
+        expected.file_identity.clone_from(&after.file_identity);
+        assert_ne!(before.file_identity, after.file_identity);
+        assert_eq!(expected, after);
+        fixture.assert_stale(token).await;
+    }
+
+    #[tokio::test]
+    async fn validation_binds_shadow_sources_only() {
+        let fixture = Fixture::new().await;
+        let created = fixture
+            .store
+            .apply_provider_action_for(
+                Target::Claude,
                 Uuid::new_v4(),
-                preview.management_revision,
+                0,
                 serde_json::json!({
-                    "kind": "create-provider",
-                    "name": "Revision mutation",
-                    "baseUrl": "https://other.test/v1",
-                    "model": "other",
-                    "credential": { "kind": "replace", "value": "other-secret" },
-                    "authentication": "openai-bearer",
-                    "presetKey": null
+                    "kind": "create-provider", "name": "Claude",
+                    "baseUrl": "https://api.anthropic.test", "model": "claude-test",
+                    "credential": { "kind": "replace", "value": "claude-secret" },
+                    "authentication": "anthropic-api-key", "presetKey": null
                 }),
             )
             .await
             .unwrap();
-        fixture.assert_stale(preview.observation_token).await;
-
-        let current = fixture.store.target_view_for(Target::Codex).await.unwrap();
-        let snapshot = current.activated_snapshot.unwrap().id;
-        let recovery = current.recovery.intent_id.unwrap();
-        let preview = fixture.preview().await;
-        let connection = Connection::open(fixture.home.database_path()).unwrap();
-        connection
-            .execute(
-                "UPDATE target_route_state SET activated_snapshot_id = ?1 WHERE target = 'codex'",
-                [Uuid::new_v4().to_string()],
-            )
-            .unwrap();
-        fixture.assert_stale(preview.observation_token).await;
-        connection
-            .execute(
-                "UPDATE target_route_state SET activated_snapshot_id = ?1 WHERE target = 'codex'",
-                [snapshot.to_string()],
-            )
-            .unwrap();
-
-        let preview = fixture.preview().await;
-        connection
-            .execute(
-                "UPDATE target_route_state SET recovery_intent_id = ?1 WHERE target = 'codex'",
-                [Uuid::new_v4().to_string()],
-            )
-            .unwrap();
-        fixture.assert_stale(preview.observation_token).await;
-        connection
-            .execute(
-                "UPDATE target_route_state SET recovery_intent_id = ?1 WHERE target = 'codex'",
-                [recovery],
-            )
-            .unwrap();
-        drop(connection);
-
-        let preview = fixture.preview().await;
-        fixture.service.codex.user_home.push("changed");
-        fixture.assert_stale(preview.observation_token).await;
-        fixture.service.codex.user_home.pop();
-
-        let preview = fixture.preview().await;
-        let restarted_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
-        let restarted = ReconciliationService::with_runtimes(
-            restarted_store,
-            &fixture.home,
+        let provider_id = created.view.providers[0].id;
+        let project = fixture.home.user_home().join("project");
+        fs::create_dir(&project).unwrap();
+        let context = ClaudePreflightContext {
+            claude_config_dir: None,
+            selector_state: ClaudeSelectorState::Unset,
+            blocking_selector: None,
+            host_managed_state: ClaudeHostManagedState::Unmanaged,
+            cwd: project.to_string_lossy().into_owned(),
+        };
+        let activation = ActivationService::new(
+            Arc::clone(&fixture.store),
+            fixture.home.clone(),
             fixture.probe.clone(),
             "/usr/bin/codex".into(),
-            Arc::new(TestedClaude),
-            "/usr/bin/claude".into(),
+            Arc::new(NoopUpstream),
+        )
+        .with_claude_runtime(Arc::new(TestedClaude), "/usr/bin/claude".into());
+        activation
+            .apply_raw_for_with_context(
+                Target::Claude,
+                Uuid::new_v4(),
+                1,
+                serde_json::json!({
+                    "kind": "activate-provider",
+                    "providerId": provider_id,
+                    "mode": "direct"
+                }),
+                Some(&context),
+            )
+            .await
+            .unwrap();
+        let service = ReconciliationService::from_runtime(
+            Arc::clone(&fixture.store),
+            activation.reconciliation_runtime(),
         )
         .unwrap();
-        let failure = restarted
+        let preview = service
+            .preview(
+                Target::Claude,
+                ReconciliationStrategy::Reapply,
+                ReconciliationContext::Claude(context.clone()),
+            )
+            .await
+            .unwrap();
+        let before = service
+            .tokens
+            .lock()
+            .await
+            .get(&super::ObservationKey(
+                Target::Claude,
+                ReconciliationStrategy::Reapply,
+            ))
+            .unwrap()
+            .clone();
+        fs::create_dir(project.join(".claude")).unwrap();
+        fs::write(
+            project.join(".claude/settings.json"),
+            r#"{"env":{"ANTHROPIC_MODEL":"shadow-model"}}"#,
+        )
+        .unwrap();
+        let after = service
+            .observe(
+                Target::Claude,
+                ReconciliationStrategy::Reapply,
+                &ReconciliationContext::Claude(context.clone()),
+            )
+            .await
+            .unwrap()
+            .0
+            .with_token(preview.observation_token);
+        let mut expected = before.clone();
+        expected.shadows.clone_from(&after.shadows);
+        assert_eq!(
+            before.shadows,
+            Vec::<crate::control::protocol::ShadowSource>::new()
+        );
+        assert_eq!(
+            after.shadows,
+            vec![crate::control::protocol::ShadowSource::ClaudeShared]
+        );
+        assert_eq!(expected, after);
+        let failure = service
+            .validate_preview(
+                Target::Claude,
+                ReconciliationStrategy::Reapply,
+                preview.observation_token,
+                ReconciliationContext::Claude(context),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, "stale-reconciliation-preview");
+    }
+
+    #[tokio::test]
+    async fn validation_binds_canonical_home_only() {
+        let fixture = Fixture::new().await;
+        let user_home = fixture.home.user_home();
+        let configured = user_home.join(".codex");
+        let first_home = user_home.join("codex-first");
+        let second_home = user_home.join("codex-second");
+        fs::rename(&configured, &first_home).unwrap();
+        fs::create_dir(&second_home).unwrap();
+        fs::hard_link(
+            first_home.join("config.toml"),
+            second_home.join("config.toml"),
+        )
+        .unwrap();
+        symlink(&first_home, &configured).unwrap();
+        let service = reconciliation_service(
+            Arc::clone(&fixture.store),
+            &fixture.home,
+            fixture.probe.clone(),
+        );
+        let preview = service
+            .preview(
+                Target::Codex,
+                ReconciliationStrategy::Reapply,
+                ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap();
+        let before = service
+            .tokens
+            .lock()
+            .await
+            .get(&super::ObservationKey(
+                Target::Codex,
+                ReconciliationStrategy::Reapply,
+            ))
+            .unwrap()
+            .clone();
+        fs::remove_file(&configured).unwrap();
+        symlink(&second_home, &configured).unwrap();
+        let after = service
+            .observe(
+                Target::Codex,
+                ReconciliationStrategy::Reapply,
+                &ReconciliationContext::Codex,
+            )
+            .await
+            .unwrap()
+            .0
+            .with_token(preview.observation_token);
+        let mut expected = before.clone();
+        expected.canonical_home.clone_from(&after.canonical_home);
+        assert_ne!(before.canonical_home, after.canonical_home);
+        assert_eq!(expected, after);
+        let failure = service
             .validate_preview(
                 Target::Codex,
                 ReconciliationStrategy::Reapply,
@@ -828,45 +1140,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validation_recanonicalizes_configuration_home_directory_symlinks() {
+    async fn validation_binds_exact_existing_alternate_snapshot_only() {
         let fixture = Fixture::new().await;
-        let user_home = fixture.home.user_home();
-        let configured = user_home.join(".codex");
-        let first_home = user_home.join("codex-first");
-        let second_home = user_home.join("codex-second");
-        fs::rename(&configured, &first_home).unwrap();
-        fs::create_dir(&second_home).unwrap();
-        fs::copy(
-            first_home.join("config.toml"),
-            second_home.join("config.toml"),
-        )
-        .unwrap();
-        symlink(&first_home, &configured).unwrap();
-        let service = ReconciliationService::with_runtimes(
-            Arc::clone(&fixture.store),
-            &fixture.home,
-            fixture.probe.clone(),
-            "/usr/bin/codex".into(),
-            Arc::new(TestedClaude),
-            "/usr/bin/claude".into(),
-        )
-        .unwrap();
-        let preview = service
-            .preview(
+        let (token, before) = fixture.preview_record().await;
+        let original_id = before.snapshot_id.unwrap();
+        let alternate_id = Uuid::new_v4();
+        let connection = Connection::open(fixture.home.database_path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO activated_snapshots
+                 (id, target, provider_id, base_url, model, protocol, authentication,
+                  provider_bearer_token, epoch)
+                 SELECT ?1, target, provider_id, base_url, model, protocol, authentication,
+                        provider_bearer_token, epoch
+                 FROM activated_snapshots WHERE id = ?2",
+                [alternate_id.to_string(), original_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE target_route_state SET activated_snapshot_id = ?1
+                 WHERE target = 'codex'",
+                [alternate_id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let after = fixture.reobserved_record(token).await;
+        let mut expected = before.clone();
+        expected.snapshot_id = after.snapshot_id;
+        assert_eq!(after.snapshot_id, Some(alternate_id));
+        assert_eq!(expected, after);
+        fixture.assert_stale(token).await;
+    }
+
+    #[tokio::test]
+    async fn validation_binds_exact_existing_alternate_recovery_intent_only() {
+        let fixture = Fixture::new().await;
+        let (token, before) = fixture.preview_record().await;
+        let original_id = before.recovery_intent_id.unwrap();
+        let alternate_id = Uuid::new_v4();
+        let alternate_action_id = Uuid::new_v4();
+        let connection = Connection::open(fixture.home.database_path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO activation_recovery
+                 (id, target, action_id, config_path, file_identity_json, payload_json,
+                  state, created_revision)
+                 SELECT ?1, target, ?2, config_path, file_identity_json, payload_json,
+                        state, created_revision
+                 FROM activation_recovery WHERE id = ?3",
+                [
+                    alternate_id.to_string(),
+                    alternate_action_id.to_string(),
+                    original_id.to_string(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE target_route_state SET recovery_intent_id = ?1
+                 WHERE target = 'codex'",
+                [alternate_id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let after = fixture.reobserved_record(token).await;
+        let mut expected = before.clone();
+        expected.recovery_intent_id = after.recovery_intent_id;
+        assert_eq!(after.recovery_intent_id, Some(alternate_id));
+        assert_eq!(expected, after);
+        fixture.assert_stale(token).await;
+    }
+
+    #[tokio::test]
+    async fn validation_binds_service_epoch_with_nonempty_restarted_registry_only() {
+        let fixture = Fixture::new().await;
+        let (token, before) = fixture.preview_record().await;
+        let restarted_store = Arc::new(StateStore::open(&fixture.home).await.unwrap());
+        let restarted =
+            reconciliation_service(restarted_store, &fixture.home, fixture.probe.clone());
+        restarted.tokens.lock().await.insert(
+            super::ObservationKey(Target::Codex, ReconciliationStrategy::Reapply),
+            before.clone(),
+        );
+        assert_eq!(restarted.token_count().await, 1);
+        let after = restarted
+            .observe(
                 Target::Codex,
                 ReconciliationStrategy::Reapply,
-                ReconciliationContext::Codex,
+                &ReconciliationContext::Codex,
             )
             .await
-            .unwrap();
-        fs::remove_file(&configured).unwrap();
-        symlink(&second_home, &configured).unwrap();
-
-        let failure = service
+            .unwrap()
+            .0
+            .with_token(token);
+        let mut expected = before.clone();
+        expected.service_epoch = after.service_epoch;
+        assert_ne!(before.service_epoch, after.service_epoch);
+        assert_eq!(expected, after);
+        let failure = restarted
             .validate_preview(
                 Target::Codex,
                 ReconciliationStrategy::Reapply,
-                preview.observation_token,
+                token,
                 ReconciliationContext::Codex,
             )
             .await

@@ -32,6 +32,8 @@ use crate::{
     },
 };
 
+use super::reconcile::ReconciliationRuntime;
+
 enum ConfigurationPreflight {
     Codex {
         codec: CodexConfigCodec,
@@ -362,6 +364,17 @@ impl ActivationService {
     pub fn with_configuration_home_override(mut self, home: Option<PathBuf>) -> Self {
         self.configuration_home_override = home;
         self
+    }
+
+    pub(crate) fn reconciliation_runtime(&self) -> ReconciliationRuntime {
+        ReconciliationRuntime {
+            home: self.home.clone(),
+            codex_probe: Arc::clone(&self.codex_probe),
+            claude_probe: Arc::clone(&self.claude_probe),
+            codex_executable: self.codex_executable.clone(),
+            claude_executable: self.claude_executable.clone(),
+            configuration_home_override: self.configuration_home_override.clone(),
+        }
     }
 
     pub async fn apply_raw(

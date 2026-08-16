@@ -180,8 +180,11 @@ impl ControlServer {
             ProviderInspector::new(Arc::clone(&store)).map_err(|_| ControlServerError::State)?,
         );
         let reconciliation = Arc::new(
-            ReconciliationService::for_home(Arc::clone(&store), home)
-                .map_err(|_| ControlServerError::State)?,
+            ReconciliationService::from_runtime(
+                Arc::clone(&store),
+                activation.reconciliation_runtime(),
+            )
+            .map_err(|_| ControlServerError::State)?,
         );
         for target in [Target::Codex, Target::Claude] {
             let reconciled = match target {

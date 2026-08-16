@@ -645,6 +645,26 @@ fn reconciliation_probe_rejects_malformed_missing_contradictory_and_non_utf8_out
 
 #[cfg(unix)]
 #[test]
+fn reconciliation_probe_preserves_valid_version_when_help_is_incompatible() {
+    let temp = TempDir::new().unwrap();
+    let executable = temp.path().join("codex-versioned-incompatible-fixture");
+    fs::write(
+        &executable,
+        "#!/bin/sh\ncase \"$1\" in\n --version) printf 'codex-cli 8.7.6\\n' ;;\n --help) printf 'Usage: codex [OPTIONS]\\nHELP_STDOUT_SECRET_83017\\n' >&1; printf 'HELP_STDERR_SECRET_83018\\n' >&2 ;;\n *) exit 91 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = CommandCodexProbe.probe(&executable).unwrap_err();
+    assert_eq!(error.code(), "incompatible-target-cli");
+    assert_eq!(error.version(), Some("codex-cli 8.7.6"));
+    let diagnostic = format!("{error:?}\n{error}");
+    assert!(!diagnostic.contains("HELP_STDOUT_SECRET_83017"));
+    assert!(!diagnostic.contains("HELP_STDERR_SECRET_83018"));
+}
+
+#[cfg(unix)]
+#[test]
 fn command_probe_maps_nonzero_status_to_incompatible_target_cli() {
     let temp = TempDir::new().unwrap();
     let executable = temp.path().join("codex-fixture");

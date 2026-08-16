@@ -1,4 +1,4 @@
-use std::{fmt, path::Path, process::Command};
+use std::{fmt, future::Future, path::Path, pin::Pin, process::Command};
 
 use uuid::Uuid;
 
@@ -9,6 +9,13 @@ const TESTED_CLAUDE_VERSION: &str = "2.1.37 (Claude Code)";
 
 pub trait ClaudeProbe: Send + Sync {
     fn probe(&self, executable: &Path) -> Result<ClaudeCapability, ClaudeProblem>;
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        executable: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeCapability, ClaudeProblem>> + Send + 'a>> {
+        Box::pin(async move { self.probe(executable) })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +43,7 @@ impl ClaudeCapability {
 pub struct ClaudeProblem {
     code: &'static str,
     path: Option<std::path::PathBuf>,
+    version: Option<String>,
     source: Option<&'static str>,
     selector: Option<ClaudeBlockingSelector>,
     correlation_id: Uuid,
@@ -46,6 +54,7 @@ impl ClaudeProblem {
         Self {
             code,
             path: path.map(Path::to_path_buf),
+            version: None,
             source: None,
             selector: None,
             correlation_id: Uuid::new_v4(),
@@ -54,6 +63,15 @@ impl ClaudeProblem {
 
     pub fn code(&self) -> &'static str {
         self.code
+    }
+
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    fn with_version(mut self, version: String) -> Self {
+        self.version = Some(version);
+        self
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -114,21 +132,21 @@ impl ClaudeProbe for CommandClaudeProbe {
                 Some(executable),
             ));
         }
-        let version = run_read_only(executable, "--version")?;
-        let help = run_read_only(executable, "--help")?;
+        let version = parse_version(&run_read_only(executable, "--version")?)
+            .ok_or_else(|| ClaudeProblem::new("incompatible-target-cli", Some(executable)))?;
+        let help = run_read_only(executable, "--help")
+            .map_err(|problem| problem.with_version(version.clone()))?;
         let normalized_help = help.to_ascii_lowercase();
         if !normalized_help.contains("usage:")
             || !normalized_help.contains("claude")
             || !normalized_help.contains("--settings")
             || !normalized_help.contains("--model")
         {
-            return Err(ClaudeProblem::new(
-                "incompatible-target-cli",
-                Some(executable),
-            ));
+            return Err(
+                ClaudeProblem::new("incompatible-target-cli", Some(executable))
+                    .with_version(version),
+            );
         }
-        let version = parse_version(&version)
-            .ok_or_else(|| ClaudeProblem::new("incompatible-target-cli", Some(executable)))?;
         if version == TESTED_CLAUDE_VERSION {
             Ok(ClaudeCapability::Tested { version })
         } else {
@@ -137,6 +155,44 @@ impl ClaudeProbe for CommandClaudeProbe {
                 version,
             })
         }
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        executable: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeCapability, ClaudeProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            if !executable.is_absolute() {
+                return Err(ClaudeProblem::new(
+                    "incompatible-target-cli",
+                    Some(executable),
+                ));
+            }
+            let version = parse_version(&run_read_only_cancellable(executable, "--version").await?)
+                .ok_or_else(|| ClaudeProblem::new("incompatible-target-cli", Some(executable)))?;
+            let help = run_read_only_cancellable(executable, "--help")
+                .await
+                .map_err(|problem| problem.with_version(version.clone()))?;
+            let normalized_help = help.to_ascii_lowercase();
+            if !normalized_help.contains("usage:")
+                || !normalized_help.contains("claude")
+                || !normalized_help.contains("--settings")
+                || !normalized_help.contains("--model")
+            {
+                return Err(
+                    ClaudeProblem::new("incompatible-target-cli", Some(executable))
+                        .with_version(version),
+                );
+            }
+            if version == TESTED_CLAUDE_VERSION {
+                Ok(ClaudeCapability::Tested { version })
+            } else {
+                Ok(ClaudeCapability::UnknownCompatible {
+                    warning: format!("Untested Claude Code version: {version}"),
+                    version,
+                })
+            }
+        })
     }
 }
 
@@ -174,6 +230,26 @@ fn run_read_only(executable: &Path, argument: &str) -> Result<String, ClaudeProb
     let output = Command::new(executable)
         .arg(argument)
         .output()
+        .map_err(|_| ClaudeProblem::new("incompatible-target-cli", Some(executable)))?;
+    if !output.status.success() {
+        return Err(ClaudeProblem::new(
+            "incompatible-target-cli",
+            Some(executable),
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| ClaudeProblem::new("incompatible-target-cli", Some(executable)))
+}
+
+async fn run_read_only_cancellable(
+    executable: &Path,
+    argument: &str,
+) -> Result<String, ClaudeProblem> {
+    let mut command = tokio::process::Command::new(executable);
+    command.arg(argument).kill_on_drop(true);
+    let output = command
+        .output()
+        .await
         .map_err(|_| ClaudeProblem::new("incompatible-target-cli", Some(executable)))?;
     if !output.status.success() {
         return Err(ClaudeProblem::new(

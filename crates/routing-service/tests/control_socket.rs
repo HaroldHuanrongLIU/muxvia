@@ -14,10 +14,10 @@ use std::{
 use async_trait::async_trait;
 use muxvia_routing::{
     claude::{ClaudeCapability, ClaudeProbe, ClaudeProblem},
-    codex::{CodexCapability, CodexProbe, CodexProblem},
+    codex::{CodexCapability, CodexProbe, CodexProblem, CommandCodexProbe},
     control::{
         framing::{FrameError, read_frame, write_frame},
-        server::{ControlServer, peer_uid_matches},
+        server::{ControlServer, ControlServerHandle, peer_uid_matches},
     },
     home::MuxviaHome,
     model::{UpstreamError, UpstreamRequest, UpstreamResponse, UpstreamTransport},
@@ -39,6 +39,21 @@ impl CodexProbe for ControlCodexProbe {
     fn probe(&self, _: &Path) -> Result<CodexCapability, CodexProblem> {
         Ok(CodexCapability::Tested {
             version: "test".into(),
+        })
+    }
+}
+
+struct RuntimeSourceCodexProbe {
+    expected_executable: PathBuf,
+    calls: AtomicUsize,
+}
+
+impl CodexProbe for RuntimeSourceCodexProbe {
+    fn probe(&self, executable: &Path) -> Result<CodexCapability, CodexProblem> {
+        assert_eq!(executable, self.expected_executable);
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(CodexCapability::Tested {
+            version: "shared-runtime-codex 7.4.1".into(),
         })
     }
 }
@@ -354,24 +369,198 @@ async fn request(stream: &mut UnixStream, request_id: &str, operation: Value) ->
     read_frame(stream).await.unwrap()
 }
 
-#[tokio::test]
-async fn reconciliation_preview_codex_direct_is_read_only_and_emits_no_target_view() {
-    let root = short_temp_root("mx-reconcile-preview");
-    let user_home = root.join("home");
-    fs::create_dir_all(&user_home).unwrap();
-    let home = MuxviaHome::from_user_home(&user_home);
-    let store = Arc::new(StateStore::open(&home).await.unwrap());
-    let activation = Arc::new(ActivationService::new(
+async fn seed_codex_direct(home: &MuxviaHome, store: Arc<StateStore>) {
+    let created = store
+        .apply_provider_action_for(
+            muxvia_routing::control::protocol::Target::Codex,
+            Uuid::new_v4(),
+            0,
+            json!({
+                "kind": "create-provider",
+                "name": "Codex",
+                "baseUrl": "https://seed.test/v1",
+                "model": "seed-model",
+                "credential": { "kind": "replace", "value": "seed-secret" },
+                "authentication": "openai-bearer",
+                "presetKey": null
+            }),
+        )
+        .await
+        .unwrap();
+    let activation = ActivationService::new(
         Arc::clone(&store),
         home.clone(),
         Arc::new(ControlCodexProbe),
         "/usr/bin/codex".into(),
         Arc::new(ControlNoopUpstream),
+    );
+    activation
+        .apply_raw_for(
+            muxvia_routing::control::protocol::Target::Codex,
+            Uuid::new_v4(),
+            created.view.management_revision,
+            json!({
+                "kind": "activate-provider",
+                "providerId": created.view.providers[0].id,
+                "mode": "direct"
+            }),
+        )
+        .await
+        .unwrap();
+}
+
+fn hanging_probe_executable(root: &Path) -> (PathBuf, PathBuf) {
+    let started = root.join("probe-started");
+    let pid = root.join("probe.pid");
+    let executable = root.join("hanging-codex");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\ntouch '{}'\nprintf 'HUNG_PROBE_STDERR_SECRET_92017\\n' >&2\nexec /bin/sleep 2\n",
+            pid.display(),
+            started.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    (executable, started)
+}
+
+async fn wait_for_path(path: &Path) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn wait_for_process_exit(pid_path: &Path) {
+    let pid: i32 = fs::read_to_string(pid_path).unwrap().parse().unwrap();
+    tokio::time::timeout(Duration::from_millis(500), async move {
+        loop {
+            // SAFETY: signal 0 only checks whether the recorded child PID still exists.
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("hanging probe child survived cancellation");
+}
+
+async fn start_hanging_preview_fixture(
+    prefix: &str,
+) -> (PathBuf, ControlServerHandle, UnixStream, PathBuf) {
+    let root = short_temp_root(prefix);
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    seed_codex_direct(&home, Arc::clone(&store)).await;
+    let (executable, started) = hanging_probe_executable(&root);
+    let activation = Arc::new(ActivationService::new(
+        Arc::clone(&store),
+        home,
+        Arc::new(CommandCodexProbe),
+        executable,
+        Arc::new(ControlNoopUpstream),
     ));
-    let handle =
-        ControlServer::bind_with_activation(&home, Arc::clone(&store), "routing-test", activation)
-            .await
-            .unwrap();
+    let handle = ControlServer::bind_with_activation(
+        &MuxviaHome::from_user_home(&user_home),
+        store,
+        "routing-test",
+        activation,
+    )
+    .await
+    .unwrap();
+    let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut stream).await;
+    let _opened = request(
+        &mut stream,
+        "open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "hanging-preview",
+            "operation": {
+                "kind": "preview-reconciliation",
+                "target": "codex",
+                "strategy": "reapply"
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    wait_for_path(&started).await;
+    let pid = root.join("probe.pid");
+    (root, handle, stream, pid)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconciliation_preview_disconnect_kills_hung_probe_and_reaps_tracking() {
+    let (root, handle, stream, pid) = start_hanging_preview_fixture("mx-preview-drop").await;
+    assert_eq!(handle.tracked_inspections(), 1);
+    drop(stream);
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while handle.tracked_inspections() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnect did not reap hanging preview");
+    wait_for_process_exit(&pid).await;
+    handle.shutdown().await.unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconciliation_preview_shutdown_kills_hung_probe_and_is_bounded() {
+    let (root, handle, _stream, pid) = start_hanging_preview_fixture("mx-preview-stop").await;
+    assert_eq!(handle.tracked_inspections(), 1);
+    tokio::time::timeout(Duration::from_millis(500), handle.shutdown())
+        .await
+        .expect("shutdown was starved by hanging preview")
+        .unwrap();
+    wait_for_process_exit(&pid).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn reconciliation_preview_codex_direct_is_read_only_and_emits_no_target_view() {
+    let root = short_temp_root("mx-reconcile-preview");
+    let service_user_home = root.join("service-home");
+    let runtime_user_home = root.join("runtime-home");
+    fs::create_dir_all(&service_user_home).unwrap();
+    fs::create_dir_all(&runtime_user_home).unwrap();
+    let service_home = MuxviaHome::from_user_home(&service_user_home);
+    let runtime_home = MuxviaHome::from_user_home(&runtime_user_home);
+    let store = Arc::new(StateStore::open(&service_home).await.unwrap());
+    let runtime_probe = Arc::new(RuntimeSourceCodexProbe {
+        expected_executable: "/runtime/source/codex".into(),
+        calls: AtomicUsize::new(0),
+    });
+    let activation = Arc::new(ActivationService::new(
+        Arc::clone(&store),
+        runtime_home,
+        runtime_probe.clone(),
+        "/runtime/source/codex".into(),
+        Arc::new(ControlNoopUpstream),
+    ));
+    let handle = ControlServer::bind_with_activation(
+        &service_home,
+        Arc::clone(&store),
+        "routing-test",
+        activation,
+    )
+    .await
+    .unwrap();
     let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
     hello(&mut stream).await;
     let opened = request(
@@ -416,8 +605,10 @@ async fn reconciliation_preview_codex_direct_is_read_only_and_emits_no_target_vi
         .as_u64()
         .unwrap();
     let _activated_push = read_frame(&mut stream).await.unwrap();
-    let before_database = fs::read(home.database_path()).unwrap();
-    let before_config = fs::read(user_home.join(".codex/config.toml")).unwrap();
+    let before_database = fs::read(service_home.database_path()).unwrap();
+    let runtime_config = runtime_user_home.join(".codex/config.toml");
+    let before_config = fs::read(&runtime_config).unwrap();
+    assert!(!service_user_home.join(".codex/config.toml").exists());
 
     let preview = request(
         &mut stream,
@@ -432,13 +623,23 @@ async fn reconciliation_preview_codex_direct_is_read_only_and_emits_no_target_vi
     assert_eq!(preview["result"]["kind"], "reconciliation-preview");
     assert_eq!(preview["result"]["preview"]["target"], "codex");
     assert_eq!(preview["result"]["preview"]["strategy"], "reapply");
+    assert_eq!(
+        preview["result"]["preview"]["compatibility"],
+        json!({
+            "version": "shared-runtime-codex 7.4.1",
+            "classification": "tested",
+            "acknowledgementRequired": false
+        })
+    );
+    assert_eq!(runtime_probe.calls.load(Ordering::SeqCst), 2);
     assert_eq!(preview["result"]["preview"]["managementRevision"], revision);
     assert!(!preview.to_string().contains("preview-secret"));
-    assert_eq!(fs::read(home.database_path()).unwrap(), before_database);
     assert_eq!(
-        fs::read(user_home.join(".codex/config.toml")).unwrap(),
-        before_config
+        fs::read(service_home.database_path()).unwrap(),
+        before_database
     );
+    assert_eq!(fs::read(runtime_config).unwrap(), before_config);
+    assert!(!service_user_home.join(".codex/config.toml").exists());
     assert!(
         tokio::time::timeout(Duration::from_millis(100), read_frame(&mut stream))
             .await

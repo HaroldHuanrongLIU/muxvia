@@ -1,4 +1,4 @@
-use std::{fmt, path::Path, process::Command};
+use std::{fmt, future::Future, path::Path, pin::Pin, process::Command};
 
 use uuid::Uuid;
 
@@ -8,6 +8,13 @@ const TESTED_CODEX_VERSION: &str = "codex-cli 0.106.0";
 
 pub trait CodexProbe: Send + Sync {
     fn probe(&self, executable: &Path) -> Result<CodexCapability, CodexProblem>;
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        executable: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<CodexCapability, CodexProblem>> + Send + 'a>> {
+        Box::pin(async move { self.probe(executable) })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +42,7 @@ impl CodexCapability {
 pub struct CodexProblem {
     code: &'static str,
     path: Option<std::path::PathBuf>,
+    version: Option<String>,
     correlation_id: Uuid,
 }
 
@@ -43,12 +51,22 @@ impl CodexProblem {
         Self {
             code,
             path: path.map(Path::to_path_buf),
+            version: None,
             correlation_id: Uuid::new_v4(),
         }
     }
 
     pub fn code(&self) -> &'static str {
         self.code
+    }
+
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    fn with_version(mut self, version: String) -> Self {
+        self.version = Some(version);
+        self
     }
 }
 
@@ -85,20 +103,20 @@ impl CodexProbe for CommandCodexProbe {
                 Some(executable),
             ));
         }
-        let version = run_read_only(executable, "--version")?;
-        let help = run_read_only(executable, "--help")?;
+        let version = parse_version(&run_read_only(executable, "--version")?)
+            .ok_or_else(|| CodexProblem::new("incompatible-target-cli", Some(executable)))?;
+        let help = run_read_only(executable, "--help")
+            .map_err(|problem| problem.with_version(version.clone()))?;
         let normalized_help = help.to_ascii_lowercase();
         if !normalized_help.contains("usage:")
             || !normalized_help.contains("codex")
             || !normalized_help.contains("--config")
         {
-            return Err(CodexProblem::new(
-                "incompatible-target-cli",
-                Some(executable),
-            ));
+            return Err(
+                CodexProblem::new("incompatible-target-cli", Some(executable))
+                    .with_version(version),
+            );
         }
-        let version = parse_version(&version)
-            .ok_or_else(|| CodexProblem::new("incompatible-target-cli", Some(executable)))?;
         if version == TESTED_CODEX_VERSION {
             Ok(CodexCapability::Tested { version })
         } else {
@@ -107,6 +125,43 @@ impl CodexProbe for CommandCodexProbe {
                 version,
             })
         }
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        executable: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = Result<CodexCapability, CodexProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            if !executable.is_absolute() {
+                return Err(CodexProblem::new(
+                    "incompatible-target-cli",
+                    Some(executable),
+                ));
+            }
+            let version = parse_version(&run_read_only_cancellable(executable, "--version").await?)
+                .ok_or_else(|| CodexProblem::new("incompatible-target-cli", Some(executable)))?;
+            let help = run_read_only_cancellable(executable, "--help")
+                .await
+                .map_err(|problem| problem.with_version(version.clone()))?;
+            let normalized_help = help.to_ascii_lowercase();
+            if !normalized_help.contains("usage:")
+                || !normalized_help.contains("codex")
+                || !normalized_help.contains("--config")
+            {
+                return Err(
+                    CodexProblem::new("incompatible-target-cli", Some(executable))
+                        .with_version(version),
+                );
+            }
+            if version == TESTED_CODEX_VERSION {
+                Ok(CodexCapability::Tested { version })
+            } else {
+                Ok(CodexCapability::UnknownCompatible {
+                    warning: format!("Untested Codex CLI version: {version}"),
+                    version,
+                })
+            }
+        })
     }
 }
 
@@ -144,6 +199,26 @@ fn run_read_only(executable: &Path, argument: &str) -> Result<String, CodexProbl
     let output = Command::new(executable)
         .arg(argument)
         .output()
+        .map_err(|_| CodexProblem::new("incompatible-target-cli", Some(executable)))?;
+    if !output.status.success() {
+        return Err(CodexProblem::new(
+            "incompatible-target-cli",
+            Some(executable),
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| CodexProblem::new("incompatible-target-cli", Some(executable)))
+}
+
+async fn run_read_only_cancellable(
+    executable: &Path,
+    argument: &str,
+) -> Result<String, CodexProblem> {
+    let mut command = tokio::process::Command::new(executable);
+    command.arg(argument).kill_on_drop(true);
+    let output = command
+        .output()
+        .await
         .map_err(|_| CodexProblem::new("incompatible-target-cli", Some(executable)))?;
     if !output.status.success() {
         return Err(CodexProblem::new(

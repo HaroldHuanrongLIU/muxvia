@@ -581,6 +581,26 @@ fn reconciliation_probe_rejects_malformed_missing_contradictory_and_non_utf8_out
 
 #[cfg(unix)]
 #[test]
+fn reconciliation_probe_preserves_valid_version_when_help_is_incompatible() {
+    let temp = TempDir::new().unwrap();
+    let executable = temp.path().join("claude-versioned-incompatible-fixture");
+    fs::write(
+        &executable,
+        "#!/bin/sh\ncase \"$1\" in\n --version) printf '8.7.6 (Claude Code)\\n' ;;\n --help) printf 'Usage: claude [options]\\n--settings <file>\\nHELP_STDOUT_SECRET_84017\\n' >&1; printf 'HELP_STDERR_SECRET_84018\\n' >&2 ;;\n *) exit 91 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = CommandClaudeProbe.probe(&executable).unwrap_err();
+    assert_eq!(error.code(), "incompatible-target-cli");
+    assert_eq!(error.version(), Some("8.7.6 (Claude Code)"));
+    let diagnostic = format!("{error:?}\n{error}");
+    assert!(!diagnostic.contains("HELP_STDOUT_SECRET_84017"));
+    assert!(!diagnostic.contains("HELP_STDERR_SECRET_84018"));
+}
+
+#[cfg(unix)]
+#[test]
 fn command_probe_classifies_unknown_compatible_and_incompatible_fake_versions() {
     let unknown = TempDir::new().unwrap();
     let (unknown_executable, _) = fake_claude(

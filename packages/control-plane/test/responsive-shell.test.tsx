@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
 
 import type { TargetSession } from "../src/control/target-session"
-import type { ActionOutcome, TargetAction, TargetView } from "../src/control/types"
+import type { ActionOutcome, ReconciliationPreview, ReconciliationStrategy, TargetAction, TargetView } from "../src/control/types"
 import { App } from "../src/ui/app"
 
 const sizes = [[1, 1], [2, 2], [20, 5], [40, 10], [80, 24], [120, 30], [121, 30]] as const
@@ -30,8 +30,12 @@ function view(): TargetView {
 class StaticTargetSession implements TargetSession {
   readonly #view: TargetView
 
-  constructor(target: "codex" | "claude" = "codex") {
-    this.#view = { ...view(), target }
+  constructor(target: "codex" | "claude" = "codex", drifted = false) {
+    this.#view = {
+      ...view(),
+      target,
+      problems: drifted ? [{ code: "configuration-drift", message: "must-not-render" }] : [],
+    }
   }
 
   get(): Readonly<TargetView> {
@@ -40,7 +44,20 @@ class StaticTargetSession implements TargetSession {
 
   async discoverModels(): Promise<never> { throw new Error("not used by this fixture") }
   async checkReachability(): Promise<never> { throw new Error("not used by this fixture") }
-  async previewReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
+  async previewReconciliation(strategy: ReconciliationStrategy): Promise<ReconciliationPreview> {
+    return {
+      observationToken: "00000000-0000-4000-8000-000000000090",
+      target: this.#view.target,
+      strategy,
+      managementRevision: this.#view.managementRevision,
+      compatibility: { version: "9.9.9", classification: "tested", acknowledgementRequired: false },
+      shadowSources: [],
+      changes: [{ field: "provider", state: "changed" }],
+      providerEffect: "keep-current",
+      restartRequired: true,
+      unobservableRuntimeBoundary: true,
+    }
+  }
   async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
 
   async act(_action: TargetAction): Promise<ActionOutcome> {
@@ -156,3 +173,32 @@ test("Claude renders the exact extreme-size matrix without excluded application 
     setup.renderer.destroy()
   }
 })
+
+test.each(["codex", "claude"] as const)(
+  "Reconciliation modal renders the exact extreme-size matrix for %s",
+  async (target) => {
+    const session = new StaticTargetSession(target, true)
+    const setup = await testRender(() => <App sessions={{ [target]: session }} />, {
+      width: 80,
+      height: 24,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey(target === "codex" ? "1" : "2")
+      await setup.waitForFrame((frame) => frame.includes("Reconcile Managed Configuration"))
+      await setup.mockInput.typeText("/reconcile")
+      setup.mockInput.pressEnter()
+      await setup.waitForFrame((frame) => frame.includes("Adopt observed configuration"))
+      for (const [width, height] of [[1, 1], [2, 2], [20, 5], [40, 10], [80, 24], [121, 30]] as const) {
+        setup.resize(width, height)
+        await setup.renderOnce()
+        expect(() => setup.captureCharFrame()).not.toThrow()
+        expectExcludedChrome(setup.captureCharFrame())
+      }
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)

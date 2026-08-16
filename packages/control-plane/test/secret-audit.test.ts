@@ -6,11 +6,74 @@ import {
   auditSecretFreeActions,
   auditSecretFreeActivities,
   auditSecretFreeDiagnostic,
+  auditSecretFreeError,
   auditSecretFreeFrame,
+  auditSecretFreePreview,
+  auditSecretFreeTimeout,
   auditSecretFreeView,
   waitForSecretFreeCondition,
   waitForSecretFreeFrame,
 } from "./secret-audit"
+
+test("Reconciliation scans every sensitive surface before semantic assertions with fixed diagnostics", () => {
+  const secrets = [
+    "controlled-provider-secret",
+    "controlled-config-secret",
+    "controlled-backend-secret",
+    "controlled-settings-secret",
+  ] as const
+  const contaminated = {
+    provider: secrets[0],
+    config: { raw: secrets[1] },
+    backend: new AggregateError([new Error(secrets[2])], "safe aggregate"),
+    settings: secrets[3],
+  }
+  assertControlledSecretSource(contaminated, secrets, "reconciliation-source")
+
+  const surfaces = [
+    ["frame", () => auditSecretFreeFrame(`Reconcile ${secrets[0]}`, secrets, "reconciliation")],
+    ["action", () => auditSecretFreeActions({ kind: "reconcile", extension: contaminated }, secrets, "reconciliation")],
+    ["activity", () => auditSecretFreeActivities({ messageKey: "activity.reconciliation.applied", extension: contaminated }, secrets, "reconciliation")],
+    ["view", () => auditSecretFreeView({ target: "codex", extension: contaminated }, secrets, "reconciliation")],
+    ["preview", () => auditSecretFreePreview({ strategy: "adopt", extension: contaminated }, secrets, "reconciliation")],
+    ["error", () => auditSecretFreeError(contaminated.backend, secrets, "reconciliation")],
+    ["timeout", () => auditSecretFreeTimeout(new Error(`timeout ${secrets[1]}`), secrets, "reconciliation")],
+    ["diagnostic", () => auditSecretFreeDiagnostic(contaminated, secrets, "reconciliation")],
+  ] as const
+
+  for (const [kind, audit] of surfaces) {
+    let diagnostic = ""
+    try {
+      audit()
+    } catch (error) {
+      diagnostic = error instanceof Error ? error.message : String(error)
+    }
+    expect(diagnostic).toBe(`secret-scan-failed:reconciliation-${kind}`)
+    for (const secret of secrets) expect(diagnostic).not.toContain(secret)
+  }
+})
+
+test("Reconciliation preview mutations scan opposite, missing, extension, custom Error, stack, and AggregateError sources", () => {
+  const cases = [
+    ["opposite", "controlled-opposite-secret", { strategy: "restore", additive: "controlled-opposite-secret" }],
+    ["missing-source", "controlled-missing-source-secret", { shadowSources: [], missing: "controlled-missing-source-secret" }],
+    ["preview-extension", "controlled-preview-extension-secret", { extension: { credential: "controlled-preview-extension-secret" } }],
+    ["custom-error", "controlled-custom-error-secret", Object.assign(new Error("safe"), { backend: "controlled-custom-error-secret" })],
+    ["error-stack", "controlled-error-stack-secret", Object.assign(new Error("safe"), { stack: "at controlled-error-stack-secret" })],
+    ["aggregate", "controlled-aggregate-secret", new AggregateError([new Error("controlled-aggregate-secret")], "safe")],
+  ] as const
+
+  for (const [label, secret, value] of cases) {
+    let diagnostic = ""
+    try {
+      auditSecretFreePreview(value, [secret], label)
+    } catch (error) {
+      diagnostic = error instanceof Error ? error.message : String(error)
+    }
+    expect(diagnostic).toBe(`secret-scan-failed:${label}-preview`)
+    expect(diagnostic).not.toContain(secret)
+  }
+})
 
 test("Claude Direct audits reject every contaminated surface with fixed secret-free diagnostics", () => {
   const secret = "controlled-claude-direct-secret-must-not-escape"

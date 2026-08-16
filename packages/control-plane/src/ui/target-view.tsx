@@ -32,6 +32,12 @@ function activityColor(kind: ActivityEntry["kind"]): string {
 }
 
 export function TargetView(props: TargetViewProps) {
+  const reconciliationAvailable = () => props.view.problems.some((problem) => (
+    problem.code === "configuration-drift"
+    || problem.code === "shadowing-configuration"
+    || problem.code === "untested-target-cli"
+    || problem.code === "incompatible-target-cli"
+  ))
   const snapshot = () => {
     if (!props.view.activatedSnapshot) return props.t("value.none")
     const provider = providerName(props.view, props.view.activatedSnapshot.providerId, props.t)
@@ -47,9 +53,19 @@ export function TargetView(props: TargetViewProps) {
     const path = props.view.managedConfiguration.path
     return path ? `${state} · ${path}` : state
   }
-  const problemText = (code: string) => {
-    const key = messageKeyForProblem(code)
-    return props.t(key, key === "error.generic" ? { code } : undefined)
+  const problemText = (problem: TargetViewProjection["problems"][number]) => {
+    const key = messageKeyForProblem(problem.code)
+    if (key === "error.generic") return props.t(key, { code: problem.code })
+    if (key === "error.shadowing-configuration") {
+      return props.t(key, { source: problem.source ?? props.t("value.none") })
+    }
+    if (key === "error.provider-mode-active") {
+      return props.t(key, {
+        source: problem.source ?? props.t("value.none"),
+        selector: problem.selector ?? props.t("value.none"),
+      })
+    }
+    return props.t(key)
   }
 
   return (
@@ -78,8 +94,14 @@ export function TargetView(props: TargetViewProps) {
         <text fg={theme.warning}>{props.t(props.view.target === "claude" ? "activity.restart.claude" : "activity.restart")}</text>
       </Show>
       <For each={props.view.problems}>{(problem) => (
-        <text fg={theme.error}>{problemText(problem.code)}</text>
+        <text fg={theme.error}>{problemText(problem)}</text>
       )}</For>
+      <Show when={reconciliationAvailable()}>
+        <box flexDirection="column">
+          <text fg={theme.primary}>{props.t("reconciliation.title")}</text>
+          <text fg={theme.muted}>{props.t("reconciliation.entry")}</text>
+        </box>
+      </Show>
       <Show when={props.activities.length > 0}>
         <box flexDirection="column">
           <text fg={theme.muted}>{props.t("activity.heading")}</text>

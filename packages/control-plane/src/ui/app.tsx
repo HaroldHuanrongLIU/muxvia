@@ -3,7 +3,7 @@ import { createSignal, Match, onCleanup, onMount, Show, Switch, type Accessor } 
 
 import { MuxviaKeymapProvider, useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
 import type { TargetSession } from "../control/target-session"
-import type { ReachabilityResult, Target, TargetAction, TargetView as TargetViewProjection } from "../control/types"
+import type { ReachabilityResult, ReconciliationStrategy, Target, TargetAction, TargetView as TargetViewProjection } from "../control/types"
 import { createCommandPresenter, createTranslator, messageKeyForProblem, type Locale, type Translator } from "../i18n"
 import { theme } from "../theme"
 import { ActionPrompt } from "./action-prompt"
@@ -17,6 +17,7 @@ import { ProviderCredentialConfirmation } from "./provider-credential-confirmati
 import { ProviderForm, type ProviderDraft, type ProviderFormRef, type ProviderFormResult } from "./provider-form"
 import { ProviderPicker } from "./provider-picker"
 import { ProviderSourcePicker, type ProviderSource } from "./provider-source-picker"
+import { Reconciliation, type ReconciliationUiState } from "./reconciliation"
 import { TargetSidebar } from "./target-sidebar"
 import { TargetView, type ActivityEntry } from "./target-view"
 import { TakeoverRequiredConfirm } from "./takeover-required-confirm"
@@ -41,6 +42,44 @@ type Editor = {
   credentialPresence: "present" | "missing"
   duplicateCredentialChoice?: "without" | "reuse-source"
   dirty?: boolean
+}
+type ReconciliationWorkflowState = ReconciliationUiState & {
+  overlayToken: OverlayToken
+  originSession: TargetSession
+  generation: number
+}
+
+const reconciliationProblemCodes = new Set([
+  "configuration-drift",
+  "shadowing-configuration",
+  "untested-target-cli",
+  "incompatible-target-cli",
+])
+
+function managedWriteProblem(view: TargetViewProjection | undefined): string | undefined {
+  return view?.problems.find((problem) => reconciliationProblemCodes.has(problem.code))?.code
+}
+
+function safeReconciliationProblem(error: unknown): string {
+  let code = "internal-failure"
+  try {
+    if (typeof error === "object" && error !== null && "code" in error) code = String(error.code)
+  } catch {
+    return "internal-failure"
+  }
+  switch (code) {
+    case "compatibility-acknowledgement-required":
+    case "configuration-write-failed":
+    case "incompatible-target-cli":
+    case "recovery-required":
+    case "shadowing-configuration":
+    case "stale-reconciliation-preview":
+    case "target-busy":
+    case "untested-target-cli":
+      return code
+    default:
+      return "internal-failure"
+  }
 }
 
 function safeInspectionCategory(error: unknown): InspectionCategory {
@@ -157,6 +196,7 @@ function Shell(props: {
   }
   const [reachabilityByTarget, setReachabilityByTarget] = createSignal<Partial<Record<Target, ReachabilityState>>>({})
   const [applyingByTarget, setApplyingByTarget] = createSignal<Record<Target, "direct" | "takeover" | undefined>>({ codex: undefined, claude: undefined })
+  const [reconciliationByTarget, setReconciliationByTarget] = createSignal<Partial<Record<Target, ReconciliationWorkflowState>>>({})
   const showCommandPalette = useCommandPaletteOpener(props.t, () => applying() === undefined)
   const [notices, setNotices] = createSignal<Partial<Record<Target | "home", Notice>>>({})
   const [activitiesByTarget, setActivitiesByTarget] = createSignal<Record<Target, ActivityEntry[]>>({ codex: [], claude: [] })
@@ -176,12 +216,19 @@ function Shell(props: {
   let exitScheduled = false
   const providerPickerScheduled: Record<Target, boolean> = { codex: false, claude: false }
   const providerSourcePickerScheduled: Record<Target, boolean> = { codex: false, claude: false }
+  const reconciliationScheduled: Record<Target, boolean> = { codex: false, claude: false }
+  const reconciliationGenerations: Record<Target, number> = { codex: 0, claude: 0 }
+  const reconciliationAborts: Partial<Record<Target, AbortController>> = {}
   const reachabilityAborts: Partial<Record<Target, AbortController>> = {}
   const reachabilityGenerations: Record<Target, number> = { codex: 0, claude: 0 }
   let exiting = false
   let disposed = false
 
-  onCleanup(() => { disposed = true })
+  onCleanup(() => {
+    disposed = true
+    reconciliationAborts.codex?.abort()
+    reconciliationAborts.claude?.abort()
+  })
 
   const activeTarget = (): Target | undefined => {
     const current = route()
@@ -274,6 +321,189 @@ function Shell(props: {
     }
   }
 
+  const updateReconciliation = (
+    target: Target,
+    token: OverlayToken,
+    update: (current: ReconciliationWorkflowState) => ReconciliationWorkflowState,
+  ) => {
+    setReconciliationByTarget((states) => {
+      const current = states[target]
+      if (!current || current.overlayToken !== token) return states
+      return { ...states, [target]: update(current) }
+    })
+  }
+
+  const closeReconciliation = (target: Target, token: OverlayToken) => {
+    const current = reconciliationByTarget()[target]
+    if (!current || current.overlayToken !== token || current.pending === "apply") return
+    reconciliationAborts[target]?.abort()
+    overlay.close(token)
+  }
+
+  const previewReconciliation = async (
+    target: Target,
+    token: OverlayToken,
+    strategy: ReconciliationStrategy,
+  ) => {
+    const current = reconciliationByTarget()[target]
+    if (!current || current.overlayToken !== token || current.pending) return
+    reconciliationAborts[target]?.abort()
+    const controller = new AbortController()
+    reconciliationAborts[target] = controller
+    const generation = ++reconciliationGenerations[target]
+    const originSession = current.originSession
+    updateReconciliation(target, token, (state) => ({
+      ...state,
+      strategy,
+      generation,
+      preview: undefined,
+      pending: "preview",
+      errorCode: undefined,
+      acknowledgedVersion: undefined,
+    }))
+    try {
+      const preview = await originSession.previewReconciliation(strategy, controller.signal)
+      const latest = reconciliationByTarget()[target]
+      if (
+        disposed
+        || exiting
+        || controller.signal.aborted
+        || !latest
+        || latest.overlayToken !== token
+        || latest.originSession !== originSession
+        || latest.generation !== generation
+      ) return
+      updateReconciliation(target, token, (state) => ({ ...state, preview, pending: undefined }))
+    } catch (error) {
+      const latest = reconciliationByTarget()[target]
+      if (controller.signal.aborted || !latest || latest.overlayToken !== token || latest.generation !== generation) return
+      updateReconciliation(target, token, (state) => ({
+        ...state,
+        pending: undefined,
+        errorCode: safeReconciliationProblem(error),
+      }))
+    } finally {
+      if (reconciliationAborts[target] === controller) delete reconciliationAborts[target]
+    }
+  }
+
+  const acknowledgeReconciliation = (target: Target, token: OverlayToken, version: string) => {
+    updateReconciliation(target, token, (state) => state.preview?.compatibility.version === version
+      ? { ...state, acknowledgedVersion: version, errorCode: undefined }
+      : state)
+  }
+
+  const applyReconciliation = async (target: Target, token: OverlayToken) => {
+    const current = reconciliationByTarget()[target]
+    const preview = current?.preview
+    if (!current || current.overlayToken !== token || current.pending || !preview) return
+    if (preview.compatibility.classification === "incompatible") {
+      updateReconciliation(target, token, (state) => ({ ...state, errorCode: "incompatible-target-cli" }))
+      return
+    }
+    if (
+      preview.compatibility.acknowledgementRequired
+      && current.acknowledgedVersion !== preview.compatibility.version
+    ) {
+      updateReconciliation(target, token, (state) => ({
+        ...state,
+        errorCode: "compatibility-acknowledgement-required",
+      }))
+      return
+    }
+    const originSession = current.originSession
+    const generation = current.generation
+    updateReconciliation(target, token, (state) => ({ ...state, pending: "apply", errorCode: undefined }))
+    try {
+      const outcome = await originSession.applyReconciliation({
+        strategy: preview.strategy,
+        observationToken: preview.observationToken,
+        ...(preview.compatibility.acknowledgementRequired
+          ? { acknowledgeVersion: preview.compatibility.version }
+          : {}),
+      })
+      const latest = reconciliationByTarget()[target]
+      if (
+        disposed
+        || exiting
+        || !latest
+        || latest.overlayToken !== token
+        || latest.originSession !== originSession
+        || latest.generation !== generation
+      ) return
+      installView(outcome.view, "action")
+      const activity: ActivityDraft = {
+        kind: "success",
+        messageKey: "activity.reconciliation.applied",
+        values: { strategy: props.t(`reconciliation.strategy.short.${preview.strategy}`) },
+      }
+      appendActivity(activity, target)
+      if (activeTarget() === target) setNotice({ kind: "success", text: props.t(activity.messageKey, activity.values) }, target)
+      overlay.close(token)
+    } catch (error) {
+      if (disposed || exiting) return
+      installView(originSession.get() as TargetViewProjection, "action")
+      const latest = reconciliationByTarget()[target]
+      if (!latest || latest.overlayToken !== token || latest.generation !== generation) return
+      const code = safeReconciliationProblem(error)
+      updateReconciliation(target, token, (state) => ({
+        ...state,
+        pending: undefined,
+        errorCode: code,
+        ...(code === "stale-reconciliation-preview"
+          ? { preview: undefined, acknowledgedVersion: undefined }
+          : {}),
+      }))
+    }
+  }
+
+  const openReconciliation = () => {
+    const target = activeTarget()
+    const originSession = session(target)
+    if (
+      !target
+      || !originSession
+      || !managedWriteProblem(views()[target])
+      || reconciliationScheduled[target]
+      || overlay.depth > 0
+    ) return
+    reconciliationScheduled[target] = true
+    queueMicrotask(() => {
+      reconciliationScheduled[target] = false
+      if (disposed || exiting || activeTarget() !== target || overlay.depth > 0) return
+      const token = Symbol(`reconciliation-${target}`)
+      const generation = ++reconciliationGenerations[target]
+      const initial: ReconciliationWorkflowState = {
+        target,
+        originSession,
+        overlayToken: token,
+        generation,
+      }
+      setReconciliationByTarget((states) => ({ ...states, [target]: initial }))
+      overlay.replace({
+        id: "target-reconciliation",
+        token,
+        dismissOnEscape: () => reconciliationByTarget()[target]?.pending !== "apply",
+        render: () => <Reconciliation
+          state={() => reconciliationByTarget()[target] ?? initial}
+          t={props.t}
+          onPreview={(strategy) => { void previewReconciliation(target, token, strategy) }}
+          onAcknowledge={(version) => acknowledgeReconciliation(target, token, version)}
+          onApply={() => { void applyReconciliation(target, token) }}
+          onCancel={() => closeReconciliation(target, token)}
+        />,
+        onClose: () => {
+          reconciliationAborts[target]?.abort()
+          delete reconciliationAborts[target]
+          reconciliationGenerations[target]++
+          setReconciliationByTarget((states) => states[target]?.overlayToken === token
+            ? { ...states, [target]: undefined }
+            : states)
+        },
+      })
+    })
+  }
+
   onMount(() => {
     const unsubscribes = Object.values(props.sessions()).map((targetSession) =>
       targetSession.subscribe((next) => installView(next, "subscription")))
@@ -345,6 +575,13 @@ function Shell(props: {
     const targetSession = session()
     const target = activeTarget()
     if (!targetSession || !target) return false
+    const blocked = managedWriteProblem(views()[target])
+    if (blocked) {
+      const activity = actionProblem({ code: blocked })
+      appendActivity(activity, target)
+      setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) }, target)
+      return false
+    }
     const generation = editorGenerations[target]
     const providerName = action.name
     setTargetSaving(target, true)
@@ -467,7 +704,7 @@ function Shell(props: {
           t={props.t}
           pending={() => providerMutationPending() || applying() !== undefined}
           activationMode={applying}
-          allowDirect={() => true}
+          allowDirect={() => managedWriteProblem(views()[target]) === undefined}
           onSelectedIdChange={setSelectedProviderId}
           onEdit={() => {
             const provider = selectedProvider()
@@ -571,6 +808,13 @@ function Shell(props: {
     const targetSession = session()
     const target = activeTarget()
     if (!targetSession || !target) return false
+    const blocked = managedWriteProblem(views()[target])
+    if (blocked) {
+      const activity = actionProblem({ code: blocked })
+      appendActivity(activity, target)
+      setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) }, target)
+      return false
+    }
     setTargetMutationPending(target, true)
     setNotice()
     try {
@@ -656,6 +900,13 @@ function Shell(props: {
     const targetSession = session()
     const target = activeTarget()
     if (!targetSession || !target) return
+    const blocked = managedWriteProblem(views()[target])
+    if (blocked) {
+      const activity = actionProblem({ code: blocked })
+      appendActivity(activity, target)
+      setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) }, target)
+      return
+    }
     const provider = view()?.providers.find((candidate) => candidate.id === providerId)
     if (!provider) {
       closeOriginPicker(pickerToken)
@@ -766,6 +1017,7 @@ function Shell(props: {
       "provider.list": openProviderPicker,
       "target.direct.apply": () => applyDefaultProvider("direct"),
       "target.takeover.apply": () => applyDefaultProvider("takeover"),
+      "target.reconciliation.open": openReconciliation,
     },
   })
   useCommandLayer({
@@ -779,6 +1031,7 @@ function Shell(props: {
       "provider.list": openProviderPicker,
       "target.direct.apply": () => applyDefaultProvider("direct"),
       "target.takeover.apply": () => applyDefaultProvider("takeover"),
+      "target.reconciliation.open": openReconciliation,
     },
   })
   const horizontalPadding = () => dimensions().width >= 5 ? 2 : 0

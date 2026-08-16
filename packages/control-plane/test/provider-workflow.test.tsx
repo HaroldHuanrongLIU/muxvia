@@ -4,7 +4,16 @@ import { testRender } from "@opentui/solid"
 
 import { MuxviaKeymapProvider, useMuxviaKeymap } from "../src/commands/keymap"
 import type { TargetSession } from "../src/control/target-session"
-import type { ActionOutcome, TargetAction, TargetView } from "../src/control/types"
+import type {
+  ActionOutcome,
+  DiscoverySource,
+  ModelDiscoveryResult,
+  ReachabilityResult,
+  ReconciliationPreview,
+  ReconciliationStrategy,
+  TargetAction,
+  TargetView,
+} from "../src/control/types"
 import { createTranslator } from "../src/i18n"
 import { App } from "../src/ui/app"
 import { OverlayProvider } from "../src/ui/overlay-stack"
@@ -13,6 +22,9 @@ import {
   assertControlledSecretSource,
   assertSecretFreeStructured,
   auditSecretFreeActions,
+  auditSecretFreeFrame,
+  auditSecretFreePreview,
+  auditSecretFreeView,
   waitForSecretFreeCondition,
   waitForSecretFreeFrame,
 } from "./secret-audit"
@@ -95,10 +107,27 @@ function projectAction(action: TargetAction): RecordedTargetAction {
 
 class MemoryTargetSession implements TargetSession {
   readonly actions: RecordedTargetAction[] = []
+  readonly reconciliationPreviews: ReconciliationStrategy[] = []
+  readonly reconciliationPreviewResults: ReconciliationPreview[] = []
+  readonly reconciliationApplies: Array<{
+    strategy: ReconciliationStrategy
+    observationToken: string
+    acknowledgeVersion?: string
+  }> = []
+  readonly reachabilityChecks: string[] = []
+  readonly discoveryRequests: DiscoverySource[] = []
   lastError: unknown
   readonly #listeners = new Set<(next: TargetView) => void>()
   #view: TargetView
   #handler: (action: TargetAction) => Promise<ActionOutcome>
+  previewHandler?: (strategy: ReconciliationStrategy, signal?: AbortSignal) => Promise<ReconciliationPreview>
+  reconciliationHandler?: (input: {
+    strategy: ReconciliationStrategy
+    observationToken: string
+    acknowledgeVersion?: string
+  }) => Promise<ActionOutcome>
+  reachabilityHandler?: (providerId: string, providerRevision: number, signal?: AbortSignal) => Promise<ReachabilityResult>
+  discoveryHandler?: (source: DiscoverySource, signal?: AbortSignal) => Promise<ModelDiscoveryResult>
 
   constructor(
     initial: TargetView,
@@ -125,16 +154,64 @@ class MemoryTargetSession implements TargetSession {
     this.#view = next
     for (const listener of this.#listeners) listener(next)
   }
-  async discoverModels(): Promise<never> { throw new Error("not used") }
-  async checkReachability(): Promise<never> { throw new Error("not used") }
-  async previewReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
-  async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
+  async discoverModels(source: DiscoverySource, signal?: AbortSignal): Promise<ModelDiscoveryResult> {
+    this.discoveryRequests.push(source)
+    if (!this.discoveryHandler) throw new Error("discovery not configured in this fixture")
+    return await this.discoveryHandler(source, signal)
+  }
+  async checkReachability(providerId: string, providerRevision: number, signal?: AbortSignal): Promise<ReachabilityResult> {
+    this.reachabilityChecks.push(`${providerId}:${providerRevision}`)
+    if (!this.reachabilityHandler) throw new Error("reachability not configured in this fixture")
+    return await this.reachabilityHandler(providerId, providerRevision, signal)
+  }
+  async previewReconciliation(strategy: ReconciliationStrategy, signal?: AbortSignal): Promise<ReconciliationPreview> {
+    this.reconciliationPreviews.push(strategy)
+    if (!this.previewHandler) throw new Error("reconciliation not configured in this fixture")
+    const preview = await this.previewHandler(strategy, signal)
+    this.reconciliationPreviewResults.push(preview)
+    return preview
+  }
+  async applyReconciliation(input: {
+    strategy: ReconciliationStrategy
+    observationToken: string
+    acknowledgeVersion?: string
+  }): Promise<ActionOutcome> {
+    this.reconciliationApplies.push(input)
+    if (!this.reconciliationHandler) throw new Error("reconciliation not configured in this fixture")
+    const outcome = await this.reconciliationHandler(input)
+    this.#view = outcome.view
+    return outcome
+  }
   subscribe(listener: (next: TargetView) => void): () => void {
     this.#listeners.add(listener)
     return () => this.#listeners.delete(listener)
   }
   async whenClosed(): Promise<void> { return await new Promise(() => {}) }
   async close(): Promise<void> {}
+}
+
+function reconciliationPreview(
+  target: "codex" | "claude",
+  strategy: ReconciliationStrategy,
+  overrides: Partial<ReconciliationPreview> = {},
+): ReconciliationPreview {
+  return {
+    observationToken: "00000000-0000-4000-8000-000000000090",
+    target,
+    strategy,
+    managementRevision: 1,
+    compatibility: { version: "9.9.9", classification: "tested", acknowledgementRequired: false },
+    shadowSources: [],
+    changes: [
+      { field: "provider", state: "changed" },
+      { field: "credential", state: "unchanged" },
+      { field: "takeover", state: "absent" },
+    ],
+    providerEffect: "keep-current",
+    restartRequired: true,
+    unobservableRuntimeBoundary: true,
+    ...overrides,
+  }
 }
 
 function controlledClaudeDirectSources(): unknown {
@@ -185,6 +262,60 @@ function expectInOrder(frame: string, names: readonly string[]): void {
     expect(next ?? -1).toBeGreaterThanOrEqual(cursor)
     cursor = (next ?? 0) + name.length
   }
+}
+
+async function fillProviderDraft(
+  mockInput: Awaited<ReturnType<typeof testRender>>["mockInput"],
+  fields: readonly [string, string, string, string],
+): Promise<void> {
+  await mockInput.typeText(fields[0])
+  mockInput.pressTab()
+  await mockInput.typeText(fields[1])
+  mockInput.pressTab()
+  await mockInput.typeText(fields[2])
+  mockInput.pressTab()
+  await mockInput.typeText(fields[3])
+}
+
+function auditReconciliationSessions(sessions: readonly MemoryTargetSession[], label: string): void {
+  for (const [index, session] of sessions.entries()) {
+    auditSecretFreeActions({
+      actions: session.actions,
+      applies: session.reconciliationApplies,
+      discovery: session.discoveryRequests,
+      reachability: session.reachabilityChecks,
+    }, claudeDirectSecrets, `${label}-${index}`)
+    auditSecretFreePreview(session.reconciliationPreviewResults, claudeDirectSecrets, `${label}-${index}`)
+    auditSecretFreeView(session.get(), claudeDirectSecrets, `${label}-${index}`)
+  }
+}
+
+async function waitForReconciliationFrame(
+  setup: Awaited<ReturnType<typeof testRender>>,
+  sessions: readonly MemoryTargetSession[],
+  predicate: (frame: string) => boolean,
+  label: string,
+): Promise<string> {
+  auditReconciliationSessions(sessions, label)
+  return await waitForSecretFreeFrame(setup, (frame) => {
+    auditReconciliationSessions(sessions, label)
+    return predicate(frame)
+  }, claudeDirectSecrets, label)
+}
+
+async function waitForReconciliationState(
+  setup: Awaited<ReturnType<typeof testRender>>,
+  sessions: readonly MemoryTargetSession[],
+  predicate: () => boolean,
+  label: string,
+): Promise<void> {
+  await waitForSecretFreeCondition(
+    setup,
+    predicate,
+    () => auditReconciliationSessions(sessions, label),
+    `secret-scan-failed:${label}-action`,
+    label,
+  )
 }
 
 test("/providers renders provenance kinds and generated state with secret-free selected Provider detail", async () => {
@@ -1581,6 +1712,421 @@ test("authoritative takeover-required preserves the pending picker and restores 
     expect(JSON.stringify(session.actions)).not.toContain("backend-takeover-secret-must-not-render")
   } finally {
     pendingDirect.reject({ code: "takeover-required" })
+    setup.renderer.destroy()
+  }
+})
+
+test.each(["codex", "claude"] as const)(
+  "Reconciliation previews and applies unknown-compatible Adopt for %s with exact origin focus and one activity",
+  async (target) => {
+    const initial = view({
+      target,
+      problems: [
+        { code: "configuration-drift", message: "Configuration drift" },
+        { code: "untested-target-cli", message: "Untested Target CLI" },
+      ],
+    })
+    const applied = view({
+      ...initial,
+      managementRevision: 2,
+      viewSequence: 2,
+      managedConfiguration: { state: "managed", path: null, restartRequired: true },
+      problems: [],
+    })
+    const session = new MemoryTargetSession(initial)
+    session.previewHandler = async (strategy) => reconciliationPreview(target, strategy, {
+      compatibility: { version: "9.9.9", classification: "unknown-compatible", acknowledgementRequired: true },
+      shadowSources: target === "codex" ? ["codex-profile"] : ["claude-shared"],
+    })
+    session.reconciliationHandler = async () => ({ status: "applied", view: applied })
+    assertControlledSecretSource(controlledClaudeDirectSources(), claudeDirectSecrets, `reconciliation-${target}`)
+    const setup = await testRender(() => <App sessions={{ [target]: session }} />, {
+      width: 80,
+      height: 30,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey(target === "codex" ? "1" : "2")
+      const targetFrame = await waitForReconciliationFrame(
+        setup,
+        [session],
+        (frame) => frame.includes("Reconcile Managed Configuration"),
+        `reconciliation-entry-${target}`,
+      )
+      expect(targetFrame).not.toContain(backendSecret)
+      const originFocus = setup.renderer.currentFocusedRenderable as InputRenderable
+      const globalKeyboardListeners = setup.renderer.keyInput.listenerCount("keypress")
+
+      await setup.mockInput.typeText("/reconcile")
+      setup.mockInput.pressEnter()
+      await waitForReconciliationFrame(setup, [session], (frame) => frame.includes("Adopt observed configuration"), `reconciliation-open-${target}`)
+      expect(setup.renderer.keyInput.listenerCount("keypress")).toBe(globalKeyboardListeners)
+      setup.mockInput.pressKey("a")
+      await waitForReconciliationState(setup, [session], () => session.reconciliationPreviews.length === 1, `reconciliation-preview-call-${target}`)
+      const previewFrame = await waitForReconciliationFrame(
+        setup,
+        [session],
+        (frame) => frame.includes("Untested but compatible · 9.9.9") && frame.includes("Changed"),
+        `reconciliation-preview-${target}`,
+      )
+      expect(previewFrame).toContain(target === "codex" ? "Codex profile" : "Claude shared settings")
+      expect(previewFrame).toContain("Command-line flags and resumed sessions")
+      expect(previewFrame).toContain(target === "codex"
+        ? "Restart Codex after applying this reconciliation."
+        : "Restart Claude Code after applying this reconciliation.")
+
+      setup.mockInput.pressKey("y")
+      setup.mockInput.pressEnter()
+      await waitForReconciliationState(setup, [session], () => session.reconciliationApplies.length === 1, `reconciliation-apply-call-${target}`)
+      const appliedFrame = await waitForReconciliationFrame(setup, [session], (frame) => frame.includes("Reconciliation applied: Adopt"), `reconciliation-applied-${target}`)
+      auditSecretFreePreview(session.reconciliationPreviewResults, claudeDirectSecrets, `reconciliation-preview-${target}`)
+      auditSecretFreeActions(session.reconciliationApplies, claudeDirectSecrets, `reconciliation-action-${target}`)
+      auditSecretFreeView(session.get(), claudeDirectSecrets, `reconciliation-view-${target}`)
+      assertSecretFreeStructured("action", session.reconciliationApplies, claudeDirectSecrets, `reconciliation-exact-apply-${target}`, (safeApplies) => {
+        expect(safeApplies).toEqual([{
+          strategy: "adopt",
+          observationToken: "00000000-0000-4000-8000-000000000090",
+          acknowledgeVersion: "9.9.9",
+        }])
+      })
+      expect(appliedFrame).toContain(target === "codex"
+        ? "Restart Codex to use the managed configuration."
+        : "Restart Claude Code to use the managed configuration.")
+      expect(appliedFrame.match(/Reconciliation applied: Adopt/g)).toHaveLength(1)
+      expect(setup.renderer.currentFocusedRenderable).toBe(originFocus)
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)
+
+test("Reconciliation stale apply stays open, uses a fixed error, and never retries automatically", async () => {
+  const initial = view({ problems: [{ code: "configuration-drift", message: "Configuration drift" }] })
+  const session = new MemoryTargetSession(initial)
+  let token = 90
+  session.previewHandler = async (strategy) => reconciliationPreview("codex", strategy, {
+    observationToken: `00000000-0000-4000-8000-0000000000${token++}`,
+  })
+  session.reconciliationHandler = async () => {
+    const error = Object.assign(new Error(`raw ${backendSecret}`), { code: "stale-reconciliation-preview", settings: settingsSecret })
+    error.stack = `at ${credentialSecret}`
+    throw error
+  }
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 30, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/reconcile")
+    setup.mockInput.pressEnter()
+    await waitForReconciliationFrame(setup, [session], (frame) => frame.includes("Adopt observed configuration"), "reconciliation-stale-open")
+    setup.mockInput.pressKey("r")
+    await waitForReconciliationState(setup, [session], () => session.reconciliationPreviews.length === 1, "reconciliation-stale-preview-call")
+    setup.mockInput.pressEnter()
+    await waitForReconciliationState(setup, [session], () => session.reconciliationApplies.length === 1, "reconciliation-stale-apply-call")
+    const stale = await waitForReconciliationFrame(
+      setup,
+      [session],
+      (frame) => frame.includes("Target state changed. Preview the reconciliation again."),
+      "reconciliation-stale",
+    )
+    expect(stale).toContain("Reapply committed configuration")
+    assertSecretFreeStructured("preview", session.reconciliationPreviews, claudeDirectSecrets, "reconciliation-stale-strategy", (safePreviews) => {
+      expect(safePreviews).toEqual(["reapply"])
+    })
+    await Promise.resolve()
+    auditReconciliationSessions([session], "reconciliation-stale-no-retry")
+    expect(session.reconciliationPreviews).toHaveLength(1)
+
+    setup.mockInput.pressKey("r")
+    await waitForReconciliationState(setup, [session], () => session.reconciliationPreviews.length === 2, "reconciliation-stale-repreview")
+    expect(session.reconciliationApplies).toHaveLength(1)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Reconciliation target-busy keeps the exact Restore preview open with fixed retry guidance", async () => {
+  const session = new MemoryTargetSession(view({
+    problems: [{ code: "configuration-drift", message: "Configuration drift" }],
+  }))
+  session.previewHandler = async (strategy) => reconciliationPreview("codex", strategy)
+  session.reconciliationHandler = async () => {
+    throw Object.assign(new AggregateError([new Error(backendSecret)], "safe"), {
+      code: "target-busy",
+      settings: settingsSecret,
+    })
+  }
+  const setup = await testRender(() => <App session={session} />, {
+    width: 80,
+    height: 30,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/reconcile")
+    setup.mockInput.pressEnter()
+    await waitForReconciliationFrame(setup, [session], (frame) => frame.includes("Adopt observed configuration"), "reconciliation-busy-open")
+    setup.mockInput.pressKey("s")
+    await waitForReconciliationFrame(setup, [session], (frame) => frame.includes("Restore pre-Muxvia configuration") && frame.includes("Tested · 9.9.9"), "reconciliation-busy-preview")
+    setup.mockInput.pressEnter()
+    await waitForReconciliationState(setup, [session], () => session.reconciliationApplies.length === 1, "reconciliation-busy-apply")
+    const frame = await waitForReconciliationFrame(setup, [session], (current) => current.includes("This Target has active model requests."), "reconciliation-busy-error")
+    expect(frame).toContain("Restore pre-Muxvia configuration")
+    expect(frame).not.toContain("Reconciliation applied")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Reconciliation apply pending is nondismissible, suppresses background commands, and dispatches once", async () => {
+  const initial = view({ problems: [{ code: "configuration-drift", message: "safe" }] })
+  const pending = deferred<ActionOutcome>()
+  const session = new MemoryTargetSession(initial)
+  session.previewHandler = async (strategy) => reconciliationPreview("codex", strategy)
+  session.reconciliationHandler = async () => await pending.promise
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 30, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/reconcile")
+    setup.mockInput.pressEnter()
+    await waitForReconciliationFrame(setup, [session], (frame) => frame.includes("Adopt observed configuration"), "reconciliation-pending-open")
+    setup.mockInput.pressKey("s")
+    await waitForReconciliationState(setup, [session], () => session.reconciliationPreviews.length === 1, "reconciliation-pending-preview")
+    setup.mockInput.pressEnter()
+    setup.mockInput.pressEnter()
+    setup.mockInput.pressEscape()
+    setup.mockInput.pressKey("p", { ctrl: true })
+    await waitForReconciliationState(setup, [session], () => session.reconciliationApplies.length === 1, "reconciliation-pending-apply")
+    const frame = await waitForReconciliationFrame(setup, [session], (current) => current.includes("Applying reconciliation…"), "reconciliation-pending-frame")
+    expect(frame).toContain("Restore pre-Muxvia configuration")
+    expect(frame).not.toContain("Search commands")
+    expect(frame).not.toContain("Choose a target")
+    expect(session.reconciliationApplies).toHaveLength(1)
+
+    pending.resolve({ status: "applied", view: view({ managementRevision: 2, viewSequence: 2 }) })
+    await waitForReconciliationFrame(setup, [session], (current) => current.includes("Reconciliation applied: Restore"), "reconciliation-pending-success")
+    expect(session.reconciliationApplies).toHaveLength(1)
+  } finally {
+    pending.reject(new Error("cleanup"))
+    setup.renderer.destroy()
+  }
+})
+
+test("Cancelled Reconciliation preview cannot mutate or close a later Target workflow", async () => {
+  const codexPreview = deferred<ReconciliationPreview>()
+  const codex = new MemoryTargetSession(view({ problems: [{ code: "configuration-drift", message: "safe" }] }))
+  codex.previewHandler = async () => await codexPreview.promise
+  const claude = new MemoryTargetSession(view({ target: "claude", problems: [{ code: "configuration-drift", message: "safe" }] }))
+  claude.previewHandler = async (strategy) => reconciliationPreview("claude", strategy)
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, { width: 80, height: 30, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/reconcile")
+    setup.mockInput.pressEnter()
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Adopt observed configuration"), "reconciliation-cancel-codex-open")
+    setup.mockInput.pressKey("a")
+    await waitForReconciliationState(setup, [codex, claude], () => codex.reconciliationPreviews.length === 1, "reconciliation-cancel-codex-preview")
+    setup.mockInput.pressEscape()
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Codex · Control Plane") && !frame.includes("Adopt observed configuration"), "reconciliation-cancel-codex-closed")
+    setup.mockInput.pressEscape()
+    setup.mockInput.pressKey("2")
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Claude · Control Plane"), "reconciliation-cancel-claude-target")
+    await setup.mockInput.typeText("/reconcile")
+    setup.mockInput.pressEnter()
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Adopt observed configuration"), "reconciliation-cancel-claude-open")
+    setup.mockInput.pressKey("r")
+    await waitForReconciliationState(setup, [codex, claude], () => claude.reconciliationPreviews.length === 1, "reconciliation-cancel-claude-preview")
+
+    codexPreview.resolve(reconciliationPreview("codex", "adopt"))
+    await Promise.resolve()
+    await setup.renderOnce()
+    const current = setup.captureCharFrame()
+    auditSecretFreeFrame(current, claudeDirectSecrets, "reconciliation-cancel-current-frame")
+    auditReconciliationSessions([codex, claude], "reconciliation-cancel-current")
+    expect(current).toContain("Claude Code")
+    expect(current).toContain("Reapply committed configuration")
+    expect(current).not.toContain("Codex · Control Plane")
+    expect(codex.reconciliationApplies).toHaveLength(0)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("drift gates Provider saves and activation target-locally while read-only reachability and the healthy peer remain available", async () => {
+  const selected = provider({ id: "00000000-0000-4000-8000-000000000011" })
+  const codexInitial = view({
+    providers: [selected],
+    currentProviderId: selected.id,
+    problems: [{ code: "configuration-drift", message: "Configuration drift" }],
+  })
+  const codex = new MemoryTargetSession(codexInitial)
+  codex.reachabilityHandler = async () => ({
+    status: "reachable",
+    httpStatus: 200,
+    ttfbMs: 1,
+    checkedAtUnixMs: 1,
+    retryCount: 0,
+    slow: false,
+    endpointOrigin: "https://safe.example",
+  })
+  codex.discoveryHandler = async () => ({
+    status: "success",
+    models: [{ id: "read-only-model", displayName: null }],
+    attempts: 1,
+    elapsedMs: 1,
+    endpointOrigin: "https://safe.example",
+  })
+  const claudeProvider = provider({
+    id: "00000000-0000-4000-8000-000000000012",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-api-key",
+  })
+  const claudeInitial = view({ target: "claude", providers: [claudeProvider], currentProviderId: claudeProvider.id })
+  const claude = new MemoryTargetSession(claudeInitial)
+  const setup = await testRender(() => <App sessions={{ codex, claude }} />, { width: 80, height: 30, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("d")
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Managed configuration changed outside Muxvia"), "reconciliation-gate-activation")
+    expect(codex.actions).toHaveLength(0)
+
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Navigate Providers"), "reconciliation-gate-inspection")
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("t")
+    await waitForReconciliationState(setup, [codex, claude], () => codex.reachabilityChecks.length === 1, "reconciliation-gate-reachability-call")
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Reachable · HTTP 200"), "reconciliation-gate-reachability")
+    expect(codex.actions).toHaveLength(0)
+
+    setup.mockInput.pressEnter()
+    await waitForReconciliationState(setup, [codex, claude], () => codex.discoveryRequests.length === 1, "reconciliation-gate-discovery-call")
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("models available"), "reconciliation-gate-discovery")
+    assertSecretFreeStructured("action", codex.discoveryRequests, claudeDirectSecrets, "reconciliation-gate-discovery-action", (safeRequests) => {
+      expect(safeRequests).toEqual([{
+        kind: "saved",
+        providerId: selected.id,
+        providerRevision: selected.providerRevision,
+      }])
+    })
+
+    setup.mockInput.pressEscape()
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Codex · Control Plane") && !frame.includes("Navigate Providers"), "reconciliation-gate-editor-closed")
+    await setup.mockInput.typeText("/provider")
+    setup.mockInput.pressEnter()
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Blank"), "reconciliation-gate-source")
+    setup.mockInput.pressEnter()
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Enter save"), "reconciliation-gate-draft")
+    await fillProviderDraft(setup.mockInput, ["Blocked", "https://safe.example", "model", credentialSecret])
+    setup.mockInput.pressEnter()
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Managed configuration changed outside Muxvia"), "reconciliation-gate-save")
+    expect(codex.actions).toHaveLength(0)
+
+    setup.mockInput.pressEscape()
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Codex · Control Plane") && !frame.includes("Enter save"), "reconciliation-gate-draft-closed")
+    setup.mockInput.pressEscape()
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Choose a target"), "reconciliation-gate-home")
+    setup.mockInput.pressKey("2")
+    await waitForReconciliationFrame(setup, [codex, claude], (frame) => frame.includes("Claude · Control Plane"), "reconciliation-gate-peer")
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("d")
+    await waitForReconciliationState(setup, [codex, claude], () => claude.actions.length === 1, "reconciliation-gate-peer-action")
+    assertSecretFreeStructured("action", claude.actions, claudeDirectSecrets, "reconciliation-gate-peer-exact", (safeActions) => {
+      expect(safeActions).toEqual([{ kind: "activate-provider", providerId: claudeProvider.id, mode: "direct" }])
+    })
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test.each(["shadowing-configuration", "incompatible-target-cli", "untested-target-cli"])(
+  "reconciliation managed-write gate keeps %s read-only while Provider inspection remains available",
+  async (code) => {
+    const selected = provider({})
+    const session = new MemoryTargetSession(view({
+      providers: [selected],
+      currentProviderId: selected.id,
+      problems: [{ code, message: "Managed write blocked" }],
+    }))
+    const setup = await testRender(() => <App session={session} />, {
+      width: 80,
+      height: 30,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("1")
+      setup.mockInput.pressKey("x", { ctrl: true })
+      setup.mockInput.pressKey("d")
+      await setup.renderOnce()
+      auditReconciliationSessions([session], `reconciliation-readonly-${code}`)
+      expect(session.actions).toHaveLength(0)
+      auditSecretFreeFrame(setup.captureCharFrame(), claudeDirectSecrets, `reconciliation-readonly-${code}`)
+
+      await setup.mockInput.typeText("/providers")
+      setup.mockInput.pressEnter()
+      const picker = await waitForReconciliationFrame(setup, [session], (frame) => frame.includes("Navigate Providers"), `reconciliation-readonly-picker-${code}`)
+      expect(picker).toContain("First Provider")
+      expect(picker).not.toContain(backendSecret)
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)
+
+test("compatibility version change clears the exact acknowledgement and incompatible preview stays read-only", async () => {
+  const initial = view({ problems: [{ code: "untested-target-cli", message: "safe" }] })
+  const session = new MemoryTargetSession(initial)
+  let version = "1.0.0"
+  session.previewHandler = async (strategy) => reconciliationPreview("codex", strategy, {
+    compatibility: { version, classification: "unknown-compatible", acknowledgementRequired: true },
+  })
+  session.reconciliationHandler = async () => ({ status: "applied", view: view({ managementRevision: 2, viewSequence: 2 }) })
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 30, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/reconcile")
+    setup.mockInput.pressEnter()
+    await waitForReconciliationFrame(setup, [session], (frame) => frame.includes("Adopt observed configuration"), "reconciliation-version-open")
+    setup.mockInput.pressKey("a")
+    await waitForReconciliationFrame(setup, [session], (frame) => frame.includes("1.0.0"), "reconciliation-version-one")
+    setup.mockInput.pressKey("y")
+
+    version = "2.0.0"
+    setup.mockInput.pressKey("r")
+    await waitForReconciliationFrame(setup, [session], (frame) => frame.includes("2.0.0"), "reconciliation-version-two")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    expect(session.reconciliationApplies).toHaveLength(0)
+    const acknowledgementFrame = setup.captureCharFrame()
+    auditSecretFreeFrame(acknowledgementFrame, claudeDirectSecrets, "reconciliation-version-acknowledgement")
+    auditReconciliationSessions([session], "reconciliation-version-acknowledgement")
+    expect(acknowledgementFrame).toContain("Acknowledge the exact Target CLI version before applying.")
+
+    version = "3.0.0"
+    session.previewHandler = async (strategy) => reconciliationPreview("codex", strategy, {
+      compatibility: { version, classification: "incompatible", acknowledgementRequired: false },
+    })
+    setup.mockInput.pressKey("s")
+    await waitForReconciliationFrame(setup, [session], (frame) => frame.includes("Incompatible · 3.0.0"), "reconciliation-version-incompatible")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    expect(session.reconciliationApplies).toHaveLength(0)
+    const incompatibleFrame = setup.captureCharFrame()
+    auditSecretFreeFrame(incompatibleFrame, claudeDirectSecrets, "reconciliation-version-incompatible-error")
+    auditReconciliationSessions([session], "reconciliation-version-incompatible-error")
+    expect(incompatibleFrame).toContain("This Target CLI is incompatible with managed changes.")
+  } finally {
     setup.renderer.destroy()
   }
 })

@@ -1,4 +1,4 @@
-export type SecretSurfaceKind = "frame" | "action" | "activity" | "view" | "diagnostic"
+export type SecretSurfaceKind = "frame" | "action" | "activity" | "view" | "preview" | "error" | "timeout" | "diagnostic"
 
 interface SecretScan {
   matched: boolean[]
@@ -142,6 +142,24 @@ export const auditSecretFreeView = (
   label: string,
 ) => auditSecretFreeSurface("view", value, secrets, label)
 
+export const auditSecretFreePreview = (
+  value: unknown,
+  secrets: readonly string[],
+  label: string,
+) => auditSecretFreeSurface("preview", value, secrets, label)
+
+export const auditSecretFreeError = (
+  value: unknown,
+  secrets: readonly string[],
+  label: string,
+) => auditSecretFreeSurface("error", value, secrets, label)
+
+export const auditSecretFreeTimeout = (
+  value: unknown,
+  secrets: readonly string[],
+  label: string,
+) => auditSecretFreeSurface("timeout", value, secrets, label)
+
 export const auditSecretFreeDiagnostic = (
   value: unknown,
   secrets: readonly string[],
@@ -187,7 +205,7 @@ export async function waitForSecretFreeCondition(
 }
 
 export function assertSecretFreeStructured<T>(
-  kind: Exclude<SecretSurfaceKind, "frame" | "diagnostic">,
+  kind: Exclude<SecretSurfaceKind, "frame" | "diagnostic" | "error" | "timeout">,
   value: T,
   secrets: readonly string[],
   label: string,

@@ -892,6 +892,41 @@ test("maps known and unknown problems without rendering backend messages", async
   }
 })
 
+test("Reconciliation guidance is target-local for drift, shadowing, unknown-compatible, and incompatible states", async () => {
+  for (const code of [
+    "configuration-drift",
+    "shadowing-configuration",
+    "untested-target-cli",
+    "incompatible-target-cli",
+  ]) {
+    const affected = new MemoryTargetSession(view({
+      problems: [{ code, message: `${problemMessageSentinel}-${code}` }],
+    }))
+    const healthy = new MemoryTargetSession(view({ target: "claude" }))
+    const setup = await testRender(() => <App sessions={{ codex: affected, claude: healthy }} />, {
+      width: 80,
+      height: 24,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("1")
+      const affectedFrame = await waitForClaudeDirectFrame(setup, (frame) => frame.includes("Reconcile Managed Configuration"), `reconciliation-guidance-${code}`)
+      expect(affectedFrame).toContain("Use /reconcile to inspect and resolve this Target.")
+      expect(affectedFrame).not.toContain(problemMessageSentinel)
+
+      setup.mockInput.pressEscape()
+      setup.mockInput.pressKey("2")
+      const healthyFrame = await waitForClaudeDirectFrame(setup, (frame) => frame.includes("Claude · Control Plane"), `reconciliation-healthy-${code}`)
+      expect(healthyFrame).not.toContain("Reconcile Managed Configuration")
+      expect(healthyFrame).not.toContain("Use /reconcile")
+    } finally {
+      setup.renderer.destroy()
+    }
+  }
+})
+
 test("renders canonical Chinese status concepts and the managed configuration state", async () => {
   const session = new MemoryTargetSession(view({
     managedConfiguration: { state: "managed", path: "/tmp/home/.codex/config.toml", restartRequired: false },

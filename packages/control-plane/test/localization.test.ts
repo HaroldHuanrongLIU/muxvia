@@ -89,6 +89,151 @@ test("Direct Activation and Takeover confirmation copy is complete in both local
   ])
 })
 
+test("Reconciliation compatibility, strategy, field, shadow, stale, busy, acknowledgement, and restart copy is exact in both locales", () => {
+  const english = createTranslator("en")
+  const chinese = createTranslator("zh-CN")
+
+  expect([
+    english("reconciliation.title"),
+    english("reconciliation.compatibility.unknown-compatible", { version: "9.9.9" }),
+    english("reconciliation.shadow.codex-profile"),
+    english("reconciliation.shadow.claude-selector", { selector: "CLAUDE_CODE_USE_VERTEX" }),
+    english("reconciliation.boundary"),
+    english("reconciliation.field.credential"),
+    english("reconciliation.state.changed"),
+    english("reconciliation.strategy.adopt"),
+    english("reconciliation.strategy.reapply"),
+    english("reconciliation.strategy.restore"),
+    english("reconciliation.acknowledgement", { version: "9.9.9" }),
+    english("error.stale-reconciliation-preview"),
+    english("error.target-busy"),
+    english("reconciliation.restart.codex"),
+    english("reconciliation.restart.claude"),
+  ]).toEqual([
+    "Reconcile Managed Configuration",
+    "Untested but compatible · 9.9.9",
+    "Codex profile",
+    "Claude environment selector · CLAUDE_CODE_USE_VERTEX",
+    "Command-line flags and resumed sessions may still override this configuration.",
+    "Credential Reference",
+    "Changed",
+    "Adopt observed configuration",
+    "Reapply committed configuration",
+    "Restore pre-Muxvia configuration",
+    "I acknowledge untested Target CLI version 9.9.9.",
+    "Target state changed. Preview the reconciliation again.",
+    "This Target has active model requests. Retry Restore when it is idle.",
+    "Restart Codex after applying this reconciliation.",
+    "Restart Claude Code after applying this reconciliation.",
+  ])
+  expect([
+    chinese("reconciliation.title"),
+    chinese("reconciliation.compatibility.unknown-compatible", { version: "9.9.9" }),
+    chinese("reconciliation.shadow.codex-profile"),
+    chinese("reconciliation.shadow.claude-selector", { selector: "CLAUDE_CODE_USE_VERTEX" }),
+    chinese("reconciliation.boundary"),
+    chinese("reconciliation.field.credential"),
+    chinese("reconciliation.state.changed"),
+    chinese("reconciliation.strategy.adopt"),
+    chinese("reconciliation.strategy.reapply"),
+    chinese("reconciliation.strategy.restore"),
+    chinese("reconciliation.acknowledgement", { version: "9.9.9" }),
+    chinese("error.stale-reconciliation-preview"),
+    chinese("error.target-busy"),
+    chinese("reconciliation.restart.codex"),
+    chinese("reconciliation.restart.claude"),
+  ]).toEqual([
+    "协调受管理配置",
+    "未经测试但兼容 · 9.9.9",
+    "Codex 配置文件",
+    "Claude 环境选择器 · CLAUDE_CODE_USE_VERTEX",
+    "命令行标志和恢复的会话仍可能覆盖此配置。",
+    "凭据引用",
+    "已更改",
+    "采用观测到的配置",
+    "重新应用已提交配置",
+    "恢复 Muxvia 之前的配置",
+    "我确认使用未经测试的 Target CLI 版本 9.9.9。",
+    "Target 状态已更改。请重新预览协调操作。",
+    "此 Target 有活动的模型请求。请在空闲时重试恢复。",
+    "应用此协调操作后重启 Codex。",
+    "应用此协调操作后重启 Claude Code。",
+  ])
+})
+
+test("Reconciliation stable problems map to fixed localized diagnostics", () => {
+  expect(messageKeyForProblem("compatibility-acknowledgement-required")).toBe("error.compatibility-acknowledgement-required")
+  expect(messageKeyForProblem("stale-reconciliation-preview")).toBe("error.stale-reconciliation-preview")
+  expect(messageKeyForProblem("target-busy")).toBe("error.target-busy")
+})
+
+test("Reconciliation closed compatibility, shadow, field, and state labels have full locale parity", () => {
+  const english = createTranslator("en")
+  const chinese = createTranslator("zh-CN")
+  expect([
+    english("reconciliation.compatibility.tested", { version: "1" }),
+    english("reconciliation.compatibility.incompatible", { version: "1" }),
+    english("reconciliation.shadow.claude-managed"),
+    english("reconciliation.shadow.claude-shared"),
+    english("reconciliation.shadow.claude-project"),
+    english("reconciliation.shadow.claude-local"),
+    english("reconciliation.shadow.claude-host-managed"),
+    english("reconciliation.field.provider"),
+    english("reconciliation.field.current-provider"),
+    english("reconciliation.field.activated-snapshot"),
+    english("reconciliation.field.takeover"),
+    english("reconciliation.state.present"),
+    english("reconciliation.state.absent"),
+    english("reconciliation.state.unchanged"),
+  ]).toEqual([
+    "Tested · 1",
+    "Incompatible · 1",
+    "Claude managed settings",
+    "Claude shared settings",
+    "Claude project settings",
+    "Claude local settings",
+    "Claude host-managed settings",
+    "Target Provider",
+    "Current Target Provider",
+    "Activated Snapshot",
+    "Target Takeover",
+    "Present",
+    "Absent",
+    "Unchanged",
+  ])
+  expect([
+    chinese("reconciliation.compatibility.tested", { version: "1" }),
+    chinese("reconciliation.compatibility.incompatible", { version: "1" }),
+    chinese("reconciliation.shadow.claude-managed"),
+    chinese("reconciliation.shadow.claude-shared"),
+    chinese("reconciliation.shadow.claude-project"),
+    chinese("reconciliation.shadow.claude-local"),
+    chinese("reconciliation.shadow.claude-host-managed"),
+    chinese("reconciliation.field.provider"),
+    chinese("reconciliation.field.current-provider"),
+    chinese("reconciliation.field.activated-snapshot"),
+    chinese("reconciliation.field.takeover"),
+    chinese("reconciliation.state.present"),
+    chinese("reconciliation.state.absent"),
+    chinese("reconciliation.state.unchanged"),
+  ]).toEqual([
+    "已测试 · 1",
+    "不兼容 · 1",
+    "Claude 受管理设置",
+    "Claude 共享设置",
+    "Claude 项目设置",
+    "Claude 本地设置",
+    "Claude 主机管理设置",
+    "Target Provider",
+    "当前 Target Provider",
+    "已激活快照",
+    "Target Takeover",
+    "存在",
+    "不存在",
+    "未更改",
+  ])
+})
+
 test("interpolation preserves operator values verbatim", () => {
   const operator = "模型-$A {unsafe} <b>markup</b>"
 

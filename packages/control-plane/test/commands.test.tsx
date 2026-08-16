@@ -19,7 +19,7 @@ type Handlers = Partial<Record<CommandId, () => void>>
 
 function CommandHarness(props: {
   handlers: Handlers
-  scope?: "home" | "codex" | "claude"
+  scope?: "home" | "codex" | "claude" | "reconciliation"
   Overlay?: () => JSX.Element
   onExecute?: (id: CommandId) => void
   onDispatch: (name: string) => void
@@ -48,7 +48,7 @@ function CommandHarness(props: {
 
 async function commandHarness(options: {
   handlers: Handlers
-  scope?: "home" | "codex" | "claude"
+  scope?: "home" | "codex" | "claude" | "reconciliation"
   Overlay?: () => JSX.Element
   onExecute?: (id: CommandId) => void
   onDispatch: (name: string) => void
@@ -290,6 +290,50 @@ test("Claude accepts Provider Direct and Takeover route commands", () => {
   expect(resolveSlash("/takeover", "claude")).toBe("target.takeover.apply")
   expect(resolveSlash("/direct", "claude")).toBe("target.direct.apply")
 })
+
+test.each(["codex", "claude"] as const)(
+  "Reconciliation uses the exact shared command family through the real %s keymap",
+  async (scope) => {
+    const executed: string[] = []
+    const handlers = Object.fromEntries([
+      "target.reconciliation.open",
+      "target.reconciliation.preview.adopt",
+      "target.reconciliation.preview.reapply",
+      "target.reconciliation.preview.restore",
+      "target.reconciliation.apply",
+      "target.reconciliation.cancel",
+    ].map((id) => [id, () => executed.push(id)])) as Handlers
+    const setup = await commandHarness({ handlers, onDispatch: () => {}, scope })
+    try {
+      expect(resolveSlash("/reconcile", scope)).toBe("target.reconciliation.open")
+      setup.keymap.dispatchCommand(resolveSlash("/reconcile", scope)!)
+      await setup.renderOnce()
+      expect(executed).toEqual(["target.reconciliation.open"])
+    } finally {
+      setup.renderer.destroy()
+    }
+
+    const modal = await commandHarness({ handlers, onDispatch: () => {}, scope: "reconciliation" })
+    try {
+      modal.keymap.dispatchCommand("target.reconciliation.preview.adopt")
+      modal.keymap.dispatchCommand("target.reconciliation.preview.reapply")
+      modal.keymap.dispatchCommand("target.reconciliation.preview.restore")
+      modal.keymap.dispatchCommand("target.reconciliation.apply")
+      modal.keymap.dispatchCommand("target.reconciliation.cancel")
+      await modal.renderOnce()
+      expect(executed).toEqual([
+        "target.reconciliation.open",
+        "target.reconciliation.preview.adopt",
+        "target.reconciliation.preview.reapply",
+        "target.reconciliation.preview.restore",
+        "target.reconciliation.apply",
+        "target.reconciliation.cancel",
+      ])
+    } finally {
+      modal.renderer.destroy()
+    }
+  },
+)
 
 test("an overlay layer consumes escape before route and global layers", async () => {
   const executed: string[] = []

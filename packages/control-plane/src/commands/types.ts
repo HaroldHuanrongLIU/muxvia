@@ -29,12 +29,18 @@ export type CommandId =
   | "provider.activate.takeover-cancel"
   | "target.direct.apply"
   | "target.takeover.apply"
+  | "target.reconciliation.open"
+  | "target.reconciliation.preview.adopt"
+  | "target.reconciliation.preview.reapply"
+  | "target.reconciliation.preview.restore"
+  | "target.reconciliation.apply"
+  | "target.reconciliation.cancel"
   | "app.exit.request"
   | "overlay.close"
   | "app.exit.confirm"
   | "app.exit.cancel"
 
-export type CommandScope = "global" | "home" | "codex" | "claude" | "editor" | "provider-picker" | "provider-picker-claude" | "provider-source-picker" | "provider-model-picker" | "provider-credential-confirm" | "provider-delete-confirm" | "takeover-required-confirm" | "overlay" | "confirm"
+export type CommandScope = "global" | "home" | "codex" | "claude" | "editor" | "provider-picker" | "provider-picker-claude" | "provider-source-picker" | "provider-model-picker" | "provider-credential-confirm" | "provider-delete-confirm" | "takeover-required-confirm" | "reconciliation" | "overlay" | "confirm"
 
 export type CommandTextKey = `command.${string}`
 

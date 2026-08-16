@@ -24,9 +24,9 @@ use crate::{
     control::{
         framing::{FrameError, read_frame, write_frame},
         protocol::{
-            ClaudePreflightContext, ClientFrame, ControlOperation, ControlProblem, ControlResult,
-            DiscoverySource, FrameLimit, ReconciliationStrategy, RpcVersion, ServerFrame, Target,
-            TargetAction, TargetView,
+            ClaudePreflightContext, ClientFrame, CompatibilityProbeResult, ControlOperation,
+            ControlProblem, ControlResult, DiscoverySource, FrameLimit, ReconciliationStrategy,
+            RpcVersion, ServerFrame, Target, TargetAction, TargetView,
         },
     },
     domain::provider::has_valid_provider_authentication,
@@ -699,10 +699,10 @@ async fn serve_session(
                                 } => Some((*strategy, *observation_token, acknowledge_version.clone())),
                                 _ => None,
                             });
-                        let compatibility_acknowledgement =
+                        let compatibility_resolution =
                             parsed_action.as_ref().and_then(|action| match action {
-                                TargetAction::AcknowledgeCompatibility { version } => {
-                                    Some(version.clone())
+                                TargetAction::ResolveCompatibility(action) => {
+                                    Some(action.version.clone())
                                 }
                                 _ => None,
                             });
@@ -753,9 +753,9 @@ async fn serve_session(
                                     "State store unavailable",
                                 ).await), None),
                             }
-                        } else if let Some(version) = compatibility_acknowledgement {
+                        } else if let Some(version) = compatibility_resolution {
                             let deferred = reconciliation
-                                .acknowledge_compatibility(
+                                .resolve_compatibility(
                                     target,
                                     action_id,
                                     expected_revision,
@@ -838,7 +838,7 @@ async fn serve_session(
                     operation @ (ControlOperation::DiscoverModels { .. }
                     | ControlOperation::CheckReachability { .. }
                     | ControlOperation::PreviewReconciliation { .. }
-                    | ControlOperation::PreviewCompatibility { .. }) => {
+                    | ControlOperation::ProbeCompatibility(_)) => {
                         if let ControlOperation::DiscoverModels {
                             source: DiscoverySource::Draft { authentication, .. },
                             ..
@@ -951,8 +951,8 @@ fn operation_target(operation: &ControlOperation) -> Target {
         | ControlOperation::Act { target, .. }
         | ControlOperation::DiscoverModels { target, .. }
         | ControlOperation::CheckReachability { target, .. }
-        | ControlOperation::PreviewReconciliation { target, .. }
-        | ControlOperation::PreviewCompatibility { target } => *target,
+        | ControlOperation::PreviewReconciliation { target, .. } => *target,
+        ControlOperation::ProbeCompatibility(operation) => operation.target,
     }
 }
 
@@ -1029,10 +1029,15 @@ async fn inspect_and_queue(
                         )
                     })
             }
-            ControlOperation::PreviewCompatibility { .. } => reconciliation
-                .preview_compatibility_cancellable(target, inspection_cancellation)
+            ControlOperation::ProbeCompatibility(_) => reconciliation
+                .probe_compatibility_cancellable(target, inspection_cancellation)
                 .await
-                .map(|preview| (ControlResult::CompatibilityPreview { preview }, None)),
+                .map(|probe| {
+                    (
+                        ControlResult::CompatibilityProbe(CompatibilityProbeResult { probe }),
+                        None,
+                    )
+                }),
             _ => unreachable!(),
         }
     };

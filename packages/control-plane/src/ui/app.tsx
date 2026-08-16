@@ -388,7 +388,7 @@ function Shell(props: {
     }
   }
 
-  const previewCompatibility = async (
+  const probeCompatibility = async (
     target: Target,
     token: OverlayToken,
   ) => {
@@ -402,12 +402,12 @@ function Shell(props: {
     updateReconciliation(target, token, (state) => ({
       ...state,
       generation,
-      compatibilityPreview: undefined,
+      compatibilityProbe: undefined,
       pending: "preview",
       errorCode: undefined,
     }))
     try {
-      const preview = await originSession.previewCompatibility(controller.signal)
+      const probe = await originSession.probeCompatibility(controller.signal)
       const latest = reconciliationByTarget()[target]
       if (
         disposed
@@ -420,7 +420,7 @@ function Shell(props: {
       ) return
       updateReconciliation(target, token, (state) => ({
         ...state,
-        compatibilityPreview: preview,
+        compatibilityProbe: probe,
         pending: undefined,
       }))
     } catch (error) {
@@ -436,7 +436,7 @@ function Shell(props: {
     }
   }
 
-  const acknowledgeReconciliation = async (target: Target, token: OverlayToken, version: string) => {
+  const resolveReconciliationCompatibility = async (target: Target, token: OverlayToken, version: string) => {
     const current = reconciliationByTarget()[target]
     if (!current || current.overlayToken !== token || current.pending) return
     if (!current.compatibilityOnly) {
@@ -445,16 +445,18 @@ function Shell(props: {
         : state)
       return
     }
+    const classification = current.compatibilityProbe?.compatibility.classification
     if (
-      current.compatibilityPreview?.compatibility.classification !== "unknown-compatible"
-      || !current.compatibilityPreview.compatibility.acknowledgementRequired
-      || current.compatibilityPreview.compatibility.version !== version
+      (classification !== "unknown-compatible" && classification !== "tested")
+      || current.compatibilityProbe?.compatibility.version !== version
+      || (classification === "unknown-compatible"
+        && !current.compatibilityProbe.compatibility.acknowledgementRequired)
     ) return
     const originSession = current.originSession
     const generation = current.generation
     updateReconciliation(target, token, (state) => ({ ...state, pending: "apply", errorCode: undefined }))
     try {
-      const outcome = await originSession.acknowledgeCompatibility(version)
+      const outcome = await originSession.resolveCompatibility(version)
       const latest = reconciliationByTarget()[target]
       if (
         disposed
@@ -465,6 +467,19 @@ function Shell(props: {
         || latest.generation !== generation
       ) return
       installView(outcome.view, "action")
+      if (outcome.status === "applied") {
+        const activity: ActivityDraft = {
+          kind: "success",
+          messageKey: classification === "unknown-compatible"
+            ? "activity.compatibility.acknowledged"
+            : "activity.compatibility.resolved",
+          values: { version },
+        }
+        appendActivity(activity, target)
+        if (activeTarget() === target) {
+          setNotice({ kind: "success", text: props.t(activity.messageKey, activity.values) }, target)
+        }
+      }
       overlay.close(token)
     } catch (error) {
       if (disposed || exiting) return
@@ -581,7 +596,7 @@ function Shell(props: {
           state={() => reconciliationByTarget()[target] ?? initial}
           t={props.t}
           onPreview={(strategy) => { void previewReconciliation(target, token, strategy) }}
-          onAcknowledge={(version) => { void acknowledgeReconciliation(target, token, version) }}
+          onResolve={(version) => { void resolveReconciliationCompatibility(target, token, version) }}
           onApply={() => { void applyReconciliation(target, token) }}
           onCancel={() => closeReconciliation(target, token)}
         />,
@@ -594,7 +609,7 @@ function Shell(props: {
             : states)
         },
       })
-      if (compatibilityOnly) void previewCompatibility(target, token)
+      if (compatibilityOnly) void probeCompatibility(target, token)
     })
   }
 

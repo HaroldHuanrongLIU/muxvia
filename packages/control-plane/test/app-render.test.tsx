@@ -3,7 +3,7 @@ import { testRender } from "@opentui/solid"
 
 import { App } from "../src/ui/app"
 import type { TargetSession } from "../src/control/target-session"
-import type { ActionOutcome, CompatibilityPreview, TargetAction, TargetView } from "../src/control/types"
+import type { ActionOutcome, CompatibilityProbe, TargetAction, TargetView } from "../src/control/types"
 import {
   assertControlledSecretSource,
   assertSecretFreeStructured,
@@ -113,8 +113,8 @@ class MemoryTargetSession implements TargetSession {
   async checkReachability(): Promise<never> { throw new Error("not used by this fixture") }
   async previewReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
   async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
-  async previewCompatibility(): Promise<CompatibilityPreview> { throw new Error("compatibility preview not configured in this fixture") }
-  async acknowledgeCompatibility(): Promise<ActionOutcome> { throw new Error("compatibility acknowledgement not configured in this fixture") }
+  async probeCompatibility(): Promise<CompatibilityProbe> { throw new Error("compatibility probe not configured in this fixture") }
+  async resolveCompatibility(): Promise<ActionOutcome> { throw new Error("compatibility resolution not configured in this fixture") }
 
   async act(action: TargetAction): Promise<ActionOutcome> {
     this.actions.push(projectAction(action))
@@ -768,6 +768,7 @@ test("Claude localizes incomplete and unknown Takeover failures without backend 
 })
 
 test("Claude renders a closed blocking selector without undefined or backend text", async () => {
+  assertControlledSecretSource(controlledClaudeDirectSources(), claudeDirectSecrets, "closed-selector-source")
   const claudeProvider = provider({
     id: "claude-provider",
     protocol: "anthropic-messages",
@@ -792,7 +793,11 @@ test("Claude renders a closed blocking selector without undefined or backend tex
     setup.mockInput.pressKey("2")
     await setup.mockInput.typeText("/takeover")
     setup.mockInput.pressEnter()
-    const frame = await setup.waitForFrame((value) => value.includes("CLAUDE_CODE_USE_VERTEX"))
+    const frame = await waitForClaudeDirectFrame(
+      setup,
+      (value) => value.includes("CLAUDE_CODE_USE_VERTEX"),
+      "closed-selector-frame",
+    )
     expect(frame).toContain("control-plane-context")
     expect(frame).not.toContain("undefined")
     expect(frame).not.toContain(problemMessageSentinel)
@@ -902,6 +907,7 @@ test.each([
   ["CLAUDE_CODE_USE_ANTHROPIC_AWS", "claude-selector"],
   ["CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "claude-host-managed"],
 ] as const)("renders the exact durable Claude selector %s without backend text", async (selector, source) => {
+  assertControlledSecretSource(controlledClaudeDirectSources(), claudeDirectSecrets, `durable-selector-source-${selector}`)
   const session = new MemoryTargetSession(view({
     target: "claude",
     problems: [{
@@ -916,7 +922,11 @@ test.each([
   try {
     await setup.renderOnce()
     setup.mockInput.pressKey("2")
-    const frame = await setup.waitForFrame((next) => next.includes(selector))
+    const frame = await waitForClaudeDirectFrame(
+      setup,
+      (next) => next.includes(selector),
+      `durable-selector-frame-${selector}`,
+    )
     expect(frame).toContain(source)
     expect(frame).not.toContain(problemMessageSentinel)
   } finally {

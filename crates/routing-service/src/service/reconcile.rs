@@ -14,7 +14,7 @@ use crate::{
     claude::{ClaudeConfigCodec, ClaudeProbe},
     codex::{CodexConfigCodec, CodexProbe, FileIdentity},
     control::protocol::{
-        ActionOutcome, ActionStatus, CompatibilityClassification, CompatibilityPreview,
+        ActionOutcome, ActionStatus, CompatibilityClassification, CompatibilityProbe,
         CompatibilityView, ControlProblem, ProviderEffect, ReconciliationField,
         ReconciliationFieldState, ReconciliationPreview, ReconciliationStrategy, ShadowSource,
         Target,
@@ -458,27 +458,27 @@ impl ReconciliationService {
         })
     }
 
-    pub(crate) async fn preview_compatibility_cancellable(
+    pub(crate) async fn probe_compatibility_cancellable(
         &self,
         target: Target,
         cancellation: CancellationToken,
-    ) -> Result<CompatibilityPreview, ControlProblem> {
+    ) -> Result<CompatibilityProbe, ControlProblem> {
         let view = self
             .state
             .target_view_for(target)
             .await
             .map_err(map_state_problem)?;
         let compatibility = self
-            .probe_compatibility_cancellable(target, cancellation)
+            .probe_target_compatibility_cancellable(target, cancellation)
             .await?;
-        Ok(CompatibilityPreview {
+        Ok(CompatibilityProbe {
             target,
             management_revision: view.management_revision,
             compatibility,
         })
     }
 
-    pub(crate) async fn acknowledge_compatibility(
+    pub(crate) async fn resolve_compatibility(
         &self,
         target: Target,
         action_id: Uuid,
@@ -524,55 +524,20 @@ impl ReconciliationService {
                 publication: blocked.publication,
             };
         }
-        if compatibility.classification != CompatibilityClassification::UnknownCompatible
-            || compatibility.version != version
-        {
-            let publication =
-                if compatibility.classification == CompatibilityClassification::UnknownCompatible {
-                    match self
-                        .state
-                        .project_managed_write_problem(
-                            target,
-                            "compatibility-acknowledgement-required",
-                            None,
-                            compatibility,
-                        )
-                        .await
-                    {
-                        Ok(publication) => publication,
-                        Err(_) => {
-                            return DeferredPublication::none(Err(self
-                                .failure(target, "state-store-error")
-                                .await));
-                        }
-                    }
-                } else {
-                    None
-                };
-            return DeferredPublication {
-                result: Err(self
-                    .failure(target, "compatibility-acknowledgement-required")
-                    .await),
-                publication,
-            };
-        }
-        if compatibility.acknowledgement_required
-            && self
-                .state
-                .project_managed_write_problem(
-                    target,
-                    "compatibility-acknowledgement-required",
-                    None,
-                    compatibility,
-                )
-                .await
-                .is_err()
-        {
-            return DeferredPublication::none(Err(self.failure(target, "state-store-error").await));
+        if compatibility.version != version {
+            return DeferredPublication::none(Err(self
+                .failure(target, "stale-compatibility-probe")
+                .await));
         }
         match self
             .state
-            .apply_compatibility_acknowledgement(target, action_id, expected_revision, version)
+            .apply_compatibility_resolution(
+                target,
+                action_id,
+                expected_revision,
+                version,
+                compatibility,
+            )
             .await
         {
             Ok(result) => {
@@ -1254,11 +1219,11 @@ impl ReconciliationService {
         &self,
         target: Target,
     ) -> Result<CompatibilityView, ControlProblem> {
-        self.probe_compatibility_cancellable(target, CancellationToken::new())
+        self.probe_target_compatibility_cancellable(target, CancellationToken::new())
             .await
     }
 
-    async fn probe_compatibility_cancellable(
+    async fn probe_target_compatibility_cancellable(
         &self,
         target: Target,
         cancellation: CancellationToken,
@@ -1602,6 +1567,7 @@ fn points_to_managed_endpoint(base_url: &str, endpoint: &str) -> bool {
 fn stable_message(code: &str) -> &'static str {
     match code {
         "stale-reconciliation-preview" => "Target state changed; preview again",
+        "stale-compatibility-probe" => "Target compatibility changed; probe again",
         "stale-revision" => "Target state changed; refresh and retry",
         "recovery-required" => "Managed configuration requires recovery",
         "state-store-error" => "State store unavailable",

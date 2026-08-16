@@ -89,6 +89,39 @@ impl CodexProbe for UnknownCodexProbe {
     }
 }
 
+struct ChangingCodexProbe {
+    state: Arc<AtomicUsize>,
+}
+
+impl CodexProbe for ChangingCodexProbe {
+    fn probe(&self, _: &Path) -> Result<CodexCapability, CodexProblem> {
+        match self.state.load(Ordering::SeqCst) {
+            0 => Ok(CodexCapability::UnknownCompatible {
+                version: "codex-stale-unknown".into(),
+                warning: "untested".into(),
+            }),
+            1 => CommandCodexProbe.probe(Path::new("relative-codex")),
+            _ => Ok(CodexCapability::Tested {
+                version: "codex-tested-8.2".into(),
+            }),
+        }
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<CodexCapability, CodexProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandCodexProbe.probe(Path::new("relative-codex")),
+                result = async { self.probe(Path::new("/usr/bin/codex")) } => result,
+            }
+        })
+    }
+}
+
 struct IncompatibleCodexProbe;
 
 impl CodexProbe for IncompatibleCodexProbe {
@@ -220,6 +253,39 @@ impl ClaudeProbe for UnknownClaudeProbe {
     }
 }
 
+struct ChangingClaudeProbe {
+    state: Arc<AtomicUsize>,
+}
+
+impl ClaudeProbe for ChangingClaudeProbe {
+    fn probe(&self, _: &Path) -> Result<ClaudeCapability, ClaudeProblem> {
+        match self.state.load(Ordering::SeqCst) {
+            0 => Ok(ClaudeCapability::UnknownCompatible {
+                version: "claude-stale-unknown".into(),
+                warning: "untested".into(),
+            }),
+            1 => CommandClaudeProbe.probe(Path::new("relative-claude")),
+            _ => Ok(ClaudeCapability::Tested {
+                version: "claude-tested-8.2".into(),
+            }),
+        }
+    }
+
+    fn probe_cancellable<'a>(
+        &'a self,
+        _: &'a Path,
+        cancellation: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<ClaudeCapability, ClaudeProblem>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => CommandClaudeProbe.probe(Path::new("relative-claude")),
+                result = async { self.probe(Path::new("/usr/bin/claude")) } => result,
+            }
+        })
+    }
+}
+
 struct IncompatibleClaudeProbe;
 
 impl ClaudeProbe for IncompatibleClaudeProbe {
@@ -285,6 +351,48 @@ fn assert_claude_direct_wire_is_secret_free(value: &Value) {
             "Claude Direct wire surface exposed a credential or setting"
         );
     }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn assert_compatibility_wire_is_secret_free(value: &Value, secrets: &[&str], label: &'static str) {
+    let serialized = serde_json::to_vec(value).unwrap_or_default();
+    let debug = format!("{value:?}").into_bytes();
+    let contaminated = secrets.iter().any(|secret| {
+        contains_bytes(&serialized, secret.as_bytes()) || contains_bytes(&debug, secret.as_bytes())
+    });
+    assert!(!contaminated, "compatibility-wire-secret:{label}");
+}
+
+#[test]
+fn compatibility_wire_scanner_rejects_a_controlled_mutation_with_fixed_diagnostic() {
+    const SECRETS: &[&str] = &[
+        "COMPATIBILITY_CREDENTIAL_SENTINEL_98001",
+        "COMPATIBILITY_CONFIG_SENTINEL_98002",
+        "COMPATIBILITY_BACKEND_SENTINEL_98003",
+        "COMPATIBILITY_SETTINGS_SENTINEL_98004",
+    ];
+    let panic = std::panic::catch_unwind(|| {
+        assert_compatibility_wire_is_secret_free(
+            &json!({"mutated": SECRETS[2]}),
+            SECRETS,
+            "mutation",
+        );
+    })
+    .unwrap_err();
+    let diagnostic = panic
+        .downcast_ref::<&str>()
+        .map(|value| (*value).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    let fixed = diagnostic == "compatibility-wire-secret:mutation";
+    let leaked = SECRETS.iter().any(|secret| diagnostic.contains(secret));
+    assert!(fixed && !leaked, "compatibility-wire-scanner-diagnostic");
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -4451,6 +4559,13 @@ async fn claude_unknown_nonempty_session_opens_read_only_but_takeover_has_no_sid
 
 #[tokio::test]
 async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_targets_and_modes() {
+    const SECRETS: &[&str] = &[
+        "UNKNOWN_CODEX_SECRET_98101",
+        "UNKNOWN_CLAUDE_SECRET_98102",
+        "UNKNOWN_COMPATIBILITY_CONFIG_SENTINEL_98103",
+        "UNKNOWN_COMPATIBILITY_BACKEND_SENTINEL_98104",
+        "UNKNOWN_COMPATIBILITY_SETTINGS_SENTINEL_98105",
+    ];
     for (target, target_name, mode) in [
         (Target::Codex, "codex", "direct"),
         (Target::Codex, "codex", "takeover"),
@@ -4489,18 +4604,14 @@ async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_tar
             Target::Codex => Target::Claude,
             Target::Claude => Target::Codex,
         };
-        let peer_before =
-            serde_json::to_vec(&store.target_view_for(peer_target).await.unwrap()).unwrap();
-        assert!(
-            !peer_before
-                .windows(b"UNKNOWN_CODEX_SECRET_98101".len())
-                .any(|bytes| { bytes == b"UNKNOWN_CODEX_SECRET_98101" })
+        let peer_before_value =
+            serde_json::to_value(store.target_view_for(peer_target).await.unwrap()).unwrap();
+        assert_compatibility_wire_is_secret_free(
+            &peer_before_value,
+            SECRETS,
+            "unknown-peer-before",
         );
-        assert!(
-            !peer_before
-                .windows(b"UNKNOWN_CLAUDE_SECRET_98102".len())
-                .any(|bytes| { bytes == b"UNKNOWN_CLAUDE_SECRET_98102" })
-        );
+        let peer_before = serde_json::to_vec(&peer_before_value).unwrap();
         let activation = Arc::new(
             ActivationService::new(
                 Arc::clone(&store),
@@ -4542,6 +4653,7 @@ async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_tar
             }),
         )
         .await;
+        assert_compatibility_wire_is_secret_free(&opened, SECRETS, "unknown-open");
         let revision = opened["result"]["view"]["managementRevision"]
             .as_u64()
             .unwrap();
@@ -4553,19 +4665,21 @@ async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_tar
                 "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
                 "expectedRevision": revision,
                 "action": {
-                    "kind": "activate-provider", "providerId": provider_id, "mode": mode
+                    "kind": "activate-provider", "providerId": provider_id, "mode": mode,
+                    "configDiagnostic": "UNKNOWN_COMPATIBILITY_CONFIG_SENTINEL_98103",
+                    "backendDiagnostic": "UNKNOWN_COMPATIBILITY_BACKEND_SENTINEL_98104",
+                    "settingsDiagnostic": "UNKNOWN_COMPATIBILITY_SETTINGS_SENTINEL_98105"
                 }
             }),
         )
         .await;
+        assert_compatibility_wire_is_secret_free(&blocked, SECRETS, "unknown-blocked");
         assert_eq!(
             blocked["problem"]["code"],
             "compatibility-acknowledgement-required"
         );
-        let blocked_wire = blocked.to_string();
-        assert!(!blocked_wire.contains("UNKNOWN_CODEX_SECRET_98101"));
-        assert!(!blocked_wire.contains("UNKNOWN_CLAUDE_SECRET_98102"));
         let projected = read_frame(&mut stream).await.unwrap();
+        assert_compatibility_wire_is_secret_free(&projected, SECRETS, "unknown-projected");
         assert_eq!(projected["type"], "target-view");
         assert!(
             projected["view"]["problems"]
@@ -4582,8 +4696,10 @@ async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_tar
             CompatibilityClassification::UnknownCompatible
         );
         assert!(compatibility.acknowledgement_required);
-        let peer_after =
-            serde_json::to_vec(&store.target_view_for(peer_target).await.unwrap()).unwrap();
+        let peer_after_value =
+            serde_json::to_value(store.target_view_for(peer_target).await.unwrap()).unwrap();
+        assert_compatibility_wire_is_secret_free(&peer_after_value, SECRETS, "unknown-peer-after");
+        let peer_after = serde_json::to_vec(&peer_after_value).unwrap();
         assert!(
             peer_after == peer_before,
             "compatibility blocking changed the peer Target view"
@@ -4603,23 +4719,24 @@ async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_tar
 
         let preview = request(
             &mut stream,
-            "compatibility-preview",
-            json!({ "kind": "preview-compatibility", "target": target_name }),
+            "compatibility-probe",
+            json!({ "kind": "probe-compatibility", "target": target_name }),
         )
         .await;
+        assert_compatibility_wire_is_secret_free(&preview, SECRETS, "unknown-probe");
         assert_eq!(preview["type"], "response");
-        assert_eq!(preview["result"]["kind"], "compatibility-preview");
-        assert_eq!(preview["result"]["preview"]["target"], target_name);
+        assert_eq!(preview["result"]["kind"], "compatibility-probe");
+        assert_eq!(preview["result"]["probe"]["target"], target_name);
         assert_eq!(
-            preview["result"]["preview"]["compatibility"]["version"],
+            preview["result"]["probe"]["compatibility"]["version"],
             version
         );
         assert_eq!(
-            preview["result"]["preview"]["compatibility"]["classification"],
+            preview["result"]["probe"]["compatibility"]["classification"],
             "unknown-compatible"
         );
         assert_eq!(
-            preview["result"]["preview"]["compatibility"]["acknowledgementRequired"],
+            preview["result"]["probe"]["compatibility"]["acknowledgementRequired"],
             true
         );
         let acknowledgement_action_id = Uuid::new_v4();
@@ -4629,10 +4746,11 @@ async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_tar
             json!({
                 "kind": "act", "target": target_name, "actionId": acknowledgement_action_id,
                 "expectedRevision": revision,
-                "action": { "kind": "acknowledge-compatibility", "version": version }
+                "action": { "kind": "resolve-compatibility", "version": version }
             }),
         )
         .await;
+        assert_compatibility_wire_is_secret_free(&acknowledged, SECRETS, "unknown-resolved");
         assert_eq!(acknowledged["type"], "response");
         assert_eq!(acknowledged["result"]["outcome"]["status"], "applied");
         assert!(
@@ -4643,6 +4761,11 @@ async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_tar
                 .any(|problem| problem["code"] == "compatibility-acknowledgement-required")
         );
         let acknowledgement_push = read_frame(&mut stream).await.unwrap();
+        assert_compatibility_wire_is_secret_free(
+            &acknowledgement_push,
+            SECRETS,
+            "unknown-resolution-push",
+        );
         assert_eq!(acknowledgement_push["type"], "target-view");
         let replayed = request(
             &mut stream,
@@ -4650,10 +4773,11 @@ async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_tar
             json!({
                 "kind": "act", "target": target_name, "actionId": acknowledgement_action_id,
                 "expectedRevision": revision + 99,
-                "action": { "kind": "acknowledge-compatibility", "version": "stale-version" }
+                "action": { "kind": "resolve-compatibility", "version": "stale-version" }
             }),
         )
         .await;
+        assert_compatibility_wire_is_secret_free(&replayed, SECRETS, "unknown-replay");
         assert_eq!(replayed["result"]["outcome"]["status"], "replayed");
         assert!(
             tokio::time::timeout(Duration::from_millis(50), read_frame(&mut stream))
@@ -4668,11 +4792,15 @@ async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_tar
                 "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
                 "expectedRevision": revision,
                 "action": {
-                    "kind": "activate-provider", "providerId": provider_id, "mode": mode
+                    "kind": "activate-provider", "providerId": provider_id, "mode": mode,
+                    "configDiagnostic": "UNKNOWN_COMPATIBILITY_CONFIG_SENTINEL_98103",
+                    "backendDiagnostic": "UNKNOWN_COMPATIBILITY_BACKEND_SENTINEL_98104",
+                    "settingsDiagnostic": "UNKNOWN_COMPATIBILITY_SETTINGS_SENTINEL_98105"
                 }
             }),
         )
         .await;
+        assert_compatibility_wire_is_secret_free(&activated, SECRETS, "unknown-activation");
         assert_eq!(activated["type"], "response");
         assert_eq!(activated["result"]["outcome"]["status"], "applied");
         assert!(
@@ -4682,7 +4810,226 @@ async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_tar
                 .iter()
                 .any(|problem| problem["code"] == "compatibility-acknowledgement-required")
         );
-        let _activation_push = read_frame(&mut stream).await.unwrap();
+        let activation_push = read_frame(&mut stream).await.unwrap();
+        assert_compatibility_wire_is_secret_free(
+            &activation_push,
+            SECRETS,
+            "unknown-activation-push",
+        );
+        handle.shutdown().await.unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn tested_probe_resolves_stale_unknown_and_incompatible_blockers_for_both_targets() {
+    const SECRETS: &[&str] = &[
+        "TESTED_RESOLUTION_CODEX_SECRET_98701",
+        "TESTED_RESOLUTION_CLAUDE_SECRET_98702",
+        "TESTED_RESOLUTION_CONFIG_SENTINEL_98703",
+        "TESTED_RESOLUTION_BACKEND_SENTINEL_98704",
+        "TESTED_RESOLUTION_SETTINGS_SENTINEL_98705",
+    ];
+    for (target, target_name, initial_probe_state) in [
+        (Target::Codex, "codex", 0),
+        (Target::Codex, "codex", 1),
+        (Target::Claude, "claude", 0),
+        (Target::Claude, "claude", 1),
+    ] {
+        let root = short_temp_root(&format!(
+            "mx-tested-resolution-{target_name}-{initial_probe_state}"
+        ));
+        let user_home = root.join("home");
+        fs::create_dir_all(&user_home).unwrap();
+        let home = MuxviaHome::from_user_home(&user_home);
+        let store = Arc::new(StateStore::open(&home).await.unwrap());
+        let saved = store
+            .apply_provider_action_for(
+                target,
+                Uuid::new_v4(),
+                0,
+                match target {
+                    Target::Codex => json!({
+                        "kind": "create-provider", "name": "Codex changing",
+                        "baseUrl": "https://api.openai.test/v1", "model": "gpt-test",
+                        "credential": {"kind": "replace", "value": "TESTED_RESOLUTION_CODEX_SECRET_98701"},
+                        "authentication": "openai-bearer", "presetKey": null
+                    }),
+                    Target::Claude => json!({
+                        "kind": "create-provider", "name": "Claude changing",
+                        "baseUrl": "https://api.anthropic.test", "model": "claude-test",
+                        "credential": {"kind": "replace", "value": "TESTED_RESOLUTION_CLAUDE_SECRET_98702"},
+                        "authentication": "anthropic-api-key", "presetKey": null
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let provider_id = saved.view.providers[0].id;
+        let probe_state = Arc::new(AtomicUsize::new(initial_probe_state));
+        let activation = Arc::new(
+            ActivationService::new(
+                Arc::clone(&store),
+                home.clone(),
+                Arc::new(ChangingCodexProbe {
+                    state: Arc::clone(&probe_state),
+                }),
+                "/usr/bin/codex".into(),
+                Arc::new(ControlNoopUpstream),
+            )
+            .with_claude_runtime(
+                Arc::new(ChangingClaudeProbe {
+                    state: Arc::clone(&probe_state),
+                }),
+                "/usr/bin/claude".into(),
+            ),
+        );
+        let handle = ControlServer::bind_with_activation(
+            &home,
+            Arc::clone(&store),
+            "routing-test",
+            activation,
+        )
+        .await
+        .unwrap();
+        let mut stream = UnixStream::connect(handle.socket_path()).await.unwrap();
+        hello(&mut stream).await;
+        let claude_context = (target == Target::Claude).then(|| {
+            json!({
+                "claudeConfigDir": null,
+                "selectorState": "unset",
+                "blockingSelector": null,
+                "hostManagedState": "unmanaged",
+                "cwd": user_home
+            })
+        });
+        let opened = request(
+            &mut stream,
+            "open",
+            json!({
+                "kind": "open-target", "target": target_name,
+                "claudeContext": claude_context
+            }),
+        )
+        .await;
+        assert_compatibility_wire_is_secret_free(&opened, SECRETS, "tested-open");
+        let revision = opened["result"]["view"]["managementRevision"]
+            .as_u64()
+            .unwrap();
+        let blocked = request(
+            &mut stream,
+            "stale-compatibility-blocker",
+            json!({
+                "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
+                "expectedRevision": revision,
+                "action": {
+                    "kind": "activate-provider", "providerId": provider_id, "mode": "direct",
+                    "configDiagnostic": "TESTED_RESOLUTION_CONFIG_SENTINEL_98703",
+                    "backendDiagnostic": "TESTED_RESOLUTION_BACKEND_SENTINEL_98704",
+                    "settingsDiagnostic": "TESTED_RESOLUTION_SETTINGS_SENTINEL_98705"
+                }
+            }),
+        )
+        .await;
+        assert_compatibility_wire_is_secret_free(&blocked, SECRETS, "tested-blocked");
+        assert_eq!(
+            blocked["problem"]["code"],
+            if initial_probe_state == 0 {
+                "compatibility-acknowledgement-required"
+            } else {
+                "incompatible-target-cli"
+            }
+        );
+        let blocker_push = read_frame(&mut stream).await.unwrap();
+        assert_compatibility_wire_is_secret_free(&blocker_push, SECRETS, "tested-blocker-push");
+        store
+            .record_startup_problem_for(
+                target,
+                "startup-reconciliation-failed",
+                "Unrelated startup problem",
+            )
+            .await
+            .unwrap();
+        probe_state.store(2, Ordering::SeqCst);
+
+        let probe = request(
+            &mut stream,
+            "tested-compatibility-probe",
+            json!({"kind": "probe-compatibility", "target": target_name}),
+        )
+        .await;
+        assert_compatibility_wire_is_secret_free(&probe, SECRETS, "tested-probe");
+        let tested_version = format!("{target_name}-tested-8.2");
+        assert_eq!(
+            probe["result"]["probe"]["compatibility"],
+            json!({
+                "version": tested_version,
+                "classification": "tested",
+                "acknowledgementRequired": false
+            })
+        );
+        let resolution_action_id = Uuid::new_v4();
+        let resolved = request(
+            &mut stream,
+            "tested-compatibility-resolution",
+            json!({
+                "kind": "act", "target": target_name,
+                "actionId": resolution_action_id,
+                "expectedRevision": revision,
+                "action": {"kind": "resolve-compatibility", "version": tested_version}
+            }),
+        )
+        .await;
+        assert_compatibility_wire_is_secret_free(&resolved, SECRETS, "tested-resolved");
+        assert_eq!(resolved["result"]["outcome"]["status"], "applied");
+        let problems = resolved["result"]["outcome"]["view"]["problems"]
+            .as_array()
+            .unwrap();
+        assert!(
+            problems
+                .iter()
+                .any(|problem| { problem["code"] == "startup-reconciliation-failed" })
+        );
+        assert!(!problems.iter().any(|problem| {
+            matches!(
+                problem["code"].as_str(),
+                Some("compatibility-acknowledgement-required" | "incompatible-target-cli")
+            )
+        }));
+        let resolution_push = read_frame(&mut stream).await.unwrap();
+        assert_compatibility_wire_is_secret_free(
+            &resolution_push,
+            SECRETS,
+            "tested-resolution-push",
+        );
+        assert_eq!(resolution_push["type"], "target-view");
+        let compatibility = store.compatibility_for(target).await.unwrap();
+        assert_eq!(compatibility.version, tested_version);
+        assert_eq!(
+            compatibility.classification,
+            CompatibilityClassification::Tested
+        );
+        assert!(!compatibility.acknowledgement_required);
+
+        let replayed = request(
+            &mut stream,
+            "tested-compatibility-resolution-replay",
+            json!({
+                "kind": "act", "target": target_name,
+                "actionId": resolution_action_id,
+                "expectedRevision": revision + 99,
+                "action": {"kind": "resolve-compatibility", "version": "stale-version"}
+            }),
+        )
+        .await;
+        assert_compatibility_wire_is_secret_free(&replayed, SECRETS, "tested-replay");
+        assert_eq!(replayed["result"]["outcome"]["status"], "replayed");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read_frame(&mut stream))
+                .await
+                .is_err(),
+            "a compatibility resolution replay published a duplicate Target View"
+        );
         handle.shutdown().await.unwrap();
         fs::remove_dir_all(root).unwrap();
     }
@@ -4690,6 +5037,13 @@ async fn unmanaged_unknown_compatible_activation_requires_exact_ack_for_both_tar
 
 #[tokio::test]
 async fn unmanaged_incompatible_activation_exposes_only_public_read_only_guidance() {
+    const SECRETS: &[&str] = &[
+        "INCOMPATIBLE_CODEX_SECRET_98501",
+        "INCOMPATIBLE_CLAUDE_SECRET_98502",
+        "INCOMPATIBLE_CONFIG_SENTINEL_98503",
+        "INCOMPATIBLE_BACKEND_SENTINEL_98504",
+        "INCOMPATIBLE_SETTINGS_SENTINEL_98505",
+    ];
     for (target, target_name) in [(Target::Codex, "codex"), (Target::Claude, "claude")] {
         let root = short_temp_root(&format!("mx-incompatible-{target_name}"));
         let user_home = root.join("home");
@@ -4754,6 +5108,7 @@ async fn unmanaged_incompatible_activation_exposes_only_public_read_only_guidanc
             }),
         )
         .await;
+        assert_compatibility_wire_is_secret_free(&opened, SECRETS, "incompatible-open");
         let revision = opened["result"]["view"]["managementRevision"]
             .as_u64()
             .unwrap();
@@ -4763,40 +5118,56 @@ async fn unmanaged_incompatible_activation_exposes_only_public_read_only_guidanc
             json!({
                 "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
                 "expectedRevision": revision,
-                "action": {"kind": "activate-provider", "providerId": provider_id, "mode": "direct"}
+                "action": {
+                    "kind": "activate-provider", "providerId": provider_id, "mode": "direct",
+                    "configDiagnostic": "INCOMPATIBLE_CONFIG_SENTINEL_98503",
+                    "backendDiagnostic": "INCOMPATIBLE_BACKEND_SENTINEL_98504",
+                    "settingsDiagnostic": "INCOMPATIBLE_SETTINGS_SENTINEL_98505"
+                }
             }),
         )
         .await;
+        assert_compatibility_wire_is_secret_free(&blocked, SECRETS, "incompatible-blocked");
         assert_eq!(blocked["problem"]["code"], "incompatible-target-cli");
         let blocker_push = read_frame(&mut stream).await.unwrap();
+        assert_compatibility_wire_is_secret_free(&blocker_push, SECRETS, "incompatible-push");
         assert_eq!(blocker_push["type"], "target-view");
 
         let preview = request(
             &mut stream,
-            "compatibility-preview",
-            json!({"kind": "preview-compatibility", "target": target_name}),
+            "compatibility-probe",
+            json!({"kind": "probe-compatibility", "target": target_name}),
         )
         .await;
+        assert_compatibility_wire_is_secret_free(&preview, SECRETS, "incompatible-probe");
         assert_eq!(preview["type"], "response");
         assert_eq!(
-            preview["result"]["preview"]["compatibility"]["classification"],
+            preview["result"]["probe"]["compatibility"]["classification"],
             "incompatible"
         );
         assert_eq!(
-            preview["result"]["preview"]["compatibility"]["version"],
+            preview["result"]["probe"]["compatibility"]["version"],
             "unavailable"
         );
-        let rejected_ack = request(
+        let rejected_resolution = request(
             &mut stream,
-            "incompatible-acknowledgement",
+            "incompatible-resolution",
             json!({
                 "kind": "act", "target": target_name, "actionId": Uuid::new_v4(),
                 "expectedRevision": revision,
-                "action": {"kind": "acknowledge-compatibility", "version": "unavailable"}
+                "action": {"kind": "resolve-compatibility", "version": "unavailable"}
             }),
         )
         .await;
-        assert_eq!(rejected_ack["problem"]["code"], "incompatible-target-cli");
+        assert_compatibility_wire_is_secret_free(
+            &rejected_resolution,
+            SECRETS,
+            "incompatible-resolution-rejection",
+        );
+        assert_eq!(
+            rejected_resolution["problem"]["code"],
+            "incompatible-target-cli"
+        );
         assert!(
             !user_home
                 .join(format!(
@@ -4816,6 +5187,13 @@ async fn unmanaged_incompatible_activation_exposes_only_public_read_only_guidanc
 
 #[tokio::test]
 async fn durable_claude_shadow_problem_retains_every_exact_selector_across_reopen() {
+    const SECRETS: &[&str] = &[
+        "SELECTOR_SECRET_98601",
+        "BLOCKED_SELECTOR_SECRET_98602",
+        "SELECTOR_CONFIG_SENTINEL_98603",
+        "SELECTOR_BACKEND_SENTINEL_98604",
+        "SELECTOR_SETTINGS_SENTINEL_98605",
+    ];
     for selector in [
         ClaudeBlockingSelector::Bedrock,
         ClaudeBlockingSelector::Vertex,
@@ -4898,6 +5276,7 @@ async fn durable_claude_shadow_problem_retains_every_exact_selector_across_reope
             }),
         )
         .await;
+        assert_compatibility_wire_is_secret_free(&opened, SECRETS, "selector-open");
         let revision = opened["result"]["view"]["managementRevision"]
             .as_u64()
             .unwrap();
@@ -4910,11 +5289,15 @@ async fn durable_claude_shadow_problem_retains_every_exact_selector_across_reope
                 "action": {
                     "kind": "create-provider", "name": "blocked", "baseUrl": "https://blocked.test",
                     "model": "blocked", "credential": {"kind": "replace", "value": "BLOCKED_SELECTOR_SECRET_98602"},
-                    "authentication": "anthropic-api-key", "presetKey": null
+                    "authentication": "anthropic-api-key", "presetKey": null,
+                    "configDiagnostic": "SELECTOR_CONFIG_SENTINEL_98603",
+                    "backendDiagnostic": "SELECTOR_BACKEND_SENTINEL_98604",
+                    "settingsDiagnostic": "SELECTOR_SETTINGS_SENTINEL_98605"
                 }
             }),
         )
         .await;
+        assert_compatibility_wire_is_secret_free(&blocked, SECRETS, "selector-blocked");
         assert_eq!(blocked["problem"]["code"], "shadowing-configuration");
         assert_eq!(
             blocked["problem"]["source"],
@@ -4926,6 +5309,7 @@ async fn durable_claude_shadow_problem_retains_every_exact_selector_across_reope
         );
         assert_eq!(blocked["problem"]["selector"], selector.as_str());
         let push = read_frame(&mut stream).await.unwrap();
+        assert_compatibility_wire_is_secret_free(&push, SECRETS, "selector-push");
         let pushed_problem = push["view"]["problems"]
             .as_array()
             .unwrap()
@@ -4936,10 +5320,13 @@ async fn durable_claude_shadow_problem_retains_every_exact_selector_across_reope
         handle.shutdown().await.unwrap();
 
         let reopened = StateStore::open(&home).await.unwrap();
-        let persisted = reopened
-            .target_view_for(Target::Claude)
-            .await
-            .unwrap()
+        let reopened_view = reopened.target_view_for(Target::Claude).await.unwrap();
+        assert_compatibility_wire_is_secret_free(
+            &serde_json::to_value(&reopened_view).unwrap(),
+            SECRETS,
+            "selector-reopened",
+        );
+        let persisted = reopened_view
             .problems
             .into_iter()
             .find(|problem| problem.code == "shadowing-configuration")

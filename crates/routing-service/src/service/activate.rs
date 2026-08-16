@@ -509,12 +509,10 @@ impl ActivationService {
                 )
                 .await
             }
-            Ok(TargetAction::Reconcile { .. } | TargetAction::AcknowledgeCompatibility { .. }) => {
-                Err(self
-                    .store
-                    .failure_for(target, "invalid-provider", "Provider action is malformed")
-                    .await)
-            }
+            Ok(TargetAction::Reconcile { .. } | TargetAction::ResolveCompatibility(_)) => Err(self
+                .store
+                .failure_for(target, "invalid-provider", "Provider action is malformed")
+                .await),
             Err(_) => Err(self
                 .store
                 .failure_for(target, "invalid-provider", "Provider action is malformed")

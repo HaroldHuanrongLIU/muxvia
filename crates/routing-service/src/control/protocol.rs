@@ -173,9 +173,13 @@ pub enum ControlOperation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_context: Option<ClaudePreflightContext>,
     },
-    PreviewCompatibility {
-        target: Target,
-    },
+    ProbeCompatibility(ProbeCompatibilityOperation),
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProbeCompatibilityOperation {
+    pub target: Target,
 }
 
 /// Secret-free observations supplied while opening the Claude management context.
@@ -422,9 +426,9 @@ impl fmt::Debug for ControlOperation {
                 .field("target", target)
                 .field("strategy", strategy)
                 .finish(),
-            Self::PreviewCompatibility { target } => formatter
-                .debug_struct("PreviewCompatibility")
-                .field("target", target)
+            Self::ProbeCompatibility(operation) => formatter
+                .debug_struct("ProbeCompatibility")
+                .field("target", &operation.target)
                 .finish(),
         }
     }
@@ -484,9 +488,13 @@ pub enum TargetAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         acknowledge_version: Option<String>,
     },
-    AcknowledgeCompatibility {
-        version: String,
-    },
+    ResolveCompatibility(ResolveCompatibilityAction),
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolveCompatibilityAction {
+    pub version: String,
 }
 
 fn deserialize_positive_provider_revision<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -580,9 +588,9 @@ impl fmt::Debug for TargetAction {
                 .field("observation_token", observation_token)
                 .field("acknowledge_version", acknowledge_version)
                 .finish(),
-            Self::AcknowledgeCompatibility { version } => formatter
-                .debug_struct("AcknowledgeCompatibility")
-                .field("version", version)
+            Self::ResolveCompatibility(action) => formatter
+                .debug_struct("ResolveCompatibility")
+                .field("version", &action.version)
                 .finish(),
         }
     }
@@ -665,7 +673,13 @@ pub enum ControlResult {
     ModelDiscovery { result: ModelDiscoveryResult },
     Reachability { result: ReachabilityResult },
     ReconciliationPreview { preview: ReconciliationPreview },
-    CompatibilityPreview { preview: CompatibilityPreview },
+    CompatibilityProbe(CompatibilityProbeResult),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompatibilityProbeResult {
+    pub probe: CompatibilityProbe,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -685,8 +699,8 @@ pub enum CompatibilityClassification {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CompatibilityPreview {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompatibilityProbe {
     pub target: Target,
     pub management_revision: u64,
     pub compatibility: CompatibilityView,
@@ -719,7 +733,7 @@ pub struct ReconciliationFieldChange {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompatibilityView {
     pub version: String,
     pub classification: CompatibilityClassification,

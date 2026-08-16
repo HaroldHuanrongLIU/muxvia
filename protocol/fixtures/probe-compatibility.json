@@ -1,0 +1,8 @@
+{
+  "type": "request",
+  "requestId": "probe-compatibility",
+  "operation": {
+    "kind": "probe-compatibility",
+    "target": "codex"
+  }
+}

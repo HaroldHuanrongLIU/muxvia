@@ -45,6 +45,7 @@ const problemMessageKeys = new Map<string, MessageKey>([
   ["configuration-drift", "error.configuration-drift"],
   ["compatibility-acknowledgement-required", "error.compatibility-acknowledgement-required"],
   ["stale-reconciliation-preview", "error.stale-reconciliation-preview"],
+  ["stale-compatibility-probe", "error.stale-compatibility-probe"],
   ["target-busy", "error.target-busy"],
   ["provider-mode-active", "error.provider-mode-active"],
   ["shadowing-configuration", "error.shadowing-configuration"],

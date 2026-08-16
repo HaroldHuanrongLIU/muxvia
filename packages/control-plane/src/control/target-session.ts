@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto"
 import { ControlError, type RpcTransport } from "./rpc-client"
 import type {
   ActionOutcome,
-  CompatibilityPreview,
+  CompatibilityProbe,
   DiscoverySource,
   ClaudePreflightContext,
   ModelDiscoveryResult,
@@ -32,8 +32,8 @@ export interface TargetSession {
     strategy: ReconciliationStrategy,
     signal?: AbortSignal,
   ): Promise<ReconciliationPreview>
-  previewCompatibility(signal?: AbortSignal): Promise<CompatibilityPreview>
-  acknowledgeCompatibility(version: string): Promise<ActionOutcome>
+  probeCompatibility(signal?: AbortSignal): Promise<CompatibilityProbe>
+  resolveCompatibility(version: string): Promise<ActionOutcome>
   applyReconciliation(input: {
     strategy: ReconciliationStrategy
     observationToken: string
@@ -164,26 +164,26 @@ class TargetSessionImpl implements TargetSession {
     return freezeReconciliationPreview(response.preview)
   }
 
-  async previewCompatibility(signal?: AbortSignal): Promise<CompatibilityPreview> {
+  async probeCompatibility(signal?: AbortSignal): Promise<CompatibilityProbe> {
     if (this.#closed) {
       throw new ControlError("connection-closed", "Target session is closed")
     }
     const response = await this.#rpc.request({
-      kind: "preview-compatibility",
+      kind: "probe-compatibility",
       target: this.#target,
     }, { signal })
     if (
-      response.kind !== "compatibility-preview"
-      || response.preview.target !== this.#target
+      response.kind !== "compatibility-probe"
+      || response.probe.target !== this.#target
     ) {
       throw new ControlError("invalid-response", "Compatibility preview response did not match request")
     }
-    Object.freeze(response.preview.compatibility)
-    return Object.freeze(response.preview)
+    Object.freeze(response.probe.compatibility)
+    return Object.freeze(response.probe)
   }
 
-  acknowledgeCompatibility(version: string): Promise<ActionOutcome> {
-    return this.act({ kind: "acknowledge-compatibility", version })
+  resolveCompatibility(version: string): Promise<ActionOutcome> {
+    return this.act({ kind: "resolve-compatibility", version })
   }
 
   applyReconciliation(input: {

@@ -19,6 +19,26 @@
     },
     "reconciliationStrategy": { "enum": ["adopt", "reapply", "restore"] },
     "compatibilityClassification": { "enum": ["tested", "unknown-compatible", "incompatible"] },
+    "compatibilityView": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": { "type": "string" },
+        "classification": { "$ref": "#/$defs/compatibilityClassification" },
+        "acknowledgementRequired": { "type": "boolean" }
+      },
+      "required": ["version", "classification", "acknowledgementRequired"]
+    },
+    "compatibilityProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": { "enum": ["codex", "claude"] },
+        "managementRevision": { "type": "integer", "minimum": 0 },
+        "compatibility": { "$ref": "#/$defs/compatibilityView" }
+      },
+      "required": ["target", "managementRevision", "compatibility"]
+    },
     "reconciliationFieldState": { "enum": ["present", "absent", "unchanged", "changed"] },
     "reconciliationField": { "enum": ["provider", "credential", "current-provider", "activated-snapshot", "takeover"] },
     "shadowSource": {
@@ -34,7 +54,7 @@
         "target": { "enum": ["codex", "claude"] },
         "strategy": { "$ref": "#/$defs/reconciliationStrategy" },
         "managementRevision": { "type": "integer", "minimum": 1 },
-        "compatibility": { "type": "object", "properties": { "version": { "type": "string" }, "classification": { "$ref": "#/$defs/compatibilityClassification" }, "acknowledgementRequired": { "type": "boolean" } }, "required": ["version", "classification", "acknowledgementRequired"] },
+        "compatibility": { "$ref": "#/$defs/compatibilityView" },
         "shadowSources": { "type": "array", "items": { "$ref": "#/$defs/shadowSource" } },
         "changes": { "type": "array", "items": { "type": "object", "properties": { "field": { "$ref": "#/$defs/reconciliationField" }, "state": { "$ref": "#/$defs/reconciliationFieldState" } }, "required": ["field", "state"] } },
         "providerEffect": { "enum": ["create-new", "keep-current", "exit-managed"] },
@@ -64,7 +84,8 @@
         { "type": "object", "properties": { "kind": { "const": "act" }, "target": { "enum": ["codex", "claude"] }, "actionId": { "type": "string", "format": "uuid" }, "expectedRevision": { "type": "integer", "minimum": 0 }, "action": {} }, "required": ["kind", "target", "actionId", "expectedRevision", "action"] },
         { "type": "object", "properties": { "kind": { "const": "discover-models" }, "target": { "enum": ["codex", "claude"] }, "source": { "$ref": "#/$defs/discoverySource" } }, "required": ["kind", "target", "source"] },
         { "type": "object", "properties": { "kind": { "const": "check-reachability" }, "target": { "enum": ["codex", "claude"] }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "target", "providerId", "providerRevision"] },
-        { "type": "object", "properties": { "kind": { "const": "preview-reconciliation" }, "target": { "enum": ["codex", "claude"] }, "strategy": { "$ref": "#/$defs/reconciliationStrategy" }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind", "target", "strategy"] }
+        { "type": "object", "properties": { "kind": { "const": "preview-reconciliation" }, "target": { "enum": ["codex", "claude"] }, "strategy": { "$ref": "#/$defs/reconciliationStrategy" }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind", "target", "strategy"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "probe-compatibility" }, "target": { "enum": ["codex", "claude"] } }, "required": ["kind", "target"] }
       ]
     },
     "discoverySource": {
@@ -130,7 +151,8 @@
         { "type": "object", "properties": { "kind": { "const": "action-outcome" }, "outcome": { "type": "object", "properties": { "status": { "enum": ["applied", "replayed"] }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["status", "view"] } }, "required": ["kind", "outcome"] },
         { "type": "object", "properties": { "kind": { "const": "model-discovery" }, "result": { "$ref": "#/$defs/modelDiscoveryResult" } }, "required": ["kind", "result"] },
         { "type": "object", "properties": { "kind": { "const": "reachability" }, "result": { "$ref": "#/$defs/reachabilityResult" } }, "required": ["kind", "result"] },
-        { "type": "object", "properties": { "kind": { "const": "reconciliation-preview" }, "preview": { "$ref": "#/$defs/reconciliationPreview" } }, "required": ["kind", "preview"] }
+        { "type": "object", "properties": { "kind": { "const": "reconciliation-preview" }, "preview": { "$ref": "#/$defs/reconciliationPreview" } }, "required": ["kind", "preview"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "compatibility-probe" }, "probe": { "$ref": "#/$defs/compatibilityProbe" } }, "required": ["kind", "probe"] }
       ]
     },
     "inspectionCategory": {
@@ -161,7 +183,8 @@
         { "type": "object", "properties": { "kind": { "const": "delete-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"] },
         { "type": "object", "properties": { "kind": { "const": "duplicate-provider" }, "sourceProviderId": { "type": "string", "format": "uuid" }, "sourceProviderRevision": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/duplicateCredential" } }, "required": ["kind", "sourceProviderId", "sourceProviderRevision", "name", "baseUrl", "model", "credential"] },
         { "type": "object", "properties": { "kind": { "const": "activate-provider" }, "providerId": { "type": "string" }, "mode": { "enum": ["direct", "takeover"] } }, "required": ["kind", "providerId", "mode"] },
-        { "type": "object", "properties": { "kind": { "const": "reconcile" }, "strategy": { "$ref": "#/$defs/reconciliationStrategy" }, "observationToken": { "type": "string", "format": "uuid" }, "acknowledgeVersion": { "type": "string" } }, "required": ["kind", "strategy", "observationToken"] }
+        { "type": "object", "properties": { "kind": { "const": "reconcile" }, "strategy": { "$ref": "#/$defs/reconciliationStrategy" }, "observationToken": { "type": "string", "format": "uuid" }, "acknowledgeVersion": { "type": "string" } }, "required": ["kind", "strategy", "observationToken"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "resolve-compatibility" }, "version": { "type": "string" } }, "required": ["kind", "version"] }
       ]
     },
     "targetView": {
@@ -236,7 +259,7 @@
       "properties": {
         "code": { "type": "string" },
         "message": { "type": "string" },
-        "source": { "enum": ["control-plane-context", "user-settings", "managed-settings", "shared-project-settings", "local-project-settings"] },
+        "source": { "enum": ["control-plane-context", "user-settings", "managed-settings", "shared-project-settings", "local-project-settings", "codex-profile", "claude-managed", "claude-shared", "claude-project", "claude-local", "claude-selector", "claude-host-managed"] },
         "selector": { "$ref": "#/$defs/claudeBlockingSelector" }
       },
       "required": ["code", "message"]

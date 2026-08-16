@@ -9,7 +9,7 @@ import { RpcClient } from "../src/control/rpc-client"
 import type {
   ClientFrame,
   ClaudePreflightContext,
-  CompatibilityPreview,
+  CompatibilityProbe,
   ReconciliationPreview,
   ServerFrame,
   TargetView,
@@ -205,12 +205,12 @@ class ScriptedServer {
     })
   }
 
-  replyCompatibilityPreview(index: number, preview: CompatibilityPreview): void {
+  replyCompatibilityProbe(index: number, probe: CompatibilityProbe): void {
     const frame = this.requests()[index]!
     this.send({
       type: "response",
       requestId: frame.requestId,
-      result: { kind: "compatibility-preview", preview },
+      result: { kind: "compatibility-probe", probe },
     })
   }
 
@@ -480,7 +480,7 @@ test("reconciliation preview captures target and Claude context without waiting 
   await server.close()
 })
 
-test("compatibility preview and acknowledgement use the public target-scoped workflow", async () => {
+test("compatibility probe and resolution use the public target-scoped workflow", async () => {
   const initial = viewAtRevision(1)
   initial.problems = [{
     code: "compatibility-acknowledgement-required",
@@ -488,13 +488,13 @@ test("compatibility preview and acknowledgement use the public target-scoped wor
   }]
   const { session, server } = await openScriptedSession(initial)
 
-  const inspecting = session.previewCompatibility()
+  const inspecting = session.probeCompatibility()
   await server.waitForRequests(2)
   expect(server.requests()[1]!.operation).toEqual({
-    kind: "preview-compatibility",
+    kind: "probe-compatibility",
     target: "codex",
   })
-  const preview: CompatibilityPreview = {
+  const probe: CompatibilityProbe = {
     target: "codex",
     managementRevision: 1,
     compatibility: {
@@ -503,23 +503,23 @@ test("compatibility preview and acknowledgement use the public target-scoped wor
       acknowledgementRequired: true,
     },
   }
-  server.replyCompatibilityPreview(1, preview)
-  expect(await inspecting).toEqual(preview)
+  server.replyCompatibilityProbe(1, probe)
+  expect(await inspecting).toEqual(probe)
 
-  const acknowledging = session.acknowledgeCompatibility("codex-unknown-8.1")
+  const resolving = session.resolveCompatibility("codex-unknown-8.1")
   await server.waitForRequests(3)
   expect(server.requests()[2]!.operation).toMatchObject({
     kind: "act",
     target: "codex",
     expectedRevision: 1,
     action: {
-      kind: "acknowledge-compatibility",
+      kind: "resolve-compatibility",
       version: "codex-unknown-8.1",
     },
   })
   const acknowledged = viewAtRevision(1, 2)
   server.replyApplied(acknowledged)
-  expect((await acknowledging).view).toEqual(acknowledged)
+  expect((await resolving).view).toEqual(acknowledged)
   expect(session.get()).toEqual(acknowledged)
 
   await session.close()

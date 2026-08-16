@@ -3,7 +3,7 @@ import { useTerminalDimensions } from "@opentui/solid"
 import { For, onMount, Show, type Accessor } from "solid-js"
 
 import { useCommandLayer } from "../commands/keymap"
-import type { CompatibilityPreview, ReconciliationPreview, ReconciliationStrategy, Target } from "../control/types"
+import type { CompatibilityProbe, ReconciliationPreview, ReconciliationStrategy, Target } from "../control/types"
 import { messageKeyForProblem, type MessageKey, type Translator } from "../i18n"
 import { theme } from "../theme"
 
@@ -12,7 +12,7 @@ export interface ReconciliationUiState {
   strategy?: ReconciliationStrategy
   preview?: ReconciliationPreview
   compatibilityOnly?: boolean
-  compatibilityPreview?: CompatibilityPreview
+  compatibilityProbe?: CompatibilityProbe
   pending?: "preview" | "apply"
   errorCode?: string
   acknowledgedVersion?: string
@@ -22,7 +22,7 @@ export interface ReconciliationProps {
   state: Accessor<ReconciliationUiState>
   t: Translator
   onPreview: (strategy: ReconciliationStrategy) => void
-  onAcknowledge: (version: string) => void
+  onResolve: (version: string) => void
   onApply: () => void
   onCancel: () => void
 }
@@ -112,25 +112,32 @@ export function Reconciliation(props: ReconciliationProps) {
     if (input && !input.isDestroyed) input.focus()
   }))
 
-  const acknowledge = () => {
+  const resolveCompatibility = () => {
     const preview = props.state().compatibilityOnly
-      ? props.state().compatibilityPreview
+      ? props.state().compatibilityProbe
       : props.state().preview
     if (
       props.state().pending
-      || !preview?.compatibility.acknowledgementRequired
-      || preview.compatibility.classification !== "unknown-compatible"
+      || !preview
+      || preview.compatibility.classification === "incompatible"
     ) return
-    props.onAcknowledge(preview.compatibility.version)
+    if (
+      !props.state().compatibilityOnly
+      && (
+        !preview.compatibility.acknowledgementRequired
+        || preview.compatibility.classification !== "unknown-compatible"
+      )
+    ) return
+    props.onResolve(preview.compatibility.version)
   }
   const onKeyDown = (event: KeyEvent) => {
     if (event.name !== "y") return
     event.preventDefault()
     event.stopPropagation()
-    acknowledge()
+    resolveCompatibility()
   }
   const capture = (value: string) => {
-    if (value.toLowerCase().includes("y")) acknowledge()
+    if (value.toLowerCase().includes("y")) resolveCompatibility()
   }
   const padding = () => dimensions().width > 3 ? 1 : 0
 
@@ -195,7 +202,7 @@ export function Reconciliation(props: ReconciliationProps) {
         </text>
       </Show>
     </box>}</For>
-    <For each={props.state().compatibilityPreview ? [props.state().compatibilityPreview!] : []}>{(preview) => <box flexDirection="column">
+    <For each={props.state().compatibilityProbe ? [props.state().compatibilityProbe!] : []}>{(preview) => <box flexDirection="column">
       <text fg={preview.compatibility.classification === "incompatible" ? theme.error : theme.text}>
         {props.t(compatibilityKey(preview), { version: preview.compatibility.version })}
       </text>
@@ -204,14 +211,19 @@ export function Reconciliation(props: ReconciliationProps) {
           {props.t("reconciliation.acknowledgement", { version: preview.compatibility.version })}
         </text>
       </Show>
+      <text fg={theme.warning}>{props.t("reconciliation.boundary")}</text>
     </box>}</For>
     <Show when={props.state().pending === "apply"}>
-      <text fg={theme.warning}>{props.t("reconciliation.applying")}</text>
+      <text fg={theme.warning}>{props.t(props.state().compatibilityOnly
+        ? "reconciliation.compatibility.resolving"
+        : "reconciliation.applying")}</text>
     </Show>
     <text fg={theme.muted}>{props.t(props.state().compatibilityOnly
-      ? props.state().compatibilityPreview?.compatibility.classification === "incompatible"
+      ? props.state().compatibilityProbe?.compatibility.classification === "incompatible"
         ? "reconciliation.compatibility.read-only-help"
-        : "reconciliation.compatibility.help"
+        : props.state().compatibilityProbe?.compatibility.classification === "tested"
+          ? "reconciliation.compatibility.tested-help"
+          : "reconciliation.compatibility.help"
       : "reconciliation.help")}</text>
   </box>
 }

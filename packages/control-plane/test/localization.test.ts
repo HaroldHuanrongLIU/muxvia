@@ -105,6 +105,11 @@ test("Reconciliation compatibility, strategy, field, shadow, stale, busy, acknow
     english("reconciliation.strategy.reapply"),
     english("reconciliation.strategy.restore"),
     english("reconciliation.acknowledgement", { version: "9.9.9" }),
+    english("reconciliation.compatibility.tested-help"),
+    english("reconciliation.compatibility.resolving"),
+    english("activity.compatibility.acknowledged", { version: "9.9.9" }),
+    english("activity.compatibility.resolved", { version: "9.9.9" }),
+    english("error.stale-compatibility-probe"),
     english("error.stale-reconciliation-preview"),
     english("error.target-busy"),
     english("reconciliation.restart.codex"),
@@ -121,6 +126,11 @@ test("Reconciliation compatibility, strategy, field, shadow, stale, busy, acknow
     "Reapply committed configuration",
     "Restore pre-Muxvia configuration",
     "I acknowledge untested Target CLI version 9.9.9.",
+    "Y resolve tested version · Esc cancel",
+    "Resolving compatibility status…",
+    "Compatibility acknowledgement recorded: 9.9.9",
+    "Compatibility status resolved: 9.9.9",
+    "Target compatibility changed. Probe it again.",
     "Target state changed. Preview the reconciliation again.",
     "This Target has active model requests. Retry Restore when it is idle.",
     "Restart Codex after applying this reconciliation.",
@@ -138,6 +148,11 @@ test("Reconciliation compatibility, strategy, field, shadow, stale, busy, acknow
     chinese("reconciliation.strategy.reapply"),
     chinese("reconciliation.strategy.restore"),
     chinese("reconciliation.acknowledgement", { version: "9.9.9" }),
+    chinese("reconciliation.compatibility.tested-help"),
+    chinese("reconciliation.compatibility.resolving"),
+    chinese("activity.compatibility.acknowledged", { version: "9.9.9" }),
+    chinese("activity.compatibility.resolved", { version: "9.9.9" }),
+    chinese("error.stale-compatibility-probe"),
     chinese("error.stale-reconciliation-preview"),
     chinese("error.target-busy"),
     chinese("reconciliation.restart.codex"),
@@ -154,6 +169,11 @@ test("Reconciliation compatibility, strategy, field, shadow, stale, busy, acknow
     "重新应用已提交配置",
     "恢复 Muxvia 之前的配置",
     "我确认使用未经测试的 Target CLI 版本 9.9.9。",
+    "Y 解决已测试版本状态 · Esc 取消",
+    "正在解决兼容性状态…",
+    "已记录兼容性确认：9.9.9",
+    "已解决兼容性状态：9.9.9",
+    "Target 兼容性已更改。请重新探测。",
     "Target 状态已更改。请重新预览协调操作。",
     "此 Target 有活动的模型请求。请在空闲时重试恢复。",
     "应用此协调操作后重启 Codex。",
@@ -164,6 +184,7 @@ test("Reconciliation compatibility, strategy, field, shadow, stale, busy, acknow
 test("Reconciliation stable problems map to fixed localized diagnostics", () => {
   expect(messageKeyForProblem("compatibility-acknowledgement-required")).toBe("error.compatibility-acknowledgement-required")
   expect(messageKeyForProblem("stale-reconciliation-preview")).toBe("error.stale-reconciliation-preview")
+  expect(messageKeyForProblem("stale-compatibility-probe")).toBe("error.stale-compatibility-probe")
   expect(messageKeyForProblem("target-busy")).toBe("error.target-busy")
 })
 

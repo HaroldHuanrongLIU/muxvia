@@ -51,11 +51,20 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "discover-models.json",
         "check-reachability.json",
         "cancel-inspection.json",
+        "probe-compatibility.json",
     ] {
         let frame = fixture(name);
         let parsed: ClientFrame = serde_json::from_value(frame.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), frame);
     }
+
+    let compatibility_probe = fixture("compatibility-probe.json");
+    let parsed: ServerFrame = serde_json::from_value(compatibility_probe.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), compatibility_probe);
+
+    let resolve_compatibility = fixture("resolve-compatibility.json");
+    let parsed: TargetAction = serde_json::from_value(resolve_compatibility.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), resolve_compatibility);
 }
 
 // Catches a protocol mutation that accepts arbitrary reconciliation discriminators,
@@ -129,6 +138,98 @@ fn reconciliation_preview_and_apply_contracts_are_closed_and_secret_free() {
             "accepted invalid reconciliation action {field}"
         );
     }
+}
+
+#[test]
+fn compatibility_probe_and_resolution_contracts_are_exact_closed_and_secret_free() {
+    let probe_request = fixture("probe-compatibility.json");
+    let probe_response = fixture("compatibility-probe.json");
+    let resolution = fixture("resolve-compatibility.json");
+
+    for (mut invalid, pointer) in [
+        (probe_request.clone(), "/operation"),
+        (probe_response.clone(), "/result"),
+        (probe_response.clone(), "/result/probe"),
+        (resolution.clone(), ""),
+    ] {
+        let object = if pointer.is_empty() {
+            invalid.as_object_mut().unwrap()
+        } else {
+            invalid
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+        };
+        object.insert(
+            "additiveSecret".into(),
+            serde_json::json!("COMPATIBILITY_PROTOCOL_SECRET_98711"),
+        );
+        let rejected = if pointer == "/operation" {
+            serde_json::from_value::<ClientFrame>(invalid).is_err()
+        } else if pointer.starts_with("/result") {
+            serde_json::from_value::<ServerFrame>(invalid).is_err()
+        } else {
+            serde_json::from_value::<TargetAction>(invalid).is_err()
+        };
+        assert!(rejected, "accepted additive compatibility protocol field");
+    }
+
+    for legacy in [
+        serde_json::json!({"kind": "preview-compatibility", "target": "codex"}),
+        serde_json::json!({"kind": "acknowledge-compatibility", "version": "0.42.0"}),
+    ] {
+        assert!(
+            serde_json::from_value::<muxvia_routing::control::protocol::ControlOperation>(
+                legacy.clone()
+            )
+            .is_err()
+                && serde_json::from_value::<TargetAction>(legacy).is_err(),
+            "accepted removed compatibility discriminator"
+        );
+    }
+
+    let schema = fixture("../control-v1.schema.json");
+    let operation_branches = schema["$defs"]["controlOperation"]["oneOf"]
+        .as_array()
+        .unwrap();
+    let result_branches = schema["$defs"]["controlResult"]["oneOf"]
+        .as_array()
+        .unwrap();
+    let action_branches = schema["$defs"]["targetAction"]["oneOf"].as_array().unwrap();
+    assert!(operation_branches.iter().any(|branch| {
+        branch["properties"]["kind"]["const"] == "probe-compatibility"
+            && branch["additionalProperties"] == false
+    }));
+    assert!(result_branches.iter().any(|branch| {
+        branch["properties"]["kind"]["const"] == "compatibility-probe"
+            && branch["additionalProperties"] == false
+    }));
+    assert!(action_branches.iter().any(|branch| {
+        branch["properties"]["kind"]["const"] == "resolve-compatibility"
+            && branch["additionalProperties"] == false
+    }));
+    assert_eq!(
+        schema["$defs"]["controlProblem"]["properties"]["selector"]["$ref"],
+        "#/$defs/claudeBlockingSelector"
+    );
+    assert_eq!(
+        schema["$defs"]["controlProblem"]["properties"]["source"]["enum"],
+        serde_json::json!([
+            "control-plane-context",
+            "user-settings",
+            "managed-settings",
+            "shared-project-settings",
+            "local-project-settings",
+            "codex-profile",
+            "claude-managed",
+            "claude-shared",
+            "claude-project",
+            "claude-local",
+            "claude-selector",
+            "claude-host-managed"
+        ])
+    );
 }
 
 #[test]

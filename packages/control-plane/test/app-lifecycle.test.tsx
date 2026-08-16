@@ -103,8 +103,8 @@ class LifecycleSession implements TargetSession {
   async checkReachability(): Promise<never> { throw new Error("not used by this fixture") }
   async previewReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
   async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
-  async previewCompatibility(): Promise<never> { throw new Error("compatibility preview not configured in this fixture") }
-  async acknowledgeCompatibility(): Promise<never> { throw new Error("compatibility acknowledgement not configured in this fixture") }
+  async probeCompatibility(): Promise<never> { throw new Error("compatibility probe not configured in this fixture") }
+  async resolveCompatibility(): Promise<never> { throw new Error("compatibility resolution not configured in this fixture") }
   async act(action: TargetAction): Promise<ActionOutcome> {
     if (action.kind === "create-provider") {
       this.saveCalls++

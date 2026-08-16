@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
 
 import type { TargetSession } from "../src/control/target-session"
-import type { ActionOutcome, ReconciliationPreview, ReconciliationStrategy, TargetAction, TargetView } from "../src/control/types"
+import type { ActionOutcome, CompatibilityProbe, ReconciliationPreview, ReconciliationStrategy, TargetAction, TargetView } from "../src/control/types"
 import { App } from "../src/ui/app"
 
 const sizes = [[1, 1], [2, 2], [20, 5], [40, 10], [80, 24], [120, 30], [121, 30]] as const
@@ -30,11 +30,14 @@ function view(): TargetView {
 class StaticTargetSession implements TargetSession {
   readonly #view: TargetView
 
-  constructor(target: "codex" | "claude" = "codex", drifted = false) {
+  constructor(
+    target: "codex" | "claude" = "codex",
+    problem?: "configuration-drift" | "compatibility-acknowledgement-required",
+  ) {
     this.#view = {
       ...view(),
       target,
-      problems: drifted ? [{ code: "configuration-drift", message: "must-not-render" }] : [],
+      problems: problem ? [{ code: problem, message: "must-not-render" }] : [],
     }
   }
 
@@ -59,8 +62,18 @@ class StaticTargetSession implements TargetSession {
     }
   }
   async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
-  async previewCompatibility(): Promise<never> { throw new Error("compatibility preview not configured in this fixture") }
-  async acknowledgeCompatibility(): Promise<never> { throw new Error("compatibility acknowledgement not configured in this fixture") }
+  async probeCompatibility(): Promise<CompatibilityProbe> {
+    return {
+      target: this.#view.target,
+      managementRevision: this.#view.managementRevision,
+      compatibility: {
+        version: `${this.#view.target}-tested-responsive`,
+        classification: "tested",
+        acknowledgementRequired: false,
+      },
+    }
+  }
+  async resolveCompatibility(): Promise<never> { throw new Error("compatibility resolution not configured in this fixture") }
 
   async act(_action: TargetAction): Promise<ActionOutcome> {
     return { status: "applied", view: this.#view }
@@ -179,7 +192,7 @@ test("Claude renders the exact extreme-size matrix without excluded application 
 test.each(["codex", "claude"] as const)(
   "Reconciliation modal renders the exact extreme-size matrix for %s",
   async (target) => {
-    const session = new StaticTargetSession(target, true)
+    const session = new StaticTargetSession(target, "configuration-drift")
     const setup = await testRender(() => <App sessions={{ [target]: session }} />, {
       width: 80,
       height: 24,
@@ -199,6 +212,39 @@ test.each(["codex", "claude"] as const)(
         expect(() => setup.captureCharFrame()).not.toThrow()
         expectExcludedChrome(setup.captureCharFrame())
       }
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)
+
+test.each(["codex", "claude"] as const)(
+  "Compatibility Probe overlay keeps the tested resolution boundary renderable at every size for %s",
+  async (target) => {
+    const session = new StaticTargetSession(target, "compatibility-acknowledgement-required")
+    const setup = await testRender(() => <App sessions={{ [target]: session }} />, {
+      width: 80,
+      height: 24,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey(target === "codex" ? "1" : "2")
+      await setup.mockInput.typeText("/reconcile")
+      setup.mockInput.pressEnter()
+      await setup.waitForFrame((frame) => frame.includes(`${target}-tested-responsive`))
+      for (const [width, height] of sizes) {
+        setup.resize(width, height)
+        await setup.renderOnce()
+        expect(() => setup.captureCharFrame()).not.toThrow()
+        expectExcludedChrome(setup.captureCharFrame())
+      }
+      setup.resize(80, 24)
+      await setup.renderOnce()
+      const regular = setup.captureCharFrame()
+      expect(regular).toContain("Command-line flags and resumed sessions may still")
+      expect(regular).toContain("Y resolve tested version")
     } finally {
       setup.renderer.destroy()
     }

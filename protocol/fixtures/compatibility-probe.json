@@ -1,0 +1,16 @@
+{
+  "type": "response",
+  "requestId": "probe-compatibility",
+  "result": {
+    "kind": "compatibility-probe",
+    "probe": {
+      "target": "codex",
+      "managementRevision": 5,
+      "compatibility": {
+        "version": "codex-cli 0.42.0",
+        "classification": "tested",
+        "acknowledgementRequired": false
+      }
+    }
+  }
+}

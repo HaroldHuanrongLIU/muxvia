@@ -27,8 +27,11 @@ test.each([
   ["discover-models.json", parseClientFrame],
   ["check-reachability.json", parseClientFrame],
   ["cancel-inspection.json", parseClientFrame],
+  ["probe-compatibility.json", parseClientFrame],
+  ["compatibility-probe.json", parseServerFrame],
   ["preview-reconciliation.json", parseServerFrame],
   ["apply-reconciliation.json", parseTargetAction],
+  ["resolve-compatibility.json", parseTargetAction],
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)
@@ -76,6 +79,40 @@ test("reconciliation contracts are closed, validated, and secret-free", async ()
   expect(() => parseTargetAction({
     kind: "reconcile", strategy: "automatic", observationToken: "00000000-0000-4000-8000-000000000701",
   })).toThrow()
+})
+
+test("compatibility Probe and Resolve contracts are exact closed and secret-free", async () => {
+  const request = await readFixture("probe-compatibility.json") as any
+  const response = await readFixture("compatibility-probe.json") as any
+  const resolution = await readFixture("resolve-compatibility.json") as any
+  for (const [value, mutate, parse] of [
+    [request, (copy: any) => { copy.operation.additiveSecret = "COMPATIBILITY_PROTOCOL_SECRET_98711" }, parseClientFrame],
+    [response, (copy: any) => { copy.result.additiveSecret = "COMPATIBILITY_PROTOCOL_SECRET_98711" }, parseServerFrame],
+    [response, (copy: any) => { copy.result.probe.additiveSecret = "COMPATIBILITY_PROTOCOL_SECRET_98711" }, parseServerFrame],
+    [resolution, (copy: any) => { copy.additiveSecret = "COMPATIBILITY_PROTOCOL_SECRET_98711" }, parseTargetAction],
+  ] as const) {
+    const invalid = structuredClone(value)
+    mutate(invalid)
+    expect(() => parse(invalid)).toThrow()
+  }
+  expect(() => parseClientFrame({
+    type: "request", requestId: "legacy", operation: { kind: "preview-compatibility", target: "codex" },
+  })).toThrow()
+  expect(() => parseTargetAction({ kind: "acknowledge-compatibility", version: "0.42.0" })).toThrow()
+
+  const schema = JSON.parse(await readFile(fileURLToPath(new URL("../../../protocol/control-v1.schema.json", import.meta.url)), "utf8"))
+  const branch = (definition: string, discriminator: string) => schema.$defs[definition].oneOf.find(
+    (candidate: any) => candidate.properties.kind.const === discriminator,
+  )
+  expect(branch("controlOperation", "probe-compatibility")?.additionalProperties).toBeFalse()
+  expect(branch("controlResult", "compatibility-probe")?.additionalProperties).toBeFalse()
+  expect(branch("targetAction", "resolve-compatibility")?.additionalProperties).toBeFalse()
+  expect(schema.$defs.controlProblem.properties.source.enum).toEqual([
+    "control-plane-context", "user-settings", "managed-settings",
+    "shared-project-settings", "local-project-settings", "codex-profile",
+    "claude-managed", "claude-shared", "claude-project", "claude-local",
+    "claude-selector", "claude-host-managed",
+  ])
 })
 
 test("round-trips target-scoped reconciliation preview requests with Claude context", () => {

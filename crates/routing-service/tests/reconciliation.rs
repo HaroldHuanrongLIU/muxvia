@@ -2660,7 +2660,7 @@ async fn ordinary_write_gates_are_target_local_while_read_only_operations_remain
     );
     let compatibility_preview = request(
         &mut claude,
-        "peer-compatibility-preview",
+        "peer-compatibility-probe",
         json!({"kind":"preview-reconciliation","target":"claude","strategy":"reapply"}),
     )
     .await;

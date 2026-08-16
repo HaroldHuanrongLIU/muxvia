@@ -643,12 +643,13 @@ impl StateStore {
             .map_err(super::store::map_state_call_error)
     }
 
-    pub(crate) async fn apply_compatibility_acknowledgement(
+    pub(crate) async fn apply_compatibility_resolution(
         &self,
         target: Target,
         action_id: Uuid,
         expected_revision: u64,
         version: String,
+        compatibility: CompatibilityView,
     ) -> Result<Result<ActionOutcome, ActionFailure>, StateError> {
         let service_epoch = self.service_epoch().to_string();
         self.connection
@@ -691,9 +692,7 @@ impl StateStore {
                             authoritative_view,
                         }));
                     }
-                    let compatibility = read_compatibility(&transaction, target)?;
-                    if compatibility.classification
-                        != CompatibilityClassification::UnknownCompatible
+                    if compatibility.classification == CompatibilityClassification::Incompatible
                         || compatibility.version != version
                     {
                         let code = if compatibility.classification
@@ -701,7 +700,7 @@ impl StateStore {
                         {
                             "incompatible-target-cli"
                         } else {
-                            "compatibility-acknowledgement-required"
+                            "stale-compatibility-probe"
                         };
                         let authoritative_view =
                             project_target_view_for(&transaction, &service_epoch, target)?;
@@ -709,21 +708,36 @@ impl StateStore {
                         return Ok(Err(ActionFailure {
                             problem: crate::control::protocol::ControlProblem {
                                 code: code.into(),
-                                message: "Compatibility acknowledgement is not valid".into(),
+                                message: "Compatibility resolution is not valid".into(),
                                 source: None,
                                 selector: None,
                             },
                             authoritative_view,
                         }));
                     }
+                    let classification = compatibility.classification.as_str();
+                    let acknowledged_version = (compatibility.classification
+                        == CompatibilityClassification::UnknownCompatible)
+                        .then(|| version.clone());
                     transaction.execute(
-                        "UPDATE target_compatibility SET acknowledged_version = ?1
-                         WHERE target = ?2",
-                        params![version, target.as_str()],
+                        "INSERT INTO target_compatibility
+                           (target, observed_version, classification, acknowledged_version)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(target) DO UPDATE SET
+                           observed_version = excluded.observed_version,
+                           classification = excluded.classification,
+                           acknowledged_version = excluded.acknowledged_version",
+                        params![
+                            target.as_str(),
+                            version,
+                            classification,
+                            acknowledged_version
+                        ],
                     )?;
                     transaction.execute(
                         "DELETE FROM target_problems
-                         WHERE target = ?1 AND code = 'compatibility-acknowledgement-required'",
+                         WHERE target = ?1 AND code IN
+                           ('compatibility-acknowledgement-required', 'incompatible-target-cli')",
                         [target.as_str()],
                     )?;
                     transaction.execute(
@@ -739,7 +753,7 @@ impl StateStore {
                     transaction.execute(
                         "INSERT INTO action_receipts
                          (target, action_id, action_kind, committed_revision, outcome_json)
-                         VALUES (?1, ?2, 'acknowledge-compatibility', ?3, ?4)",
+                         VALUES (?1, ?2, 'resolve-compatibility', ?3, ?4)",
                         params![
                             target.as_str(),
                             action_id.to_string(),

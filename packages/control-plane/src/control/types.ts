@@ -174,7 +174,7 @@ const compatibilityViewSchema = z.object({
   version: z.string(),
   classification: compatibilityClassificationSchema,
   acknowledgementRequired: z.boolean(),
-})
+}).strict()
 const reconciliationFieldStateSchema = z.enum(["present", "absent", "unchanged", "changed"])
 const reconciliationFieldSchema = z.enum([
   "provider",
@@ -260,9 +260,9 @@ const targetActionSchema = z.discriminatedUnion("kind", [
     acknowledgeVersion: z.string().optional(),
   }),
   z.object({
-    kind: z.literal("acknowledge-compatibility"),
+    kind: z.literal("resolve-compatibility"),
     version: z.string(),
-  }),
+  }).strict(),
 ])
 
 const controlOperationSchema = z.discriminatedUnion("kind", [
@@ -296,16 +296,16 @@ const controlOperationSchema = z.discriminatedUnion("kind", [
     claudeContext: claudePreflightContextSchema.optional(),
   }),
   z.object({
-    kind: z.literal("preview-compatibility"),
+    kind: z.literal("probe-compatibility"),
     target: targetSchema,
-  }),
+  }).strict(),
 ])
 
-const compatibilityPreviewSchema = z.object({
+const compatibilityProbeSchema = z.object({
   target: targetSchema,
   managementRevision: z.number().int().nonnegative(),
   compatibility: compatibilityViewSchema,
-})
+}).strict()
 
 const actionOutcomeSchema = z.object({
   status: z.enum(["applied", "replayed"]),
@@ -380,7 +380,7 @@ const controlResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("model-discovery"), result: modelDiscoveryResultSchema }),
   z.object({ kind: z.literal("reachability"), result: reachabilityResultSchema }),
   z.object({ kind: z.literal("reconciliation-preview"), preview: reconciliationPreviewSchema }),
-  z.object({ kind: z.literal("compatibility-preview"), preview: compatibilityPreviewSchema }),
+  z.object({ kind: z.literal("compatibility-probe"), probe: compatibilityProbeSchema }).strict(),
 ])
 
 const clientFrameSchema = z.discriminatedUnion("type", [
@@ -423,7 +423,7 @@ export type ModelDiscoveryResult = z.infer<typeof modelDiscoveryResultSchema>
 export type ReachabilityResult = z.infer<typeof reachabilityResultSchema>
 export type ReconciliationStrategy = z.infer<typeof reconciliationStrategySchema>
 export type CompatibilityClassification = z.infer<typeof compatibilityClassificationSchema>
-export type CompatibilityPreview = z.infer<typeof compatibilityPreviewSchema>
+export type CompatibilityProbe = z.infer<typeof compatibilityProbeSchema>
 export type ReconciliationPreview = z.infer<typeof reconciliationPreviewSchema>
 
 export const parseClientFrame = (value: unknown): ClientFrame => clientFrameSchema.parse(value)

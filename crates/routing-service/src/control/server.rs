@@ -24,8 +24,9 @@ use crate::{
     control::{
         framing::{FrameError, read_frame, write_frame},
         protocol::{
-            ClientFrame, ControlOperation, ControlProblem, ControlResult, DiscoverySource,
-            FrameLimit, RpcVersion, ServerFrame, Target, TargetView,
+            ClaudePreflightContext, ClientFrame, ControlOperation, ControlProblem, ControlResult,
+            DiscoverySource, FrameLimit, ReconciliationStrategy, RpcVersion, ServerFrame, Target,
+            TargetView,
         },
     },
     domain::provider::has_valid_provider_authentication,
@@ -40,6 +41,7 @@ use crate::{
 
 const RESPONSE_QUEUE_CAPACITY: usize = 32;
 const MAX_IN_FLIGHT_INSPECTIONS_PER_SESSION: usize = 4;
+const FRAME_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Error)]
 pub enum ControlServerError {
@@ -68,6 +70,7 @@ pub struct ControlServerHandle {
 struct ServerLifecycle {
     accepted: AtomicBool,
     active_sessions: AtomicUsize,
+    active_writers: AtomicUsize,
     pending_actions: AtomicUsize,
     pending_inspections: AtomicUsize,
 }
@@ -77,6 +80,31 @@ struct SessionGuard(Arc<ServerLifecycle>);
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         self.0.active_sessions.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct WriterGuard(Option<Arc<ServerLifecycle>>);
+
+impl WriterGuard {
+    fn new(lifecycle: Arc<ServerLifecycle>) -> Self {
+        lifecycle.active_writers.fetch_add(1, Ordering::AcqRel);
+        Self(Some(lifecycle))
+    }
+
+    fn closed(mut self) {
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if let Some(lifecycle) = self.0.take() {
+            lifecycle.active_writers.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -332,8 +360,51 @@ impl ControlServerHandle {
     }
 
     #[doc(hidden)]
+    pub fn tracked_sessions(&self) -> usize {
+        self.lifecycle.active_sessions.load(Ordering::Acquire)
+    }
+
+    #[doc(hidden)]
+    pub fn tracked_writers(&self) -> usize {
+        self.lifecycle.active_writers.load(Ordering::Acquire)
+    }
+
+    #[doc(hidden)]
     pub async fn tracked_reconciliation_tokens(&self) -> usize {
         self.reconciliation.token_count().await
+    }
+
+    #[doc(hidden)]
+    pub async fn tracks_reconciliation_token(
+        &self,
+        target: Target,
+        strategy: ReconciliationStrategy,
+        token: uuid::Uuid,
+    ) -> bool {
+        self.reconciliation
+            .tracks_token(target, strategy, token)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn validates_reconciliation_token(
+        &self,
+        target: Target,
+        strategy: ReconciliationStrategy,
+        token: uuid::Uuid,
+        claude_context: Option<ClaudePreflightContext>,
+    ) -> bool {
+        let context = match target {
+            Target::Codex => ReconciliationContext::Codex,
+            Target::Claude => match claude_context {
+                Some(context) => ReconciliationContext::Claude(context),
+                None => return false,
+            },
+        };
+        self.reconciliation
+            .validate_preview(target, strategy, token, context)
+            .await
+            .is_ok()
     }
 
     pub fn request_shutdown(&mut self) {
@@ -494,7 +565,8 @@ async fn serve_session(
 
     let (mut reader, writer) = stream.into_split();
     let (responses, response_rx) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
-    let mut writer_task = tokio::spawn(write_responses(writer, response_rx));
+    let writer_guard = WriterGuard::new(Arc::clone(&lifecycle));
+    let mut writer_task = tokio::spawn(write_responses(writer, response_rx, writer_guard));
     let mut opened_target = None;
     let mut opened_claude_context = None;
     let mut update_rx = store.subscribe_target_views();
@@ -918,15 +990,26 @@ fn enqueue_response(responses: &mpsc::Sender<QueuedResponse>, frame: ServerFrame
 async fn write_responses(
     mut writer: tokio::net::unix::OwnedWriteHalf,
     mut responses: mpsc::Receiver<QueuedResponse>,
+    writer_guard: WriterGuard,
 ) {
     while let Some(response) = responses.recv().await {
-        if write_frame(&mut writer, &response.frame).await.is_err() {
+        let QueuedResponse { frame, written } = response;
+        if !matches!(
+            tokio::time::timeout(FRAME_WRITE_TIMEOUT, write_frame(&mut writer, &frame)).await,
+            Ok(Ok(_))
+        ) {
+            drop(writer);
+            writer_guard.closed();
+            drop(written);
+            drop(responses);
             return;
         }
-        if let Some(written) = response.written {
+        if let Some(written) = written {
             let _ = written.send(());
         }
     }
+    drop(writer);
+    writer_guard.closed();
 }
 
 fn problem_frame(

@@ -1,16 +1,12 @@
-use std::{
-    fmt,
-    future::Future,
-    path::Path,
-    pin::Pin,
-    process::{Command, Stdio},
-};
+use std::{fmt, future::Future, path::Path, pin::Pin, process::Command};
 
-use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::control::protocol::CompatibilityClassification;
+use crate::{
+    control::protocol::CompatibilityClassification,
+    probe_process::{self, ProbeProcessError},
+};
 
 const TESTED_CODEX_VERSION: &str = "codex-cli 0.106.0";
 
@@ -225,64 +221,14 @@ async fn run_read_only_cancellable(
     argument: &str,
     cancellation: CancellationToken,
 ) -> Result<String, CodexProblem> {
-    let mut command = tokio::process::Command::new(executable);
-    command
-        .arg(argument)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = command
-        .spawn()
-        .map_err(|_| CodexProblem::new("incompatible-target-cli", Some(executable)))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| CodexProblem::new("incompatible-target-cli", Some(executable)))?;
-    let mut reader = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
-    });
-    let status = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            reader.abort();
-            let _ = reader.await;
-            return Err(CodexProblem::new("probe-cancelled", Some(executable)));
-        }
-        status = child.wait() => status,
-    };
-    let status = match status {
-        Ok(status) => status,
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            reader.abort();
-            let _ = reader.await;
-            return Err(CodexProblem::new(
-                "incompatible-target-cli",
-                Some(executable),
-            ));
-        }
-    };
-    let output = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            reader.abort();
-            let _ = reader.await;
-            return Err(CodexProblem::new("probe-cancelled", Some(executable)));
-        }
-        output = &mut reader => output,
-    }
-    .map_err(|_| CodexProblem::new("incompatible-target-cli", Some(executable)))?
-    .map_err(|_| CodexProblem::new("incompatible-target-cli", Some(executable)))?;
-    if !status.success() {
-        return Err(CodexProblem::new(
-            "incompatible-target-cli",
-            Some(executable),
-        ));
-    }
+    let output = probe_process::run_cancellable(executable, argument, cancellation)
+        .await
+        .map_err(|error| match error {
+            ProbeProcessError::Cancelled => CodexProblem::new("probe-cancelled", Some(executable)),
+            ProbeProcessError::Failed => {
+                CodexProblem::new("incompatible-target-cli", Some(executable))
+            }
+        })?;
     String::from_utf8(output)
         .map_err(|_| CodexProblem::new("incompatible-target-cli", Some(executable)))
 }

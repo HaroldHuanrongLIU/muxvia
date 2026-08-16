@@ -5,5 +5,6 @@ pub mod control;
 pub mod domain;
 pub mod home;
 pub mod model;
+mod probe_process;
 pub mod service;
 pub mod state;

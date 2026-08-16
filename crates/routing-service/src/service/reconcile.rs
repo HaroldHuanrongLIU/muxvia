@@ -471,6 +471,19 @@ impl ReconciliationService {
     pub(crate) async fn token_count(&self) -> usize {
         self.tokens.lock().await.len()
     }
+
+    pub(crate) async fn tracks_token(
+        &self,
+        target: Target,
+        strategy: ReconciliationStrategy,
+        token: Uuid,
+    ) -> bool {
+        self.tokens
+            .lock()
+            .await
+            .get(&ObservationKey(target, strategy))
+            .is_some_and(|record| record.token == token)
+    }
 }
 
 impl ObservationRecord {

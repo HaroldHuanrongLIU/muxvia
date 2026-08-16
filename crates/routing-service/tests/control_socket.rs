@@ -19,7 +19,10 @@ use muxvia_routing::{
     codex::{CodexCapability, CodexProbe, CodexProblem, CommandCodexProbe},
     control::{
         framing::{FrameError, read_frame, write_frame},
-        protocol::{ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState, Target},
+        protocol::{
+            ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState,
+            ReconciliationStrategy, Target,
+        },
         server::{ControlServer, ControlServerHandle, peer_uid_matches},
     },
     home::MuxviaHome,
@@ -1737,7 +1740,6 @@ async fn target_isolation_scopes_pushes_actions_and_receipts_to_the_opened_targe
             .management_revision,
         1
     );
-
     let mismatch = request(
         &mut claude,
         "cross-target",
@@ -1839,6 +1841,129 @@ async fn wait_for_inspections(fixture: &ControlFixture, expected: usize) {
 
 async fn wait_for_zero_inspections(fixture: &ControlFixture) {
     wait_for_inspections(fixture, 0).await;
+}
+
+async fn backpressure_reconciliation_fixture() -> ControlFixture {
+    let root = short_temp_root("mx-writer-bound");
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    seed_codex_direct(&home, Arc::clone(&store)).await;
+    let revision = store.target_view().await.unwrap().management_revision;
+    store
+        .apply_provider_action(
+            Uuid::new_v4(),
+            revision,
+            json!({
+                "kind": "create-provider",
+                "name": "Large response",
+                "baseUrl": "https://provider.example/v1",
+                "model": "m".repeat(128 * 1024),
+                "credential": { "kind": "replace", "value": "large-view-secret" },
+                "presetKey": null,
+            }),
+        )
+        .await
+        .unwrap();
+    let activation = Arc::new(ActivationService::new(
+        Arc::clone(&store),
+        home.clone(),
+        Arc::new(ControlCodexProbe),
+        "/usr/bin/codex".into(),
+        Arc::new(ControlNoopUpstream),
+    ));
+    let handle =
+        ControlServer::bind_with_activation(&home, Arc::clone(&store), "routing-test", activation)
+            .await
+            .unwrap();
+    ControlFixture {
+        root,
+        store,
+        handle: Some(handle),
+    }
+}
+
+async fn opened_reconciliation_session(fixture: &ControlFixture) -> UnixStream {
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    let opened = request(
+        &mut stream,
+        "open-reconciliation",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    assert_eq!(opened["type"], "response");
+    stream
+}
+
+async fn preview_token(stream: &mut UnixStream, request_id: &str, strategy: &str) -> Uuid {
+    request(
+        stream,
+        request_id,
+        json!({
+            "kind": "preview-reconciliation",
+            "target": "codex",
+            "strategy": strategy
+        }),
+    )
+    .await["result"]["preview"]["observationToken"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+async fn backpressured_preview_session(fixture: &ControlFixture, request_id: &str) -> UnixStream {
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    for index in 0..8 {
+        write_frame(
+            &mut stream,
+            &json!({
+                "type": "request",
+                "requestId": format!("{request_id}-fill-{index}"),
+                "operation": { "kind": "open-target", "target": "codex" }
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": request_id,
+            "operation": {
+                "kind": "preview-reconciliation",
+                "target": "codex",
+                "strategy": "reapply"
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    stream
+}
+
+async fn wait_until_token_is_not(
+    fixture: &ControlFixture,
+    strategy: ReconciliationStrategy,
+    prior: Uuid,
+) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture
+            .handle
+            .as_ref()
+            .unwrap()
+            .tracks_reconciliation_token(Target::Codex, strategy, prior)
+            .await
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("backpressured preview did not register");
 }
 
 fn create_action(name: &str, secret: &str) -> Value {
@@ -2044,6 +2169,198 @@ async fn shutdown_is_bounded_when_an_authorized_peer_stops_reading() {
     tokio::time::timeout(Duration::from_secs(1), fixture.shutdown())
         .await
         .expect("Control Server shutdown waited on a non-reading peer")
+}
+
+#[tokio::test]
+async fn backpressured_preview_times_out_and_restores_the_prior_disclosed_token() {
+    let mut fixture = backpressure_reconciliation_fixture().await;
+    let mut disclosed_session = opened_reconciliation_session(&fixture).await;
+    let disclosed = preview_token(&mut disclosed_session, "disclosed-preview", "reapply").await;
+    assert!(
+        fixture
+            .handle
+            .as_ref()
+            .unwrap()
+            .tracks_reconciliation_token(Target::Codex, ReconciliationStrategy::Reapply, disclosed,)
+            .await
+    );
+
+    let mut blocked = backpressured_preview_session(&fixture, "blocked-preview").await;
+    wait_until_token_is_not(&fixture, ReconciliationStrategy::Reapply, disclosed).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.handle.as_ref().unwrap().tracked_writers() != 1 {
+            assert!(
+                !fixture
+                    .handle
+                    .as_ref()
+                    .unwrap()
+                    .tracks_reconciliation_token(
+                        Target::Codex,
+                        ReconciliationStrategy::Reapply,
+                        disclosed,
+                    )
+                    .await,
+                "the prior token became visible before the blocked writer terminated"
+            );
+            tokio::task::yield_now().await;
+        }
+        while fixture.handle.as_ref().unwrap().tracked_sessions() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the blocked writer/session did not terminate before rollback was observed");
+    let mut queued_bytes = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        blocked.read_to_end(&mut queued_bytes),
+    )
+    .await
+    .expect("the terminated preview session did not reach EOF")
+    .expect("failed to drain the terminated preview session");
+    let mut queued = queued_bytes.as_slice();
+    while queued.len() >= 4 {
+        let length = u32::from_be_bytes(queued[..4].try_into().unwrap()) as usize;
+        queued = &queued[4..];
+        if queued.len() < length {
+            break;
+        }
+        let frame: Value = serde_json::from_slice(&queued[..length])
+            .expect("the blocked writer emitted a malformed complete frame");
+        assert_ne!(
+            frame.get("requestId").and_then(Value::as_str),
+            Some("blocked-preview"),
+            "the timed-out preview response was delivered after its registration rolled back"
+        );
+        queued = &queued[length..];
+    }
+    assert_eq!(fixture.handle.as_ref().unwrap().tracked_inspections(), 0);
+    assert!(
+        fixture
+            .handle
+            .as_ref()
+            .unwrap()
+            .tracks_reconciliation_token(Target::Codex, ReconciliationStrategy::Reapply, disclosed)
+            .await,
+        "the writer/session closed without restoring the prior disclosed token"
+    );
+    assert_eq!(
+        fixture
+            .handle
+            .as_ref()
+            .unwrap()
+            .tracked_reconciliation_tokens()
+            .await,
+        1
+    );
+    assert!(
+        fixture
+            .handle
+            .as_ref()
+            .unwrap()
+            .validates_reconciliation_token(
+                Target::Codex,
+                ReconciliationStrategy::Reapply,
+                disclosed,
+                None,
+            )
+            .await,
+        "the exact prior disclosed token did not validate after rollback"
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn backpressured_same_key_serializes_without_blocking_a_different_key() {
+    let mut fixture = backpressure_reconciliation_fixture().await;
+    let mut responsive = opened_reconciliation_session(&fixture).await;
+    let disclosed = preview_token(&mut responsive, "disclosed-preview", "reapply").await;
+    let _blocked = backpressured_preview_session(&fixture, "blocked-preview").await;
+    wait_until_token_is_not(&fixture, ReconciliationStrategy::Reapply, disclosed).await;
+
+    write_frame(
+        &mut responsive,
+        &json!({
+            "type": "request",
+            "requestId": "same-key-preview",
+            "operation": {
+                "kind": "preview-reconciliation",
+                "target": "codex",
+                "strategy": "reapply"
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.handle.as_ref().unwrap().tracked_inspections() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("same-key preview did not serialize behind the pending registration");
+    write_frame(
+        &mut responsive,
+        &json!({
+            "type": "request",
+            "requestId": "different-key-preview",
+            "operation": {
+                "kind": "preview-reconciliation",
+                "target": "codex",
+                "strategy": "adopt"
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let different_key =
+        tokio::time::timeout(Duration::from_millis(100), read_frame(&mut responsive))
+            .await
+            .expect("a blocked reapply registration starved an adopt preview")
+            .unwrap();
+    assert_eq!(different_key["requestId"], "different-key-preview");
+    let different_key_token: Uuid = different_key["result"]["preview"]["observationToken"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let same_key = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut responsive))
+        .await
+        .expect("same-key preview did not resume after the writer bound")
+        .unwrap();
+    assert_eq!(same_key["requestId"], "same-key-preview");
+    let same_key_token: Uuid = same_key["result"]["preview"]["observationToken"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let handle = fixture.handle.as_ref().unwrap();
+    assert!(
+        handle
+            .validates_reconciliation_token(
+                Target::Codex,
+                ReconciliationStrategy::Reapply,
+                same_key_token,
+                None,
+            )
+            .await
+    );
+    assert!(
+        handle
+            .validates_reconciliation_token(
+                Target::Codex,
+                ReconciliationStrategy::Adopt,
+                different_key_token,
+                None,
+            )
+            .await
+    );
+    assert_eq!(handle.tracked_reconciliation_tokens().await, 2);
+
+    fixture.shutdown().await;
 }
 
 #[tokio::test]

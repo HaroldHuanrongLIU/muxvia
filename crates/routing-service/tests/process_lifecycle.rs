@@ -115,7 +115,7 @@ fn fake_cli(root: &Path, name: &str, version: &str) -> PathBuf {
     fs::write(
         &path,
         format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '{version}' ;;\n  --help) printf '%s\\n' 'Usage: {name}' ;;\n  *) exit 64 ;;\nesac\n"
+            "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '{version}' ;;\n  --help) printf '%s\\n' 'Usage: {name} --config --settings --model' ;;\n  *) exit 64 ;;\nesac\n"
         ),
     )
     .unwrap();
@@ -351,12 +351,12 @@ async fn clean_claude_direct_is_control_only_across_restart_and_exits_after_last
     )
     .await;
     assert_claude_direct_process_surface_is_secret_free(&applied);
-    let activation_push = read_frame(&mut stream).await.unwrap();
-    assert_claude_direct_process_surface_is_secret_free(&activation_push);
     let applied_view = &applied["result"]["outcome"]["view"];
     assert_eq!(applied_view["mode"], "direct");
     assert!(applied_view["takeover"]["endpoint"].is_null());
     let snapshot_id = applied_view["activatedSnapshot"]["id"].clone();
+    let activation_push = read_frame(&mut stream).await.unwrap();
+    assert_claude_direct_process_surface_is_secret_free(&activation_push);
     drop(stream);
     assert!(
         timeout(PROCESS_TIMEOUT, first.wait())

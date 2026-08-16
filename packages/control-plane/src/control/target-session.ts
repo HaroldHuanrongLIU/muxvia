@@ -81,19 +81,24 @@ class TargetSessionImpl implements TargetSession {
 
   act(action: OrdinaryTargetAction): Promise<ActionOutcome> {
     if ((action as TargetAction).kind === "resolve-compatibility") {
-      return Promise.reject(new ControlError(
-        "unsupported-operation",
-        "Compatibility resolution requires resolveCompatibility",
-      ))
+      return Promise.reject(compatibilityResolutionBypassError())
     }
-    return this.#enqueueAction(action)
+    const capturedAction = captureOrdinaryAction(action)
+    return this.#enqueueAction(capturedAction)
   }
 
-  #enqueueAction(action: TargetAction, expectedRevision?: number): Promise<ActionOutcome> {
+  #enqueueAction(
+    action: TargetAction,
+    expectedRevision?: number,
+    compatibilityResolution = false,
+  ): Promise<ActionOutcome> {
     if (this.#closed) {
       return Promise.reject(new ControlError("connection-closed", "Target session is closed"))
     }
     const result = this.#actions.then(async () => {
+      if (action.kind === "resolve-compatibility" && !compatibilityResolution) {
+        throw compatibilityResolutionBypassError()
+      }
       const actionId = randomUUID()
       try {
         const response = await this.#rpc.request({
@@ -202,6 +207,7 @@ class TargetSessionImpl implements TargetSession {
     return this.#enqueueAction(
       { kind: "resolve-compatibility", version: input.version },
       input.managementRevision,
+      true,
     )
   }
 
@@ -287,6 +293,23 @@ function captureClaudeContext(
     hostManagedState: context.hostManagedState,
     cwd: context.cwd,
   })
+}
+
+function captureOrdinaryAction(action: OrdinaryTargetAction): OrdinaryTargetAction {
+  return freezeOwnedValue(structuredClone(action))
+}
+
+function freezeOwnedValue<T>(value: T): T {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value
+  for (const nested of Object.values(value)) freezeOwnedValue(nested)
+  return Object.freeze(value)
+}
+
+function compatibilityResolutionBypassError(): ControlError {
+  return new ControlError(
+    "unsupported-operation",
+    "Compatibility resolution requires resolveCompatibility",
+  )
 }
 
 function freezeReconciliationPreview(preview: ReconciliationPreview): ReconciliationPreview {

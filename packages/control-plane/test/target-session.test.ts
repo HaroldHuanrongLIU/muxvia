@@ -10,8 +10,10 @@ import type {
   ClientFrame,
   ClaudePreflightContext,
   CompatibilityProbe,
+  OrdinaryTargetAction,
   ReconciliationPreview,
   ServerFrame,
+  TargetAction,
   TargetView,
 } from "../src/control/types"
 
@@ -243,6 +245,34 @@ async function openScriptedSession(initial: TargetView) {
   return { session, server }
 }
 
+function assertCapturedCreateProvider(
+  frame: Extract<ClientFrame, { type: "request" }> | undefined,
+  expected: {
+    expectedRevision: number
+    name: string
+    baseUrl: string
+    model: string
+    credential: string
+  },
+): void {
+  const operation = frame?.operation
+  if (operation?.kind !== "act") {
+    throw new Error("Queued ordinary action did not match captured input")
+  }
+  const action = operation.action as TargetAction
+  if (action.kind !== "create-provider") {
+    throw new Error("Queued ordinary action did not match captured input")
+  }
+  const matches = operation.expectedRevision === expected.expectedRevision
+    && action.name === expected.name
+    && action.baseUrl === expected.baseUrl
+    && action.model === expected.model
+    && action.credential.kind === "replace"
+    && action.credential.value === expected.credential
+    && action.presetKey === null
+  if (!matches) throw new Error("Queued ordinary action did not match captured input")
+}
+
 function ordinaryActionTypeExcludesCompatibilityResolution(
   session: Awaited<ReturnType<typeof openScriptedSession>>["session"],
 ): void {
@@ -320,6 +350,79 @@ test("a target session serializes actions and replaces stale state", async () =>
   expect(session.get().managementRevision).toBe(2)
   expect(server.receivedActionCount()).toBe(2)
 
+  await session.close()
+  await server.close()
+})
+
+test("act captures an ordinary action before its discriminator is mutated while queued", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  const first = session.act({
+    kind: "activate-provider",
+    providerId: "provider-1",
+    mode: "direct",
+  })
+  const mutable = {
+    kind: "create-provider",
+    name: "Captured Provider",
+    baseUrl: "https://captured.example/v1",
+    model: "captured-model",
+    credential: { kind: "replace", value: "captured-credential" },
+    presetKey: null,
+  } satisfies OrdinaryTargetAction
+  const queued = session.act(mutable)
+  Object.assign(
+    mutable as unknown as { kind: string; version?: string },
+    { kind: "resolve-compatibility", version: "forged-after-call" },
+  )
+
+  await server.waitForRequests(2)
+  server.replyApplied(viewAtRevision(2, 2))
+  await first
+  await server.waitForRequests(3)
+  assertCapturedCreateProvider(server.requests()[2], {
+    expectedRevision: 2,
+    name: "Captured Provider",
+    baseUrl: "https://captured.example/v1",
+    model: "captured-model",
+    credential: "captured-credential",
+  })
+  server.replyApplied(viewAtRevision(3, 3))
+  await queued
+  await session.close()
+  await server.close()
+})
+
+test("act deeply captures nested ordinary action fields before queued execution", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  const first = session.act({
+    kind: "activate-provider",
+    providerId: "provider-1",
+    mode: "direct",
+  })
+  const mutable = {
+    kind: "create-provider",
+    name: "Nested Provider",
+    baseUrl: "https://nested.example/v1",
+    model: "nested-model",
+    credential: { kind: "replace", value: "original-credential" },
+    presetKey: null,
+  } satisfies OrdinaryTargetAction
+  const queued = session.act(mutable)
+  mutable.credential.value = "mutated-credential"
+
+  await server.waitForRequests(2)
+  server.replyApplied(viewAtRevision(2, 2))
+  await first
+  await server.waitForRequests(3)
+  assertCapturedCreateProvider(server.requests()[2], {
+    expectedRevision: 2,
+    name: "Nested Provider",
+    baseUrl: "https://nested.example/v1",
+    model: "nested-model",
+    credential: "original-credential",
+  })
+  server.replyApplied(viewAtRevision(3, 3))
+  await queued
   await session.close()
   await server.close()
 })

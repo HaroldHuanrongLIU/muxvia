@@ -3,6 +3,7 @@ pub(crate) mod providers;
 mod reconciliation;
 mod recovery;
 mod store;
+mod universal_providers;
 
 pub use crate::control::protocol::CompatibilityClassification;
 pub use migrations::SCHEMA_VERSION;
@@ -16,3 +17,4 @@ pub use store::{
     CommittedActivationSnapshot, CommittedRouteRuntime, CommittedTakeover, RoutingSnapshot,
     StateError, StateStore,
 };
+pub use universal_providers::UniversalProviderActionFailure;

@@ -17,4 +17,7 @@ pub use store::{
     CommittedActivationSnapshot, CommittedRouteRuntime, CommittedTakeover, RoutingSnapshot,
     StateError, StateStore,
 };
-pub use universal_providers::UniversalProviderActionFailure;
+pub use universal_providers::{
+    UniversalProviderActionFailure, UniversalProviderSynchronizationCommit,
+    UniversalSynchronizationFailpoint,
+};

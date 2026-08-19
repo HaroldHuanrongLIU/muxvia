@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf};
 use muxvia_routing::{
     control::protocol::{ActionStatus, CredentialPresence, Target},
     home::MuxviaHome,
-    state::StateStore,
+    state::{StateStore, UniversalSynchronizationFailpoint},
 };
 use uuid::Uuid;
 
@@ -359,6 +359,574 @@ async fn one_time_seed_is_keyed_only_by_the_stable_preset_key() {
         .await
         .unwrap();
     assert_eq!(marker, seeded_id.to_string());
+}
+
+#[tokio::test]
+async fn codex_only_synchronization_materializes_one_generated_provider_transactionally() {
+    const SECRET: &str = "UNIVERSAL_SYNCHRONIZE_SECRET_92014";
+    let fixture = CatalogFixture::new();
+    let store = StateStore::open(&fixture.home).await.unwrap();
+    let codex_before = store.target_view_for(Target::Codex).await.unwrap();
+    let claude_before = store.target_view_for(Target::Claude).await.unwrap();
+    let created = store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x601),
+            0,
+            serde_json::json!({
+                "kind": "create-universal-provider",
+                "name": "Codex Shared",
+                "baseUrl": "https://sync.example/v1",
+                "credential": { "kind": "replace", "value": SECRET },
+                "presetKey": null,
+                "targets": [
+                    { "target": "codex", "enabled": true, "model": "sync-codex", "authentication": "openai-bearer", "routingRequirement": "takeover-required" },
+                    { "target": "claude", "enabled": false, "model": "sync-claude", "authentication": "anthropic-api-key", "routingRequirement": "direct-compatible" }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    let provider_id = created.view.providers[0].id;
+    let synchronization_id = Uuid::from_u128(0x602);
+
+    let synchronized = store
+        .synchronize_universal_provider_action(synchronization_id, 1, provider_id, 1)
+        .await
+        .unwrap();
+    assert_eq!(synchronized.outcome.status, ActionStatus::Applied);
+    assert_eq!(synchronized.outcome.view.revision, 2);
+    assert_eq!(synchronized.target_views.len(), 1);
+    let catalog_provider = &synchronized.outcome.view.providers[0];
+    assert_eq!(
+        catalog_provider.targets[0].synchronization,
+        muxvia_routing::control::protocol::UniversalSynchronizationState::Current
+    );
+    assert!(catalog_provider.targets[0].generated_provider_id.is_some());
+    assert_eq!(
+        catalog_provider.targets[1].synchronization,
+        muxvia_routing::control::protocol::UniversalSynchronizationState::Current
+    );
+    assert!(catalog_provider.targets[1].generated_provider_id.is_none());
+
+    let codex_after = store.target_view_for(Target::Codex).await.unwrap();
+    assert_eq!(codex_after.management_revision, 1);
+    assert_eq!(codex_after.view_sequence, 1);
+    assert_eq!(codex_after.providers.len(), 1);
+    let generated = &codex_after.providers[0];
+    assert!(generated.generated);
+    assert_eq!(generated.name, "Codex Shared");
+    assert_eq!(generated.base_url, "https://sync.example/v1");
+    assert_eq!(generated.model, "sync-codex");
+    assert_eq!(generated.credential, CredentialPresence::Present);
+    assert_eq!(
+        generated.routing_requirement.to_string(),
+        "takeover-required"
+    );
+    assert_eq!(
+        generated.provenance.as_ref().map(|value| value.key.clone()),
+        Some(provider_id.to_string())
+    );
+    assert_target_runtime_unchanged(&codex_before, &codex_after);
+    assert_eq!(
+        store.target_view_for(Target::Claude).await.unwrap(),
+        claude_before
+    );
+
+    let replayed = store
+        .synchronize_universal_provider_action(synchronization_id, 0, Uuid::nil(), 99)
+        .await
+        .unwrap();
+    assert_eq!(replayed.outcome.status, ActionStatus::Replayed);
+    assert!(replayed.target_views.is_empty());
+    assert_eq!(replayed.outcome.view, synchronized.outcome.view);
+    let no_change = store
+        .synchronize_universal_provider_action(Uuid::from_u128(0x603), 2, provider_id, 1)
+        .await
+        .unwrap_err();
+    assert_eq!(no_change.problem.code, "no-universal-provider-change");
+    assert_eq!(no_change.authoritative_view, synchronized.outcome.view);
+    let serialized = serde_json::to_string(&synchronized.outcome).unwrap();
+    let debugged = format!("{synchronized:?}");
+    assert!(
+        !serialized.contains(SECRET),
+        "synchronization outcome serialized a credential"
+    );
+    assert!(
+        !debugged.contains(SECRET),
+        "synchronization commit debugged a credential"
+    );
+}
+
+fn assert_target_runtime_unchanged(
+    before: &muxvia_routing::control::protocol::TargetView,
+    after: &muxvia_routing::control::protocol::TargetView,
+) {
+    assert_eq!(after.service, before.service);
+    assert_eq!(after.mode, before.mode);
+    assert_eq!(after.takeover, before.takeover);
+    assert_eq!(after.route_health, before.route_health);
+    assert_eq!(after.current_provider_id, before.current_provider_id);
+    assert_eq!(after.serving_provider_id, before.serving_provider_id);
+    assert_eq!(after.managed_configuration, before.managed_configuration);
+    assert_eq!(after.recovery, before.recovery);
+    assert_eq!(after.activated_snapshot, before.activated_snapshot);
+    assert_eq!(after.problems, before.problems);
+}
+
+#[tokio::test]
+async fn universal_edit_stays_pending_until_both_generated_targets_resynchronize() {
+    const FIRST_SECRET: &str = "UNIVERSAL_FIRST_SYNC_SECRET_11704";
+    const SECOND_SECRET: &str = "UNIVERSAL_SECOND_SYNC_SECRET_11705";
+    let fixture = CatalogFixture::new();
+    let store = StateStore::open(&fixture.home).await.unwrap();
+    let created = store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x701),
+            0,
+            serde_json::json!({
+                "kind": "create-universal-provider",
+                "name": "Both Targets",
+                "baseUrl": "https://both.example/v1",
+                "credential": { "kind": "replace", "value": FIRST_SECRET },
+                "presetKey": null,
+                "targets": universal_targets("first")
+            }),
+        )
+        .await
+        .unwrap();
+    let provider_id = created.view.providers[0].id;
+    let first_sync = store
+        .synchronize_universal_provider_action(Uuid::from_u128(0x702), 1, provider_id, 1)
+        .await
+        .unwrap();
+    assert_eq!(first_sync.target_views.len(), 2);
+    let first_ids: Vec<Uuid> = first_sync.outcome.view.providers[0]
+        .targets
+        .iter()
+        .map(|target| target.generated_provider_id.unwrap())
+        .collect();
+    let first_credentials = generated_credential_ids(&fixture, provider_id).await;
+    assert_eq!(first_credentials.len(), 2);
+    assert_ne!(first_credentials[0], first_credentials[1]);
+
+    let codex_generated_before = store
+        .target_view_for(Target::Codex)
+        .await
+        .unwrap()
+        .providers[0]
+        .clone();
+    let claude_generated_before = store
+        .target_view_for(Target::Claude)
+        .await
+        .unwrap()
+        .providers[0]
+        .clone();
+    let edited = store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x703),
+            2,
+            serde_json::json!({
+                "kind": "update-universal-provider",
+                "providerId": provider_id,
+                "providerRevision": 1,
+                "name": "Both Targets Updated",
+                "baseUrl": "https://both-updated.example/v1",
+                "credential": { "kind": "replace", "value": SECOND_SECRET },
+                "targets": [
+                    { "target": "codex", "enabled": true, "model": "second-codex", "authentication": "openai-bearer", "routingRequirement": "takeover-required" },
+                    { "target": "claude", "enabled": true, "model": "second-claude", "authentication": "anthropic-bearer", "routingRequirement": "direct-compatible" }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        edited.view.providers[0]
+            .targets
+            .iter()
+            .all(|target| target.synchronization
+                == muxvia_routing::control::protocol::UniversalSynchronizationState::Pending)
+    );
+    assert_eq!(
+        store
+            .target_view_for(Target::Codex)
+            .await
+            .unwrap()
+            .providers[0],
+        codex_generated_before
+    );
+    assert_eq!(
+        store
+            .target_view_for(Target::Claude)
+            .await
+            .unwrap()
+            .providers[0],
+        claude_generated_before
+    );
+
+    let update_failure = store
+        .synchronize_universal_provider_action_with_failpoint(
+            Uuid::from_u128(0x705),
+            3,
+            provider_id,
+            2,
+            UniversalSynchronizationFailpoint::TargetProviderWrite(Target::Claude),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(update_failure.problem.code, "state-store-error");
+    assert_eq!(
+        store.universal_provider_catalog().await.unwrap(),
+        edited.view
+    );
+    assert_eq!(
+        store
+            .target_view_for(Target::Codex)
+            .await
+            .unwrap()
+            .providers[0],
+        codex_generated_before
+    );
+    assert_eq!(
+        store
+            .target_view_for(Target::Claude)
+            .await
+            .unwrap()
+            .providers[0],
+        claude_generated_before
+    );
+    assert_eq!(
+        generated_credential_ids(&fixture, provider_id).await,
+        first_credentials
+    );
+
+    let synchronized = store
+        .synchronize_universal_provider_action(Uuid::from_u128(0x704), 3, provider_id, 2)
+        .await
+        .unwrap();
+    assert_eq!(synchronized.target_views.len(), 2);
+    let provider = &synchronized.outcome.view.providers[0];
+    assert!(provider.targets.iter().all(|target| target.synchronization
+        == muxvia_routing::control::protocol::UniversalSynchronizationState::Current));
+    let second_ids: Vec<Uuid> = provider
+        .targets
+        .iter()
+        .map(|target| target.generated_provider_id.unwrap())
+        .collect();
+    assert_eq!(second_ids, first_ids);
+    let second_credentials = generated_credential_ids(&fixture, provider_id).await;
+    assert_eq!(second_credentials.len(), 2);
+    assert_ne!(second_credentials[0], second_credentials[1]);
+    assert_ne!(second_credentials, first_credentials);
+    let codex = store.target_view_for(Target::Codex).await.unwrap();
+    let claude = store.target_view_for(Target::Claude).await.unwrap();
+    assert_eq!(codex.providers[0].provider_revision, 2);
+    assert_eq!(codex.providers[0].name, "Both Targets Updated");
+    assert_eq!(codex.providers[0].model, "second-codex");
+    assert_eq!(claude.providers[0].provider_revision, 2);
+    assert_eq!(claude.providers[0].name, "Both Targets Updated");
+    assert_eq!(claude.providers[0].model, "second-claude");
+    for value in [
+        serde_json::to_string(&synchronized.outcome).unwrap(),
+        format!("{synchronized:?}"),
+    ] {
+        assert!(
+            !value.contains(FIRST_SECRET),
+            "synchronization exposed the first credential"
+        );
+        assert!(
+            !value.contains(SECOND_SECRET),
+            "synchronization exposed the replacement credential"
+        );
+    }
+}
+
+async fn generated_credential_ids(fixture: &CatalogFixture, provider_id: Uuid) -> Vec<String> {
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(move |connection| {
+            connection
+                .prepare(
+                    "SELECT credential_id FROM providers
+                     WHERE generated_owner_id = ?1 ORDER BY target",
+                )?
+                .query_map([provider_id.to_string()], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn disabling_one_target_stays_pending_until_sync_removes_only_that_generated_record() {
+    let fixture = CatalogFixture::new();
+    let store = StateStore::open(&fixture.home).await.unwrap();
+    let created = store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x801),
+            0,
+            serde_json::json!({
+                "kind": "create-universal-provider",
+                "name": "Disable Target",
+                "baseUrl": "https://disable.example/v1",
+                "credential": { "kind": "replace", "value": "DISABLE_SECRET_80311" },
+                "presetKey": null,
+                "targets": universal_targets("disable")
+            }),
+        )
+        .await
+        .unwrap();
+    let provider_id = created.view.providers[0].id;
+    store
+        .synchronize_universal_provider_action(Uuid::from_u128(0x802), 1, provider_id, 1)
+        .await
+        .unwrap();
+    let codex_before = store.target_view_for(Target::Codex).await.unwrap();
+    let claude_before = store.target_view_for(Target::Claude).await.unwrap();
+
+    let disabled = store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x803),
+            2,
+            serde_json::json!({
+                "kind": "update-universal-provider",
+                "providerId": provider_id,
+                "providerRevision": 1,
+                "name": "Disable Target",
+                "baseUrl": "https://disable.example/v1",
+                "credential": { "kind": "keep" },
+                "targets": [
+                    { "target": "codex", "enabled": true, "model": "disable-codex", "authentication": "openai-bearer", "routingRequirement": "direct-compatible" },
+                    { "target": "claude", "enabled": false, "model": "disable-claude", "authentication": "anthropic-api-key", "routingRequirement": "takeover-required" }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disabled.view.providers[0].provider_revision, 1);
+    assert_eq!(
+        disabled.view.providers[0].targets[0].synchronization,
+        muxvia_routing::control::protocol::UniversalSynchronizationState::Current
+    );
+    assert_eq!(
+        disabled.view.providers[0].targets[1].synchronization,
+        muxvia_routing::control::protocol::UniversalSynchronizationState::Pending
+    );
+
+    let removal_failure = store
+        .synchronize_universal_provider_action_with_failpoint(
+            Uuid::from_u128(0x805),
+            3,
+            provider_id,
+            1,
+            UniversalSynchronizationFailpoint::TargetRemoval(Target::Claude),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(removal_failure.problem.code, "state-store-error");
+    assert_eq!(
+        store.universal_provider_catalog().await.unwrap(),
+        disabled.view
+    );
+    assert_eq!(
+        store.target_view_for(Target::Codex).await.unwrap(),
+        codex_before
+    );
+    assert_eq!(
+        store.target_view_for(Target::Claude).await.unwrap(),
+        claude_before
+    );
+    assert_eq!(
+        generated_credential_ids(&fixture, provider_id).await.len(),
+        2
+    );
+
+    let synchronized = store
+        .synchronize_universal_provider_action(Uuid::from_u128(0x804), 3, provider_id, 1)
+        .await
+        .unwrap();
+    assert_eq!(synchronized.target_views.len(), 1);
+    assert_eq!(synchronized.target_views[0].target, Target::Claude);
+    assert_eq!(
+        store.target_view_for(Target::Codex).await.unwrap(),
+        codex_before
+    );
+    let claude_after = store.target_view_for(Target::Claude).await.unwrap();
+    assert_eq!(
+        claude_after.management_revision,
+        claude_before.management_revision + 1
+    );
+    assert!(claude_after.providers.is_empty());
+    let catalog_provider = &synchronized.outcome.view.providers[0];
+    assert_eq!(
+        catalog_provider.targets[1].synchronization,
+        muxvia_routing::control::protocol::UniversalSynchronizationState::Current
+    );
+    assert!(catalog_provider.targets[1].generated_provider_id.is_none());
+    let credentials = generated_credential_ids(&fixture, provider_id).await;
+    assert_eq!(credentials.len(), 1);
+}
+
+#[tokio::test]
+async fn referenced_generated_provider_blocks_disable_before_any_synchronization_write() {
+    let fixture = CatalogFixture::new();
+    let store = StateStore::open(&fixture.home).await.unwrap();
+    let created = store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x811),
+            0,
+            serde_json::json!({
+                "kind": "create-universal-provider",
+                "name": "Referenced Source",
+                "baseUrl": "https://referenced.example/v1",
+                "credential": { "kind": "replace", "value": "REFERENCE_SECRET_90317" },
+                "presetKey": null,
+                "targets": [
+                    { "target": "codex", "enabled": true, "model": "reference-codex", "authentication": "openai-bearer", "routingRequirement": "direct-compatible" },
+                    { "target": "claude", "enabled": false, "model": "reference-claude", "authentication": "anthropic-api-key", "routingRequirement": "takeover-required" }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    let provider_id = created.view.providers[0].id;
+    let synchronized = store
+        .synchronize_universal_provider_action(Uuid::from_u128(0x812), 1, provider_id, 1)
+        .await
+        .unwrap();
+    let generated_id = synchronized.outcome.view.providers[0].targets[0]
+        .generated_provider_id
+        .unwrap();
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(move |connection| {
+            connection.execute(
+                "UPDATE target_route_state SET current_provider_id = ?1 WHERE target = 'codex'",
+                [generated_id.to_string()],
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+    let disabled = store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x813),
+            2,
+            serde_json::json!({
+                "kind": "update-universal-provider",
+                "providerId": provider_id,
+                "providerRevision": 1,
+                "name": "Referenced Source",
+                "baseUrl": "https://referenced.example/v1",
+                "credential": { "kind": "keep" },
+                "targets": [
+                    { "target": "codex", "enabled": false, "model": "reference-codex", "authentication": "openai-bearer", "routingRequirement": "direct-compatible" },
+                    { "target": "claude", "enabled": false, "model": "reference-claude", "authentication": "anthropic-api-key", "routingRequirement": "takeover-required" }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    let target_before = store.target_view_for(Target::Codex).await.unwrap();
+
+    let failure = store
+        .synchronize_universal_provider_action(Uuid::from_u128(0x814), 3, provider_id, 1)
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.problem.code, "provider-synchronization-blocked");
+    assert_eq!(failure.authoritative_view, disabled.view);
+    assert_eq!(
+        failure.authoritative_view.providers[0].targets[0].active_references,
+        vec![muxvia_routing::control::protocol::ProviderReferenceView::Current]
+    );
+    assert_eq!(
+        store.target_view_for(Target::Codex).await.unwrap(),
+        target_before
+    );
+    let receipt_count = database
+        .call(|connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM universal_action_receipts WHERE action_id = ?1",
+                [Uuid::from_u128(0x814).to_string()],
+                |row| row.get::<_, u64>(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt_count, 0);
+}
+
+#[tokio::test]
+async fn synchronization_failpoints_roll_back_every_target_and_catalog_boundary() {
+    for (index, failpoint) in [
+        UniversalSynchronizationFailpoint::TargetCredential(Target::Codex),
+        UniversalSynchronizationFailpoint::TargetProviderWrite(Target::Codex),
+        UniversalSynchronizationFailpoint::TargetRevision(Target::Codex),
+        UniversalSynchronizationFailpoint::TargetCredential(Target::Claude),
+        UniversalSynchronizationFailpoint::TargetProviderWrite(Target::Claude),
+        UniversalSynchronizationFailpoint::TargetRevision(Target::Claude),
+        UniversalSynchronizationFailpoint::CatalogRevision,
+        UniversalSynchronizationFailpoint::Receipt,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = CatalogFixture::new();
+        let store = StateStore::open(&fixture.home).await.unwrap();
+        let created = store
+            .apply_universal_provider_action(
+                Uuid::from_u128(0xA00 + index as u128),
+                0,
+                serde_json::json!({
+                    "kind": "create-universal-provider",
+                    "name": "Failpoint Source",
+                    "baseUrl": "https://failpoint.example/v1",
+                    "credential": { "kind": "replace", "value": "FAILPOINT_SECRET_22401" },
+                    "presetKey": null,
+                    "targets": universal_targets("failpoint")
+                }),
+            )
+            .await
+            .unwrap();
+        let provider_id = created.view.providers[0].id;
+        let codex_before = store.target_view_for(Target::Codex).await.unwrap();
+        let claude_before = store.target_view_for(Target::Claude).await.unwrap();
+
+        let failure = store
+            .synchronize_universal_provider_action_with_failpoint(
+                Uuid::from_u128(0xB00 + index as u128),
+                1,
+                provider_id,
+                1,
+                failpoint,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(failure.problem.code, "state-store-error");
+        assert_eq!(
+            store.universal_provider_catalog().await.unwrap(),
+            created.view
+        );
+        assert_eq!(
+            store.target_view_for(Target::Codex).await.unwrap(),
+            codex_before
+        );
+        assert_eq!(
+            store.target_view_for(Target::Claude).await.unwrap(),
+            claude_before
+        );
+        assert!(
+            generated_credential_ids(&fixture, provider_id)
+                .await
+                .is_empty()
+        );
+    }
 }
 
 impl CatalogFixture {

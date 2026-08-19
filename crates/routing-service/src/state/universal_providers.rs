@@ -1,3 +1,4 @@
+use subtle::ConstantTimeEq;
 use tokio_rusqlite::rusqlite::{Connection, OptionalExtension, Transaction, params};
 use uuid::Uuid;
 
@@ -5,12 +6,12 @@ use crate::{
     control::protocol::{
         ActionStatus, ControlProblem, CredentialEdit, CredentialPresence, DuplicateCredential,
         ProviderAuthentication, ProviderProvenanceView, ProviderReferenceView,
-        ProviderRoutingRequirement, Target, UniversalProviderAction, UniversalProviderCatalogView,
-        UniversalProviderOutcome, UniversalProviderPresetTargetView, UniversalProviderPresetView,
-        UniversalProviderTargetDraft, UniversalProviderTargetView, UniversalProviderView,
-        UniversalSynchronizationState,
+        ProviderRoutingRequirement, Target, TargetView, UniversalProviderAction,
+        UniversalProviderCatalogView, UniversalProviderOutcome, UniversalProviderPresetTargetView,
+        UniversalProviderPresetView, UniversalProviderTargetDraft, UniversalProviderTargetView,
+        UniversalProviderView, UniversalSynchronizationState,
     },
-    domain::provider::normalize_provider_base_url,
+    domain::{provider::normalize_provider_base_url, view::project_target_view_for},
 };
 
 use super::{
@@ -28,8 +29,26 @@ pub struct UniversalProviderActionFailure {
     pub authoritative_view: UniversalProviderCatalogView,
 }
 
+#[derive(Debug)]
+pub struct UniversalProviderSynchronizationCommit {
+    pub outcome: UniversalProviderOutcome,
+    pub target_views: Vec<TargetView>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UniversalSynchronizationFailpoint {
+    TargetCredential(Target),
+    TargetProviderWrite(Target),
+    TargetRemoval(Target),
+    TargetRevision(Target),
+    CatalogRevision,
+    Receipt,
+}
+
 enum CatalogAttempt {
     Applied(UniversalProviderOutcome),
+    Synchronized(UniversalProviderSynchronizationCommit),
     Failure(UniversalProviderActionFailure),
 }
 
@@ -206,7 +225,437 @@ impl StateStore {
         match attempt {
             Ok(CatalogAttempt::Applied(outcome)) => Ok(outcome),
             Ok(CatalogAttempt::Failure(failure)) => Err(failure),
-            Err(_) => Err(self
+            Ok(CatalogAttempt::Synchronized(_)) | Err(_) => Err(self
+                .catalog_failure("state-store-error", "State store operation failed")
+                .await),
+        }
+    }
+
+    #[doc(hidden)]
+    pub async fn synchronize_universal_provider_action(
+        &self,
+        action_id: Uuid,
+        expected_revision: u64,
+        provider_id: Uuid,
+        provider_revision: u64,
+    ) -> Result<UniversalProviderSynchronizationCommit, UniversalProviderActionFailure> {
+        self.synchronize_universal_provider_action_inner(
+            action_id,
+            expected_revision,
+            provider_id,
+            provider_revision,
+            None,
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn synchronize_universal_provider_action_with_failpoint(
+        &self,
+        action_id: Uuid,
+        expected_revision: u64,
+        provider_id: Uuid,
+        provider_revision: u64,
+        failpoint: UniversalSynchronizationFailpoint,
+    ) -> Result<UniversalProviderSynchronizationCommit, UniversalProviderActionFailure> {
+        self.synchronize_universal_provider_action_inner(
+            action_id,
+            expected_revision,
+            provider_id,
+            provider_revision,
+            Some(failpoint),
+        )
+        .await
+    }
+
+    async fn synchronize_universal_provider_action_inner(
+        &self,
+        action_id: Uuid,
+        expected_revision: u64,
+        provider_id: Uuid,
+        provider_revision: u64,
+        failpoint: Option<UniversalSynchronizationFailpoint>,
+    ) -> Result<UniversalProviderSynchronizationCommit, UniversalProviderActionFailure> {
+        match self.universal_provider_receipt(action_id).await {
+            Ok(Some(outcome)) => {
+                return Ok(UniversalProviderSynchronizationCommit {
+                    outcome: replayed(outcome),
+                    target_views: Vec::new(),
+                });
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return Err(self
+                    .catalog_failure("state-store-error", "State store operation failed")
+                    .await);
+            }
+        }
+        let action_id = action_id.to_string();
+        let provider_id = provider_id.to_string();
+        let service_epoch = self.service_epoch().to_string();
+        let attempt = self
+            .connection
+            .call(move |connection| -> Result<CatalogAttempt, StateError> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                if let Some(outcome) = read_receipt(&transaction, &action_id)? {
+                    return Ok(CatalogAttempt::Synchronized(
+                        UniversalProviderSynchronizationCommit {
+                            outcome: replayed(outcome),
+                            target_views: Vec::new(),
+                        },
+                    ));
+                }
+                let current_revision: u64 = transaction.query_row(
+                    "SELECT revision FROM universal_provider_catalog_state WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if current_revision != expected_revision {
+                    return Ok(CatalogAttempt::Failure(catalog_failure_for(
+                        &transaction,
+                        "stale-universal-catalog-revision",
+                        "Universal Provider catalog changed; refresh and retry",
+                    )?));
+                }
+                let source = transaction
+                    .query_row(
+                        "SELECT u.provider_revision, u.name, u.base_url, c.bearer_token
+                         FROM universal_providers u
+                         LEFT JOIN universal_credentials c ON c.id = u.credential_id
+                         WHERE u.id = ?1",
+                        [&provider_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, u64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((actual_revision, name, base_url, credential)) = source else {
+                    return Ok(CatalogAttempt::Failure(catalog_failure_for(
+                        &transaction,
+                        "stale-universal-provider-revision",
+                        "Universal Provider changed; refresh and retry",
+                    )?));
+                };
+                if actual_revision != provider_revision {
+                    return Ok(CatalogAttempt::Failure(catalog_failure_for(
+                        &transaction,
+                        "stale-universal-provider-revision",
+                        "Universal Provider changed; refresh and retry",
+                    )?));
+                }
+                let target_rows = read_synchronization_targets(&transaction, &provider_id)?;
+                let projected_provider_id = Uuid::parse_str(&provider_id)
+                    .map_err(|_| tokio_rusqlite::rusqlite::Error::InvalidQuery)?;
+                if project_targets(&transaction, projected_provider_id, provider_revision)?
+                    .iter()
+                    .all(|target| target.synchronization == UniversalSynchronizationState::Current)
+                {
+                    return Ok(CatalogAttempt::Failure(catalog_failure_for(
+                        &transaction,
+                        "no-universal-provider-change",
+                        "Universal Provider has no pending Target synchronization",
+                    )?));
+                }
+                for target in target_rows.iter().filter(|target| !target.enabled) {
+                    let generated_provider_id = transaction
+                        .query_row(
+                            "SELECT id FROM providers
+                             WHERE generated_owner_id = ?1 AND target = ?2",
+                            params![provider_id, target.target.as_str()],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?;
+                    let Some(generated_provider_id) = generated_provider_id else {
+                        continue;
+                    };
+                    let generated_provider_id = Uuid::parse_str(&generated_provider_id)
+                        .map_err(|_| tokio_rusqlite::rusqlite::Error::InvalidQuery)?;
+                    if !project_active_references(
+                        &transaction,
+                        target.target,
+                        generated_provider_id,
+                    )?
+                    .is_empty()
+                    {
+                        return Ok(CatalogAttempt::Failure(catalog_failure_for(
+                            &transaction,
+                            "provider-synchronization-blocked",
+                            "Generated Provider is still referenced",
+                        )?));
+                    }
+                }
+                let mut target_views = Vec::new();
+                for target in target_rows {
+                    let generated = transaction
+                        .query_row(
+                            "SELECT p.id, p.credential_id, c.bearer_token
+                         FROM providers p
+                         LEFT JOIN credentials c
+                           ON c.id = p.credential_id AND c.target = p.target
+                         WHERE p.generated_owner_id = ?1 AND p.target = ?2",
+                            params![provider_id, target.target.as_str()],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, Option<String>>(1)?,
+                                    row.get::<_, Option<String>>(2)?,
+                                ))
+                            },
+                        )
+                        .optional()?;
+                    if target.enabled
+                        && generated.is_some()
+                        && target.synchronized_source_revision == Some(provider_revision)
+                        && target.synchronized_overlay_revision == Some(target.overlay_revision)
+                    {
+                        continue;
+                    }
+                    if !target.enabled {
+                        let Some((generated_provider_id, credential_id, _)) = generated else {
+                            continue;
+                        };
+                        let position: u32 = transaction.query_row(
+                            "SELECT position FROM providers WHERE id = ?1 AND target = ?2",
+                            params![generated_provider_id, target.target.as_str()],
+                            |row| row.get(0),
+                        )?;
+                        transaction.execute(
+                            "DELETE FROM providers WHERE id = ?1 AND target = ?2",
+                            params![generated_provider_id, target.target.as_str()],
+                        )?;
+                        inject_synchronization_failure(
+                            failpoint,
+                            UniversalSynchronizationFailpoint::TargetRemoval(target.target),
+                        )?;
+                        transaction.execute(
+                            "UPDATE providers SET position = position - 1
+                             WHERE target = ?1 AND position > ?2",
+                            params![target.target.as_str(), position],
+                        )?;
+                        if let Some(credential_id) = credential_id {
+                            transaction.execute(
+                                "DELETE FROM credentials
+                                 WHERE id = ?1
+                                   AND NOT EXISTS (
+                                     SELECT 1 FROM providers WHERE credential_id = ?1
+                                   )",
+                                [credential_id],
+                            )?;
+                        }
+                        transaction.execute(
+                            "UPDATE universal_provider_targets
+                             SET synchronized_source_revision = ?1,
+                                 synchronized_overlay_revision = ?2
+                             WHERE universal_provider_id = ?3 AND target = ?4",
+                            params![
+                                provider_revision,
+                                target.overlay_revision,
+                                provider_id,
+                                target.target.as_str(),
+                            ],
+                        )?;
+                        transaction.execute(
+                            "UPDATE target_route_state
+                             SET management_revision = management_revision + 1,
+                                 view_sequence = view_sequence + 1
+                             WHERE target = ?1",
+                            [target.target.as_str()],
+                        )?;
+                        inject_synchronization_failure(
+                            failpoint,
+                            UniversalSynchronizationFailpoint::TargetRevision(target.target),
+                        )?;
+                        target_views.push(project_target_view_for(
+                            &transaction,
+                            &service_epoch,
+                            target.target,
+                        )?);
+                        continue;
+                    }
+                    let previous_credential_id =
+                        generated.as_ref().and_then(|generated| generated.1.clone());
+                    let credential_unchanged = match (
+                        generated
+                            .as_ref()
+                            .and_then(|generated| generated.2.as_deref()),
+                        credential.as_deref(),
+                    ) {
+                        (None, None) => true,
+                        (Some(current), Some(desired)) => {
+                            bool::from(current.as_bytes().ct_eq(desired.as_bytes()))
+                        }
+                        _ => false,
+                    };
+                    let target_credential_id = if credential_unchanged {
+                        previous_credential_id.clone()
+                    } else if let Some(secret) = credential.as_ref() {
+                        let id = Uuid::new_v4().to_string();
+                        transaction.execute(
+                            "INSERT INTO credentials (id, target, bearer_token)
+                             VALUES (?1, ?2, ?3)",
+                            params![id, target.target.as_str(), secret],
+                        )?;
+                        inject_synchronization_failure(
+                            failpoint,
+                            UniversalSynchronizationFailpoint::TargetCredential(target.target),
+                        )?;
+                        Some(id)
+                    } else {
+                        None
+                    };
+                    if let Some((generated_provider_id, _, _)) = generated {
+                        transaction.execute(
+                            "UPDATE providers
+                             SET provider_revision = provider_revision + 1,
+                                 name = ?1, base_url = ?2, model = ?3, protocol = ?4,
+                                 authentication = ?5, credential_id = ?6,
+                                 provenance_kind = 'universal-provider', provenance_key = ?7,
+                                 routing_requirement = ?8,
+                                 generated_source_revision = ?9,
+                                 generated_overlay_revision = ?10
+                             WHERE id = ?11 AND target = ?12",
+                            params![
+                                name,
+                                base_url,
+                                target.model,
+                                protocol_for(target.target),
+                                target.authentication.to_string(),
+                                target_credential_id,
+                                provider_id,
+                                target.routing_requirement.to_string(),
+                                provider_revision,
+                                target.overlay_revision,
+                                generated_provider_id,
+                                target.target.as_str(),
+                            ],
+                        )?;
+                    } else {
+                        let position: u32 = transaction.query_row(
+                            "SELECT COALESCE(MAX(position) + 1, 0)
+                             FROM providers WHERE target = ?1",
+                            [target.target.as_str()],
+                            |row| row.get(0),
+                        )?;
+                        let generated_provider_id = Uuid::new_v4().to_string();
+                        transaction.execute(
+                            "INSERT INTO providers
+                             (id, target, position, provider_revision, name, base_url, model,
+                              protocol, authentication, credential_id, provenance_kind,
+                              provenance_key, generated_owner_id, routing_requirement,
+                              generated_source_revision, generated_overlay_revision)
+                             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9,
+                                     'universal-provider', ?10, ?10, ?11, ?12, ?13)",
+                            params![
+                                generated_provider_id,
+                                target.target.as_str(),
+                                position,
+                                name,
+                                base_url,
+                                target.model,
+                                protocol_for(target.target),
+                                target.authentication.to_string(),
+                                target_credential_id,
+                                provider_id,
+                                target.routing_requirement.to_string(),
+                                provider_revision,
+                                target.overlay_revision,
+                            ],
+                        )?;
+                    }
+                    inject_synchronization_failure(
+                        failpoint,
+                        UniversalSynchronizationFailpoint::TargetProviderWrite(target.target),
+                    )?;
+                    if previous_credential_id != target_credential_id
+                        && let Some(previous_credential_id) = previous_credential_id
+                    {
+                        transaction.execute(
+                            "DELETE FROM credentials
+                             WHERE id = ?1
+                               AND NOT EXISTS (
+                                 SELECT 1 FROM providers WHERE credential_id = ?1
+                               )",
+                            [previous_credential_id],
+                        )?;
+                    }
+                    transaction.execute(
+                        "UPDATE universal_provider_targets
+                         SET synchronized_source_revision = ?1,
+                             synchronized_overlay_revision = ?2
+                         WHERE universal_provider_id = ?3 AND target = ?4",
+                        params![
+                            provider_revision,
+                            target.overlay_revision,
+                            provider_id,
+                            target.target.as_str(),
+                        ],
+                    )?;
+                    transaction.execute(
+                        "UPDATE target_route_state
+                         SET management_revision = management_revision + 1,
+                             view_sequence = view_sequence + 1
+                         WHERE target = ?1",
+                        [target.target.as_str()],
+                    )?;
+                    inject_synchronization_failure(
+                        failpoint,
+                        UniversalSynchronizationFailpoint::TargetRevision(target.target),
+                    )?;
+                    target_views.push(project_target_view_for(
+                        &transaction,
+                        &service_epoch,
+                        target.target,
+                    )?);
+                }
+                transaction.execute(
+                    "UPDATE universal_provider_catalog_state
+                     SET revision = revision + 1, view_sequence = view_sequence + 1
+                     WHERE singleton = 1",
+                    [],
+                )?;
+                inject_synchronization_failure(
+                    failpoint,
+                    UniversalSynchronizationFailpoint::CatalogRevision,
+                )?;
+                let view = project_universal_provider_catalog(&transaction)?;
+                let outcome = UniversalProviderOutcome {
+                    status: ActionStatus::Applied,
+                    view,
+                };
+                transaction.execute(
+                    "INSERT INTO universal_action_receipts
+                     (action_id, action_kind, committed_revision, outcome_json)
+                     VALUES (?1, 'synchronize-universal-provider', ?2, ?3)",
+                    params![
+                        action_id,
+                        outcome.view.revision,
+                        serde_json::to_string(&outcome)?
+                    ],
+                )?;
+                inject_synchronization_failure(
+                    failpoint,
+                    UniversalSynchronizationFailpoint::Receipt,
+                )?;
+                transaction.commit()?;
+                Ok(CatalogAttempt::Synchronized(
+                    UniversalProviderSynchronizationCommit {
+                        outcome,
+                        target_views,
+                    },
+                ))
+            })
+            .await;
+        match attempt {
+            Ok(CatalogAttempt::Synchronized(commit)) => Ok(commit),
+            Ok(CatalogAttempt::Failure(failure)) => Err(failure),
+            Ok(CatalogAttempt::Applied(_)) | Err(_) => Err(self
                 .catalog_failure("state-store-error", "State store operation failed")
                 .await),
         }
@@ -287,7 +736,7 @@ impl StateStore {
             .map_err(map_state_call_error)
     }
 
-    async fn universal_provider_receipt(
+    pub(crate) async fn universal_provider_receipt(
         &self,
         action_id: Uuid,
     ) -> Result<Option<UniversalProviderOutcome>, StateError> {
@@ -296,6 +745,49 @@ impl StateStore {
             .call(move |connection| read_receipt(connection, &action_id))
             .await
             .map_err(map_state_call_error)
+    }
+
+    // Task 5 consumes this through the independent catalog session.
+    #[allow(dead_code)]
+    pub(crate) async fn universal_provider_synchronization_targets(
+        &self,
+        provider_id: Uuid,
+    ) -> Result<Vec<Target>, StateError> {
+        let view = self.universal_provider_catalog().await?;
+        Ok(view
+            .providers
+            .into_iter()
+            .find(|provider| provider.id == provider_id)
+            .map(|provider| {
+                provider
+                    .targets
+                    .into_iter()
+                    .filter(|target| {
+                        target.synchronization == UniversalSynchronizationState::Pending
+                    })
+                    .map(|target| target.target)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    // Task 5 consumes this through the independent catalog session.
+    #[allow(dead_code)]
+    pub(crate) async fn universal_provider_failure(
+        &self,
+        problem: ControlProblem,
+    ) -> UniversalProviderActionFailure {
+        UniversalProviderActionFailure {
+            problem,
+            authoritative_view: self.universal_provider_catalog().await.unwrap_or_else(|_| {
+                UniversalProviderCatalogView {
+                    revision: 0,
+                    view_sequence: 0,
+                    providers: Vec::new(),
+                    presets: universal_provider_presets(),
+                }
+            }),
+        }
     }
 
     async fn catalog_failure(&self, code: &str, message: &str) -> UniversalProviderActionFailure {
@@ -724,6 +1216,88 @@ fn validated_targets(
         return Err(CatalogMutationError::Invalid);
     }
     Ok(targets)
+}
+
+struct SynchronizationTarget {
+    target: Target,
+    enabled: bool,
+    model: String,
+    authentication: ProviderAuthentication,
+    routing_requirement: ProviderRoutingRequirement,
+    overlay_revision: u64,
+    synchronized_source_revision: Option<u64>,
+    synchronized_overlay_revision: Option<u64>,
+}
+
+fn read_synchronization_targets(
+    connection: &Connection,
+    provider_id: &str,
+) -> Result<Vec<SynchronizationTarget>, tokio_rusqlite::rusqlite::Error> {
+    let mut statement = connection.prepare(
+        "SELECT target, enabled, model, authentication, routing_requirement, overlay_revision,
+                synchronized_source_revision, synchronized_overlay_revision
+         FROM universal_provider_targets
+         WHERE universal_provider_id = ?1
+         ORDER BY CASE target WHEN 'codex' THEN 0 ELSE 1 END",
+    )?;
+    let rows = statement.query_map([provider_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, bool>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, u64>(5)?,
+            row.get::<_, Option<u64>>(6)?,
+            row.get::<_, Option<u64>>(7)?,
+        ))
+    })?;
+    let mut targets = Vec::new();
+    for row in rows {
+        let (
+            target,
+            enabled,
+            model,
+            authentication,
+            routing_requirement,
+            overlay_revision,
+            synchronized_source_revision,
+            synchronized_overlay_revision,
+        ) = row?;
+        targets.push(SynchronizationTarget {
+            target: parse_target(&target)?,
+            enabled,
+            model,
+            authentication: parse_authentication(&authentication)?,
+            routing_requirement: parse_routing_requirement(&routing_requirement)?,
+            overlay_revision,
+            synchronized_source_revision,
+            synchronized_overlay_revision,
+        });
+    }
+    if targets.len() != 2 {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    Ok(targets)
+}
+
+fn protocol_for(target: Target) -> &'static str {
+    match target {
+        Target::Codex => "openai-responses",
+        Target::Claude => "anthropic-messages",
+    }
+}
+
+fn inject_synchronization_failure(
+    failpoint: Option<UniversalSynchronizationFailpoint>,
+    boundary: UniversalSynchronizationFailpoint,
+) -> Result<(), StateError> {
+    if failpoint == Some(boundary) {
+        return Err(StateError::Sqlite(
+            tokio_rusqlite::rusqlite::Error::InvalidQuery,
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn project_universal_provider_catalog(

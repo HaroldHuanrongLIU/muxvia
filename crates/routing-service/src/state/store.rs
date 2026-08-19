@@ -18,6 +18,7 @@ use crate::{
 };
 
 use super::recovery::RecoveryPayload;
+use super::universal_providers::generated_reference_fingerprint;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{problem:?}")]
@@ -786,6 +787,7 @@ impl StateStore {
                 }
                 None => payload_json,
             };
+            let generated_references_before = generated_reference_fingerprint(&transaction)?;
             transaction.execute(
                 "INSERT INTO activated_snapshots
                  (id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch)
@@ -830,6 +832,13 @@ impl StateStore {
                     'incompatible-target-cli', 'shadowing-configuration')",
                 [target.as_str()],
             )?;
+            if generated_references_before != generated_reference_fingerprint(&transaction)? {
+                transaction.execute(
+                    "UPDATE universal_provider_catalog_state
+                     SET view_sequence = view_sequence + 1 WHERE singleton = 1",
+                    [],
+                )?;
+            }
             if let Some(problem) = capability_problem {
                 transaction.execute(
                     "INSERT INTO target_problems (target, code, message)

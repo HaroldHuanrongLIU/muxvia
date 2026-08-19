@@ -342,8 +342,13 @@ const universalProviderPresetTargetSchema = z.object({
   routingRequirement: z.enum(["direct-compatible", "takeover-required"]),
 }).strict()
 
+const universalProviderPresetKeySchema = z.enum([
+  "openai-api-responses",
+  "anthropic-api-messages",
+])
+
 const universalProviderPresetSchema = z.object({
-  key: z.string(),
+  key: universalProviderPresetKeySchema,
   name: z.string(),
   baseUrl: z.string(),
   targets: z.array(universalProviderPresetTargetSchema),
@@ -380,7 +385,7 @@ const universalProviderActionSchema = z.discriminatedUnion("kind", [
     name: z.string(),
     baseUrl: z.string(),
     credential: credentialEditSchema,
-    presetKey: z.string().nullable(),
+    presetKey: universalProviderPresetKeySchema.nullable(),
     targets: z.array(universalProviderPresetTargetSchema),
   }).strict(),
   z.object({
@@ -512,6 +517,7 @@ const serverFrameSchema = z.discriminatedUnion("type", [
     requestId: z.string().nullable(),
     problem: controlProblemSchema,
     authoritativeView: targetViewSchema.optional(),
+    authoritativeUniversalProviderView: universalProviderCatalogSchema.optional(),
   }),
   z.object({ type: z.literal("target-view"), view: targetViewSchema }),
   z.object({ type: z.literal("universal-provider-view"), view: universalProviderCatalogSchema }).strict(),

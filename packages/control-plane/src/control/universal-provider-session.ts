@@ -66,6 +66,17 @@ class UniversalProviderSessionImpl implements UniversalProviderSession {
       } catch (error) {
         if (
           error instanceof ControlError
+          && error.authoritativeUniversalProviderView
+          && error.authoritativeUniversalProviderView.viewSequence >= this.#view.viewSequence
+        ) {
+          if (error.authoritativeUniversalProviderView.viewSequence === this.#view.viewSequence) {
+            this.#view = error.authoritativeUniversalProviderView
+          } else {
+            this.#replace(error.authoritativeUniversalProviderView)
+          }
+        }
+        if (
+          error instanceof ControlError
           && (error.code === "stale-universal-catalog-revision"
             || error.code === "stale-universal-provider-revision")
         ) {

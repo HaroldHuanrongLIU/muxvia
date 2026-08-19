@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use tokio::sync::OwnedMutexGuard;
 use uuid::Uuid;
 
 use crate::{
@@ -42,6 +43,18 @@ impl ProviderSynchronizationService {
             state: Arc::clone(&state),
             reconciliation: ReconciliationService::from_runtime(state, runtime),
         }
+    }
+
+    pub(crate) async fn lock_catalog_lifecycle_mutation(&self) -> [OwnedMutexGuard<()>; 2] {
+        let codex = self
+            .reconciliation
+            .lock_target_mutation(Target::Codex)
+            .await;
+        let claude = self
+            .reconciliation
+            .lock_target_mutation(Target::Claude)
+            .await;
+        [codex, claude]
     }
 
     pub(crate) async fn apply_raw(

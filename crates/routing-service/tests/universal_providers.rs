@@ -1045,7 +1045,9 @@ async fn referenced_generated_provider_blocks_disable_before_any_synchronization
         })
         .await
         .unwrap();
-    let disabled = store
+    let catalog_before = store.universal_provider_catalog().await.unwrap();
+    let target_before = store.target_view_for(Target::Codex).await.unwrap();
+    let failure = store
         .apply_universal_provider_action(
             Uuid::from_u128(0x813),
             2,
@@ -1063,16 +1065,11 @@ async fn referenced_generated_provider_blocks_disable_before_any_synchronization
             }),
         )
         .await
-        .unwrap();
-    let target_before = store.target_view_for(Target::Codex).await.unwrap();
-
-    let failure = store
-        .synchronize_universal_provider_action(Uuid::from_u128(0x814), 3, provider_id, 1)
-        .await
         .unwrap_err();
 
-    assert_eq!(failure.problem.code, "provider-synchronization-blocked");
-    assert_eq!(failure.authoritative_view, disabled.view);
+    assert_eq!(failure.problem.code, "generated-provider-referenced");
+    assert_eq!(failure.authoritative_view, catalog_before);
+    assert!(failure.authoritative_view.providers[0].targets[0].enabled);
     assert_eq!(
         failure.authoritative_view.providers[0].targets[0].active_references,
         vec![muxvia_routing::control::protocol::ProviderReferenceView::Current]
@@ -1085,13 +1082,44 @@ async fn referenced_generated_provider_blocks_disable_before_any_synchronization
         .call(|connection| {
             connection.query_row(
                 "SELECT COUNT(*) FROM universal_action_receipts WHERE action_id = ?1",
-                [Uuid::from_u128(0x814).to_string()],
+                [Uuid::from_u128(0x813).to_string()],
                 |row| row.get::<_, u64>(0),
             )
         })
         .await
         .unwrap();
     assert_eq!(receipt_count, 0);
+
+    database
+        .call(|connection| {
+            connection.execute(
+                "UPDATE target_route_state SET current_provider_id = NULL WHERE target = 'codex'",
+                [],
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+    let disabled = store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x815),
+            2,
+            serde_json::json!({
+                "kind": "update-universal-provider",
+                "providerId": provider_id,
+                "providerRevision": 1,
+                "name": "Referenced Source",
+                "baseUrl": "https://referenced.example/v1",
+                "credential": { "kind": "keep" },
+                "targets": [
+                    { "target": "codex", "enabled": false, "model": "reference-codex", "authentication": "openai-bearer", "routingRequirement": "direct-compatible" },
+                    { "target": "claude", "enabled": false, "model": "reference-claude", "authentication": "anthropic-api-key", "routingRequirement": "takeover-required" }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!disabled.view.providers[0].targets[0].enabled);
 }
 
 #[tokio::test]

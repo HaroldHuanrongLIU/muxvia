@@ -181,4 +181,3 @@ Run focused tracer, full Rust workspace serialized, full Control Plane, `bun run
 ## Final Review
 
 Run independent Spec and Standards reviews against the T08 branch base. Fix every Critical, Important, and accepted Minor through focused RED→GREEN loops. Repeat full gates, update the ignored local report, and leave the worktree clean without pushing.
-

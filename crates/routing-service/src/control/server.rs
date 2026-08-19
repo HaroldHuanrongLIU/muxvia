@@ -719,10 +719,12 @@ async fn serve_session(
                                         (Ok(outcome), None, Vec::new(), None)
                                     }
                                     Ok(None) => {
-                                        let synchronize = matches!(
+                                        let parsed_action =
                                             serde_json::from_value::<UniversalProviderAction>(
-                                                action.clone()
-                                            ),
+                                                action.clone(),
+                                            );
+                                        let synchronize = matches!(
+                                            &parsed_action,
                                             Ok(UniversalProviderAction::SynchronizeUniversalProvider { .. })
                                         );
                                         if synchronize {
@@ -754,6 +756,21 @@ async fn serve_session(
                                                 ),
                                             }
                                         } else {
+                                            let _target_gates = if matches!(
+                                                &parsed_action,
+                                                Ok(
+                                                    UniversalProviderAction::UpdateUniversalProvider { .. }
+                                                        | UniversalProviderAction::DeleteUniversalProvider { .. }
+                                                )
+                                            ) {
+                                                Some(
+                                                    provider_synchronization
+                                                        .lock_catalog_lifecycle_mutation()
+                                                        .await,
+                                                )
+                                            } else {
+                                                None
+                                            };
                                             let result = store
                                                 .apply_universal_provider_action_with_target_views(
                                                     action_id,
@@ -802,6 +819,9 @@ async fn serve_session(
                                     request_id: Some(request_id),
                                     problem: failure.problem,
                                     authoritative_view: None,
+                                    authoritative_universal_provider_view: Some(
+                                        failure.authoritative_view,
+                                    ),
                                 },
                             };
                             if !enqueue_universal_provider_action_response(
@@ -1026,6 +1046,7 @@ async fn serve_session(
                                     request_id: Some(request_id),
                                     problem: failure.problem,
                                     authoritative_view: Some(failure.authoritative_view),
+                                    authoritative_universal_provider_view: None,
                                 }
                             }
                         };
@@ -1296,6 +1317,7 @@ async fn inspect_and_queue(
                 request_id: Some(request_id.clone()),
                 problem,
                 authoritative_view: None,
+                authoritative_universal_provider_view: None,
             },
             None,
         ),
@@ -1452,6 +1474,7 @@ fn problem_frame(
             selector: None,
         },
         authoritative_view,
+        authoritative_universal_provider_view: None,
     }
 }
 
@@ -1512,6 +1535,7 @@ async fn write_problem(
                 selector: None,
             },
             authoritative_view,
+            authoritative_universal_provider_view: None,
         },
     )
     .await

@@ -333,6 +333,86 @@ async fn pending_universal_source_blocks_target_overlay_edits_until_explicit_syn
     );
 }
 
+#[tokio::test]
+async fn pending_universal_overlay_blocks_target_overlay_edits_until_explicit_sync() {
+    let fixture = StoreFixture::new();
+    let store = fixture.open().await;
+    let created = store
+        .apply_universal_provider_action(
+            action_id(91),
+            0,
+            serde_json::json!({
+                "kind": "create-universal-provider",
+                "name": "Overlay Source",
+                "baseUrl": "https://overlay-pending.example/v1",
+                "credential": { "kind": "replace", "value": "PENDING_OVERLAY_SECRET_90318" },
+                "presetKey": null,
+                "targets": [
+                    { "target": "codex", "enabled": true, "model": "overlay-one", "authentication": "openai-bearer", "routingRequirement": "direct-compatible" },
+                    { "target": "claude", "enabled": false, "model": "claude-model", "authentication": "anthropic-api-key", "routingRequirement": "takeover-required" }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    let universal_id = created.view.providers[0].id;
+    store
+        .synchronize_universal_provider_action(action_id(92), 1, universal_id, 1)
+        .await
+        .unwrap();
+    let pending = store
+        .apply_universal_provider_action(
+            action_id(93),
+            2,
+            serde_json::json!({
+                "kind": "update-universal-provider",
+                "providerId": universal_id,
+                "providerRevision": 1,
+                "name": "Overlay Source",
+                "baseUrl": "https://overlay-pending.example/v1",
+                "credential": { "kind": "keep" },
+                "targets": [
+                    { "target": "codex", "enabled": true, "model": "overlay-two", "authentication": "openai-bearer", "routingRequirement": "takeover-required" },
+                    { "target": "claude", "enabled": false, "model": "claude-model", "authentication": "anthropic-api-key", "routingRequirement": "takeover-required" }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    let target_before = store.target_view_for(Target::Codex).await.unwrap();
+    let generated = &target_before.providers[0];
+    assert_eq!(
+        generated.synchronization,
+        Some(UniversalSynchronizationState::Pending)
+    );
+
+    let failure = store
+        .apply_provider_action_for(
+            Target::Codex,
+            action_id(94),
+            target_before.management_revision,
+            serde_json::json!({
+                "kind": "update-provider",
+                "providerId": generated.id,
+                "providerRevision": generated.provider_revision,
+                "name": generated.name,
+                "baseUrl": generated.base_url,
+                "model": "target-overlay-bypass",
+                "credential": { "kind": "keep" },
+                "authentication": "openai-bearer",
+                "routingRequirement": "direct-compatible"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.problem.code, "generated-provider-read-only");
+    assert_eq!(failure.authoritative_view, target_before);
+    assert_eq!(
+        store.universal_provider_catalog().await.unwrap(),
+        pending.view
+    );
+}
+
 async fn share_credential(home: &MuxviaHome, source: Uuid, destination: Uuid) {
     tokio_rusqlite::Connection::open(home.database_path())
         .await

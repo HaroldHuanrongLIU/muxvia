@@ -603,7 +603,7 @@ fn update_provider(
             .ok_or(ProviderMutationError::Invalid)?;
         if !enabled
             || existing.generated_source_revision != Some(source_revision)
-            || existing.generated_overlay_revision.is_none()
+            || existing.generated_overlay_revision != Some(overlay_revision)
             || name != source_name
             || base_url != source_base_url
             || existing.name != source_name

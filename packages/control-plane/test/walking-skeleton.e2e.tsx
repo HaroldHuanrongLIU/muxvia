@@ -7329,28 +7329,26 @@ test("real processes prove Universal Provider synchronization across both Target
       throw new Error("universal-provider-active-traffic-not-pinned")
     }
 
-    // Referenced disable and delete report every Target blocker before any generated removal.
+    // Referenced disable and delete both reject before any generated removal.
     const current = catalog().get().providers[0]!
-    await catalog().act({
-      kind: "update-universal-provider",
-      providerId: current.id,
-      providerRevision: current.providerRevision,
-      name: current.name,
-      baseUrl: current.baseUrl,
-      credential: { kind: "keep" },
-      targets: current.targets.map(({ target, model, authentication, routingRequirement }) => ({
-        target, enabled: false, model, authentication, routingRequirement,
-      })),
-    })
-    const disabled = catalog().get().providers[0]!
     let disableCode = ""
     try {
-      await catalog().act({ kind: "synchronize-universal-provider", providerId: disabled.id, providerRevision: disabled.providerRevision })
+      await catalog().act({
+        kind: "update-universal-provider",
+        providerId: current.id,
+        providerRevision: current.providerRevision,
+        name: current.name,
+        baseUrl: current.baseUrl,
+        credential: { kind: "keep" },
+        targets: current.targets.map(({ target, model, authentication, routingRequirement }) => ({
+          target, enabled: false, model, authentication, routingRequirement,
+        })),
+      })
     } catch (error) { disableCode = fixedProblemCode(error, "disable") }
-    if (disableCode !== "provider-synchronization-blocked") throw new Error("universal-provider-disable-not-blocked")
+    if (disableCode !== "generated-provider-referenced") throw new Error("universal-provider-disable-not-blocked")
     let deleteCode = ""
     try {
-      await catalog().act({ kind: "delete-universal-provider", providerId: disabled.id, providerRevision: disabled.providerRevision })
+      await catalog().act({ kind: "delete-universal-provider", providerId: current.id, providerRevision: current.providerRevision })
     } catch (error) { deleteCode = fixedProblemCode(error, "delete") }
     if (deleteCode !== "generated-provider-referenced") throw new Error("universal-provider-delete-not-blocked")
     const blocked = catalog().get().providers[0]!
@@ -7399,7 +7397,23 @@ test("real processes prove Universal Provider synchronization across both Target
       throw new Error("universal-provider-references-not-released")
     }
     const released = catalog().get().providers[0]!
-    await catalog().act({ kind: "synchronize-universal-provider", providerId: released.id, providerRevision: released.providerRevision })
+    const disabled = await catalog().act({
+      kind: "update-universal-provider",
+      providerId: released.id,
+      providerRevision: released.providerRevision,
+      name: released.name,
+      baseUrl: released.baseUrl,
+      credential: { kind: "keep" },
+      targets: released.targets.map(({ target, model, authentication, routingRequirement }) => ({
+        target, enabled: false, model, authentication, routingRequirement,
+      })),
+    })
+    const disabledProvider = disabled.view.providers[0]!
+    await catalog().act({
+      kind: "synchronize-universal-provider",
+      providerId: disabledProvider.id,
+      providerRevision: disabledProvider.providerRevision,
+    })
     await waitForSession(codex(), (view) => !view.providers.some((provider) => provider.id === generatedIds.codex), "Codex generated removal")
     await waitForSession(claude(), (view) => !view.providers.some((provider) => provider.id === generatedIds.claude), "Claude generated removal")
     const removable = catalog().get().providers[0]!

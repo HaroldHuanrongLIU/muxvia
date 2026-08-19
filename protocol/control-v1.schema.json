@@ -76,7 +76,7 @@
       "oneOf": [
         { "type": "object", "properties": { "type": { "const": "hello-ack" }, "rpc": { "$ref": "#/$defs/rpc" }, "release": { "type": "string" }, "serviceEpoch": { "type": "string", "format": "uuid" }, "frameLimit": { "const": 1048576 } }, "required": ["type", "rpc", "release", "serviceEpoch", "frameLimit"] },
         { "type": "object", "properties": { "type": { "const": "response" }, "requestId": { "type": "string" }, "result": { "$ref": "#/$defs/controlResult" } }, "required": ["type", "requestId", "result"] },
-        { "type": "object", "properties": { "type": { "const": "error" }, "requestId": { "type": ["string", "null"] }, "problem": { "$ref": "#/$defs/controlProblem" }, "authoritativeView": { "$ref": "#/$defs/targetView" } }, "required": ["type", "requestId", "problem"] },
+        { "type": "object", "properties": { "type": { "const": "error" }, "requestId": { "type": ["string", "null"] }, "problem": { "$ref": "#/$defs/controlProblem" }, "authoritativeView": { "$ref": "#/$defs/targetView" }, "authoritativeUniversalProviderView": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["type", "requestId", "problem"] },
         { "type": "object", "properties": { "type": { "const": "target-view" }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["type", "view"] },
         { "type": "object", "additionalProperties": false, "properties": { "type": { "const": "universal-provider-view" }, "view": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["type", "view"] }
       ]

@@ -133,6 +133,8 @@ pub enum ServerFrame {
         problem: ControlProblem,
         #[serde(skip_serializing_if = "Option::is_none")]
         authoritative_view: Option<TargetView>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        authoritative_universal_provider_view: Option<UniversalProviderCatalogView>,
     },
     TargetView {
         view: TargetView,

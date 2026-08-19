@@ -134,6 +134,7 @@ function safeUniversalProblem(error: unknown): string {
     case "untested-target-cli":
     case "incompatible-target-cli":
     case "configuration-drift":
+    case "compatibility-acknowledgement-required":
       return code
     default:
       return "internal-failure"

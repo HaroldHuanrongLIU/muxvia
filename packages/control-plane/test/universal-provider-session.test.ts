@@ -29,6 +29,34 @@ function catalogAt(revision: number, viewSequence = revision): UniversalProvider
   }
 }
 
+function referencedCatalogAt(viewSequence: number): UniversalProviderCatalogView {
+  return {
+    revision: 0,
+    viewSequence,
+    providers: [{
+      id: "00000000-0000-4000-8000-000000000951",
+      position: 0,
+      providerRevision: 1,
+      name: "Referenced",
+      baseUrl: "https://referenced.example/v1",
+      credential: "present",
+      provenance: null,
+      targets: [{
+        target: "codex",
+        enabled: true,
+        model: "reference-model",
+        authentication: "openai-bearer",
+        routingRequirement: "direct-compatible",
+        overlayRevision: 1,
+        generatedProviderId: "00000000-0000-4000-8000-000000000952",
+        synchronization: "current",
+        activeReferences: ["current", "activated-snapshot"],
+      }],
+    }],
+    presets: [],
+  }
+}
+
 class CatalogServer {
   readonly frames: ClientFrame[] = []
   readonly #server: Server
@@ -274,6 +302,36 @@ test("catalog actions capture caller input, serialize revisions, and refresh sta
     code: "stale-universal-catalog-revision",
   })
   expect(session.get()).toEqual(catalogAt(4, 4))
+
+  await session.close()
+  await server.close()
+})
+
+test("catalog failures install their authoritative Universal Provider view", async () => {
+  const { server, path } = await CatalogServer.start()
+  const client = await RpcClient.connect(path, "control-test")
+  const opening = client.openUniversalProviders()
+  await server.waitForRequests(1)
+  server.replyOpen(0)
+  const session = await opening
+  const referenced = referencedCatalogAt(1)
+
+  const attempted = session.act(createUniversalProvider("Blocked", "BLOCKED_CREDENTIAL"))
+  await server.waitForRequests(2)
+  const request = server.requests()[1]!
+  server.send({
+    type: "error",
+    requestId: request.requestId,
+    problem: {
+      code: "generated-provider-referenced",
+      message: "Generated Target Provider is still referenced",
+    },
+    authoritativeUniversalProviderView: referenced,
+  })
+
+  await expect(attempted).rejects.toMatchObject({ code: "generated-provider-referenced" })
+  expect(session.get()).toEqual(referenced)
+  expect(server.requests()).toHaveLength(2)
 
   await session.close()
   await server.close()

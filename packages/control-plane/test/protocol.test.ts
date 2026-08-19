@@ -69,6 +69,10 @@ test("Universal Provider JSON schema exposes the complete closed catalog contrac
   const action = await readFixture("create-universal-provider.json") as Record<string, unknown>
   action.additiveSecret = "UNIVERSAL_ADDITIVE_SECRET_99310"
   expect(() => parseUniversalProviderAction(action)).toThrow()
+
+  const invalidPreset = await readFixture("create-universal-provider.json") as Record<string, unknown>
+  invalidPreset.presetKey = "unstable-user-defined-preset"
+  expect(() => parseUniversalProviderAction(invalidPreset)).toThrow()
 })
 
 // Catches a parser mutation that accepts arbitrary reconciliation values or lets

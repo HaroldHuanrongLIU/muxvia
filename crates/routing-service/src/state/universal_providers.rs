@@ -1060,6 +1060,27 @@ fn update_universal_provider(
             || current.1 != target.model
             || current.2 != target.authentication.to_string()
             || current.3 != target.routing_requirement.to_string();
+        if !target.enabled {
+            let generated_provider_id = transaction
+                .query_row(
+                    "SELECT id FROM providers
+                     WHERE generated_owner_id = ?1 AND target = ?2",
+                    params![provider_id, target.target.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|_| CatalogMutationError::State)?;
+            if let Some(generated_provider_id) = generated_provider_id {
+                let generated_provider_id = Uuid::parse_str(&generated_provider_id)
+                    .map_err(|_| CatalogMutationError::Invalid)?;
+                if !project_active_references(transaction, target.target, generated_provider_id)
+                    .map_err(|_| CatalogMutationError::State)?
+                    .is_empty()
+                {
+                    return Err(CatalogMutationError::GeneratedProviderReferenced);
+                }
+            }
+        }
         if changed {
             transaction
                 .execute(
@@ -1612,6 +1633,34 @@ fn project_active_references(
         references.push(ProviderReferenceView::ActivatedSnapshot);
     }
     Ok(references)
+}
+
+pub(super) fn generated_reference_fingerprint(
+    connection: &Connection,
+) -> Result<Vec<(String, String, bool, bool)>, tokio_rusqlite::rusqlite::Error> {
+    let mut statement = connection.prepare(
+        "SELECT target, id FROM providers
+         WHERE generated_owner_id IS NOT NULL
+         ORDER BY target, id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut fingerprint = Vec::new();
+    for row in rows {
+        let (target, provider_id) = row?;
+        let target = parse_target(&target)?;
+        let provider_id = Uuid::parse_str(&provider_id)
+            .map_err(|_| tokio_rusqlite::rusqlite::Error::InvalidQuery)?;
+        let references = project_active_references(connection, target, provider_id)?;
+        fingerprint.push((
+            target.as_str().to_owned(),
+            provider_id.to_string(),
+            references.contains(&ProviderReferenceView::Current),
+            references.contains(&ProviderReferenceView::ActivatedSnapshot),
+        ));
+    }
+    Ok(fingerprint)
 }
 
 fn read_receipt(

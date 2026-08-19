@@ -15,6 +15,7 @@ use crate::{
     },
 };
 
+use super::universal_providers::generated_reference_fingerprint;
 use super::{ActionFailure, StateError, StateStore};
 
 pub(crate) struct AdoptReconciliation {
@@ -311,6 +312,7 @@ impl StateStore {
                 if !pending {
                     return Err(StateError::MissingRecoveryIntent);
                 }
+                let generated_references_before = generated_reference_fingerprint(&transaction)?;
 
                 match input.strategy {
                     ReconciliationStrategy::Adopt => {
@@ -459,6 +461,13 @@ impl StateStore {
                        view_sequence = view_sequence + 1 WHERE target = ?1",
                     [input.target.as_str()],
                 )?;
+                if generated_references_before != generated_reference_fingerprint(&transaction)? {
+                    transaction.execute(
+                        "UPDATE universal_provider_catalog_state
+                         SET view_sequence = view_sequence + 1 WHERE singleton = 1",
+                        [],
+                    )?;
+                }
                 fail_reconciliation_commit(
                     input.failpoint,
                     ReconciliationCommitFailpoint::FinalRevision,

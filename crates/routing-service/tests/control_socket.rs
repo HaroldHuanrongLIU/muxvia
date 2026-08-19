@@ -27,7 +27,7 @@ use muxvia_routing::{
     },
     home::MuxviaHome,
     model::{UpstreamError, UpstreamRequest, UpstreamResponse, UpstreamTransport},
-    service::activate::ActivationService,
+    service::activate::{ActivationHooks, ActivationPause, ActivationService},
     state::StateStore,
 };
 use serde_json::{Value, json};
@@ -504,6 +504,10 @@ struct ControlFixture {
 
 impl ControlFixture {
     async fn start() -> Self {
+        Self::start_with_activation_hooks(ActivationHooks::default()).await
+    }
+
+    async fn start_with_activation_hooks(hooks: ActivationHooks) -> Self {
         let root = short_temp_root("mx-ctl");
         let user_home = root.join("home");
         fs::create_dir_all(&user_home).unwrap();
@@ -517,6 +521,7 @@ impl ControlFixture {
                 "/usr/bin/codex".into(),
                 Arc::new(ControlNoopUpstream),
             )
+            .with_hooks(hooks)
             .with_claude_runtime(Arc::new(ControlClaudeProbe), "/usr/bin/claude".into()),
         );
         let handle = ControlServer::bind_with_activation(
@@ -1195,6 +1200,413 @@ async fn generated_overlay_update_publishes_the_authoritative_universal_catalog(
         !catalog_push
             .to_string()
             .contains("OVERLAY_SOURCE_SECRET_941")
+    );
+}
+
+#[tokio::test]
+async fn generated_activation_advances_catalog_references_and_disable_returns_authoritative_catalog()
+ {
+    const SECRETS: &[&str] = &["REFERENCE_SOURCE_SECRET_951"];
+    let fixture = ControlFixture::start().await;
+    let mut catalog = fixture.connect().await;
+    let mut codex = fixture.connect().await;
+    hello(&mut catalog).await;
+    hello(&mut codex).await;
+    let _opened_catalog = request(
+        &mut catalog,
+        "open-generated-reference-catalog",
+        json!({ "kind": "open-universal-providers" }),
+    )
+    .await;
+    let opened_codex = request(
+        &mut codex,
+        "open-generated-reference-codex",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+
+    let created = request(
+        &mut catalog,
+        "create-generated-reference-source",
+        json!({
+            "kind": "universal-provider-act",
+            "actionId": "00000000-0000-4000-8000-000000000951",
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-universal-provider",
+                "name": "Reference Source",
+                "baseUrl": "https://reference-source.example/v1",
+                "credential": { "kind": "replace", "value": "REFERENCE_SOURCE_SECRET_951" },
+                "presetKey": null,
+                "targets": [
+                    { "target": "codex", "enabled": true, "model": "reference-model", "authentication": "openai-bearer", "routingRequirement": "direct-compatible" },
+                    { "target": "claude", "enabled": false, "model": "unused", "authentication": "anthropic-api-key", "routingRequirement": "direct-compatible" }
+                ]
+            }
+        }),
+    )
+    .await;
+    assert_compatibility_wire_is_secret_free(&created, SECRETS, "generated-reference-create");
+    let _created_catalog_push = read_frame(&mut catalog).await.unwrap();
+    let source_id = created["result"]["outcome"]["view"]["providers"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let synchronized = request(
+        &mut catalog,
+        "sync-generated-reference-source",
+        json!({
+            "kind": "universal-provider-act",
+            "actionId": "00000000-0000-4000-8000-000000000952",
+            "expectedRevision": 1,
+            "action": {
+                "kind": "synchronize-universal-provider",
+                "providerId": source_id,
+                "providerRevision": 1
+            }
+        }),
+    )
+    .await;
+    assert_compatibility_wire_is_secret_free(&synchronized, SECRETS, "generated-reference-sync");
+    let _synchronized_catalog_push = read_frame(&mut catalog).await.unwrap();
+    let generated_target_push = read_frame(&mut codex).await.unwrap();
+    assert_compatibility_wire_is_secret_free(
+        &generated_target_push,
+        SECRETS,
+        "generated-reference-target-push",
+    );
+    let generated_id = synchronized["result"]["outcome"]["view"]["providers"][0]["targets"][0]
+        ["generatedProviderId"]
+        .as_str()
+        .unwrap();
+    let catalog_sequence = synchronized["result"]["outcome"]["view"]["viewSequence"]
+        .as_u64()
+        .unwrap();
+    let target_revision = generated_target_push["view"]["managementRevision"]
+        .as_u64()
+        .unwrap_or_else(|| {
+            opened_codex["result"]["view"]["managementRevision"]
+                .as_u64()
+                .unwrap()
+        });
+
+    let activated = request(
+        &mut codex,
+        "activate-generated-reference",
+        json!({
+            "kind": "act",
+            "target": "codex",
+            "actionId": "00000000-0000-4000-8000-000000000953",
+            "expectedRevision": target_revision,
+            "action": {
+                "kind": "activate-provider",
+                "providerId": generated_id,
+                "mode": "direct"
+            }
+        }),
+    )
+    .await;
+    assert_compatibility_wire_is_secret_free(&activated, SECRETS, "generated-reference-activation");
+    assert_eq!(activated["type"], "response");
+    let activated_target_push = read_frame(&mut codex).await.unwrap();
+    assert_compatibility_wire_is_secret_free(
+        &activated_target_push,
+        SECRETS,
+        "generated-reference-activation-push",
+    );
+    let catalog_push = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut catalog))
+        .await
+        .expect("Generated activation did not publish updated catalog references")
+        .unwrap();
+    assert_compatibility_wire_is_secret_free(
+        &catalog_push,
+        SECRETS,
+        "generated-reference-catalog-push",
+    );
+    assert_eq!(catalog_push["type"], "universal-provider-view");
+    assert!(catalog_push["view"]["viewSequence"].as_u64().unwrap() > catalog_sequence);
+    assert_eq!(
+        catalog_push["view"]["providers"][0]["targets"][0]["activeReferences"],
+        json!(["current", "activated-snapshot"])
+    );
+
+    let blocked_disable = request(
+        &mut catalog,
+        "disable-generated-reference",
+        json!({
+            "kind": "universal-provider-act",
+            "actionId": "00000000-0000-4000-8000-000000000954",
+            "expectedRevision": 2,
+            "action": {
+                "kind": "update-universal-provider",
+                "providerId": source_id,
+                "providerRevision": 1,
+                "name": "Reference Source",
+                "baseUrl": "https://reference-source.example/v1",
+                "credential": { "kind": "keep" },
+                "targets": [
+                    { "target": "codex", "enabled": false, "model": "reference-model", "authentication": "openai-bearer", "routingRequirement": "direct-compatible" },
+                    { "target": "claude", "enabled": false, "model": "unused", "authentication": "anthropic-api-key", "routingRequirement": "direct-compatible" }
+                ]
+            }
+        }),
+    )
+    .await;
+    assert_compatibility_wire_is_secret_free(
+        &blocked_disable,
+        SECRETS,
+        "generated-reference-disable",
+    );
+    assert_eq!(blocked_disable["type"], "error");
+    assert_eq!(
+        blocked_disable["problem"]["code"],
+        "generated-provider-referenced"
+    );
+    assert_eq!(
+        blocked_disable["authoritativeUniversalProviderView"]["providers"][0]["targets"][0]["activeReferences"],
+        json!(["current", "activated-snapshot"])
+    );
+    let restore_preview = request(
+        &mut codex,
+        "preview-generated-reference-restore",
+        json!({
+            "kind": "preview-reconciliation",
+            "target": "codex",
+            "strategy": "restore"
+        }),
+    )
+    .await;
+    assert_compatibility_wire_is_secret_free(
+        &restore_preview,
+        SECRETS,
+        "generated-reference-restore-preview",
+    );
+    let restored = request(
+        &mut codex,
+        "restore-generated-reference",
+        json!({
+            "kind": "act",
+            "target": "codex",
+            "actionId": "00000000-0000-4000-8000-000000000955",
+            "expectedRevision": activated["result"]["outcome"]["view"]["managementRevision"],
+            "action": {
+                "kind": "reconcile",
+                "strategy": "restore",
+                "observationToken": restore_preview["result"]["preview"]["observationToken"]
+            }
+        }),
+    )
+    .await;
+    assert_compatibility_wire_is_secret_free(&restored, SECRETS, "generated-reference-restore");
+    assert_eq!(restored["type"], "response");
+    let restored_target_push = read_frame(&mut codex).await.unwrap();
+    assert_compatibility_wire_is_secret_free(
+        &restored_target_push,
+        SECRETS,
+        "generated-reference-restore-target-push",
+    );
+    let restored_catalog_push =
+        tokio::time::timeout(Duration::from_secs(1), read_frame(&mut catalog))
+            .await
+            .expect("Generated Restore did not publish updated catalog references")
+            .unwrap();
+    assert_compatibility_wire_is_secret_free(
+        &restored_catalog_push,
+        SECRETS,
+        "generated-reference-restore-catalog-push",
+    );
+    assert_eq!(restored_catalog_push["type"], "universal-provider-view");
+    assert_eq!(
+        restored_catalog_push["view"]["providers"][0]["targets"][0]["activeReferences"],
+        json!([])
+    );
+    assert!(
+        restored_catalog_push["view"]["viewSequence"]
+            .as_u64()
+            .unwrap()
+            > catalog_push["view"]["viewSequence"].as_u64().unwrap()
+    );
+
+    let disabled = request(
+        &mut catalog,
+        "disable-restored-generated-reference",
+        json!({
+            "kind": "universal-provider-act",
+            "actionId": "00000000-0000-4000-8000-000000000956",
+            "expectedRevision": 2,
+            "action": {
+                "kind": "update-universal-provider",
+                "providerId": source_id,
+                "providerRevision": 1,
+                "name": "Reference Source",
+                "baseUrl": "https://reference-source.example/v1",
+                "credential": { "kind": "keep" },
+                "targets": [
+                    { "target": "codex", "enabled": false, "model": "reference-model", "authentication": "openai-bearer", "routingRequirement": "direct-compatible" },
+                    { "target": "claude", "enabled": false, "model": "unused", "authentication": "anthropic-api-key", "routingRequirement": "direct-compatible" }
+                ]
+            }
+        }),
+    )
+    .await;
+    assert_compatibility_wire_is_secret_free(
+        &disabled,
+        SECRETS,
+        "generated-reference-disable-after-restore",
+    );
+    assert_eq!(disabled["type"], "response");
+}
+
+#[tokio::test]
+async fn catalog_delete_waits_for_target_activation_and_observes_the_committed_reference() {
+    const SECRETS: &[&str] = &["DELETE_RACE_SECRET_961"];
+    let pause = Arc::new(ActivationPause::default());
+    let fixture = ControlFixture::start_with_activation_hooks(
+        ActivationHooks::pausing_final_commit(Arc::clone(&pause)),
+    )
+    .await;
+    let mut catalog = fixture.connect().await;
+    hello(&mut catalog).await;
+    let _opened_catalog = request(
+        &mut catalog,
+        "open-delete-race-catalog",
+        json!({ "kind": "open-universal-providers" }),
+    )
+    .await;
+
+    let created = request(
+        &mut catalog,
+        "create-delete-race-source",
+        json!({
+            "kind": "universal-provider-act",
+            "actionId": "00000000-0000-4000-8000-000000000961",
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-universal-provider",
+                "name": "Delete Race Source",
+                "baseUrl": "https://delete-race.example/v1",
+                "credential": { "kind": "replace", "value": "DELETE_RACE_SECRET_961" },
+                "presetKey": null,
+                "targets": [
+                    { "target": "codex", "enabled": true, "model": "delete-race-model", "authentication": "openai-bearer", "routingRequirement": "direct-compatible" },
+                    { "target": "claude", "enabled": false, "model": "unused", "authentication": "anthropic-api-key", "routingRequirement": "direct-compatible" }
+                ]
+            }
+        }),
+    )
+    .await;
+    assert_compatibility_wire_is_secret_free(&created, SECRETS, "delete-race-create");
+    let created_push = read_frame(&mut catalog).await.unwrap();
+    assert_compatibility_wire_is_secret_free(&created_push, SECRETS, "delete-race-create-push");
+    let source_id = created["result"]["outcome"]["view"]["providers"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let synchronized = request(
+        &mut catalog,
+        "sync-delete-race-source",
+        json!({
+            "kind": "universal-provider-act",
+            "actionId": "00000000-0000-4000-8000-000000000962",
+            "expectedRevision": 1,
+            "action": {
+                "kind": "synchronize-universal-provider",
+                "providerId": source_id,
+                "providerRevision": 1
+            }
+        }),
+    )
+    .await;
+    assert_compatibility_wire_is_secret_free(&synchronized, SECRETS, "delete-race-sync");
+    let synchronized_push = read_frame(&mut catalog).await.unwrap();
+    assert_compatibility_wire_is_secret_free(&synchronized_push, SECRETS, "delete-race-sync-push");
+    let generated_id = synchronized["result"]["outcome"]["view"]["providers"][0]["targets"]
+        [0]["generatedProviderId"]
+        .as_str()
+        .unwrap();
+    let mut codex = fixture.connect().await;
+    hello(&mut codex).await;
+    let opened_codex = request(
+        &mut codex,
+        "open-delete-race-codex",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    let target_revision = opened_codex["result"]["view"]["managementRevision"]
+        .as_u64()
+        .unwrap();
+
+    write_frame(
+        &mut codex,
+        &json!({
+            "type": "request",
+            "requestId": "activate-delete-race",
+            "operation": {
+                "kind": "act",
+                "target": "codex",
+                "actionId": "00000000-0000-4000-8000-000000000963",
+                "expectedRevision": target_revision,
+                "action": {
+                    "kind": "activate-provider",
+                    "providerId": generated_id,
+                    "mode": "direct"
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    pause.wait_until_reached().await;
+
+    write_frame(
+        &mut catalog,
+        &json!({
+            "type": "request",
+            "requestId": "delete-racing-source",
+            "operation": {
+                "kind": "universal-provider-act",
+                "actionId": "00000000-0000-4000-8000-000000000964",
+                "expectedRevision": 2,
+                "action": {
+                    "kind": "delete-universal-provider",
+                    "providerId": source_id,
+                    "providerRevision": 1
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let premature =
+        tokio::time::timeout(Duration::from_millis(150), read_frame(&mut catalog)).await;
+    pause.release();
+    assert!(
+        premature.is_err(),
+        "catalog delete crossed an in-flight Target activation"
+    );
+
+    let activated = read_frame(&mut codex).await.unwrap();
+    assert_compatibility_wire_is_secret_free(&activated, SECRETS, "delete-race-activation");
+    assert_eq!(activated["type"], "response");
+    let target_push = read_frame(&mut codex).await.unwrap();
+    assert_compatibility_wire_is_secret_free(&target_push, SECRETS, "delete-race-target-push");
+    let mut blocked = None;
+    for _ in 0..3 {
+        let frame = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut catalog))
+            .await
+            .unwrap()
+            .unwrap();
+        if frame["type"] == "error" {
+            blocked = Some(frame);
+            break;
+        }
+    }
+    let blocked = blocked.expect("catalog delete did not return a reference failure");
+    assert_compatibility_wire_is_secret_free(&blocked, SECRETS, "delete-race-blocked");
+    assert_eq!(blocked["problem"]["code"], "generated-provider-referenced");
+    assert_eq!(
+        blocked["authoritativeUniversalProviderView"]["providers"][0]["targets"][0]["activeReferences"],
+        json!(["current", "activated-snapshot"])
     );
 }
 

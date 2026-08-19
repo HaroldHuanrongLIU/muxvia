@@ -1111,50 +1111,56 @@ test("Preset draft edits both Target overlays and synchronizes only after confir
   }
 })
 
-test("Universal Provider workflow scans credential, configuration, backend, and settings failures before rendering", async () => {
-  const universalSecret = "universal-provider-credential-secret-must-not-render"
-  const secrets = [universalSecret, configSecret, backendSecret, settingsSecret] as const
-  const catalog = new MemoryUniversalProviderSession(universalCatalog(), async () => {
-    throw {
-      code: "invalid-universal-provider",
-      message: backendSecret,
-      configuration: configSecret,
-      settings: { raw: settingsSecret },
+test.each(["invalid-universal-provider", "compatibility-acknowledgement-required"])(
+  "Universal Provider workflow scans %s failures before rendering",
+  async (problemCode) => {
+    const universalSecret = "universal-provider-credential-secret-must-not-render"
+    const secrets = [universalSecret, configSecret, backendSecret, settingsSecret] as const
+    const catalog = new MemoryUniversalProviderSession(universalCatalog(), async () => {
+      throw {
+        code: problemCode,
+        message: backendSecret,
+        configuration: configSecret,
+        settings: { raw: settingsSecret },
+      }
+    })
+    const session = new MemoryTargetSession(view())
+    const setup = await testRender(() => <App session={session} universalSession={catalog} />, {
+      width: 80, height: 30, useThread: false, kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("1")
+      await setup.mockInput.typeText("/universal-providers")
+      setup.mockInput.pressEnter()
+      await waitForSecretFreeFrame(setup, (frame) => frame.includes("Shared Frontier"), secrets, "universal-open")
+      setup.mockInput.pressEnter()
+      await waitForSecretFreeFrame(setup, (frame) => frame.includes("Edit Universal Provider"), secrets, "universal-edit")
+      setup.mockInput.pressTab()
+      setup.mockInput.pressTab()
+      await setup.mockInput.typeText(universalSecret)
+      setup.mockInput.pressEnter()
+      await waitForSecretFreeCondition(
+        setup,
+        () => catalog.actions.length === 1,
+        () => auditSecretFreeActions(catalog.actions, secrets, "universal-action"),
+        "secret-scan-failed:universal-action",
+        "universal-action",
+      )
+      await setup.renderOnce()
+      const failure = setup.captureCharFrame()
+      auditSecretFreeFrame(failure, secrets, "universal-error")
+      const renderedCode = problemCode === "invalid-universal-provider"
+        ? "invalid-universal-"
+        : "compatibility"
+      expect(failure.includes(renderedCode)).toBeTrue()
+      expect(failure.includes("Universal Provider action failed")).toBeTrue()
+      auditSecretFreeActions(catalog.actions, secrets, "universal-action-final")
+    } finally {
+      setup.renderer.destroy()
     }
-  })
-  const session = new MemoryTargetSession(view())
-  const setup = await testRender(() => <App session={session} universalSession={catalog} />, {
-    width: 80, height: 30, useThread: false, kittyKeyboard: true,
-  })
-  try {
-    await setup.renderOnce()
-    setup.mockInput.pressKey("1")
-    await setup.mockInput.typeText("/universal-providers")
-    setup.mockInput.pressEnter()
-    await waitForSecretFreeFrame(setup, (frame) => frame.includes("Shared Frontier"), secrets, "universal-open")
-    setup.mockInput.pressEnter()
-    await waitForSecretFreeFrame(setup, (frame) => frame.includes("Edit Universal Provider"), secrets, "universal-edit")
-    setup.mockInput.pressTab()
-    setup.mockInput.pressTab()
-    await setup.mockInput.typeText(universalSecret)
-    setup.mockInput.pressEnter()
-    await waitForSecretFreeCondition(
-      setup,
-      () => catalog.actions.length === 1,
-      () => auditSecretFreeActions(catalog.actions, secrets, "universal-action"),
-      "secret-scan-failed:universal-action",
-      "universal-action",
-    )
-    await setup.renderOnce()
-    const failure = setup.captureCharFrame()
-    auditSecretFreeFrame(failure, secrets, "universal-error")
-    expect(failure.includes("invalid-universal-")).toBeTrue()
-    expect(failure.includes("Universal Provider action failed")).toBeTrue()
-    auditSecretFreeActions(catalog.actions, secrets, "universal-action-final")
-  } finally {
-    setup.renderer.destroy()
-  }
-})
+  },
+)
 
 test("Universal Provider catalog keeps English and Chinese parity at every supported terminal size", async () => {
   for (const locale of ["en", "zh-CN"] as const) {

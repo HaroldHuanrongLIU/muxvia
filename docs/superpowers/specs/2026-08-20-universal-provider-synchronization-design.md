@@ -240,4 +240,3 @@ Tests prove:
 - response-before-push, no replay push, catalog/Target publication ordering, reconnect, and multi-session races;
 - scan-first diagnostics with controlled credential, configuration, backend, and settings sentinels; and
 - end-to-end create, edit, sync-both, overlay edit, duplicate-detach, reference-blocked disable/delete, release, resynchronize, delete, natural exit, and UDS removal.
-

@@ -143,6 +143,7 @@ export const zhCN = {
   "provider.credential-reference.missing": "凭据引用缺失",
   "provider.reference.current": "当前 Provider",
   "provider.reference.activated-snapshot": "已激活快照",
+  "provider.reference.activated-route-plan": "已激活路由计划",
   "provider.reference.none": "没有活动引用",
   "provider.list.help": "Enter 编辑 · ctrl+x a 激活 · ctrl+x u/n 移动 · ctrl+x d 删除 · Esc 关闭",
   "provider.list.help.claude": "Enter 编辑 · ctrl+x a 直接激活 · ctrl+x o Takeover · ctrl+x u/n 移动 · ctrl+x d 删除 · Esc 关闭",

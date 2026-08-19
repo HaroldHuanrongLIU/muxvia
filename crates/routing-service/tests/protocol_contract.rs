@@ -404,6 +404,31 @@ fn inspection_protocol_round_trips_all_sources_cancellation_and_view_free_result
 
 #[test]
 fn provider_lifecycle_actions_use_revision_guarded_secret_free_wire_shapes() {
+    let update = TargetAction::UpdateProvider {
+        provider_id: "00000000-0000-4000-8000-000000000101".into(),
+        provider_revision: 7,
+        name: "Overlay Provider".into(),
+        base_url: "https://overlay.example/v1".into(),
+        model: "overlay-model".into(),
+        credential: CredentialEdit::Keep,
+        authentication: Some(ProviderAuthentication::OpenaiBearer),
+        routing_requirement: Some(ProviderRoutingRequirement::TakeoverRequired),
+    };
+    assert_eq!(
+        serde_json::to_value(update).unwrap(),
+        serde_json::json!({
+            "kind": "update-provider",
+            "providerId": "00000000-0000-4000-8000-000000000101",
+            "providerRevision": 7,
+            "name": "Overlay Provider",
+            "baseUrl": "https://overlay.example/v1",
+            "model": "overlay-model",
+            "credential": { "kind": "keep" },
+            "authentication": "openai-bearer",
+            "routingRequirement": "takeover-required"
+        })
+    );
+
     let reorder = TargetAction::ReorderProviders {
         provider_ids: vec![
             "00000000-0000-4000-8000-000000000103".parse().unwrap(),
@@ -503,6 +528,17 @@ fn provider_declaration_contract_round_trips_the_secret_free_projection_and_acti
         "missingFields": [],
         "provenance": null,
         "generated": false,
+        "universalProviderId": null,
+        "synchronization": null,
+        "ownership": {
+            "name": "target-provider",
+            "baseUrl": "target-provider",
+            "model": "target-provider",
+            "protocol": "target-fixed",
+            "authentication": "target-provider",
+            "routingRequirement": "target-provider",
+            "credential": "target-provider"
+        },
         "activeReferences": []
     });
     let view = serde_json::json!({
@@ -588,6 +624,17 @@ fn claude_declarations_use_the_exact_messages_authentication_and_neutral_health_
             "missingFields": [],
             "provenance": null,
             "generated": false,
+            "universalProviderId": null,
+            "synchronization": null,
+            "ownership": {
+                "name": "target-provider",
+                "baseUrl": "target-provider",
+                "model": "target-provider",
+                "protocol": "target-fixed",
+                "authentication": "target-provider",
+                "routingRequirement": "target-provider",
+                "credential": "target-provider"
+            },
             "activeReferences": []
         }],
         "providerPresets": [{

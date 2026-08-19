@@ -6,10 +6,10 @@ use tokio_rusqlite::rusqlite::{
 
 use crate::control::protocol::{
     ActionOutcome, ActionStatus, ActivatedSnapshotView, ControlProblem, CredentialPresence,
-    ManagedConfigurationView, ProviderAuthentication, ProviderCompleteness, ProviderPresetView,
-    ProviderProtocol, ProviderProvenanceView, ProviderReferenceView, ProviderRequirement,
-    ProviderRoutingRequirement, ProviderView, RecoveryView, RouteHealthView, ServiceView,
-    TakeoverView, Target, TargetView,
+    ManagedConfigurationView, ProviderAuthentication, ProviderCompleteness,
+    ProviderFieldOwnershipView, ProviderPresetView, ProviderProtocol, ProviderProvenanceView,
+    ProviderReferenceView, ProviderRequirement, ProviderRoutingRequirement, ProviderView,
+    RecoveryView, RouteHealthView, ServiceView, TakeoverView, Target, TargetView,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -922,6 +922,9 @@ impl LegacyV2ProviderView {
             missing_fields: self.missing_fields,
             provenance: self.provenance,
             generated: self.generated,
+            universal_provider_id: None,
+            synchronization: None,
+            ownership: ProviderFieldOwnershipView::target_provider(),
             active_references: self.active_references,
         }
     }
@@ -1057,6 +1060,9 @@ impl LegacyV3ProviderView {
             missing_fields: self.missing_fields,
             provenance: self.provenance,
             generated: self.generated,
+            universal_provider_id: None,
+            synchronization: None,
+            ownership: ProviderFieldOwnershipView::target_provider(),
             active_references: self.active_references,
         }
     }

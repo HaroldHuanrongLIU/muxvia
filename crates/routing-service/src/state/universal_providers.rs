@@ -183,10 +183,13 @@ impl StateStore {
                             "no-universal-provider-change",
                             "Universal Provider declaration is unchanged",
                         ),
-                        CatalogMutationError::GeneratedProvidersExist => (
-                            "provider-synchronization-blocked",
-                            "Generated Target Providers must be checked before deletion",
+                        CatalogMutationError::GeneratedProviderReferenced => (
+                            "generated-provider-referenced",
+                            "Generated Target Provider is still referenced",
                         ),
+                        CatalogMutationError::State => {
+                            ("state-store-error", "State store operation failed")
+                        }
                     };
                     return Ok(CatalogAttempt::Failure(catalog_failure_for(
                         &transaction,
@@ -938,6 +941,27 @@ fn update_universal_provider(
     if existing.3 != provider_revision {
         return Err(CatalogMutationError::StaleProviderRevision);
     }
+    let current_generated_targets = transaction
+        .prepare(
+            "SELECT p.target
+             FROM providers p
+             JOIN universal_provider_targets t
+               ON t.universal_provider_id = p.generated_owner_id AND t.target = p.target
+             WHERE p.generated_owner_id = ?1
+               AND p.generated_source_revision = ?2
+               AND p.generated_overlay_revision = t.overlay_revision
+             ORDER BY CASE p.target WHEN 'codex' THEN 0 ELSE 1 END",
+        )
+        .map_err(|_| CatalogMutationError::State)?
+        .query_map(params![provider_id, existing.3], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|_| CatalogMutationError::State)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CatalogMutationError::State)?
+        .into_iter()
+        .map(|target| parse_target(&target).map_err(|_| CatalogMutationError::Invalid))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let credential_id = match credential {
         CredentialEdit::Keep => existing.2.clone(),
@@ -959,7 +983,7 @@ fn update_universal_provider(
     let source_changed =
         existing.0 != name || existing.1 != base_url || existing.2 != credential_id;
 
-    let mut target_changed = false;
+    let mut changed_targets = Vec::new();
     for target in targets {
         let current = transaction
             .query_row(
@@ -998,10 +1022,10 @@ fn update_universal_provider(
                     ],
                 )
                 .map_err(|_| CatalogMutationError::Invalid)?;
-            target_changed = true;
+            changed_targets.push(target.target);
         }
     }
-    if !source_changed && !target_changed {
+    if !source_changed && changed_targets.is_empty() {
         return Err(CatalogMutationError::NoChange);
     }
     if source_changed {
@@ -1027,6 +1051,18 @@ fn update_universal_provider(
                     [previous_credential_id],
                 )
                 .map_err(|_| CatalogMutationError::Invalid)?;
+        }
+    }
+    for target in current_generated_targets {
+        if source_changed || changed_targets.contains(&target) {
+            transaction
+                .execute(
+                    "UPDATE target_route_state
+                     SET view_sequence = view_sequence + 1
+                     WHERE target = ?1",
+                    [target.as_str()],
+                )
+                .map_err(|_| CatalogMutationError::State)?;
         }
     }
     Ok(())
@@ -1145,30 +1181,87 @@ fn delete_universal_provider(
     if provider.1 != provider_revision {
         return Err(CatalogMutationError::StaleProviderRevision);
     }
-    let has_generated: bool = transaction
-        .query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM providers WHERE generated_owner_id = ?1
-             )",
-            [&provider_id],
-            |row| row.get(0),
+
+    let generated = transaction
+        .prepare(
+            "SELECT id, target, position, credential_id
+             FROM providers WHERE generated_owner_id = ?1
+             ORDER BY CASE target WHEN 'codex' THEN 0 ELSE 1 END",
         )
-        .map_err(|_| CatalogMutationError::Invalid)?;
-    if has_generated {
-        return Err(CatalogMutationError::GeneratedProvidersExist);
+        .map_err(|_| CatalogMutationError::State)?
+        .query_map([&provider_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|_| CatalogMutationError::State)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CatalogMutationError::State)?;
+    let mut generated = generated
+        .into_iter()
+        .map(|(id, target, position, credential_id)| {
+            let id = Uuid::parse_str(&id).map_err(|_| CatalogMutationError::Invalid)?;
+            let target = parse_target(&target).map_err(|_| CatalogMutationError::Invalid)?;
+            Ok((id, target, position, credential_id))
+        })
+        .collect::<Result<Vec<_>, CatalogMutationError>>()?;
+    for (id, target, _, _) in &generated {
+        if !project_active_references(transaction, *target, *id)
+            .map_err(|_| CatalogMutationError::State)?
+            .is_empty()
+        {
+            return Err(CatalogMutationError::GeneratedProviderReferenced);
+        }
+    }
+    for (id, target, position, credential_id) in generated.drain(..) {
+        transaction
+            .execute(
+                "DELETE FROM providers WHERE id = ?1 AND target = ?2",
+                params![id.to_string(), target.as_str()],
+            )
+            .map_err(|_| CatalogMutationError::State)?;
+        transaction
+            .execute(
+                "UPDATE providers SET position = position - 1
+                 WHERE target = ?1 AND position > ?2",
+                params![target.as_str(), position],
+            )
+            .map_err(|_| CatalogMutationError::State)?;
+        if let Some(credential_id) = credential_id {
+            transaction
+                .execute(
+                    "DELETE FROM credentials
+                     WHERE id = ?1
+                       AND NOT EXISTS (SELECT 1 FROM providers WHERE credential_id = ?1)",
+                    [credential_id],
+                )
+                .map_err(|_| CatalogMutationError::State)?;
+        }
+        transaction
+            .execute(
+                "UPDATE target_route_state
+                 SET management_revision = management_revision + 1,
+                     view_sequence = view_sequence + 1
+                 WHERE target = ?1",
+                [target.as_str()],
+            )
+            .map_err(|_| CatalogMutationError::State)?;
     }
     transaction
         .execute(
             "DELETE FROM universal_providers WHERE id = ?1",
             [&provider_id],
         )
-        .map_err(|_| CatalogMutationError::Invalid)?;
+        .map_err(|_| CatalogMutationError::State)?;
     transaction
         .execute(
             "UPDATE universal_providers SET position = position - 1 WHERE position > ?1",
             [provider.0],
         )
-        .map_err(|_| CatalogMutationError::Invalid)?;
+        .map_err(|_| CatalogMutationError::State)?;
     if let Some(credential_id) = provider.2 {
         transaction
             .execute(
@@ -1179,7 +1272,7 @@ fn delete_universal_provider(
                    )",
                 [credential_id],
             )
-            .map_err(|_| CatalogMutationError::Invalid)?;
+            .map_err(|_| CatalogMutationError::State)?;
     }
     Ok(())
 }
@@ -1596,7 +1689,8 @@ enum CatalogMutationError {
     Unsupported,
     StaleProviderRevision,
     NoChange,
-    GeneratedProvidersExist,
+    GeneratedProviderReferenced,
+    State,
 }
 
 fn map_call_error(error: tokio_rusqlite::Error<tokio_rusqlite::rusqlite::Error>) -> StateError {

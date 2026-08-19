@@ -72,7 +72,18 @@ const providerViewSchema = z.object({
     key: z.string(),
   }).nullable(),
   generated: z.boolean(),
-  activeReferences: z.array(z.enum(["current", "activated-snapshot"])),
+  universalProviderId: z.string().uuid().nullable(),
+  synchronization: z.enum(["current", "pending"]).nullable(),
+  ownership: z.object({
+    name: z.enum(["target-provider", "universal-provider", "target-overlay", "target-fixed"]),
+    baseUrl: z.enum(["target-provider", "universal-provider", "target-overlay", "target-fixed"]),
+    model: z.enum(["target-provider", "universal-provider", "target-overlay", "target-fixed"]),
+    protocol: z.enum(["target-provider", "universal-provider", "target-overlay", "target-fixed"]),
+    authentication: z.enum(["target-provider", "universal-provider", "target-overlay", "target-fixed"]),
+    routingRequirement: z.enum(["target-provider", "universal-provider", "target-overlay", "target-fixed"]),
+    credential: z.enum(["target-provider", "universal-provider", "target-overlay", "target-fixed"]),
+  }).strict(),
+  activeReferences: z.array(z.enum(["current", "activated-snapshot", "activated-route-plan"])),
 })
 
 const providerPresetSchema = z.discriminatedUnion("key", [
@@ -229,6 +240,7 @@ const targetActionSchema = z.discriminatedUnion("kind", [
     model: z.string(),
     credential: credentialEditSchema,
     authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]).optional(),
+    routingRequirement: z.enum(["direct-compatible", "takeover-required"]).optional(),
   }),
   z.object({
     kind: z.literal("reorder-providers"),

@@ -1,7 +1,7 @@
 use std::{fs, path::PathBuf};
 
 use muxvia_routing::{
-    control::protocol::{ActionStatus, CredentialPresence, Target},
+    control::protocol::{ActionStatus, CredentialPresence, ProviderReferenceView, Target},
     home::MuxviaHome,
     state::{StateStore, UniversalSynchronizationFailpoint},
 };
@@ -284,6 +284,234 @@ async fn delete_without_generated_records_cascades_targets_and_orphaned_credenti
 }
 
 #[tokio::test]
+async fn delete_cascades_unreferenced_generated_targets_atomically() {
+    let fixture = CatalogFixture::new();
+    let store = StateStore::open(&fixture.home).await.unwrap();
+    let created = store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x411),
+            0,
+            serde_json::json!({
+                "kind": "create-universal-provider",
+                "name": "Generated Delete",
+                "baseUrl": "https://generated-delete.example/v1",
+                "credential": { "kind": "replace", "value": "GENERATED_DELETE_SECRET_99104" },
+                "presetKey": null,
+                "targets": universal_targets("generated-delete")
+            }),
+        )
+        .await
+        .unwrap();
+    let provider_id = created.view.providers[0].id;
+    store
+        .synchronize_universal_provider_action(Uuid::from_u128(0x412), 1, provider_id, 1)
+        .await
+        .unwrap();
+    let catalog_before = store.universal_provider_catalog().await.unwrap();
+    let codex_before = store.target_view_for(Target::Codex).await.unwrap();
+    let claude_before = store.target_view_for(Target::Claude).await.unwrap();
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    let owner = provider_id.to_string();
+    database
+        .call(move |connection| {
+            connection.execute_batch(&format!(
+                "CREATE TRIGGER fail_generated_delete
+                 BEFORE DELETE ON providers
+                 WHEN OLD.generated_owner_id = '{owner}' AND OLD.target = 'claude'
+                 BEGIN SELECT RAISE(ABORT, 'controlled generated delete failure'); END;"
+            ))
+        })
+        .await
+        .unwrap();
+
+    let failed = store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x413),
+            2,
+            serde_json::json!({
+                "kind": "delete-universal-provider",
+                "providerId": provider_id,
+                "providerRevision": 1
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failed.problem.code, "state-store-error");
+    assert_eq!(
+        store.universal_provider_catalog().await.unwrap(),
+        catalog_before
+    );
+    assert_eq!(
+        store.target_view_for(Target::Codex).await.unwrap(),
+        codex_before
+    );
+    assert_eq!(
+        store.target_view_for(Target::Claude).await.unwrap(),
+        claude_before
+    );
+    database
+        .call(|connection| connection.execute_batch("DROP TRIGGER fail_generated_delete"))
+        .await
+        .unwrap();
+
+    let deleted = store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x414),
+            2,
+            serde_json::json!({
+                "kind": "delete-universal-provider",
+                "providerId": provider_id,
+                "providerRevision": 1
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(deleted.view.providers.is_empty());
+    assert_eq!(deleted.view.revision, 3);
+    let codex_after = store.target_view_for(Target::Codex).await.unwrap();
+    let claude_after = store.target_view_for(Target::Claude).await.unwrap();
+    assert!(codex_after.providers.is_empty());
+    assert!(claude_after.providers.is_empty());
+    assert_eq!(
+        codex_after.management_revision,
+        codex_before.management_revision + 1
+    );
+    assert_eq!(
+        claude_after.management_revision,
+        claude_before.management_revision + 1
+    );
+    assert_target_runtime_unchanged(&codex_before, &codex_after);
+    assert_target_runtime_unchanged(&claude_before, &claude_after);
+
+    let counts: (u64, u64, u64, u64) = database
+        .call(move |connection| {
+            Ok::<_, tokio_rusqlite::rusqlite::Error>((
+                connection.query_row("SELECT COUNT(*) FROM providers", [], |row| row.get(0))?,
+                connection.query_row("SELECT COUNT(*) FROM credentials", [], |row| row.get(0))?,
+                connection.query_row("SELECT COUNT(*) FROM universal_credentials", [], |row| row.get(0))?,
+                connection.query_row(
+                    "SELECT COUNT(*) FROM universal_provider_targets WHERE universal_provider_id = ?1",
+                    [provider_id.to_string()],
+                    |row| row.get(0),
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(counts, (0, 0, 0, 0));
+}
+
+#[tokio::test]
+async fn delete_reports_every_generated_reference_before_any_write() {
+    const SNAPSHOT_SECRET: &str = "GENERATED_REFERENCE_SECRET_24611";
+    let fixture = CatalogFixture::new();
+    let store = StateStore::open(&fixture.home).await.unwrap();
+    let created = store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x421),
+            0,
+            serde_json::json!({
+                "kind": "create-universal-provider",
+                "name": "Referenced Delete",
+                "baseUrl": "https://referenced-delete.example/v1",
+                "credential": { "kind": "replace", "value": "GENERATED_SOURCE_SECRET_24610" },
+                "presetKey": null,
+                "targets": universal_targets("referenced-delete")
+            }),
+        )
+        .await
+        .unwrap();
+    let provider_id = created.view.providers[0].id;
+    let synchronized = store
+        .synchronize_universal_provider_action(Uuid::from_u128(0x422), 1, provider_id, 1)
+        .await
+        .unwrap();
+    let codex_id = synchronized.outcome.view.providers[0].targets[0]
+        .generated_provider_id
+        .unwrap();
+    let claude_id = synchronized.outcome.view.providers[0].targets[1]
+        .generated_provider_id
+        .unwrap();
+    let snapshot_id = Uuid::from_u128(0x423);
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(move |connection| {
+            connection.execute(
+                "UPDATE target_route_state SET current_provider_id = ?1 WHERE target = 'codex'",
+                [codex_id.to_string()],
+            )?;
+            connection.execute(
+                "INSERT INTO activated_snapshots
+                 (id, target, provider_id, base_url, model, protocol, authentication,
+                  provider_bearer_token, epoch)
+                 SELECT ?1, target, id, base_url, model, protocol, authentication, ?2, ?3
+                 FROM providers WHERE id = ?4 AND target = 'claude'",
+                tokio_rusqlite::rusqlite::params![
+                    snapshot_id.to_string(),
+                    SNAPSHOT_SECRET,
+                    Uuid::from_u128(0x424).to_string(),
+                    claude_id.to_string(),
+                ],
+            )?;
+            connection.execute(
+                "UPDATE target_route_state SET activated_snapshot_id = ?1 WHERE target = 'claude'",
+                [snapshot_id.to_string()],
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+    let codex_before = store.target_view_for(Target::Codex).await.unwrap();
+    let claude_before = store.target_view_for(Target::Claude).await.unwrap();
+
+    let failure = store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x425),
+            2,
+            serde_json::json!({
+                "kind": "delete-universal-provider",
+                "providerId": provider_id,
+                "providerRevision": 1
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failure.problem.code, "generated-provider-referenced");
+    assert_eq!(
+        failure.authoritative_view.providers[0].targets[0].active_references,
+        [ProviderReferenceView::Current]
+    );
+    assert_eq!(
+        failure.authoritative_view.providers[0].targets[1].active_references,
+        [ProviderReferenceView::ActivatedSnapshot]
+    );
+    assert!(!format!("{failure:?}").contains(SNAPSHOT_SECRET));
+    assert_eq!(
+        store.target_view_for(Target::Codex).await.unwrap(),
+        codex_before
+    );
+    assert_eq!(
+        store.target_view_for(Target::Claude).await.unwrap(),
+        claude_before
+    );
+    let receipt_count: u64 = database
+        .call(|connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM universal_action_receipts WHERE action_id = ?1",
+                [Uuid::from_u128(0x425).to_string()],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt_count, 0);
+}
+
+#[tokio::test]
 async fn one_time_seed_is_keyed_only_by_the_stable_preset_key() {
     let fixture = CatalogFixture::new();
     let store = StateStore::open(&fixture.home).await.unwrap();
@@ -547,22 +775,20 @@ async fn universal_edit_stays_pending_until_both_generated_targets_resynchronize
             .all(|target| target.synchronization
                 == muxvia_routing::control::protocol::UniversalSynchronizationState::Pending)
     );
-    assert_eq!(
-        store
-            .target_view_for(Target::Codex)
-            .await
-            .unwrap()
-            .providers[0],
-        codex_generated_before
-    );
-    assert_eq!(
-        store
-            .target_view_for(Target::Claude)
-            .await
-            .unwrap()
-            .providers[0],
-        claude_generated_before
-    );
+    let codex_pending = store.target_view_for(Target::Codex).await.unwrap();
+    let claude_pending = store.target_view_for(Target::Claude).await.unwrap();
+    let mut expected_codex = codex_generated_before.clone();
+    expected_codex.synchronization =
+        Some(muxvia_routing::control::protocol::UniversalSynchronizationState::Pending);
+    let mut expected_claude = claude_generated_before.clone();
+    expected_claude.synchronization =
+        Some(muxvia_routing::control::protocol::UniversalSynchronizationState::Pending);
+    assert_eq!(codex_pending.providers[0], expected_codex);
+    assert_eq!(claude_pending.providers[0], expected_claude);
+    assert_eq!(codex_pending.management_revision, 1);
+    assert_eq!(claude_pending.management_revision, 1);
+    assert_eq!(codex_pending.view_sequence, 2);
+    assert_eq!(claude_pending.view_sequence, 2);
 
     let update_failure = store
         .synchronize_universal_provider_action_with_failpoint(
@@ -580,20 +806,12 @@ async fn universal_edit_stays_pending_until_both_generated_targets_resynchronize
         edited.view
     );
     assert_eq!(
-        store
-            .target_view_for(Target::Codex)
-            .await
-            .unwrap()
-            .providers[0],
-        codex_generated_before
+        store.target_view_for(Target::Codex).await.unwrap(),
+        codex_pending
     );
     assert_eq!(
-        store
-            .target_view_for(Target::Claude)
-            .await
-            .unwrap()
-            .providers[0],
-        claude_generated_before
+        store.target_view_for(Target::Claude).await.unwrap(),
+        claude_pending
     );
     assert_eq!(
         generated_credential_ids(&fixture, provider_id).await,
@@ -714,6 +932,21 @@ async fn disabling_one_target_stays_pending_until_sync_removes_only_that_generat
         disabled.view.providers[0].targets[1].synchronization,
         muxvia_routing::control::protocol::UniversalSynchronizationState::Pending
     );
+    let codex_after_edit = store.target_view_for(Target::Codex).await.unwrap();
+    let claude_after_edit = store.target_view_for(Target::Claude).await.unwrap();
+    assert_eq!(codex_after_edit, codex_before);
+    assert_eq!(
+        claude_after_edit.management_revision,
+        claude_before.management_revision
+    );
+    assert_eq!(
+        claude_after_edit.view_sequence,
+        claude_before.view_sequence + 1
+    );
+    assert_eq!(
+        claude_after_edit.providers[0].synchronization,
+        Some(muxvia_routing::control::protocol::UniversalSynchronizationState::Pending)
+    );
 
     let removal_failure = store
         .synchronize_universal_provider_action_with_failpoint(
@@ -732,11 +965,11 @@ async fn disabling_one_target_stays_pending_until_sync_removes_only_that_generat
     );
     assert_eq!(
         store.target_view_for(Target::Codex).await.unwrap(),
-        codex_before
+        codex_after_edit
     );
     assert_eq!(
         store.target_view_for(Target::Claude).await.unwrap(),
-        claude_before
+        claude_after_edit
     );
     assert_eq!(
         generated_credential_ids(&fixture, provider_id).await.len(),

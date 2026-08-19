@@ -10,7 +10,7 @@ import {
   parseTargetView,
   parseUniversalProviderAction,
 } from "../src/control/types"
-import type { TargetView } from "../src/control/types"
+import type { TargetAction, TargetView } from "../src/control/types"
 
 const fixtures = new URL("../../../protocol/fixtures/", import.meta.url)
 
@@ -313,6 +313,13 @@ test("round-trips schema-v3 Provider declarations, Presets, and credential inten
     missingFields: [],
     provenance: null,
     generated: false,
+    universalProviderId: null,
+    synchronization: null,
+    ownership: {
+      name: "target-provider", baseUrl: "target-provider", model: "target-provider",
+      protocol: "target-fixed", authentication: "target-provider",
+      routingRequirement: "target-provider", credential: "target-provider",
+    },
     activeReferences: [],
   } satisfies TargetView["providers"][number]
   const view = {
@@ -375,6 +382,77 @@ test("round-trips schema-v3 Provider declarations, Presets, and credential inten
   })
 })
 
+test("round-trips generated Provider ownership and Target Overlay edits as a closed contract", () => {
+  const generated = {
+    id: "00000000-0000-4000-8000-000000000108",
+    position: 0,
+    providerRevision: 3,
+    name: "Universal Generated",
+    baseUrl: "https://universal.example/v1",
+    model: "overlay-model",
+    protocol: "openai-responses",
+    authentication: "openai-bearer",
+    routingRequirement: "takeover-required",
+    credential: "present",
+    completeness: "complete",
+    missingFields: [],
+    provenance: { kind: "universal-provider", key: "00000000-0000-4000-8000-000000000801" },
+    generated: true,
+    universalProviderId: "00000000-0000-4000-8000-000000000801",
+    synchronization: "current",
+    ownership: {
+      name: "universal-provider",
+      baseUrl: "universal-provider",
+      model: "target-overlay",
+      protocol: "target-fixed",
+      authentication: "target-overlay",
+      routingRequirement: "target-overlay",
+      credential: "universal-provider",
+    },
+    activeReferences: ["activated-route-plan"],
+  } satisfies TargetView["providers"][number]
+  const view = {
+    target: "codex",
+    managementRevision: 4,
+    viewSequence: 4,
+    service: { epoch: "00000000-0000-4000-8000-000000000001", state: "running" },
+    mode: "unmanaged",
+    takeover: { state: "inactive", endpoint: null },
+    routeHealth: { state: "unobserved" },
+    providers: [generated],
+    providerPresets: [],
+    currentProviderId: null,
+    servingProviderId: null,
+    managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
+    recovery: { intentId: null, state: "clean" },
+    activatedSnapshot: null,
+    problems: [],
+  }
+  expect(parseTargetView(view).providers[0]).toEqual(generated)
+
+  const overlayEdit = {
+    kind: "update-provider",
+    providerId: generated.id,
+    providerRevision: generated.providerRevision,
+    name: generated.name,
+    baseUrl: generated.baseUrl,
+    model: "overlay-two",
+    credential: { kind: "keep" },
+    authentication: "openai-bearer",
+    routingRequirement: "direct-compatible",
+  } satisfies TargetAction
+  expect(parseTargetAction(overlayEdit)).toEqual(overlayEdit)
+
+  expect(() => parseTargetView({
+    ...view,
+    providers: [{ ...generated, ownership: { ...generated.ownership, model: "universal-provider" } }],
+  })).not.toThrow()
+  expect(() => parseTargetView({
+    ...view,
+    providers: [{ ...generated, ownership: { ...generated.ownership, model: "future-owner" } }],
+  })).toThrow()
+})
+
 test("round-trips Claude Messages declarations with explicit authentication and neutral Route Health", () => {
   const view = {
     target: "claude",
@@ -399,6 +477,13 @@ test("round-trips Claude Messages declarations with explicit authentication and 
       missingFields: [],
       provenance: null,
       generated: false,
+      universalProviderId: null,
+      synchronization: null,
+      ownership: {
+        name: "target-provider", baseUrl: "target-provider", model: "target-provider",
+        protocol: "target-fixed", authentication: "target-provider",
+        routingRequirement: "target-provider", credential: "target-provider",
+      },
       activeReferences: [],
     }],
     providerPresets: [{

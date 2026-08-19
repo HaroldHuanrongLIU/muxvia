@@ -1,7 +1,10 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
 use muxvia_routing::{
-    control::protocol::{ActionStatus, CredentialPresence, ProviderReferenceView, Target},
+    control::protocol::{
+        ActionStatus, CredentialPresence, ProviderFieldOwner, ProviderReferenceView, Target,
+        UniversalSynchronizationState,
+    },
     home::MuxviaHome,
     state::StateStore,
 };
@@ -97,6 +100,237 @@ async fn credential_count(home: &MuxviaHome) -> u64 {
         })
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn generated_provider_projects_ownership_accepts_only_overlay_edits_and_rejects_delete() {
+    let fixture = StoreFixture::new();
+    let store = fixture.open().await;
+    let created = store
+        .apply_universal_provider_action(
+            action_id(80),
+            0,
+            serde_json::json!({
+                "kind": "create-universal-provider",
+                "name": "Universal Owner",
+                "baseUrl": "https://universal-owner.example/v1",
+                "credential": { "kind": "replace", "value": "UNIVERSAL_OWNER_SECRET_41902" },
+                "presetKey": null,
+                "targets": [
+                    { "target": "codex", "enabled": true, "model": "overlay-one", "authentication": "openai-bearer", "routingRequirement": "direct-compatible" },
+                    { "target": "claude", "enabled": false, "model": "claude-model", "authentication": "anthropic-api-key", "routingRequirement": "takeover-required" }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    let universal_id = created.view.providers[0].id;
+    store
+        .synchronize_universal_provider_action(action_id(81), 1, universal_id, 1)
+        .await
+        .unwrap();
+    let generated = store
+        .target_view_for(Target::Codex)
+        .await
+        .unwrap()
+        .providers[0]
+        .clone();
+    assert_eq!(generated.universal_provider_id, Some(universal_id));
+    assert_eq!(
+        generated.synchronization,
+        Some(UniversalSynchronizationState::Current)
+    );
+    assert_eq!(
+        generated.ownership.name,
+        ProviderFieldOwner::UniversalProvider
+    );
+    assert_eq!(
+        generated.ownership.base_url,
+        ProviderFieldOwner::UniversalProvider
+    );
+    assert_eq!(
+        generated.ownership.credential,
+        ProviderFieldOwner::UniversalProvider
+    );
+    assert_eq!(generated.ownership.model, ProviderFieldOwner::TargetOverlay);
+    assert_eq!(
+        generated.ownership.authentication,
+        ProviderFieldOwner::TargetOverlay
+    );
+    assert_eq!(
+        generated.ownership.routing_requirement,
+        ProviderFieldOwner::TargetOverlay
+    );
+    assert_eq!(
+        generated.ownership.protocol,
+        ProviderFieldOwner::TargetFixed
+    );
+
+    let read_only = store
+        .apply_provider_action_for(
+            Target::Codex,
+            action_id(82),
+            1,
+            serde_json::json!({
+                "kind": "update-provider",
+                "providerId": generated.id,
+                "providerRevision": generated.provider_revision,
+                "name": "Client Override",
+                "baseUrl": generated.base_url,
+                "model": "overlay-two",
+                "credential": { "kind": "keep" },
+                "authentication": "openai-bearer",
+                "routingRequirement": "takeover-required"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(read_only.problem.code, "generated-provider-read-only");
+    assert_eq!(
+        store
+            .target_view_for(Target::Codex)
+            .await
+            .unwrap()
+            .providers[0],
+        generated
+    );
+
+    let overlay = store
+        .apply_provider_action_for(
+            Target::Codex,
+            action_id(83),
+            1,
+            serde_json::json!({
+                "kind": "update-provider",
+                "providerId": generated.id,
+                "providerRevision": generated.provider_revision,
+                "name": generated.name,
+                "baseUrl": generated.base_url,
+                "model": "overlay-two",
+                "credential": { "kind": "keep" },
+                "authentication": "openai-bearer",
+                "routingRequirement": "takeover-required"
+            }),
+        )
+        .await
+        .unwrap();
+    let updated = &overlay.view.providers[0];
+    assert_eq!(updated.provider_revision, 2);
+    assert_eq!(updated.model, "overlay-two");
+    assert_eq!(updated.routing_requirement.to_string(), "takeover-required");
+    assert_eq!(
+        updated.synchronization,
+        Some(UniversalSynchronizationState::Current)
+    );
+    let catalog = store.universal_provider_catalog().await.unwrap();
+    assert_eq!(catalog.revision, 3);
+    assert_eq!(catalog.providers[0].targets[0].overlay_revision, 2);
+    assert_eq!(
+        catalog.providers[0].targets[0].synchronization,
+        UniversalSynchronizationState::Current
+    );
+
+    let delete_failure = store
+        .apply_provider_action_for(
+            Target::Codex,
+            action_id(84),
+            overlay.view.management_revision,
+            delete(updated.id, updated.provider_revision),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        delete_failure.problem.code,
+        "generated-provider-delete-forbidden"
+    );
+}
+
+#[tokio::test]
+async fn pending_universal_source_blocks_target_overlay_edits_until_explicit_sync() {
+    let fixture = StoreFixture::new();
+    let store = fixture.open().await;
+    let created = store
+        .apply_universal_provider_action(
+            action_id(85),
+            0,
+            serde_json::json!({
+                "kind": "create-universal-provider",
+                "name": "Source One",
+                "baseUrl": "https://source-one.example/v1",
+                "credential": { "kind": "replace", "value": "PENDING_SOURCE_SECRET_74109" },
+                "presetKey": null,
+                "targets": [
+                    { "target": "codex", "enabled": true, "model": "overlay-one", "authentication": "openai-bearer", "routingRequirement": "direct-compatible" },
+                    { "target": "claude", "enabled": false, "model": "claude-model", "authentication": "anthropic-api-key", "routingRequirement": "takeover-required" }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    let universal_id = created.view.providers[0].id;
+    store
+        .synchronize_universal_provider_action(action_id(86), 1, universal_id, 1)
+        .await
+        .unwrap();
+    let updated = store
+        .apply_universal_provider_action(
+            action_id(87),
+            2,
+            serde_json::json!({
+                "kind": "update-universal-provider",
+                "providerId": universal_id,
+                "providerRevision": 1,
+                "name": "Source Two",
+                "baseUrl": "https://source-two.example/v1",
+                "credential": { "kind": "keep" },
+                "targets": [
+                    { "target": "codex", "enabled": true, "model": "overlay-one", "authentication": "openai-bearer", "routingRequirement": "direct-compatible" },
+                    { "target": "claude", "enabled": false, "model": "claude-model", "authentication": "anthropic-api-key", "routingRequirement": "takeover-required" }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    let target_before = store.target_view_for(Target::Codex).await.unwrap();
+    let generated = &target_before.providers[0];
+    assert_eq!(
+        generated.synchronization,
+        Some(UniversalSynchronizationState::Pending)
+    );
+
+    for (index, (name, base_url)) in [
+        (generated.name.as_str(), generated.base_url.as_str()),
+        ("Source Two", "https://source-two.example/v1"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let failure = store
+            .apply_provider_action_for(
+                Target::Codex,
+                action_id(88 + index as u8),
+                target_before.management_revision,
+                serde_json::json!({
+                    "kind": "update-provider",
+                    "providerId": generated.id,
+                    "providerRevision": generated.provider_revision,
+                    "name": name,
+                    "baseUrl": base_url,
+                    "model": "overlay-two",
+                    "credential": { "kind": "keep" },
+                    "authentication": "openai-bearer",
+                    "routingRequirement": "takeover-required"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.problem.code, "generated-provider-read-only");
+        assert_eq!(failure.authoritative_view, target_before);
+    }
+    assert_eq!(
+        store.universal_provider_catalog().await.unwrap(),
+        updated.view
+    );
 }
 
 async fn share_credential(home: &MuxviaHome, source: Uuid, destination: Uuid) {

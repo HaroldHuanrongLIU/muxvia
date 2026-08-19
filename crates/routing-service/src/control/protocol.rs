@@ -480,6 +480,8 @@ pub enum TargetAction {
         credential: CredentialEdit,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authentication: Option<ProviderAuthentication>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        routing_requirement: Option<ProviderRoutingRequirement>,
     },
     ReorderProviders {
         provider_ids: Vec<Uuid>,
@@ -610,6 +612,7 @@ impl fmt::Debug for TargetAction {
                 model,
                 credential,
                 authentication,
+                routing_requirement,
             } => formatter
                 .debug_struct("UpdateProvider")
                 .field("provider_id", provider_id)
@@ -619,6 +622,7 @@ impl fmt::Debug for TargetAction {
                 .field("model", model)
                 .field("credential", credential)
                 .field("authentication", authentication)
+                .field("routing_requirement", routing_requirement)
                 .finish(),
             Self::ReorderProviders { provider_ids } => formatter
                 .debug_struct("ReorderProviders")
@@ -1026,7 +1030,66 @@ pub struct ProviderView {
     pub missing_fields: Vec<ProviderRequirement>,
     pub provenance: Option<ProviderProvenanceView>,
     pub generated: bool,
+    #[serde(default)]
+    pub universal_provider_id: Option<Uuid>,
+    #[serde(default)]
+    pub synchronization: Option<UniversalSynchronizationState>,
+    #[serde(default)]
+    pub ownership: ProviderFieldOwnershipView,
     pub active_references: Vec<ProviderReferenceView>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderFieldOwner {
+    TargetProvider,
+    UniversalProvider,
+    TargetOverlay,
+    TargetFixed,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderFieldOwnershipView {
+    pub name: ProviderFieldOwner,
+    pub base_url: ProviderFieldOwner,
+    pub model: ProviderFieldOwner,
+    pub protocol: ProviderFieldOwner,
+    pub authentication: ProviderFieldOwner,
+    pub routing_requirement: ProviderFieldOwner,
+    pub credential: ProviderFieldOwner,
+}
+
+impl ProviderFieldOwnershipView {
+    pub(crate) fn target_provider() -> Self {
+        Self {
+            name: ProviderFieldOwner::TargetProvider,
+            base_url: ProviderFieldOwner::TargetProvider,
+            model: ProviderFieldOwner::TargetProvider,
+            protocol: ProviderFieldOwner::TargetFixed,
+            authentication: ProviderFieldOwner::TargetProvider,
+            routing_requirement: ProviderFieldOwner::TargetProvider,
+            credential: ProviderFieldOwner::TargetProvider,
+        }
+    }
+
+    pub(crate) fn generated() -> Self {
+        Self {
+            name: ProviderFieldOwner::UniversalProvider,
+            base_url: ProviderFieldOwner::UniversalProvider,
+            model: ProviderFieldOwner::TargetOverlay,
+            protocol: ProviderFieldOwner::TargetFixed,
+            authentication: ProviderFieldOwner::TargetOverlay,
+            routing_requirement: ProviderFieldOwner::TargetOverlay,
+            credential: ProviderFieldOwner::UniversalProvider,
+        }
+    }
+}
+
+impl Default for ProviderFieldOwnershipView {
+    fn default() -> Self {
+        Self::target_provider()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1125,6 +1188,7 @@ pub struct ProviderProvenanceView {
 pub enum ProviderReferenceView {
     Current,
     ActivatedSnapshot,
+    ActivatedRoutePlan,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

@@ -63,6 +63,13 @@ function provider(
     missingFields: [],
     provenance: null,
     generated: false,
+    universalProviderId: null,
+    synchronization: null,
+    ownership: {
+      name: "target-provider", baseUrl: "target-provider", model: "target-provider",
+      protocol: "target-fixed", authentication: "target-provider",
+      routingRequirement: "target-provider", credential: "target-provider",
+    },
     activeReferences: [],
     ...overrides,
   }

@@ -1342,6 +1342,7 @@ impl StateStore {
                 model,
                 credential,
                 authentication,
+                routing_requirement,
             }) => (
                 super::providers::ProviderAction::Update {
                     provider_id,
@@ -1351,6 +1352,7 @@ impl StateStore {
                     model,
                     credential,
                     authentication,
+                    routing_requirement,
                 },
                 "update-provider",
             ),
@@ -1483,6 +1485,14 @@ impl StateStore {
                         super::providers::ProviderMutationError::NoProviderChange => {
                             ("no-provider-change", "Provider declaration is unchanged")
                         }
+                        super::providers::ProviderMutationError::GeneratedProviderReadOnly => (
+                            "generated-provider-read-only",
+                            "Universal-owned Generated Provider fields are read-only",
+                        ),
+                        super::providers::ProviderMutationError::GeneratedProviderDeleteForbidden => (
+                            "generated-provider-delete-forbidden",
+                            "Generated Provider must be disabled or deleted from its Universal Provider",
+                        ),
                     };
                     return Ok(ProviderAttempt::Failure(ActionFailure {
                         problem: ControlProblem {

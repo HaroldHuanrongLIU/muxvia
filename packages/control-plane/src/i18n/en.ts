@@ -141,6 +141,7 @@ export const en = {
   "provider.credential-reference.missing": "Credential Reference missing",
   "provider.reference.current": "Current",
   "provider.reference.activated-snapshot": "Activated Snapshot",
+  "provider.reference.activated-route-plan": "Activated Route Plan",
   "provider.reference.none": "No active references",
   "provider.list.help": "Enter edit · ctrl+x a activate · ctrl+x u/n move · ctrl+x d delete · Esc close",
   "provider.list.help.claude": "Enter edit · ctrl+x a direct · ctrl+x o takeover · ctrl+x u/n move · ctrl+x d delete · Esc close",

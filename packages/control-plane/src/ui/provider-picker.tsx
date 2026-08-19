@@ -178,6 +178,7 @@ export function ProviderPicker(props: ProviderPickerProps) {
       <text fg={theme.muted}>{provider.model}</text>
       <text fg={theme.muted}>{props.t(provider.credential === "present" ? "provider.credential-reference.present" : "provider.credential-reference.missing")}</text>
       <text fg={theme.muted}>{provider.generated ? props.t("provider.generated") : props.t("provider.not-generated")}</text>
+      <Show when={provider.generated}><text fg={theme.warning}>{props.t("generated-provider.lifecycle")}</text></Show>
       <text fg={theme.muted}>{provider.activeReferences.length
         ? provider.activeReferences.map((reference) => props.t(`provider.reference.${reference}`)).join(" · ")
         : props.t("provider.reference.none")}</text>

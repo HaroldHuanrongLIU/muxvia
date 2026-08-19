@@ -522,6 +522,7 @@ export type ClaudePreflightContext = z.infer<typeof claudePreflightContextSchema
 export type ClaudeBlockingSelector = z.infer<typeof claudeBlockingSelectorSchema>
 export type TargetAction = z.infer<typeof targetActionSchema>
 export type UniversalProviderAction = z.infer<typeof universalProviderActionSchema>
+export type UniversalProviderCatalogView = z.infer<typeof universalProviderCatalogSchema>
 export type OrdinaryTargetAction = Exclude<TargetAction, { kind: "resolve-compatibility" }>
 export type ActionOutcome = z.infer<typeof actionOutcomeSchema>
 export type ControlProblem = z.infer<typeof controlProblemSchema>
@@ -534,6 +535,10 @@ export type ReconciliationStrategy = z.infer<typeof reconciliationStrategySchema
 export type CompatibilityClassification = z.infer<typeof compatibilityClassificationSchema>
 export type CompatibilityProbe = z.infer<typeof compatibilityProbeSchema>
 export type ReconciliationPreview = z.infer<typeof reconciliationPreviewSchema>
+export type UniversalProviderOutcome = Extract<
+  ControlResult,
+  { kind: "universal-provider-outcome" }
+>["outcome"]
 
 export const parseClientFrame = (value: unknown): ClientFrame => clientFrameSchema.parse(value)
 export const parseServerFrame = (value: unknown): ServerFrame => serverFrameSchema.parse(value)

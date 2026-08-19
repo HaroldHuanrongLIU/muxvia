@@ -1056,8 +1056,6 @@ impl ReconciliationService {
             .await
     }
 
-    // Task 5 consumes this stricter gate through ProviderSynchronizationService.
-    #[allow(dead_code)]
     pub(crate) async fn ensure_synchronization_write_allowed(
         &self,
         target: Target,

@@ -15,9 +15,11 @@ import type {
   Target,
   TargetView,
 } from "./types"
+import type { UniversalProviderSession } from "./universal-provider-session"
 
 export interface MuxviaControl {
   openTarget(target: Target): Promise<TargetSession>
+  openUniversalProviders(): Promise<UniversalProviderSession>
 }
 
 export interface CompatibilityResolution {

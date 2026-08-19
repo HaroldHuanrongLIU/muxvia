@@ -4,6 +4,10 @@ import { createConnection, type Socket } from "node:net"
 import { encodeFrame, FrameDecoder } from "./framing"
 import { createTargetSession, type MuxviaControl, type TargetSession } from "./target-session"
 import {
+  createUniversalProviderSession,
+  type UniversalProviderSession,
+} from "./universal-provider-session"
+import {
   parseServerFrame,
   type ControlOperation,
   type ClaudePreflightContext,
@@ -11,6 +15,7 @@ import {
   type ServerFrame,
   type TargetView,
   type Target,
+  type UniversalProviderCatalogView,
 } from "./types"
 
 type Pending = {
@@ -57,6 +62,7 @@ export interface RpcTransport {
   request(operation: InspectionOperation, options?: RequestOptions): Promise<ControlResult>
   request(operation: NonInspectionOperation): Promise<ControlResult>
   onTargetView(listener: (view: TargetView) => void): () => void
+  onUniversalProviderView(listener: (view: UniversalProviderCatalogView) => void): () => void
   whenClosed(): Promise<void>
   close(): Promise<void>
 }
@@ -66,6 +72,9 @@ export class RpcClient implements RpcTransport, MuxviaControl {
   readonly #decoder = new FrameDecoder()
   readonly #pending = new Map<string, Pending>()
   readonly #viewListeners = new Set<(view: TargetView) => void>()
+  readonly #universalProviderViewListeners = new Set<
+    (view: UniversalProviderCatalogView) => void
+  >()
   #handshake?: {
     resolve: () => void
     reject: (error: ControlError) => void
@@ -142,6 +151,14 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     return createTargetSession(this, result.view, claudeContext)
   }
 
+  async openUniversalProviders(): Promise<UniversalProviderSession> {
+    const result = await this.request({ kind: "open-universal-providers" })
+    if (result.kind !== "universal-provider-catalog") {
+      throw new ControlError("invalid-response", "Expected a Universal Provider catalog")
+    }
+    return createUniversalProviderSession(this, result.view)
+  }
+
   request(operation: InspectionOperation, options?: RequestOptions): Promise<ControlResult>
   request(operation: NonInspectionOperation): Promise<ControlResult>
   request(operation: ControlOperation, options: RequestOptions = {}): Promise<ControlResult> {
@@ -182,6 +199,13 @@ export class RpcClient implements RpcTransport, MuxviaControl {
   onTargetView(listener: (view: TargetView) => void): () => void {
     this.#viewListeners.add(listener)
     return () => this.#viewListeners.delete(listener)
+  }
+
+  onUniversalProviderView(
+    listener: (view: UniversalProviderCatalogView) => void,
+  ): () => void {
+    this.#universalProviderViewListeners.add(listener)
+    return () => this.#universalProviderViewListeners.delete(listener)
   }
 
   whenClosed(): Promise<void> {
@@ -230,6 +254,13 @@ export class RpcClient implements RpcTransport, MuxviaControl {
       }, 0)
       return
     }
+    if (frame.type === "universal-provider-view") {
+      setTimeout(() => {
+        if (this.#closed) return
+        for (const listener of this.#universalProviderViewListeners) listener(frame.view)
+      }, 0)
+      return
+    }
     if (frame.type === "response") {
       const pending = this.#takePending(frame.requestId)
       if (!pending) return
@@ -262,6 +293,7 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     for (const requestId of [...this.#pending.keys()]) this.#takePending(requestId)?.reject(failure)
     this.#pending.clear()
     this.#viewListeners.clear()
+    this.#universalProviderViewListeners.clear()
     this.#resolveClosed()
   }
 

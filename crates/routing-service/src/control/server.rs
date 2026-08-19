@@ -24,9 +24,10 @@ use crate::{
     control::{
         framing::{FrameError, read_frame, write_frame},
         protocol::{
-            ClaudePreflightContext, ClientFrame, CompatibilityProbeResult, ControlOperation,
-            ControlProblem, ControlResult, DiscoverySource, FrameLimit, ReconciliationStrategy,
-            RpcVersion, ServerFrame, Target, TargetAction, TargetView,
+            ActionStatus, ClaudePreflightContext, ClientFrame, CompatibilityProbeResult,
+            ControlOperation, ControlProblem, ControlResult, DiscoverySource, FrameLimit,
+            ReconciliationStrategy, RpcVersion, ServerFrame, Target, TargetAction, TargetView,
+            UniversalProviderAction, UniversalProviderCatalogView,
         },
     },
     domain::provider::has_valid_provider_authentication,
@@ -34,7 +35,8 @@ use crate::{
     model::ReqwestUpstream,
     service::{
         activate::ActivationService, provider_inspector::ProviderInspector,
-        reconcile::ReconciliationService, reconciliation_adapter::ReconciliationContext,
+        provider_synchronization::ProviderSynchronizationService, reconcile::ReconciliationService,
+        reconciliation_adapter::ReconciliationContext,
     },
     state::{ManagedWriteStatus, StateStore},
 };
@@ -151,6 +153,7 @@ struct SessionServices {
     activation: Arc<ActivationService>,
     inspector: Arc<ProviderInspector>,
     reconciliation: Arc<ReconciliationService>,
+    provider_synchronization: Arc<ProviderSynchronizationService>,
 }
 
 struct InspectionOperation {
@@ -212,6 +215,10 @@ impl ControlServer {
         let inspector = Arc::new(
             ProviderInspector::new(Arc::clone(&store)).map_err(|_| ControlServerError::State)?,
         );
+        let provider_synchronization = Arc::new(ProviderSynchronizationService::from_runtime(
+            Arc::clone(&store),
+            reconciliation_runtime.clone(),
+        ));
         let reconciliation = Arc::new(ReconciliationService::from_runtime(
             Arc::clone(&store),
             reconciliation_runtime,
@@ -314,6 +321,7 @@ impl ControlServer {
                         let activation = Arc::clone(&activation);
                         let inspector = Arc::clone(&inspector);
                         let reconciliation = Arc::clone(&reconciliation);
+                        let provider_synchronization = Arc::clone(&provider_synchronization);
                         let release = release.clone();
                         let lifecycle = Arc::clone(&lifecycle);
                         let session_shutdown = session_shutdown_rx.clone();
@@ -322,6 +330,7 @@ impl ControlServer {
                             activation,
                             inspector,
                             reconciliation,
+                            provider_synchronization,
                         };
                         sessions.spawn(async move {
                             let _guard = SessionGuard(Arc::clone(&lifecycle));
@@ -502,6 +511,7 @@ async fn serve_session(
         activation,
         inspector,
         reconciliation,
+        provider_synchronization,
     } = services;
     let first = match read_frame(&mut stream).await {
         Ok(first) => first,
@@ -572,8 +582,10 @@ async fn serve_session(
     let writer_guard = WriterGuard::new(Arc::clone(&lifecycle));
     let mut writer_task = tokio::spawn(write_responses(writer, response_rx, writer_guard));
     let mut opened_target = None;
+    let mut opened_universal_providers = false;
     let mut opened_claude_context = None;
     let mut update_rx = store.subscribe_target_views();
+    let mut universal_provider_update_rx = store.subscribe_universal_provider_views();
     let mut inspections = JoinSet::<InspectionCompletion>::new();
     let mut inspection_requests = std::collections::HashMap::<String, InspectionRequest>::new();
     'session: loop {
@@ -640,17 +652,188 @@ async fn serve_session(
                     }
                 };
 
+                if matches!(
+                    operation,
+                    ControlOperation::OpenUniversalProviders
+                        | ControlOperation::UniversalProviderAct { .. }
+                ) {
+                    if opened_target.is_some() {
+                        if !enqueue_response(&responses, problem_frame(
+                            Some(request_id),
+                            "catalog-session-kind-mismatch",
+                            "Universal Provider operations require a catalog session",
+                            None,
+                        )) {
+                            break 'session;
+                        }
+                        continue;
+                    }
+                    match operation {
+                        ControlOperation::OpenUniversalProviders => {
+                            let Ok(view) = store.universal_provider_catalog().await else {
+                                if !enqueue_response(&responses, problem_frame(
+                                    Some(request_id),
+                                    "state-store-error",
+                                    "State store unavailable",
+                                    None,
+                                )) {
+                                    break 'session;
+                                }
+                                continue;
+                            };
+                            opened_universal_providers = true;
+                            if !enqueue_response(
+                                &responses,
+                                ServerFrame::Response {
+                                    request_id,
+                                    result: ControlResult::UniversalProviderCatalog { view },
+                                },
+                            ) {
+                                break 'session;
+                            }
+                        }
+                        ControlOperation::UniversalProviderAct {
+                            action_id,
+                            expected_revision,
+                            action,
+                        } => {
+                            if !opened_universal_providers {
+                                if !enqueue_response(&responses, problem_frame(
+                                    Some(request_id),
+                                    "universal-provider-catalog-not-open",
+                                    "Open the Universal Provider catalog before issuing actions",
+                                    None,
+                                )) {
+                                    break 'session;
+                                }
+                                continue;
+                            }
+                            lifecycle.pending_actions.fetch_add(1, Ordering::AcqRel);
+                            let _action_guard = ActionGuard(Arc::clone(&lifecycle));
+                            let receipt = store.universal_provider_receipt(action_id).await;
+                            let (result, catalog_publication, target_publications, eligibility) =
+                                match receipt {
+                                    Ok(Some(mut outcome)) => {
+                                        outcome.status = ActionStatus::Replayed;
+                                        (Ok(outcome), None, Vec::new(), None)
+                                    }
+                                    Ok(None) => {
+                                        let synchronize = matches!(
+                                            serde_json::from_value::<UniversalProviderAction>(
+                                                action.clone()
+                                            ),
+                                            Ok(UniversalProviderAction::SynchronizeUniversalProvider { .. })
+                                        );
+                                        if synchronize {
+                                            let attempt = provider_synchronization
+                                                .apply_raw(
+                                                    action_id,
+                                                    expected_revision,
+                                                    action,
+                                                    opened_claude_context.clone(),
+                                                )
+                                                .await;
+                                            match attempt.result {
+                                                Ok(commit) => {
+                                                    let catalog = (commit.outcome.status
+                                                        == ActionStatus::Applied)
+                                                        .then(|| commit.outcome.view.clone());
+                                                    (
+                                                        Ok(commit.outcome),
+                                                        catalog,
+                                                        commit.target_views,
+                                                        attempt.eligibility_publication,
+                                                    )
+                                                }
+                                                Err(failure) => (
+                                                    Err(failure),
+                                                    None,
+                                                    Vec::new(),
+                                                    attempt.eligibility_publication,
+                                                ),
+                                            }
+                                        } else {
+                                            let result = store
+                                                .apply_universal_provider_action_with_target_views(
+                                                    action_id,
+                                                    expected_revision,
+                                                    action,
+                                                )
+                                                .await;
+                                            match result {
+                                                Ok(commit) => {
+                                                    let publication = (commit.outcome.status
+                                                        == ActionStatus::Applied)
+                                                        .then(|| commit.outcome.view.clone());
+                                                    (
+                                                        Ok(commit.outcome),
+                                                        publication,
+                                                        commit.target_views,
+                                                        None,
+                                                    )
+                                                }
+                                                Err(failure) => {
+                                                    (Err(failure), None, Vec::new(), None)
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(_) => (
+                                        Err(store
+                                            .universal_provider_failure(ControlProblem {
+                                                code: "state-store-error".into(),
+                                                message: "State store unavailable".into(),
+                                                source: None,
+                                                selector: None,
+                                            })
+                                            .await),
+                                        None,
+                                        Vec::new(),
+                                        None,
+                                    ),
+                                };
+                            let frame = match result {
+                                Ok(outcome) => ServerFrame::Response {
+                                    request_id,
+                                    result: ControlResult::UniversalProviderOutcome { outcome },
+                                },
+                                Err(failure) => ServerFrame::Error {
+                                    request_id: Some(request_id),
+                                    problem: failure.problem,
+                                    authoritative_view: None,
+                                },
+                            };
+                            if !enqueue_universal_provider_action_response(
+                                &responses,
+                                frame,
+                                catalog_publication,
+                                target_publications,
+                                eligibility,
+                                &store,
+                            )
+                            .await
+                            {
+                                break 'session;
+                            }
+                        }
+                        _ => unreachable!("catalog operation was matched above"),
+                    }
+                    continue;
+                }
                 let Some(target) = operation_target(&operation) else {
+                    unreachable!("all targetless operations are handled before target dispatch")
+                };
+                if opened_universal_providers {
                     if !enqueue_response(&responses, problem_frame(
                         Some(request_id),
-                        "unsupported-operation",
-                        "Universal Provider catalog is not available yet",
+                        "catalog-session-kind-mismatch",
+                        "Target operations require a Target session",
                         None,
                     )) {
                         break 'session;
                     }
                     continue;
-                };
+                }
                 if opened_target.is_none() && !matches!(operation, ControlOperation::OpenTarget { .. }) {
                     if !enqueue_response(&responses, problem_frame(
                         Some(request_id),
@@ -931,6 +1114,22 @@ async fn serve_session(
                     Err(broadcast::error::RecvError::Closed) => break 'session,
                 }
             }
+            update = universal_provider_update_rx.recv(), if opened_universal_providers => {
+                match update {
+                    Ok(view) => {
+                        if !enqueue_response(&responses, ServerFrame::UniversalProviderView { view }) {
+                            break 'session;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Ok(view) = store.universal_provider_catalog().await else { continue };
+                        if !enqueue_response(&responses, ServerFrame::UniversalProviderView { view }) {
+                            break 'session;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break 'session,
+                }
+            }
         }
     }
 
@@ -1161,6 +1360,43 @@ async fn enqueue_action_response(
         && store.publish_target_view(view).await.is_err()
     {
         return false;
+    }
+    true
+}
+
+async fn enqueue_universal_provider_action_response(
+    responses: &mpsc::Sender<QueuedResponse>,
+    frame: ServerFrame,
+    catalog_publication: Option<UniversalProviderCatalogView>,
+    target_publications: Vec<TargetView>,
+    eligibility_publication: Option<TargetView>,
+    store: &StateStore,
+) -> bool {
+    let (written, acknowledged) = oneshot::channel();
+    if responses
+        .try_send(QueuedResponse {
+            frame,
+            written: Some(written),
+        })
+        .is_err()
+    {
+        return false;
+    }
+    if acknowledged.await.is_err() {
+        return false;
+    }
+    if let Some(view) = catalog_publication
+        && store.publish_universal_provider_view(view).await.is_err()
+    {
+        return false;
+    }
+    for view in target_publications
+        .into_iter()
+        .chain(eligibility_publication)
+    {
+        if store.publish_target_view(view).await.is_err() {
+            return false;
+        }
     }
     true
 }

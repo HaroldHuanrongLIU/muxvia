@@ -777,6 +777,454 @@ async fn request(stream: &mut UnixStream, request_id: &str, operation: Value) ->
     read_frame(stream).await.unwrap()
 }
 
+#[tokio::test]
+async fn universal_provider_catalog_sessions_respond_before_one_push_and_replay_without_push() {
+    let fixture = ControlFixture::start().await;
+    let mut initiator = fixture.connect().await;
+    let mut subscriber = fixture.connect().await;
+    hello(&mut initiator).await;
+    hello(&mut subscriber).await;
+
+    for (stream, request_id) in [
+        (&mut initiator, "open-universal-initiator"),
+        (&mut subscriber, "open-universal-subscriber"),
+    ] {
+        let opened = request(
+            stream,
+            request_id,
+            json!({ "kind": "open-universal-providers" }),
+        )
+        .await;
+        assert_eq!(
+            opened["result"]["kind"].as_str(),
+            Some("universal-provider-catalog"),
+            "opening a Universal Provider catalog session returned the wrong result",
+        );
+        assert_eq!(
+            opened["result"]["view"]["revision"].as_u64(),
+            Some(0),
+            "a fresh Universal Provider catalog did not start at revision zero",
+        );
+    }
+
+    let action_id = "00000000-0000-4000-8000-000000000901";
+    write_frame(
+        &mut initiator,
+        &json!({
+            "type": "request",
+            "requestId": "create-universal",
+            "operation": {
+                "kind": "universal-provider-act",
+                "actionId": action_id,
+                "expectedRevision": 0,
+                "action": {
+                    "kind": "create-universal-provider",
+                    "name": "Shared Gateway",
+                    "baseUrl": "https://universal-session.example/v1",
+                    "credential": {
+                        "kind": "replace",
+                        "value": "UNIVERSAL_SESSION_CREDENTIAL_901"
+                    },
+                    "presetKey": null,
+                    "targets": [
+                        {
+                            "target": "codex",
+                            "enabled": true,
+                            "model": "shared-model",
+                            "authentication": "openai-bearer",
+                            "routingRequirement": "direct-compatible"
+                        },
+                        {
+                            "target": "claude",
+                            "enabled": true,
+                            "model": "shared-model",
+                            "authentication": "anthropic-bearer",
+                            "routingRequirement": "takeover-required"
+                        }
+                    ]
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let response = read_frame(&mut initiator).await.unwrap();
+    assert!(
+        !response
+            .to_string()
+            .contains("UNIVERSAL_SESSION_CREDENTIAL_901"),
+        "Universal Provider action response exposed a credential",
+    );
+    assert_eq!(
+        response["result"]["kind"].as_str(),
+        Some("universal-provider-outcome"),
+        "Universal Provider action did not return an outcome",
+    );
+    assert_eq!(
+        response["result"]["outcome"]["status"].as_str(),
+        Some("applied"),
+        "Universal Provider action was not applied",
+    );
+    let initiating_push = read_frame(&mut initiator).await.unwrap();
+    let subscriber_push = read_frame(&mut subscriber).await.unwrap();
+    for push in [&initiating_push, &subscriber_push] {
+        assert!(
+            !push
+                .to_string()
+                .contains("UNIVERSAL_SESSION_CREDENTIAL_901"),
+            "Universal Provider catalog push exposed a credential",
+        );
+        assert_eq!(
+            push["type"].as_str(),
+            Some("universal-provider-view"),
+            "Universal Provider catalog subscriber received the wrong push",
+        );
+        assert_eq!(
+            push["view"]["viewSequence"].as_u64(),
+            Some(1),
+            "Universal Provider catalog push carried the wrong sequence",
+        );
+    }
+
+    let replay = request(
+        &mut initiator,
+        "replay-universal",
+        json!({
+            "kind": "universal-provider-act",
+            "actionId": action_id,
+            "expectedRevision": 999,
+            "action": { "malformed": "UNIVERSAL_REPLAY_SECRET_902" }
+        }),
+    )
+    .await;
+    assert!(
+        !replay.to_string().contains("UNIVERSAL_REPLAY_SECRET_902"),
+        "Universal Provider receipt replay exposed malformed action input",
+    );
+    assert_eq!(
+        replay["result"]["outcome"]["status"].as_str(),
+        Some("replayed"),
+        "Universal Provider receipt did not replay before action parsing",
+    );
+    for stream in [&mut initiator, &mut subscriber] {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), read_frame(stream))
+                .await
+                .is_err(),
+            "Universal Provider receipt replay published a duplicate catalog view",
+        );
+    }
+
+    let provider_id = response["result"]["outcome"]["view"]["providers"][0]["id"]
+        .as_str()
+        .expect("created Universal Provider did not expose its identity")
+        .to_owned();
+    let mut codex = fixture.connect().await;
+    let mut claude = fixture.connect().await;
+    hello(&mut codex).await;
+    hello(&mut claude).await;
+    let codex_open = request(
+        &mut codex,
+        "open-codex-for-universal",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    let claude_open = request(
+        &mut claude,
+        "open-claude-for-universal",
+        json!({ "kind": "open-target", "target": "claude" }),
+    )
+    .await;
+    assert_eq!(codex_open["result"]["view"]["viewSequence"], 0);
+    assert_eq!(claude_open["result"]["view"]["viewSequence"], 0);
+
+    write_frame(
+        &mut initiator,
+        &json!({
+            "type": "request",
+            "requestId": "synchronize-universal",
+            "operation": {
+                "kind": "universal-provider-act",
+                "actionId": "00000000-0000-4000-8000-000000000902",
+                "expectedRevision": 1,
+                "action": {
+                    "kind": "synchronize-universal-provider",
+                    "providerId": provider_id,
+                    "providerRevision": 1
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let synchronized = read_frame(&mut initiator).await.unwrap();
+    assert_eq!(
+        synchronized["result"]["outcome"]["status"].as_str(),
+        Some("applied"),
+        "cross-Target synchronization did not return an applied catalog outcome",
+    );
+    let initiating_catalog_push = read_frame(&mut initiator).await.unwrap();
+    let subscribing_catalog_push = read_frame(&mut subscriber).await.unwrap();
+    let codex_push = read_frame(&mut codex).await.unwrap();
+    let claude_push = read_frame(&mut claude).await.unwrap();
+    for push in [&initiating_catalog_push, &subscribing_catalog_push] {
+        assert_eq!(push["type"].as_str(), Some("universal-provider-view"));
+        assert_eq!(push["view"]["revision"].as_u64(), Some(2));
+        assert_eq!(
+            push["view"]["providers"][0]["targets"][0]["synchronization"].as_str(),
+            Some("current"),
+        );
+        assert_eq!(
+            push["view"]["providers"][0]["targets"][1]["synchronization"].as_str(),
+            Some("current"),
+        );
+    }
+    assert_eq!(codex_push["type"].as_str(), Some("target-view"));
+    assert_eq!(codex_push["view"]["target"].as_str(), Some("codex"));
+    assert_eq!(codex_push["view"]["providers"][0]["generated"], true);
+    assert_eq!(claude_push["type"].as_str(), Some("target-view"));
+    assert_eq!(claude_push["view"]["target"].as_str(), Some("claude"));
+    assert_eq!(claude_push["view"]["providers"][0]["generated"], true);
+
+    write_frame(
+        &mut initiator,
+        &json!({
+            "type": "request",
+            "requestId": "update-synchronized-universal",
+            "operation": {
+                "kind": "universal-provider-act",
+                "actionId": "00000000-0000-4000-8000-000000000904",
+                "expectedRevision": 2,
+                "action": {
+                    "kind": "update-universal-provider",
+                    "providerId": provider_id,
+                    "providerRevision": 1,
+                    "name": "Shared Gateway Updated",
+                    "baseUrl": "https://universal-session-updated.example/v1",
+                    "credential": { "kind": "keep" },
+                    "targets": [
+                        {
+                            "target": "codex",
+                            "enabled": true,
+                            "model": "shared-model",
+                            "authentication": "openai-bearer",
+                            "routingRequirement": "direct-compatible"
+                        },
+                        {
+                            "target": "claude",
+                            "enabled": true,
+                            "model": "shared-model",
+                            "authentication": "anthropic-bearer",
+                            "routingRequirement": "takeover-required"
+                        }
+                    ]
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let updated = read_frame(&mut initiator).await.unwrap();
+    assert_eq!(updated["result"]["outcome"]["view"]["revision"], 3);
+    let _initiating_update_push = read_frame(&mut initiator).await.unwrap();
+    let _subscribing_update_push = read_frame(&mut subscriber).await.unwrap();
+    let codex_pending = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut codex))
+        .await
+        .expect("Universal source edit did not publish the affected Codex Target View")
+        .unwrap();
+    let claude_pending = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut claude))
+        .await
+        .expect("Universal source edit did not publish the affected Claude Target View")
+        .unwrap();
+    for (push, target) in [(&codex_pending, "codex"), (&claude_pending, "claude")] {
+        assert_eq!(push["type"].as_str(), Some("target-view"));
+        assert_eq!(push["view"]["target"].as_str(), Some(target));
+        assert_eq!(push["view"]["providers"][0]["synchronization"], "pending");
+    }
+
+    let stale = request(
+        &mut initiator,
+        "stale-universal",
+        json!({
+            "kind": "universal-provider-act",
+            "actionId": "00000000-0000-4000-8000-000000000903",
+            "expectedRevision": 2,
+            "action": {
+                "kind": "delete-universal-provider",
+                "providerId": provider_id,
+                "providerRevision": 1
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        stale["problem"]["code"].as_str(),
+        Some("stale-universal-catalog-revision"),
+        "stale catalog revision returned the wrong fixed problem",
+    );
+    let refreshed = request(
+        &mut initiator,
+        "refresh-universal-after-stale",
+        json!({ "kind": "open-universal-providers" }),
+    )
+    .await;
+    assert_eq!(
+        refreshed["result"]["view"]["revision"].as_u64(),
+        Some(3),
+        "catalog refresh after a stale action did not return authoritative state",
+    );
+}
+
+#[tokio::test]
+async fn universal_provider_writer_failure_suppresses_push_and_reconnects_to_durable_catalog() {
+    let fixture = ControlFixture::start().await;
+    let created = fixture
+        .store
+        .apply_universal_provider_action(
+            Uuid::from_u128(0x910),
+            0,
+            json!({
+                "kind": "create-universal-provider",
+                "name": "Inflated catalog",
+                "baseUrl": "https://writer-failure.example/v1",
+                "credential": { "kind": "remove" },
+                "presetKey": null,
+                "targets": [
+                    {
+                        "target": "codex",
+                        "enabled": true,
+                        "model": "m".repeat(128 * 1024),
+                        "authentication": "openai-bearer",
+                        "routingRequirement": "direct-compatible"
+                    },
+                    {
+                        "target": "claude",
+                        "enabled": false,
+                        "model": "m".repeat(128 * 1024),
+                        "authentication": "anthropic-api-key",
+                        "routingRequirement": "direct-compatible"
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+    let provider_id = created.view.providers[0].id;
+
+    let mut initiator = fixture.connect().await;
+    let mut subscriber = fixture.connect().await;
+    hello(&mut initiator).await;
+    hello(&mut subscriber).await;
+    request(
+        &mut initiator,
+        "open-writer-failure-initiator",
+        json!({ "kind": "open-universal-providers" }),
+    )
+    .await;
+    request(
+        &mut subscriber,
+        "open-writer-failure-subscriber",
+        json!({ "kind": "open-universal-providers" }),
+    )
+    .await;
+
+    for index in 0..8 {
+        write_frame(
+            &mut initiator,
+            &json!({
+                "type": "request",
+                "requestId": format!("universal-fill-{index}"),
+                "operation": { "kind": "open-universal-providers" }
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    write_frame(
+        &mut initiator,
+        &json!({
+            "type": "request",
+            "requestId": "universal-writer-failure-action",
+            "operation": {
+                "kind": "universal-provider-act",
+                "actionId": "00000000-0000-4000-8000-000000000911",
+                "expectedRevision": 1,
+                "action": {
+                    "kind": "update-universal-provider",
+                    "providerId": provider_id,
+                    "providerRevision": 1,
+                    "name": "Durable after writer failure",
+                    "baseUrl": "https://writer-failure.example/v1",
+                    "credential": { "kind": "keep" },
+                    "targets": [
+                        {
+                            "target": "codex",
+                            "enabled": true,
+                            "model": "m".repeat(128 * 1024),
+                            "authentication": "openai-bearer",
+                            "routingRequirement": "direct-compatible"
+                        },
+                        {
+                            "target": "claude",
+                            "enabled": false,
+                            "model": "m".repeat(128 * 1024),
+                            "authentication": "anthropic-api-key",
+                            "routingRequirement": "direct-compatible"
+                        }
+                    ]
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if fixture
+                .store
+                .universal_provider_catalog()
+                .await
+                .unwrap()
+                .revision
+                == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Universal Provider action did not durably commit behind the blocked writer");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), read_frame(&mut subscriber))
+            .await
+            .is_err(),
+        "subscriber received a catalog push before the initiating response writer ack",
+    );
+    drop(initiator);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(320), read_frame(&mut subscriber))
+            .await
+            .is_err(),
+        "writer failure published a catalog view",
+    );
+
+    let mut reconnected = fixture.connect().await;
+    hello(&mut reconnected).await;
+    let visible = request(
+        &mut reconnected,
+        "open-after-universal-writer-failure",
+        json!({ "kind": "open-universal-providers" }),
+    )
+    .await;
+    assert_eq!(visible["result"]["view"]["revision"].as_u64(), Some(2));
+    assert_eq!(
+        visible["result"]["view"]["providers"][0]["name"].as_str(),
+        Some("Durable after writer failure"),
+    );
+}
+
 async fn seed_codex_direct(home: &MuxviaHome, store: Arc<StateStore>) {
     let created = store
         .apply_provider_action_for(

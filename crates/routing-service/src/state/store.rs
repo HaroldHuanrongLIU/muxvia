@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     control::protocol::{
         ActionOutcome, ActionStatus, ControlProblem, ProviderAuthentication, ProviderProtocol,
-        ProviderRoutingRequirement, Target, TargetAction, TargetView,
+        ProviderRoutingRequirement, Target, TargetAction, TargetView, UniversalProviderCatalogView,
     },
     domain::{
         activation::ActivatedSnapshot, provider::has_valid_provider_declaration,
@@ -57,6 +57,8 @@ pub struct StateStore {
     service_epoch: String,
     target_views: broadcast::Sender<TargetView>,
     published_view_sequences: [Arc<Mutex<Option<u64>>>; 2],
+    universal_provider_views: broadcast::Sender<UniversalProviderCatalogView>,
+    published_universal_provider_view_sequence: Arc<Mutex<Option<u64>>>,
 }
 
 type ActivationPreparationRow = (
@@ -198,11 +200,14 @@ impl StateStore {
             .map_err(map_call_error)?;
 
         let (target_views, _) = broadcast::channel(32);
+        let (universal_provider_views, _) = broadcast::channel(32);
         Ok(Self {
             connection,
             service_epoch: Uuid::new_v4().to_string(),
             target_views,
             published_view_sequences: [Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None))],
+            universal_provider_views,
+            published_universal_provider_view_sequence: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -239,6 +244,12 @@ impl StateStore {
 
     pub fn subscribe_target_views(&self) -> broadcast::Receiver<TargetView> {
         self.target_views.subscribe()
+    }
+
+    pub(crate) fn subscribe_universal_provider_views(
+        &self,
+    ) -> broadcast::Receiver<UniversalProviderCatalogView> {
+        self.universal_provider_views.subscribe()
     }
 
     pub fn service_epoch(&self) -> Uuid {
@@ -977,6 +988,34 @@ impl StateStore {
                 let authoritative: u64 = connection.query_row(
                     "SELECT view_sequence FROM target_route_state WHERE target = ?1",
                     [view.target.as_str()],
+                    |row| row.get(0),
+                )?;
+                let mut last = published
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if view.view_sequence == authoritative
+                    && last.is_none_or(|sequence| view.view_sequence > sequence)
+                {
+                    *last = Some(view.view_sequence);
+                    let _ = sender.send(view);
+                }
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    pub(crate) async fn publish_universal_provider_view(
+        &self,
+        view: UniversalProviderCatalogView,
+    ) -> Result<(), StateError> {
+        let published = Arc::clone(&self.published_universal_provider_view_sequence);
+        let sender = self.universal_provider_views.clone();
+        self.connection
+            .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                let authoritative: u64 = connection.query_row(
+                    "SELECT view_sequence FROM universal_provider_catalog_state WHERE singleton = 1",
+                    [],
                     |row| row.get(0),
                 )?;
                 let mut last = published

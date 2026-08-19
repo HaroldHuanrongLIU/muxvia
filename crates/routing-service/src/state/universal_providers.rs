@@ -35,6 +35,11 @@ pub struct UniversalProviderSynchronizationCommit {
     pub target_views: Vec<TargetView>,
 }
 
+pub(crate) struct UniversalProviderCatalogCommit {
+    pub(crate) outcome: UniversalProviderOutcome,
+    pub(crate) target_views: Vec<TargetView>,
+}
+
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UniversalSynchronizationFailpoint {
@@ -47,7 +52,7 @@ pub enum UniversalSynchronizationFailpoint {
 }
 
 enum CatalogAttempt {
-    Applied(UniversalProviderOutcome),
+    Applied(UniversalProviderCatalogCommit),
     Synchronized(UniversalProviderSynchronizationCommit),
     Failure(UniversalProviderActionFailure),
 }
@@ -68,8 +73,28 @@ impl StateStore {
         expected_revision: u64,
         raw_action: serde_json::Value,
     ) -> Result<UniversalProviderOutcome, UniversalProviderActionFailure> {
+        self.apply_universal_provider_action_with_target_views(
+            action_id,
+            expected_revision,
+            raw_action,
+        )
+        .await
+        .map(|commit| commit.outcome)
+    }
+
+    pub(crate) async fn apply_universal_provider_action_with_target_views(
+        &self,
+        action_id: Uuid,
+        expected_revision: u64,
+        raw_action: serde_json::Value,
+    ) -> Result<UniversalProviderCatalogCommit, UniversalProviderActionFailure> {
         match self.universal_provider_receipt(action_id).await {
-            Ok(Some(outcome)) => return Ok(replayed(outcome)),
+            Ok(Some(outcome)) => {
+                return Ok(UniversalProviderCatalogCommit {
+                    outcome: replayed(outcome),
+                    target_views: Vec::new(),
+                });
+            }
             Ok(None) => {}
             Err(_) => {
                 return Err(self
@@ -91,6 +116,7 @@ impl StateStore {
         };
         let action_kind = action_kind(&action);
         let action_id = action_id.to_string();
+        let service_epoch = self.service_epoch().to_string();
         let attempt = self
             .connection
             .call(move |connection| -> Result<CatalogAttempt, StateError> {
@@ -98,7 +124,10 @@ impl StateStore {
                     tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
                 )?;
                 if let Some(outcome) = read_receipt(&transaction, &action_id)? {
-                    return Ok(CatalogAttempt::Applied(replayed(outcome)));
+                    return Ok(CatalogAttempt::Applied(UniversalProviderCatalogCommit {
+                        outcome: replayed(outcome),
+                        target_views: Vec::new(),
+                    }));
                 }
                 let current_revision: u64 = transaction.query_row(
                     "SELECT revision FROM universal_provider_catalog_state WHERE singleton = 1",
@@ -112,6 +141,15 @@ impl StateStore {
                         "Universal Provider catalog changed; refresh and retry",
                     )?));
                 }
+                let target_view_sequences = [Target::Codex, Target::Claude].map(|target| {
+                    transaction.query_row(
+                        "SELECT view_sequence FROM target_route_state WHERE target = ?1",
+                        [target.as_str()],
+                        |row| row.get::<_, u64>(0),
+                    )
+                });
+                let [codex_sequence, claude_sequence] = target_view_sequences;
+                let target_view_sequences = [codex_sequence?, claude_sequence?];
                 let mutation = match action {
                     UniversalProviderAction::CreateUniversalProvider {
                         name,
@@ -220,13 +258,34 @@ impl StateStore {
                         serde_json::to_string(&outcome)?
                     ],
                 )?;
+                let mut target_views = Vec::new();
+                for (target, previous_sequence) in [Target::Codex, Target::Claude]
+                    .into_iter()
+                    .zip(target_view_sequences)
+                {
+                    let current_sequence: u64 = transaction.query_row(
+                        "SELECT view_sequence FROM target_route_state WHERE target = ?1",
+                        [target.as_str()],
+                        |row| row.get(0),
+                    )?;
+                    if current_sequence != previous_sequence {
+                        target_views.push(project_target_view_for(
+                            &transaction,
+                            &service_epoch,
+                            target,
+                        )?);
+                    }
+                }
                 transaction.commit()?;
-                Ok(CatalogAttempt::Applied(outcome))
+                Ok(CatalogAttempt::Applied(UniversalProviderCatalogCommit {
+                    outcome,
+                    target_views,
+                }))
             })
             .await;
 
         match attempt {
-            Ok(CatalogAttempt::Applied(outcome)) => Ok(outcome),
+            Ok(CatalogAttempt::Applied(commit)) => Ok(commit),
             Ok(CatalogAttempt::Failure(failure)) => Err(failure),
             Ok(CatalogAttempt::Synchronized(_)) | Err(_) => Err(self
                 .catalog_failure("state-store-error", "State store operation failed")
@@ -750,8 +809,6 @@ impl StateStore {
             .map_err(map_state_call_error)
     }
 
-    // Task 5 consumes this through the independent catalog session.
-    #[allow(dead_code)]
     pub(crate) async fn universal_provider_synchronization_targets(
         &self,
         provider_id: Uuid,
@@ -774,8 +831,6 @@ impl StateStore {
             .unwrap_or_default())
     }
 
-    // Task 5 consumes this through the independent catalog session.
-    #[allow(dead_code)]
     pub(crate) async fn universal_provider_failure(
         &self,
         problem: ControlProblem,

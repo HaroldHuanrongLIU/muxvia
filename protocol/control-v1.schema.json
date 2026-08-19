@@ -83,7 +83,7 @@
     },
     "controlOperation": {
       "oneOf": [
-        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "open-universal-providers" } }, "required": ["kind"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "open-universal-providers" }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind"] },
         { "type": "object", "properties": { "kind": { "const": "universal-provider-act" }, "actionId": { "type": "string", "format": "uuid" }, "expectedRevision": { "type": "integer", "minimum": 0 }, "action": {} }, "required": ["kind", "actionId", "expectedRevision", "action"] },
         { "type": "object", "properties": { "kind": { "const": "open-target" }, "target": { "enum": ["codex", "claude"] }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind", "target"] },
         { "type": "object", "properties": { "kind": { "const": "act" }, "target": { "enum": ["codex", "claude"] }, "actionId": { "type": "string", "format": "uuid" }, "expectedRevision": { "type": "integer", "minimum": 0 }, "action": {} }, "required": ["kind", "target", "actionId", "expectedRevision", "action"] },

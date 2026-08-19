@@ -199,8 +199,19 @@ function assertCapturedUniversalCreate(
 test("catalog actions capture caller input, serialize revisions, and refresh stale state", async () => {
   const { server, path } = await CatalogServer.start()
   const client = await RpcClient.connect(path, "control-test")
-  const opening = client.openUniversalProviders()
+  const claudeContext = {
+    claudeConfigDir: null,
+    selectorState: "unset" as const,
+    blockingSelector: null,
+    hostManagedState: "unmanaged" as const,
+    cwd: "/tmp/universal-provider-session",
+  }
+  const opening = client.openUniversalProviders(claudeContext)
   await server.waitForRequests(1)
+  expect(server.requests()[0]!.operation).toEqual({
+    kind: "open-universal-providers",
+    claudeContext,
+  })
   server.replyOpen(0)
   const session = await opening
   const ordering: string[] = []
@@ -254,7 +265,10 @@ test("catalog actions capture caller input, serialize revisions, and refresh sta
   await server.waitForRequests(4)
   server.replyStale()
   await server.waitForRequests(5)
-  expect(server.requests()[4]!.operation).toEqual({ kind: "open-universal-providers" })
+  expect(server.requests()[4]!.operation).toEqual({
+    kind: "open-universal-providers",
+    claudeContext,
+  })
   server.replyOpen(4, catalogAt(4, 4))
   await expect(stale).rejects.toMatchObject({
     code: "stale-universal-catalog-revision",

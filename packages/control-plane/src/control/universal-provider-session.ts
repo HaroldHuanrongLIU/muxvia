@@ -5,6 +5,7 @@ import type {
   UniversalProviderAction,
   UniversalProviderCatalogView,
   UniversalProviderOutcome,
+  ClaudePreflightContext,
 } from "./types"
 
 export interface UniversalProviderSession {
@@ -23,12 +24,20 @@ class UniversalProviderSessionImpl implements UniversalProviderSession {
   #actions: Promise<void> = Promise.resolve()
   #refresh?: Promise<void>
   #lastNotifiedSequence: number
+  readonly #claudeContext?: ClaudePreflightContext
   #closed = false
 
-  constructor(rpc: RpcTransport, initialView: UniversalProviderCatalogView) {
+  constructor(
+    rpc: RpcTransport,
+    initialView: UniversalProviderCatalogView,
+    claudeContext?: ClaudePreflightContext,
+  ) {
     this.#rpc = rpc
     this.#view = initialView
     this.#lastNotifiedSequence = initialView.viewSequence
+    this.#claudeContext = claudeContext === undefined
+      ? undefined
+      : freezeOwnedValue(structuredClone(claudeContext))
     this.#removePushListener = rpc.onUniversalProviderView((view) => this.#receivePush(view))
   }
 
@@ -107,7 +116,10 @@ class UniversalProviderSessionImpl implements UniversalProviderSession {
 
   async #refreshCatalog(): Promise<void> {
     try {
-      const result = await this.#rpc.request({ kind: "open-universal-providers" })
+      const result = await this.#rpc.request({
+        kind: "open-universal-providers",
+        ...(this.#claudeContext ? { claudeContext: this.#claudeContext } : {}),
+      })
       if (
         result.kind === "universal-provider-catalog"
         && result.view.viewSequence > this.#view.viewSequence
@@ -135,6 +147,7 @@ function freezeOwnedValue<T>(value: T): T {
 export function createUniversalProviderSession(
   rpc: RpcTransport,
   initialView: UniversalProviderCatalogView,
+  claudeContext?: ClaudePreflightContext,
 ): UniversalProviderSession {
-  return new UniversalProviderSessionImpl(rpc, initialView)
+  return new UniversalProviderSessionImpl(rpc, initialView, claudeContext)
 }

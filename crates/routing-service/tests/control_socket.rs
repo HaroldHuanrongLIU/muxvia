@@ -1077,6 +1077,128 @@ async fn universal_provider_catalog_sessions_respond_before_one_push_and_replay_
 }
 
 #[tokio::test]
+async fn generated_overlay_update_publishes_the_authoritative_universal_catalog() {
+    let fixture = ControlFixture::start().await;
+    let mut catalog = fixture.connect().await;
+    let mut codex = fixture.connect().await;
+    hello(&mut catalog).await;
+    hello(&mut codex).await;
+    let _opened_catalog = request(
+        &mut catalog,
+        "open-generated-overlay-catalog",
+        json!({ "kind": "open-universal-providers" }),
+    )
+    .await;
+    let _opened_codex = request(
+        &mut codex,
+        "open-generated-overlay-codex",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+
+    let created = request(
+        &mut catalog,
+        "create-generated-overlay-source",
+        json!({
+            "kind": "universal-provider-act",
+            "actionId": "00000000-0000-4000-8000-000000000941",
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-universal-provider",
+                "name": "Overlay Source",
+                "baseUrl": "https://overlay-source.example/v1",
+                "credential": { "kind": "replace", "value": "OVERLAY_SOURCE_SECRET_941" },
+                "presetKey": null,
+                "targets": [
+                    { "target": "codex", "enabled": true, "model": "overlay-v1", "authentication": "openai-bearer", "routingRequirement": "direct-compatible" },
+                    { "target": "claude", "enabled": false, "model": "unused", "authentication": "anthropic-api-key", "routingRequirement": "direct-compatible" }
+                ]
+            }
+        }),
+    )
+    .await;
+    let _created_push = read_frame(&mut catalog).await.unwrap();
+    let source_id = created["result"]["outcome"]["view"]["providers"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let synchronized = request(
+        &mut catalog,
+        "sync-generated-overlay-source",
+        json!({
+            "kind": "universal-provider-act",
+            "actionId": "00000000-0000-4000-8000-000000000942",
+            "expectedRevision": 1,
+            "action": {
+                "kind": "synchronize-universal-provider",
+                "providerId": source_id,
+                "providerRevision": 1
+            }
+        }),
+    )
+    .await;
+    let _synchronized_catalog_push = read_frame(&mut catalog).await.unwrap();
+    let generated_target_push = read_frame(&mut codex).await.unwrap();
+    let generated = &synchronized["result"]["outcome"]["view"]["providers"][0]["targets"][0];
+    let generated_id = generated["generatedProviderId"].as_str().unwrap();
+    let target_revision = generated_target_push["view"]["managementRevision"]
+        .as_u64()
+        .unwrap();
+    let provider_revision = generated_target_push["view"]["providers"][0]["providerRevision"]
+        .as_u64()
+        .unwrap();
+
+    write_frame(
+        &mut codex,
+        &json!({
+            "type": "request",
+            "requestId": "update-generated-overlay",
+            "operation": {
+                "kind": "act",
+                "target": "codex",
+                "actionId": "00000000-0000-4000-8000-000000000943",
+                "expectedRevision": target_revision,
+                "action": {
+                    "kind": "update-provider",
+                    "providerId": generated_id,
+                    "providerRevision": provider_revision,
+                    "name": "Overlay Source",
+                    "baseUrl": "https://overlay-source.example/v1",
+                    "model": "overlay-v2",
+                    "authentication": "openai-bearer",
+                    "routingRequirement": "takeover-required",
+                    "credential": { "kind": "keep" }
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let response = read_frame(&mut codex).await.unwrap();
+    assert_eq!(response["type"], "response");
+    let _target_push = read_frame(&mut codex).await.unwrap();
+    let catalog_push = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut catalog))
+        .await
+        .expect("Generated Overlay update did not publish the Universal Provider catalog")
+        .unwrap();
+    assert_eq!(catalog_push["type"], "universal-provider-view");
+    assert_eq!(catalog_push["view"]["revision"], 3);
+    assert_eq!(
+        catalog_push["view"]["providers"][0]["targets"][0]["model"],
+        "overlay-v2"
+    );
+    assert_eq!(
+        catalog_push["view"]["providers"][0]["targets"][0]["routingRequirement"],
+        "takeover-required"
+    );
+    assert!(
+        !catalog_push
+            .to_string()
+            .contains("OVERLAY_SOURCE_SECRET_941")
+    );
+}
+
+#[tokio::test]
 async fn universal_provider_writer_failure_suppresses_push_and_reconnects_to_durable_catalog() {
     let fixture = ControlFixture::start().await;
     let created = fixture

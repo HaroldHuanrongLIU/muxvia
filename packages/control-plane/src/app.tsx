@@ -45,6 +45,7 @@ export interface RunPorts {
     socketPath: string,
     release: string,
     signal: AbortSignal,
+    claudeContext: ClaudePreflightContext,
   ): Promise<UniversalProviderSession>
   spawn(path: string, args: string[], options: SpawnOptions): void
   createRenderer(): Promise<CliRenderer>
@@ -130,11 +131,11 @@ export function createProductionRenderer(): Promise<CliRenderer> {
 const productionPorts: RunPorts = {
   connect: (socketPath, release, signal, target, claudeContext) =>
     connectTargetSession(socketPath, release, signal, target, undefined, claudeContext),
-  connectUniversalProviders: async (socketPath, release, signal) => {
+  connectUniversalProviders: async (socketPath, release, signal, claudeContext) => {
     const control = await RpcClient.connect(socketPath, release, signal)
     try {
       if (signal.aborted) throw new ConnectionDeadlineError()
-      return await control.openUniversalProviders()
+      return await control.openUniversalProviders(claudeContext)
     } catch (error) {
       await control.close().catch(() => {})
       throw error
@@ -290,6 +291,7 @@ async function connectUniversalCatalog(
   options: RunOptions,
   ports: RunPorts,
   cancellation: AbortSignal,
+  claudeContext: ClaudePreflightContext,
 ): Promise<UniversalProviderSession | undefined> {
   const connect = ports.connectUniversalProviders
   if (!connect || cancellation.aborted) return undefined
@@ -310,7 +312,7 @@ async function connectUniversalCatalog(
     rejectCancelled(new ConnectionCancelledError())
   }
   cancellation.addEventListener("abort", onCancel, { once: true })
-  const connection = connect(options.socketPath, options.release, controller.signal).then(async (session) => {
+  const connection = connect(options.socketPath, options.release, controller.signal, claudeContext).then(async (session) => {
     if (!expired && !cancellation.aborted) return session
     await session.close().catch(() => {})
     throw new ConnectionDeadlineError()
@@ -376,7 +378,7 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
     if (Object.keys(sessions()).length === 0) throw firstConnectionFailure ?? new ConnectionDeadlineError()
     if (ports.connectUniversalProviders && !startup.signal.aborted) {
       try {
-        const catalog = await connectUniversalCatalog(options, ports, startup.signal)
+        const catalog = await connectUniversalCatalog(options, ports, startup.signal, claudeContext)
         if (!catalog) throw new ConnectionDeadlineError()
         if (!startup.signal.aborted) setUniversalSession(catalog)
         else await catalog.close().catch(() => {})

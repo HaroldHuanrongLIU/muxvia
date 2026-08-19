@@ -149,7 +149,10 @@ pub enum ServerFrame {
     rename_all_fields = "camelCase"
 )]
 pub enum ControlOperation {
-    OpenUniversalProviders,
+    OpenUniversalProviders {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_context: Option<ClaudePreflightContext>,
+    },
     UniversalProviderAct {
         action_id: Uuid,
         expected_revision: u64,
@@ -397,7 +400,7 @@ impl fmt::Debug for DraftCredentialSource {
 impl fmt::Debug for ControlOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::OpenUniversalProviders => formatter.write_str("OpenUniversalProviders"),
+            Self::OpenUniversalProviders { .. } => formatter.write_str("OpenUniversalProviders"),
             Self::UniversalProviderAct {
                 action_id,
                 expected_revision,

@@ -11,7 +11,7 @@ import {
 } from "../src/app"
 import type { TargetSession } from "../src/control/target-session"
 import type { UniversalProviderSession } from "../src/control/universal-provider-session"
-import type { ActionOutcome, TargetAction, TargetView, UniversalProviderAction, UniversalProviderCatalogView, UniversalProviderOutcome } from "../src/control/types"
+import type { ActionOutcome, ClaudePreflightContext, TargetAction, TargetView, UniversalProviderAction, UniversalProviderCatalogView, UniversalProviderOutcome } from "../src/control/types"
 
 const initialView: TargetView = {
   target: "codex",
@@ -254,9 +254,11 @@ test("startup mounts and closes one independent Universal Provider catalog sessi
   const target = new LifecycleSession()
   const catalog = new LifecycleUniversalSession()
   let catalogConnections = 0
+  let catalogContext: ClaudePreflightContext | undefined
   const running = run(options, ports(setup, target, {
-    connectUniversalProviders: async () => {
+    connectUniversalProviders: async (_socketPath, _release, _signal, claudeContext) => {
       catalogConnections++
+      catalogContext = claudeContext
       return catalog
     },
   }))
@@ -271,6 +273,11 @@ test("startup mounts and closes one independent Universal Provider catalog sessi
     setup.mockInput.pressCtrlC()
     await running
     expect(catalogConnections).toBe(1)
+    expect(catalogContext).toMatchObject({
+      claudeConfigDir: null,
+      selectorState: "unset",
+      hostManagedState: "unmanaged",
+    })
     expect(catalog.closeCalls).toBe(1)
   } finally {
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()

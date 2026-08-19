@@ -16,6 +16,7 @@ import { RpcClient } from "../src/control/rpc-client"
 import { encodeFrame, FrameDecoder } from "../src/control/framing"
 import { App } from "../src/ui/app"
 import type { TargetSession } from "../src/control/target-session"
+import type { UniversalProviderSession } from "../src/control/universal-provider-session"
 import {
   parseClientFrame,
   type OrdinaryTargetAction,
@@ -1787,13 +1788,15 @@ function auditSqliteSecretLocations(path: string, policy: SqliteSecretPolicy): v
   const secrets = [...policy.providerSecrets, ...policy.routingSecrets]
   const database = new Database(path, { readonly: true })
   try {
-    const definitions = database.query(`SELECT name, sql FROM sqlite_master
+    const definitions = database.query(`SELECT type, name, sql FROM sqlite_master
       WHERE type IN ('table', 'index', 'trigger', 'view') ORDER BY type, name`).all() as Array<{
+        type: string
         name: string
         sql: string | null
       }>
     scanNoSecrets(definitions, secrets.map(({ secret }) => secret), "claude-sqlite-schema")
-    const tableNames = definitions.filter(({ sql, name }) => sql && !name.startsWith("sqlite_"))
+    const tableNames = definitions.filter(({ type, sql, name }) =>
+      type === "table" && sql && !name.startsWith("sqlite_"))
       .map(({ name }) => name)
     const providers = tableNames.includes("providers")
       ? database.query("SELECT id, target, name, credential_id FROM providers").all() as Array<{
@@ -3463,6 +3466,20 @@ test("Claude SQLite audit rejects a secret in an unrelated state column", async 
   }
   expect(diagnostic).toBe("secret-scan-failed:claude-sqlite-secret-location")
   expect(diagnostic.includes(secret)).toBeFalse()
+})
+
+test("Claude SQLite audit scans index definitions without querying indexes as tables", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-sqlite-index-audit-"))
+  roots.push(root)
+  const path = join(root, "indexed.db")
+  const database = new Database(path, { create: true })
+  database.exec("CREATE TABLE providers (id TEXT PRIMARY KEY, target TEXT, name TEXT, credential_id TEXT)")
+  database.exec("CREATE UNIQUE INDEX providers_generated_owner_target ON providers(target, id)")
+  database.close()
+  expect(() => auditSqliteSecretLocations(path, {
+    providerSecrets: [],
+    routingSecrets: [],
+  })).not.toThrow()
 })
 
 test("Claude SQLite recovery audit rejects a prefixed semantic token", async () => {
@@ -6967,3 +6984,458 @@ test("real processes prove the complete Target Provider workflow without leaking
     await upstream.stop()
   }
 })
+
+test("real processes prove Universal Provider synchronization across both Targets", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mu-"))
+  roots.push(root)
+  const userHome = join(root, "home")
+  const muxviaHome = join(userHome, ".muxvia")
+  const socketPath = join(muxviaHome, "run/control.sock")
+  const databasePath = join(muxviaHome, "state/muxvia.db")
+  const codexConfig = join(userHome, ".codex/config.toml")
+  const claudeSettings = join(userHome, ".claude/settings.json")
+  const firstShutdown = join(root, "shutdown-first")
+  const sourceSecret = "universal-source-secret-must-not-escape"
+  const replacementSecret = "universal-replacement-secret-must-not-escape"
+  const upstream = await startFakeUpstream(sourceSecret, undefined, { bearerCredentials: [sourceSecret] })
+  const replacementUpstream = await startFakeUpstream(replacementSecret, undefined, { bearerCredentials: [replacementSecret] })
+  const services: Array<{ child: ReturnType<typeof spawn>; output: ReturnType<typeof captureProcessOutput> }> = []
+  const rpcStreams: Buffer[][] = []
+  const decodedFrames: unknown[] = []
+  const nativeFrames: string[] = []
+  const routingSecrets = new Set<string>()
+  let codexClient: RpcClient | undefined
+  let claudeClient: RpcClient | undefined
+  let universalClient: RpcClient | undefined
+  let codexSession: TargetSession | undefined
+  let claudeSession: TargetSession | undefined
+  let universalSession: UniversalProviderSession | undefined
+  let setup: Awaited<ReturnType<typeof testRender>> | undefined
+  let recorder: ReturnType<typeof createRendererAudit> | undefined
+
+  await mkdir(dirname(codexConfig), { recursive: true, mode: 0o700 })
+  await mkdir(dirname(claudeSettings), { recursive: true, mode: 0o700 })
+  await writeFile(codexConfig, '# operator comment survives\nunrelated = "keep-me"\n', { mode: 0o600 })
+  await writeFile(claudeSettings, JSON.stringify({
+    operator: { theme: "dark", hooks: ["keep"] },
+    env: { OPERATOR_UNRELATED: "keep-me" },
+  }, null, 2), { mode: 0o640 })
+  await chmod(fakeCodex, 0o755)
+  await chmod(fakeClaude, 0o755)
+
+  const secrets = () => [sourceSecret, replacementSecret, ...routingSecrets]
+  const startService = async (label: string, shutdownFile?: string) => {
+    const args = [
+      "--home", muxviaHome,
+      "--test-codex-executable", fakeCodex,
+      "--test-claude-executable", fakeClaude,
+    ]
+    if (shutdownFile) args.push("--test-shutdown-file", shutdownFile)
+    const child = spawn(serviceBinary, args, {
+      cwd: root,
+      env: { HOME: userHome, PATH: `${dirname(fakeCodex)}:/usr/bin:/bin`, MUXVIA_INTEGRATION_TEST: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    const record = { child, output: captureProcessOutput(child) }
+    services.push(record)
+    await waitFor(async () => {
+      if (child.exitCode !== null) throw new Error(`universal-provider-service-exited:${label}`)
+      try { return (await stat(socketPath)).isSocket() } catch { return false }
+    }, `Universal Provider ${label} socket`)
+    return record
+  }
+  const connect = async (release: string) => {
+    const chunks: Buffer[] = []
+    const decoder = new FrameDecoder()
+    rpcStreams.push(chunks)
+    return await RpcClient.connect(socketPath, release, undefined, (path) => {
+      const socket = createConnection({ path })
+      socket.on("data", (chunk) => {
+        const bytes = Buffer.from(chunk)
+        chunks.push(bytes)
+        for (const frame of decoder.push(bytes)) {
+          assertSecretSafeStructured(frame, secrets(), "universal-provider-rpc-frame")
+          decodedFrames.push(frame)
+        }
+      })
+      return socket
+    })
+  }
+  const openSessions = async (release: string) => {
+    codexClient = await connect(`${release}-codex`)
+    claudeClient = await connect(`${release}-claude`)
+    universalClient = await connect(`${release}-catalog`)
+    codexSession = await codexClient.openTarget("codex")
+    claudeSession = await claudeClient.openTarget("claude", {
+      claudeConfigDir: null,
+      selectorState: "unset",
+      hostManagedState: "unmanaged",
+      cwd: root,
+    })
+    universalSession = await universalClient.openUniversalProviders({
+      claudeConfigDir: null,
+      selectorState: "unset",
+      blockingSelector: null,
+      hostManagedState: "unmanaged",
+      cwd: root,
+    })
+  }
+  const closeSessions = async () => {
+    const sessions = [codexSession, claudeSession, universalSession]
+    const clients = [codexClient, claudeClient, universalClient]
+    codexSession = undefined
+    claudeSession = undefined
+    universalSession = undefined
+    codexClient = undefined
+    claudeClient = undefined
+    universalClient = undefined
+    await Promise.all(sessions.map((session) => session?.close().catch(() => undefined)))
+    await Promise.all(clients.map((client) => client?.close().catch(() => undefined)))
+  }
+  const waitForCatalog = async (
+    predicate: (view: ReturnType<UniversalProviderSession["get"]>) => boolean,
+    label: string,
+  ) => {
+    if (predicate(universalSession!.get())) return
+    await new Promise<void>((resolveWait, reject) => {
+      let unsubscribe = () => {}
+      const timeout = setTimeout(() => {
+        unsubscribe()
+        reject(new Error(`universal-provider-catalog-timeout:${label}`))
+      }, deadlineMs)
+      const finish = () => {
+        clearTimeout(timeout)
+        unsubscribe()
+        resolveWait()
+      }
+      unsubscribe = universalSession!.subscribe((view) => { if (predicate(view)) finish() })
+      if (predicate(universalSession!.get())) finish()
+    })
+  }
+  const renderApp = async () => {
+    setup = await testRender(() => <App
+      sessions={{ codex: codexSession!, claude: claudeSession! }}
+      universalSession={universalSession!}
+    />, { width: 100, height: 30, useThread: false, kittyKeyboard: true })
+    recorder = createRendererAudit(setup)
+    recorder.start()
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+  }
+  const closeRenderer = () => {
+    recorder?.stop()
+    const frames = recorder?.frames() ?? []
+    scanNoSecrets(frames, secrets(), "universal-provider-renderer")
+    nativeFrames.push(...frames)
+    if (setup && !setup.renderer.isDestroyed) setup.renderer.destroy()
+    setup = undefined
+    recorder = undefined
+  }
+  const leader = (key: string) => {
+    setup!.mockInput.pressKey("x", { ctrl: true })
+    setup!.mockInput.pressKey(key)
+  }
+  const openUniversalPicker = async () => {
+    await setup!.mockInput.typeText("/universal-providers")
+    setup!.mockInput.pressEnter()
+    return await setup!.waitForFrame((frame) => frame.includes("Universal Providers"))
+  }
+  const openProviderPicker = async () => {
+    await setup!.mockInput.typeText("/providers")
+    setup!.mockInput.pressEnter()
+    return await setup!.waitForFrame((frame) => frame.includes("Providers"))
+  }
+  const fixedProblemCode = (error: unknown, label: string) => {
+    assertSecretSafeStructured(error, secrets(), `universal-provider-${label}`)
+    if (!error || typeof error !== "object" || !("code" in error) || typeof error.code !== "string") {
+      throw new Error(`universal-provider-problem-missing:${label}`)
+    }
+    return error.code
+  }
+  const catalog = () => {
+    if (!universalSession) throw new Error("universal-provider-catalog-session-missing")
+    return universalSession
+  }
+  const codex = () => {
+    if (!codexSession) throw new Error("universal-provider-codex-session-missing")
+    return codexSession
+  }
+  const claude = () => {
+    if (!claudeSession) throw new Error("universal-provider-claude-session-missing")
+    return claudeSession
+  }
+  const ui = () => {
+    if (!setup) throw new Error("universal-provider-renderer-missing")
+    return setup
+  }
+
+  try {
+    const firstService = await startService("first", firstShutdown)
+    await openSessions("first")
+
+    // A Preset-backed declaration starts pending and materializes one stable Generated Provider per Target only on explicit sync.
+    const createdOutcome = await catalog().act({
+      kind: "create-universal-provider",
+      name: "Shared Frontier",
+      baseUrl: upstream.baseUrl,
+      credential: { kind: "replace", value: sourceSecret },
+      presetKey: "openai-api-responses",
+      targets: [
+        { target: "codex", enabled: true, model: "universal-codex-v1", authentication: "openai-bearer", routingRequirement: "direct-compatible" },
+        { target: "claude", enabled: true, model: "universal-claude-v1", authentication: "anthropic-bearer", routingRequirement: "direct-compatible" },
+      ],
+    })
+    const created = createdOutcome.view.providers[0]!
+    if (created.provenance?.key !== "openai-api-responses"
+      || !created.targets.every((target) => target.synchronization === "pending" && target.generatedProviderId === null)) {
+      throw new Error("universal-provider-created-state-invalid")
+    }
+    await renderApp()
+    const pendingFrame = await openUniversalPicker()
+    if (!pendingFrame.includes("Codex CLI · Pending · Enabled") || !pendingFrame.includes("Claude Code · Pending · Enabled")) {
+      throw new Error("universal-provider-pending-rails-missing")
+    }
+    ui().mockInput.pressEscape()
+    await catalog().act({
+      kind: "synchronize-universal-provider",
+      providerId: created.id,
+      providerRevision: created.providerRevision,
+    })
+    await waitForCatalog((view) => view.providers[0]?.targets.every((target) =>
+      target.synchronization === "current" && target.generatedProviderId !== null) === true, "initial sync")
+    const synchronized = catalog().get().providers[0]!
+    const generatedIds = Object.fromEntries(synchronized.targets.map((target) => [target.target, target.generatedProviderId!])) as Record<"codex" | "claude", string>
+    await waitForSession(codex(), (view) => view.providers.some((provider) => provider.id === generatedIds.codex), "Codex Generated Provider")
+    await waitForSession(claude(), (view) => view.providers.some((provider) => provider.id === generatedIds.claude), "Claude Generated Provider")
+
+    // The Target editor changes only the Overlay; duplicating a Generated Provider creates a detached ordinary Provider.
+    await openProviderPicker()
+    ui().mockInput.pressEnter()
+    await ui().waitForFrame((frame) => frame.includes("Generated Provider Target Overlay"))
+    await ui().mockInput.typeText("-overlay")
+    ui().mockInput.pressEnter()
+    await waitForSession(codex(), (view) => view.providers.find((provider) => provider.id === generatedIds.codex)?.model.endsWith("-overlay") === true, "Generated Overlay edit")
+    await waitForCatalog((view) => view.providers[0]?.targets.find((target) => target.target === "codex")?.model.endsWith("-overlay") === true, "Overlay catalog update")
+    const generatedCodex = codex().get().providers.find((provider) => provider.id === generatedIds.codex)!
+    let duplicated: Awaited<ReturnType<TargetSession["act"]>>
+    try {
+      duplicated = await codex().act({
+        kind: "duplicate-provider",
+        sourceProviderId: generatedCodex.id,
+        sourceProviderRevision: generatedCodex.providerRevision,
+        name: `${generatedCodex.name} Detached`,
+        baseUrl: generatedCodex.baseUrl,
+        model: generatedCodex.model,
+        credential: { kind: "without" },
+      })
+    } catch (error) {
+      assertSecretSafeStructured(error, secrets(), "universal-provider-duplicate-error")
+      throw new Error("universal-provider-duplicate-failed")
+    }
+    let detachedCodex = duplicated.view.providers.find((provider) => !provider.generated)!
+    if (!detachedCodex || detachedCodex.provenance?.kind === "universal-provider") {
+      throw new Error("universal-provider-duplicate-not-detached")
+    }
+    const completedDetached = await codex().act({
+      kind: "update-provider",
+      providerId: detachedCodex.id,
+      providerRevision: detachedCodex.providerRevision,
+      name: detachedCodex.name,
+      baseUrl: detachedCodex.baseUrl,
+      model: detachedCodex.model,
+      authentication: detachedCodex.authentication,
+      routingRequirement: detachedCodex.routingRequirement,
+      credential: { kind: "replace", value: sourceSecret },
+    })
+    detachedCodex = completedDetached.view.providers.find((provider) => provider.id === detachedCodex.id)!
+
+    // Both generated declarations activate immutable Takeover snapshots.
+    try {
+      await codex().act({ kind: "activate-provider", providerId: generatedIds.codex, mode: "takeover" })
+    } catch (error) {
+      assertSecretSafeStructured(error, secrets(), "universal-provider-codex-activation-error")
+      throw new Error("universal-provider-codex-activation-failed")
+    }
+    try {
+      await claude().act({ kind: "activate-provider", providerId: generatedIds.claude, mode: "takeover" })
+    } catch (error) {
+      assertSecretSafeStructured(error, secrets(), "universal-provider-claude-activation-error")
+      throw new Error("universal-provider-claude-activation-failed")
+    }
+    const codexRoute = extractManagedConfig(await readFile(codexConfig, "utf8"), "universal-codex-v1-overlay")
+    const claudeRoute = extractClaudeManagedSettings(await readFile(claudeSettings, "utf8"), "universal-claude-v1", [sourceSecret, replacementSecret])
+    routingSecrets.add(codexRoute.credential)
+    routingSecrets.add(claudeRoute.credential)
+    const codexConfigDigest = sensitiveDigest(await readFile(codexConfig))!
+    const claudeSettingsDigest = sensitiveDigest(await readFile(claudeSettings))!
+    const snapshotIds = {
+      codex: codex().get().activatedSnapshot?.id,
+      claude: claude().get().activatedSnapshot?.id,
+    }
+    if (!snapshotIds.codex || !snapshotIds.claude) throw new Error("universal-provider-snapshot-missing")
+
+    // Restart preserves source/generated identities, revisions, current routes, and snapshots.
+    closeRenderer()
+    await closeSessions()
+    await writeFile(firstShutdown, "shutdown\n")
+    const firstExit = await eventBarrier(firstService.output.completed, "universal-provider-first-exit")
+    if (firstExit.code !== 0 || firstExit.signal !== null) throw new Error("universal-provider-first-exit-failed")
+    await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" })
+    const finalService = await startService("restart")
+    await openSessions("restart")
+    await renderApp()
+    const reopened = catalog().get().providers[0]!
+    if (reopened.id !== synchronized.id || reopened.targets.some((target) => target.generatedProviderId !== generatedIds[target.target])) {
+      throw new Error("universal-provider-restart-identity-mismatch")
+    }
+    if (codex().get().activatedSnapshot?.id !== snapshotIds.codex || claude().get().activatedSnapshot?.id !== snapshotIds.claude) {
+      throw new Error("universal-provider-restart-snapshot-mismatch")
+    }
+
+    // Source synchronization updates declarations while active config and traffic stay pinned to the immutable snapshots.
+    await catalog().act({
+      kind: "update-universal-provider",
+      providerId: reopened.id,
+      providerRevision: reopened.providerRevision,
+      name: "Shared Frontier v2",
+      baseUrl: replacementUpstream.baseUrl,
+      credential: { kind: "replace", value: replacementSecret },
+      targets: reopened.targets.map(({ target, enabled, model, authentication, routingRequirement }) => ({
+        target, enabled, model: `${model}-declared`, authentication, routingRequirement,
+      })),
+    })
+    const pending = catalog().get().providers[0]!
+    await openUniversalPicker()
+    const editedFrame = await ui().waitForFrame((frame) => frame.includes("Shared Frontier v2") && frame.includes("Pending"))
+    nativeFrames.push(editedFrame)
+    ui().mockInput.pressEscape()
+    await catalog().act({
+      kind: "synchronize-universal-provider",
+      providerId: pending.id,
+      providerRevision: pending.providerRevision,
+    })
+    await waitForCatalog((view) => view.providers[0]?.targets.every((target) => target.synchronization === "current") === true, "updated sync")
+    if (sensitiveDigest(await readFile(codexConfig)) !== codexConfigDigest
+      || sensitiveDigest(await readFile(claudeSettings)) !== claudeSettingsDigest) {
+      throw new Error("universal-provider-active-config-not-pinned")
+    }
+    if (codex().get().activatedSnapshot?.id !== snapshotIds.codex || claude().get().activatedSnapshot?.id !== snapshotIds.claude) {
+      throw new Error("universal-provider-active-snapshot-not-pinned")
+    }
+    const codexTraffic = await chunkedPost(codexRoute.endpoint, codexRoute.credential)
+    const claudeTraffic = await claudePost(claudeRoute.endpoint, claudeRoute.credential, "/v1/messages", { messages: [], stream: true })
+    if (codexTraffic.status !== 201 || claudeTraffic.status !== 200 || replacementUpstream.calls.length !== 0) {
+      throw new Error("universal-provider-active-traffic-not-pinned")
+    }
+
+    // Referenced disable and delete report every Target blocker before any generated removal.
+    const current = catalog().get().providers[0]!
+    await catalog().act({
+      kind: "update-universal-provider",
+      providerId: current.id,
+      providerRevision: current.providerRevision,
+      name: current.name,
+      baseUrl: current.baseUrl,
+      credential: { kind: "keep" },
+      targets: current.targets.map(({ target, model, authentication, routingRequirement }) => ({
+        target, enabled: false, model, authentication, routingRequirement,
+      })),
+    })
+    const disabled = catalog().get().providers[0]!
+    let disableCode = ""
+    try {
+      await catalog().act({ kind: "synchronize-universal-provider", providerId: disabled.id, providerRevision: disabled.providerRevision })
+    } catch (error) { disableCode = fixedProblemCode(error, "disable") }
+    if (disableCode !== "provider-synchronization-blocked") throw new Error("universal-provider-disable-not-blocked")
+    let deleteCode = ""
+    try {
+      await catalog().act({ kind: "delete-universal-provider", providerId: disabled.id, providerRevision: disabled.providerRevision })
+    } catch (error) { deleteCode = fixedProblemCode(error, "delete") }
+    if (deleteCode !== "generated-provider-referenced") throw new Error("universal-provider-delete-not-blocked")
+    const blocked = catalog().get().providers[0]!
+    if (!blocked.targets.every((target) => target.activeReferences.includes("current")
+      && target.activeReferences.includes("activated-snapshot"))) {
+      throw new Error("universal-provider-blocker-list-incomplete")
+    }
+
+    // Restore exits both active Takeovers; detached Direct replacements then keep Generated identities unreferenced.
+    const codexRestore = await codex().previewReconciliation("restore")
+    await codex().applyReconciliation({
+      strategy: "restore",
+      observationToken: codexRestore.observationToken,
+    })
+    const claudeRestore = await claude().previewReconciliation("restore")
+    await claude().applyReconciliation({
+      strategy: "restore",
+      observationToken: claudeRestore.observationToken,
+    })
+    await codex().act({ kind: "activate-provider", providerId: detachedCodex.id, mode: "direct" })
+    const claudeFallback = await claude().act({
+      kind: "create-provider",
+      name: "Claude Detached Fallback",
+      baseUrl: upstream.baseUrl,
+      model: "claude-fallback",
+      credential: { kind: "replace", value: sourceSecret },
+      authentication: "anthropic-bearer",
+      presetKey: null,
+    })
+    const detachedClaude = claudeFallback.view.providers.find((provider) => provider.name === "Claude Detached Fallback")!
+    await claude().act({ kind: "activate-provider", providerId: detachedClaude.id, mode: "direct" })
+    closeRenderer()
+    await universalSession!.close()
+    universalSession = undefined
+    universalClient = undefined
+    universalClient = await connect("released-catalog")
+    universalSession = await universalClient.openUniversalProviders({
+      claudeConfigDir: null,
+      selectorState: "unset",
+      blockingSelector: null,
+      hostManagedState: "unmanaged",
+      cwd: root,
+    })
+    await renderApp()
+    if (!catalog().get().providers[0]?.targets.every((target) => target.activeReferences.length === 0)) {
+      throw new Error("universal-provider-references-not-released")
+    }
+    const released = catalog().get().providers[0]!
+    await catalog().act({ kind: "synchronize-universal-provider", providerId: released.id, providerRevision: released.providerRevision })
+    await waitForSession(codex(), (view) => !view.providers.some((provider) => provider.id === generatedIds.codex), "Codex generated removal")
+    await waitForSession(claude(), (view) => !view.providers.some((provider) => provider.id === generatedIds.claude), "Claude generated removal")
+    const removable = catalog().get().providers[0]!
+    await catalog().act({ kind: "delete-universal-provider", providerId: removable.id, providerRevision: removable.providerRevision })
+    if (catalog().get().providers.length !== 0) throw new Error("universal-provider-source-delete-failed")
+
+    const database = new Database(databasePath, { readonly: true })
+    try {
+      const counts = database.query(`SELECT
+        (SELECT COUNT(*) FROM universal_providers) AS providers,
+        (SELECT COUNT(*) FROM universal_provider_targets) AS targets,
+        (SELECT COUNT(*) FROM universal_credentials) AS credentials,
+        (SELECT COUNT(*) FROM providers WHERE generated_owner_id IS NOT NULL) AS generated,
+        (SELECT COUNT(*) FROM universal_action_receipts) AS receipts`).get() as Record<string, number>
+      if (counts.providers !== 0 || counts.targets !== 0 || counts.credentials !== 0 || counts.generated !== 0 || (counts.receipts ?? 0) < 6) {
+        throw new Error("universal-provider-final-database-state-invalid")
+      }
+    } finally { database.close() }
+
+    closeRenderer()
+    await closeSessions()
+    const naturalExit = await Promise.race([finalService.output.completed, Bun.sleep(deadlineMs).then(() => undefined)])
+    if (!naturalExit || naturalExit.code !== 0 || naturalExit.signal !== null) throw new Error("universal-provider-natural-exit-failed")
+    await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" })
+    await upstream.quiesce()
+    await replacementUpstream.quiesce()
+    scanRawRpcFramesNoSecrets(rpcStreams, secrets())
+    scanNoSecrets([decodedFrames, nativeFrames], secrets(), "universal-provider-observed-surfaces")
+    scanProcessOutputNoSecrets(services.map(({ output }) => output.streams).flat(), secrets())
+  } finally {
+    closeRenderer()
+    await closeSessions()
+    await writeFile(firstShutdown, "shutdown\n").catch(() => {})
+    for (const { child } of services) if (child.exitCode === null) child.kill("SIGKILL")
+    await Promise.all(services.map(({ output }) => Promise.race([output.completed.catch(() => undefined), Bun.sleep(deadlineMs)])))
+    await upstream.stop()
+    await replacementUpstream.stop()
+  }
+}, 70_000)

@@ -654,7 +654,7 @@ async fn serve_session(
 
                 if matches!(
                     operation,
-                    ControlOperation::OpenUniversalProviders
+                    ControlOperation::OpenUniversalProviders { .. }
                         | ControlOperation::UniversalProviderAct { .. }
                 ) {
                     if opened_target.is_some() {
@@ -669,7 +669,7 @@ async fn serve_session(
                         continue;
                     }
                     match operation {
-                        ControlOperation::OpenUniversalProviders => {
+                        ControlOperation::OpenUniversalProviders { claude_context } => {
                             let Ok(view) = store.universal_provider_catalog().await else {
                                 if !enqueue_response(&responses, problem_frame(
                                     Some(request_id),
@@ -682,6 +682,7 @@ async fn serve_session(
                                 continue;
                             };
                             opened_universal_providers = true;
+                            opened_claude_context = claude_context;
                             if !enqueue_response(
                                 &responses,
                                 ServerFrame::Response {
@@ -860,7 +861,7 @@ async fn serve_session(
                 }
 
                 match operation {
-                    ControlOperation::OpenUniversalProviders
+                    ControlOperation::OpenUniversalProviders { .. }
                     | ControlOperation::UniversalProviderAct { .. } => {
                         unreachable!("catalog operations are handled before target dispatch")
                     }
@@ -1160,7 +1161,7 @@ async fn serve_session(
 
 fn operation_target(operation: &ControlOperation) -> Option<Target> {
     match operation {
-        ControlOperation::OpenUniversalProviders
+        ControlOperation::OpenUniversalProviders { .. }
         | ControlOperation::UniversalProviderAct { .. } => None,
         ControlOperation::OpenTarget { target, .. }
         | ControlOperation::Act { target, .. }
@@ -1358,6 +1359,16 @@ async fn enqueue_action_response(
     }
     if let Some(view) = publication
         && store.publish_target_view(view).await.is_err()
+    {
+        return false;
+    }
+    let Ok(catalog) = store.universal_provider_catalog().await else {
+        return false;
+    };
+    if store
+        .publish_universal_provider_view(catalog)
+        .await
+        .is_err()
     {
         return false;
     }

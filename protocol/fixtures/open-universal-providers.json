@@ -2,6 +2,12 @@
   "type": "request",
   "requestId": "universal-open-1",
   "operation": {
-    "kind": "open-universal-providers"
+    "kind": "open-universal-providers",
+    "claudeContext": {
+      "claudeConfigDir": null,
+      "selectorState": "unset",
+      "hostManagedState": "unmanaged",
+      "cwd": "/tmp/muxvia-universal-provider"
+    }
   }
 }

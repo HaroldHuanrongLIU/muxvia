@@ -278,7 +278,10 @@ const targetActionSchema = z.discriminatedUnion("kind", [
 ])
 
 const controlOperationSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("open-universal-providers") }).strict(),
+  z.object({
+    kind: z.literal("open-universal-providers"),
+    claudeContext: claudePreflightContextSchema.optional(),
+  }).strict(),
   z.object({
     kind: z.literal("universal-provider-act"),
     actionId: z.string().uuid(),

@@ -151,12 +151,15 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     return createTargetSession(this, result.view, claudeContext)
   }
 
-  async openUniversalProviders(): Promise<UniversalProviderSession> {
-    const result = await this.request({ kind: "open-universal-providers" })
+  async openUniversalProviders(claudeContext?: ClaudePreflightContext): Promise<UniversalProviderSession> {
+    const result = await this.request({
+      kind: "open-universal-providers",
+      ...(claudeContext ? { claudeContext } : {}),
+    })
     if (result.kind !== "universal-provider-catalog") {
       throw new ControlError("invalid-response", "Expected a Universal Provider catalog")
     }
-    return createUniversalProviderSession(this, result.view)
+    return createUniversalProviderSession(this, result.view, claudeContext)
   }
 
   request(operation: InspectionOperation, options?: RequestOptions): Promise<ControlResult>

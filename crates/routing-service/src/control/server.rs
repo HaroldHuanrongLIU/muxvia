@@ -640,7 +640,17 @@ async fn serve_session(
                     }
                 };
 
-                let target = operation_target(&operation);
+                let Some(target) = operation_target(&operation) else {
+                    if !enqueue_response(&responses, problem_frame(
+                        Some(request_id),
+                        "unsupported-operation",
+                        "Universal Provider catalog is not available yet",
+                        None,
+                    )) {
+                        break 'session;
+                    }
+                    continue;
+                };
                 if opened_target.is_none() && !matches!(operation, ControlOperation::OpenTarget { .. }) {
                     if !enqueue_response(&responses, problem_frame(
                         Some(request_id),
@@ -667,6 +677,10 @@ async fn serve_session(
                 }
 
                 match operation {
+                    ControlOperation::OpenUniversalProviders
+                    | ControlOperation::UniversalProviderAct { .. } => {
+                        unreachable!("catalog operations are handled before target dispatch")
+                    }
                     ControlOperation::OpenTarget { target, claude_context } => {
                         let Ok(view) = store.target_view_for(target).await else {
                             if !enqueue_response(&responses, problem_frame(Some(request_id), "state-store-error", "State store unavailable", None)) {
@@ -945,14 +959,16 @@ async fn serve_session(
     }
 }
 
-fn operation_target(operation: &ControlOperation) -> Target {
+fn operation_target(operation: &ControlOperation) -> Option<Target> {
     match operation {
+        ControlOperation::OpenUniversalProviders
+        | ControlOperation::UniversalProviderAct { .. } => None,
         ControlOperation::OpenTarget { target, .. }
         | ControlOperation::Act { target, .. }
         | ControlOperation::DiscoverModels { target, .. }
         | ControlOperation::CheckReachability { target, .. }
-        | ControlOperation::PreviewReconciliation { target, .. } => *target,
-        ControlOperation::ProbeCompatibility(operation) => operation.target,
+        | ControlOperation::PreviewReconciliation { target, .. } => Some(*target),
+        ControlOperation::ProbeCompatibility(operation) => Some(operation.target),
     }
 }
 

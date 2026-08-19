@@ -1,0 +1,14 @@
+{
+  "type": "request",
+  "requestId": "universal-act-1",
+  "operation": {
+    "kind": "universal-provider-act",
+    "actionId": "00000000-0000-4000-8000-000000000902",
+    "expectedRevision": 0,
+    "action": {
+      "kind": "synchronize-universal-provider",
+      "providerId": "00000000-0000-4000-8000-000000000901",
+      "providerRevision": 7
+    }
+  }
+}

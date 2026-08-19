@@ -8,6 +8,7 @@ import {
   parseServerFrame,
   parseTargetAction,
   parseTargetView,
+  parseUniversalProviderAction,
 } from "../src/control/types"
 import type { TargetView } from "../src/control/types"
 
@@ -28,13 +29,46 @@ test.each([
   ["check-reachability.json", parseClientFrame],
   ["cancel-inspection.json", parseClientFrame],
   ["probe-compatibility.json", parseClientFrame],
+  ["open-universal-providers.json", parseClientFrame],
   ["compatibility-probe.json", parseServerFrame],
+  ["universal-provider-catalog.json", parseServerFrame],
+  ["universal-provider-act.json", parseClientFrame],
+  ["universal-provider-outcome.json", parseServerFrame],
+  ["universal-provider-view.json", parseServerFrame],
   ["preview-reconciliation.json", parseServerFrame],
   ["apply-reconciliation.json", parseTargetAction],
   ["resolve-compatibility.json", parseTargetAction],
+  ["create-universal-provider.json", parseUniversalProviderAction],
+  ["update-universal-provider.json", parseUniversalProviderAction],
+  ["duplicate-universal-provider.json", parseUniversalProviderAction],
+  ["delete-universal-provider.json", parseUniversalProviderAction],
+  ["synchronize-universal-provider.json", parseUniversalProviderAction],
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)
+})
+
+test("Universal Provider JSON schema exposes the complete closed catalog contract", async () => {
+  const schema = JSON.parse(await readFile(
+    fileURLToPath(new URL("../../../protocol/control-v1.schema.json", import.meta.url)),
+    "utf8",
+  ))
+  const hasBranch = (definition: string, discriminator: string) =>
+    schema.$defs[definition]?.oneOf?.some((branch: any) =>
+      branch.properties?.kind?.const === discriminator || branch.properties?.type?.const === discriminator)
+
+  expect(hasBranch("controlOperation", "open-universal-providers")).toBeTrue()
+  expect(hasBranch("controlOperation", "universal-provider-act")).toBeTrue()
+  expect(hasBranch("controlResult", "universal-provider-catalog")).toBeTrue()
+  expect(hasBranch("controlResult", "universal-provider-outcome")).toBeTrue()
+  expect(hasBranch("serverFrame", "universal-provider-view")).toBeTrue()
+  expect(schema.$defs.universalProviderAction).toBeDefined()
+  expect(schema.$defs.universalProviderCatalog).toBeDefined()
+  expect(schema.oneOf).toContainEqual({ $ref: "#/$defs/universalProviderAction" })
+
+  const action = await readFixture("create-universal-provider.json") as Record<string, unknown>
+  action.additiveSecret = "UNIVERSAL_ADDITIVE_SECRET_99310"
+  expect(() => parseUniversalProviderAction(action)).toThrow()
 })
 
 // Catches a parser mutation that accepts arbitrary reconciliation values or lets

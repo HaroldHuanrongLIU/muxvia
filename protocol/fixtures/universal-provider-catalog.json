@@ -1,0 +1,56 @@
+{
+  "type": "response",
+  "requestId": "universal-open-1",
+  "result": {
+    "kind": "universal-provider-catalog",
+    "view": {
+      "revision": 0,
+      "viewSequence": 0,
+      "providers": [],
+      "presets": [
+        {
+          "key": "openai-api-responses",
+          "name": "OpenAI API",
+          "baseUrl": "https://api.openai.com/v1",
+          "targets": [
+            {
+              "target": "codex",
+              "enabled": true,
+              "model": "",
+              "authentication": "openai-bearer",
+              "routingRequirement": "direct-compatible"
+            },
+            {
+              "target": "claude",
+              "enabled": false,
+              "model": "",
+              "authentication": "anthropic-bearer",
+              "routingRequirement": "direct-compatible"
+            }
+          ]
+        },
+        {
+          "key": "anthropic-api-messages",
+          "name": "Anthropic API",
+          "baseUrl": "https://api.anthropic.com/v1",
+          "targets": [
+            {
+              "target": "codex",
+              "enabled": false,
+              "model": "",
+              "authentication": "openai-bearer",
+              "routingRequirement": "direct-compatible"
+            },
+            {
+              "target": "claude",
+              "enabled": true,
+              "model": "",
+              "authentication": "anthropic-api-key",
+              "routingRequirement": "direct-compatible"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

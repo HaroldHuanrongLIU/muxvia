@@ -1,0 +1,24 @@
+{
+  "kind": "duplicate-universal-provider",
+  "sourceProviderId": "00000000-0000-4000-8000-000000000901",
+  "sourceProviderRevision": 7,
+  "name": "Copied Gateway",
+  "baseUrl": "https://copied.example/v1",
+  "credential": { "kind": "reuse-source" },
+  "targets": [
+    {
+      "target": "codex",
+      "enabled": true,
+      "model": "copied-model",
+      "authentication": "openai-bearer",
+      "routingRequirement": "direct-compatible"
+    },
+    {
+      "target": "claude",
+      "enabled": true,
+      "model": "copied-model",
+      "authentication": "anthropic-api-key",
+      "routingRequirement": "takeover-required"
+    }
+  ]
+}

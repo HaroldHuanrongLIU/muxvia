@@ -1,0 +1,24 @@
+{
+  "kind": "update-universal-provider",
+  "providerId": "00000000-0000-4000-8000-000000000901",
+  "providerRevision": 7,
+  "name": "Updated Gateway",
+  "baseUrl": "https://updated.example/v1",
+  "credential": { "kind": "keep" },
+  "targets": [
+    {
+      "target": "codex",
+      "enabled": true,
+      "model": "updated-model",
+      "authentication": "openai-bearer",
+      "routingRequirement": "direct-compatible"
+    },
+    {
+      "target": "claude",
+      "enabled": false,
+      "model": "updated-model",
+      "authentication": "anthropic-bearer",
+      "routingRequirement": "takeover-required"
+    }
+  ]
+}

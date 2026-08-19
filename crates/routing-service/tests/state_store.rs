@@ -104,7 +104,7 @@ async fn fresh_schema_v7_reopens_with_codex_and_claude_route_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, "8");
+    assert_eq!(version, "9");
     assert_eq!(targets, ["claude", "codex"]);
     let _ = fs::remove_dir_all(root);
 }

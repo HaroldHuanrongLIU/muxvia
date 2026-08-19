@@ -8,6 +8,7 @@ use muxvia_routing::{
             DraftCredentialSource, DuplicateCredential, ProviderAuthentication,
             ProviderCompleteness, ProviderProtocol, ProviderRequirement,
             ProviderRoutingRequirement, ServerFrame, Target, TargetAction, TargetView,
+            UniversalProviderAction,
         },
     },
     domain::provider::has_valid_provider_declaration,
@@ -52,6 +53,7 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "check-reachability.json",
         "cancel-inspection.json",
         "probe-compatibility.json",
+        "open-universal-providers.json",
     ] {
         let frame = fixture(name);
         let parsed: ClientFrame = serde_json::from_value(frame.clone()).unwrap();
@@ -62,9 +64,85 @@ fn fixtures_round_trip_as_their_protocol_types() {
     let parsed: ServerFrame = serde_json::from_value(compatibility_probe.clone()).unwrap();
     assert_eq!(serde_json::to_value(parsed).unwrap(), compatibility_probe);
 
+    let universal_catalog = fixture("universal-provider-catalog.json");
+    let parsed: ServerFrame = serde_json::from_value(universal_catalog.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), universal_catalog);
+
+    for name in [
+        "universal-provider-act.json",
+        "universal-provider-outcome.json",
+        "universal-provider-view.json",
+    ] {
+        let frame = fixture(name);
+        if name == "universal-provider-act.json" {
+            let parsed: ClientFrame = serde_json::from_value(frame.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), frame);
+        } else {
+            let parsed: ServerFrame = serde_json::from_value(frame.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), frame);
+        }
+    }
+
+    let universal_create = fixture("create-universal-provider.json");
+    let parsed: UniversalProviderAction = serde_json::from_value(universal_create.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), universal_create);
+    for name in [
+        "update-universal-provider.json",
+        "duplicate-universal-provider.json",
+        "delete-universal-provider.json",
+        "synchronize-universal-provider.json",
+    ] {
+        let action = fixture(name);
+        let parsed: UniversalProviderAction = serde_json::from_value(action.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), action);
+    }
+
     let resolve_compatibility = fixture("resolve-compatibility.json");
     let parsed: TargetAction = serde_json::from_value(resolve_compatibility.clone()).unwrap();
     assert_eq!(serde_json::to_value(parsed).unwrap(), resolve_compatibility);
+}
+
+#[test]
+fn universal_provider_contracts_are_closed_schema_complete_and_secret_free() {
+    let schema = fixture("../control-v1.schema.json");
+    let has_branch = |definition: &str, discriminator: &str| {
+        schema["$defs"][definition]["oneOf"]
+            .as_array()
+            .is_some_and(|branches| {
+                branches.iter().any(|branch| {
+                    branch["properties"]["kind"]["const"] == discriminator
+                        || branch["properties"]["type"]["const"] == discriminator
+                })
+            })
+    };
+    assert!(has_branch("controlOperation", "open-universal-providers"));
+    assert!(has_branch("controlOperation", "universal-provider-act"));
+    assert!(has_branch("controlResult", "universal-provider-catalog"));
+    assert!(has_branch("controlResult", "universal-provider-outcome"));
+    assert!(has_branch("serverFrame", "universal-provider-view"));
+    assert!(schema["$defs"].get("universalProviderAction").is_some());
+    assert!(schema["$defs"].get("universalProviderCatalog").is_some());
+    assert!(
+        schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|branch| { branch["$ref"] == "#/$defs/universalProviderAction" })
+    );
+
+    let mut action = fixture("create-universal-provider.json");
+    action["additiveSecret"] = serde_json::json!("UNIVERSAL_ADDITIVE_SECRET_99310");
+    assert!(
+        serde_json::from_value::<UniversalProviderAction>(action).is_err(),
+        "accepted additive Universal Provider action field"
+    );
+    let parsed: UniversalProviderAction =
+        serde_json::from_value(fixture("create-universal-provider.json")).unwrap();
+    let diagnostic = format!("{parsed:?}");
+    assert!(
+        !diagnostic.contains("universal-provider-secret-must-not-escape"),
+        "debugged Universal Provider secret"
+    );
 }
 
 // Catches a protocol mutation that accepts arbitrary reconciliation discriminators,

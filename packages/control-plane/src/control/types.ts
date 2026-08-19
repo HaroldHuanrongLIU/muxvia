@@ -266,6 +266,13 @@ const targetActionSchema = z.discriminatedUnion("kind", [
 ])
 
 const controlOperationSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("open-universal-providers") }).strict(),
+  z.object({
+    kind: z.literal("universal-provider-act"),
+    actionId: z.string().uuid(),
+    expectedRevision: z.number().int().nonnegative(),
+    action: z.unknown(),
+  }),
   z.object({
     kind: z.literal("open-target"),
     target: targetSchema,
@@ -311,6 +318,85 @@ const actionOutcomeSchema = z.object({
   status: z.enum(["applied", "replayed"]),
   view: targetViewSchema,
 })
+
+const universalProviderPresetTargetSchema = z.object({
+  target: targetSchema,
+  enabled: z.boolean(),
+  model: z.string(),
+  authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]),
+  routingRequirement: z.enum(["direct-compatible", "takeover-required"]),
+}).strict()
+
+const universalProviderPresetSchema = z.object({
+  key: z.string(),
+  name: z.string(),
+  baseUrl: z.string(),
+  targets: z.array(universalProviderPresetTargetSchema),
+}).strict()
+
+const universalProviderTargetSchema = universalProviderPresetTargetSchema.extend({
+  overlayRevision: z.number().int().positive(),
+  generatedProviderId: z.string().uuid().nullable(),
+  synchronization: z.enum(["current", "pending"]),
+  activeReferences: z.array(z.enum(["current", "activated-snapshot", "activated-route-plan"])),
+}).strict()
+
+const universalProviderSchema = z.object({
+  id: z.string().uuid(),
+  position: z.number().int().nonnegative(),
+  providerRevision: z.number().int().positive(),
+  name: z.string(),
+  baseUrl: z.string(),
+  credential: z.enum(["present", "missing"]),
+  provenance: z.object({ kind: z.string(), key: z.string() }).nullable(),
+  targets: z.array(universalProviderTargetSchema),
+}).strict()
+
+const universalProviderCatalogSchema = z.object({
+  revision: z.number().int().nonnegative(),
+  viewSequence: z.number().int().nonnegative(),
+  providers: z.array(universalProviderSchema),
+  presets: z.array(universalProviderPresetSchema),
+}).strict()
+
+const universalProviderActionSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("create-universal-provider"),
+    name: z.string(),
+    baseUrl: z.string(),
+    credential: credentialEditSchema,
+    presetKey: z.string().nullable(),
+    targets: z.array(universalProviderPresetTargetSchema),
+  }).strict(),
+  z.object({
+    kind: z.literal("update-universal-provider"),
+    providerId: z.string().uuid(),
+    providerRevision: z.number().int().positive(),
+    name: z.string(),
+    baseUrl: z.string(),
+    credential: credentialEditSchema,
+    targets: z.array(universalProviderPresetTargetSchema),
+  }).strict(),
+  z.object({
+    kind: z.literal("duplicate-universal-provider"),
+    sourceProviderId: z.string().uuid(),
+    sourceProviderRevision: z.number().int().positive(),
+    name: z.string(),
+    baseUrl: z.string(),
+    credential: duplicateCredentialSchema,
+    targets: z.array(universalProviderPresetTargetSchema),
+  }).strict(),
+  z.object({
+    kind: z.literal("delete-universal-provider"),
+    providerId: z.string().uuid(),
+    providerRevision: z.number().int().positive(),
+  }).strict(),
+  z.object({
+    kind: z.literal("synchronize-universal-provider"),
+    providerId: z.string().uuid(),
+    providerRevision: z.number().int().positive(),
+  }).strict(),
+])
 
 const inspectionCategorySchema = z.enum([
   "invalid-endpoint",
@@ -376,6 +462,14 @@ const reachabilityResultSchema = z.discriminatedUnion("status", [
 
 const controlResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("target-view"), view: targetViewSchema }),
+  z.object({ kind: z.literal("universal-provider-catalog"), view: universalProviderCatalogSchema }).strict(),
+  z.object({
+    kind: z.literal("universal-provider-outcome"),
+    outcome: z.object({
+      status: z.enum(["applied", "replayed"]),
+      view: universalProviderCatalogSchema,
+    }).strict(),
+  }).strict(),
   z.object({ kind: z.literal("action-outcome"), outcome: actionOutcomeSchema }),
   z.object({ kind: z.literal("model-discovery"), result: modelDiscoveryResultSchema }),
   z.object({ kind: z.literal("reachability"), result: reachabilityResultSchema }),
@@ -405,6 +499,7 @@ const serverFrameSchema = z.discriminatedUnion("type", [
     authoritativeView: targetViewSchema.optional(),
   }),
   z.object({ type: z.literal("target-view"), view: targetViewSchema }),
+  z.object({ type: z.literal("universal-provider-view"), view: universalProviderCatalogSchema }).strict(),
 ])
 
 export type ClientFrame = z.infer<typeof clientFrameSchema>
@@ -414,6 +509,7 @@ export type Target = z.infer<typeof targetSchema>
 export type ClaudePreflightContext = z.infer<typeof claudePreflightContextSchema>
 export type ClaudeBlockingSelector = z.infer<typeof claudeBlockingSelectorSchema>
 export type TargetAction = z.infer<typeof targetActionSchema>
+export type UniversalProviderAction = z.infer<typeof universalProviderActionSchema>
 export type OrdinaryTargetAction = Exclude<TargetAction, { kind: "resolve-compatibility" }>
 export type ActionOutcome = z.infer<typeof actionOutcomeSchema>
 export type ControlProblem = z.infer<typeof controlProblemSchema>
@@ -431,3 +527,5 @@ export const parseClientFrame = (value: unknown): ClientFrame => clientFrameSche
 export const parseServerFrame = (value: unknown): ServerFrame => serverFrameSchema.parse(value)
 export const parseTargetView = (value: unknown): TargetView => targetViewSchema.parse(value)
 export const parseTargetAction = (value: unknown): TargetAction => targetActionSchema.parse(value)
+export const parseUniversalProviderAction = (value: unknown): UniversalProviderAction =>
+  universalProviderActionSchema.parse(value)

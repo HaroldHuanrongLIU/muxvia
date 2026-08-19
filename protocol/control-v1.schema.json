@@ -6,7 +6,9 @@
     { "$ref": "#/$defs/clientFrame" },
     { "$ref": "#/$defs/serverFrame" },
     { "$ref": "#/$defs/targetView" },
-    { "$ref": "#/$defs/targetAction" }
+    { "$ref": "#/$defs/targetAction" },
+    { "$ref": "#/$defs/universalProviderCatalog" },
+    { "$ref": "#/$defs/universalProviderAction" }
   ],
   "$defs": {
     "rpc": {
@@ -75,11 +77,14 @@
         { "type": "object", "properties": { "type": { "const": "hello-ack" }, "rpc": { "$ref": "#/$defs/rpc" }, "release": { "type": "string" }, "serviceEpoch": { "type": "string", "format": "uuid" }, "frameLimit": { "const": 1048576 } }, "required": ["type", "rpc", "release", "serviceEpoch", "frameLimit"] },
         { "type": "object", "properties": { "type": { "const": "response" }, "requestId": { "type": "string" }, "result": { "$ref": "#/$defs/controlResult" } }, "required": ["type", "requestId", "result"] },
         { "type": "object", "properties": { "type": { "const": "error" }, "requestId": { "type": ["string", "null"] }, "problem": { "$ref": "#/$defs/controlProblem" }, "authoritativeView": { "$ref": "#/$defs/targetView" } }, "required": ["type", "requestId", "problem"] },
-        { "type": "object", "properties": { "type": { "const": "target-view" }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["type", "view"] }
+        { "type": "object", "properties": { "type": { "const": "target-view" }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["type", "view"] },
+        { "type": "object", "additionalProperties": false, "properties": { "type": { "const": "universal-provider-view" }, "view": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["type", "view"] }
       ]
     },
     "controlOperation": {
       "oneOf": [
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "open-universal-providers" } }, "required": ["kind"] },
+        { "type": "object", "properties": { "kind": { "const": "universal-provider-act" }, "actionId": { "type": "string", "format": "uuid" }, "expectedRevision": { "type": "integer", "minimum": 0 }, "action": {} }, "required": ["kind", "actionId", "expectedRevision", "action"] },
         { "type": "object", "properties": { "kind": { "const": "open-target" }, "target": { "enum": ["codex", "claude"] }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind", "target"] },
         { "type": "object", "properties": { "kind": { "const": "act" }, "target": { "enum": ["codex", "claude"] }, "actionId": { "type": "string", "format": "uuid" }, "expectedRevision": { "type": "integer", "minimum": 0 }, "action": {} }, "required": ["kind", "target", "actionId", "expectedRevision", "action"] },
         { "type": "object", "properties": { "kind": { "const": "discover-models" }, "target": { "enum": ["codex", "claude"] }, "source": { "$ref": "#/$defs/discoverySource" } }, "required": ["kind", "target", "source"] },
@@ -148,6 +153,8 @@
     "controlResult": {
       "oneOf": [
         { "type": "object", "properties": { "kind": { "const": "target-view" }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["kind", "view"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "universal-provider-catalog" }, "view": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["kind", "view"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "universal-provider-outcome" }, "outcome": { "type": "object", "additionalProperties": false, "properties": { "status": { "enum": ["applied", "replayed"] }, "view": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["status", "view"] } }, "required": ["kind", "outcome"] },
         { "type": "object", "properties": { "kind": { "const": "action-outcome" }, "outcome": { "type": "object", "properties": { "status": { "enum": ["applied", "replayed"] }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["status", "view"] } }, "required": ["kind", "outcome"] },
         { "type": "object", "properties": { "kind": { "const": "model-discovery" }, "result": { "$ref": "#/$defs/modelDiscoveryResult" } }, "required": ["kind", "result"] },
         { "type": "object", "properties": { "kind": { "const": "reachability" }, "result": { "$ref": "#/$defs/reachabilityResult" } }, "required": ["kind", "result"] },
@@ -185,6 +192,80 @@
         { "type": "object", "properties": { "kind": { "const": "activate-provider" }, "providerId": { "type": "string" }, "mode": { "enum": ["direct", "takeover"] } }, "required": ["kind", "providerId", "mode"] },
         { "type": "object", "properties": { "kind": { "const": "reconcile" }, "strategy": { "$ref": "#/$defs/reconciliationStrategy" }, "observationToken": { "type": "string", "format": "uuid" }, "acknowledgeVersion": { "type": "string" } }, "required": ["kind", "strategy", "observationToken"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "resolve-compatibility" }, "version": { "type": "string" } }, "required": ["kind", "version"] }
+      ]
+    },
+    "universalProviderPresetTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": { "enum": ["codex", "claude"] },
+        "enabled": { "type": "boolean" },
+        "model": { "type": "string" },
+        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer"] },
+        "routingRequirement": { "enum": ["direct-compatible", "takeover-required"] }
+      },
+      "required": ["target", "enabled", "model", "authentication", "routingRequirement"]
+    },
+    "universalProviderPreset": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "key": { "enum": ["openai-api-responses", "anthropic-api-messages"] },
+        "name": { "type": "string" },
+        "baseUrl": { "type": "string" },
+        "targets": { "type": "array", "items": { "$ref": "#/$defs/universalProviderPresetTarget" } }
+      },
+      "required": ["key", "name", "baseUrl", "targets"]
+    },
+    "universalProviderTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": { "enum": ["codex", "claude"] },
+        "enabled": { "type": "boolean" },
+        "model": { "type": "string" },
+        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer"] },
+        "routingRequirement": { "enum": ["direct-compatible", "takeover-required"] },
+        "overlayRevision": { "type": "integer", "minimum": 1 },
+        "generatedProviderId": { "type": ["string", "null"], "format": "uuid" },
+        "synchronization": { "enum": ["current", "pending"] },
+        "activeReferences": { "type": "array", "items": { "enum": ["current", "activated-snapshot", "activated-route-plan"] } }
+      },
+      "required": ["target", "enabled", "model", "authentication", "routingRequirement", "overlayRevision", "generatedProviderId", "synchronization", "activeReferences"]
+    },
+    "universalProvider": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "position": { "type": "integer", "minimum": 0 },
+        "providerRevision": { "type": "integer", "minimum": 1 },
+        "name": { "type": "string" },
+        "baseUrl": { "type": "string" },
+        "credential": { "enum": ["present", "missing"] },
+        "provenance": { "type": ["object", "null"], "properties": { "kind": { "type": "string" }, "key": { "type": "string" } }, "required": ["kind", "key"] },
+        "targets": { "type": "array", "items": { "$ref": "#/$defs/universalProviderTarget" } }
+      },
+      "required": ["id", "position", "providerRevision", "name", "baseUrl", "credential", "provenance", "targets"]
+    },
+    "universalProviderCatalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "revision": { "type": "integer", "minimum": 0 },
+        "viewSequence": { "type": "integer", "minimum": 0 },
+        "providers": { "type": "array", "items": { "$ref": "#/$defs/universalProvider" } },
+        "presets": { "type": "array", "items": { "$ref": "#/$defs/universalProviderPreset" } }
+      },
+      "required": ["revision", "viewSequence", "providers", "presets"]
+    },
+    "universalProviderAction": {
+      "oneOf": [
+        { "type": "object", "properties": { "kind": { "const": "create-universal-provider" }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "credential": { "$ref": "#/$defs/credentialEdit" }, "presetKey": { "oneOf": [{ "enum": ["openai-api-responses", "anthropic-api-messages"] }, { "type": "null" }] }, "targets": { "type": "array", "items": { "$ref": "#/$defs/universalProviderPresetTarget" } } }, "required": ["kind", "name", "baseUrl", "credential", "presetKey", "targets"], "additionalProperties": false },
+        { "type": "object", "properties": { "kind": { "const": "update-universal-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "credential": { "$ref": "#/$defs/credentialEdit" }, "targets": { "type": "array", "items": { "$ref": "#/$defs/universalProviderPresetTarget" } } }, "required": ["kind", "providerId", "providerRevision", "name", "baseUrl", "credential", "targets"], "additionalProperties": false },
+        { "type": "object", "properties": { "kind": { "const": "duplicate-universal-provider" }, "sourceProviderId": { "type": "string", "format": "uuid" }, "sourceProviderRevision": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "credential": { "$ref": "#/$defs/duplicateCredential" }, "targets": { "type": "array", "items": { "$ref": "#/$defs/universalProviderPresetTarget" } } }, "required": ["kind", "sourceProviderId", "sourceProviderRevision", "name", "baseUrl", "credential", "targets"], "additionalProperties": false },
+        { "type": "object", "properties": { "kind": { "const": "delete-universal-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"], "additionalProperties": false },
+        { "type": "object", "properties": { "kind": { "const": "synchronize-universal-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"], "additionalProperties": false }
       ]
     },
     "targetView": {

@@ -300,7 +300,8 @@ test("a Claude session captures its target and preflight context for gap refresh
     credential: { kind: "replace", value: "not-serialized" }, presetKey: "anthropic-api-messages",
   })
   await server.waitForRequests(2)
-  expect(server.requests().map((request) => request.operation.target)).toEqual(["claude", "claude"])
+  expect(server.requests().map((request) =>
+    "target" in request.operation ? request.operation.target : null)).toEqual(["claude", "claude"])
   server.replyApplied(viewAtRevision(1, 1, "claude"))
   await action
   server.push(viewAtRevision(3, 3, "claude"))

@@ -35,6 +35,7 @@ class StaticTargetSession implements TargetSession {
     target: "codex" | "claude" = "codex",
     problem?: "configuration-drift" | "compatibility-acknowledgement-required",
     withFailover = false,
+    activeTakeover = false,
   ) {
     const routeProvider: TargetView["providers"][number] = {
       id: "00000000-0000-4000-8000-000000000011",
@@ -64,6 +65,15 @@ class StaticTargetSession implements TargetSession {
     this.#view = {
       ...view(),
       target,
+      ...(activeTakeover ? {
+        mode: "takeover" as const,
+        takeover: { state: "active" as const, endpoint: "http://127.0.0.1:43123/v1" },
+        managedConfiguration: {
+          state: "managed" as const,
+          path: target === "codex" ? "/tmp/.codex/config.toml" : "/tmp/.claude/settings.json",
+          restartRequired: false,
+        },
+      } : {}),
       ...(withFailover ? {
         providers: [routeProvider],
         currentProviderId: routeProvider.id,
@@ -237,6 +247,29 @@ test("Claude renders the exact extreme-size matrix without excluded application 
     setup.renderer.destroy()
   }
 })
+
+test.each(["codex", "claude"] as const)(
+  "Takeover disable confirmation renders the exact extreme-size matrix for %s",
+  async (target) => {
+    const session = new StaticTargetSession(target, undefined, false, true)
+    const setup = await testRender(() => <App sessions={{ [target]: session }} />, {
+      width: 80,
+      height: 24,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey(target === "codex" ? "1" : "2")
+      await setup.mockInput.typeText("/disable-takeover")
+      setup.mockInput.pressEnter()
+      await setup.waitForFrame((frame) => frame.includes("Disable Target Takeover?"))
+      await expectSizeMatrix(setup)
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)
 
 test.each(["codex", "claude"] as const)(
   "Failover route overlay renders the exact extreme-size matrix for %s",

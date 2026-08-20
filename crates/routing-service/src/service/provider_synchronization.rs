@@ -221,10 +221,15 @@ mod tests {
     #[async_trait]
     impl UpstreamTransport for NoopUpstream {
         async fn send(&self, _: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
             Ok(UpstreamResponse {
                 status: StatusCode::OK,
-                headers: Default::default(),
-                body: Box::pin(stream::once(async { Ok(Bytes::new()) })),
+                headers,
+                body: Box::pin(stream::once(async { Ok(Bytes::from_static(b"{}")) })),
             })
         }
     }
@@ -248,9 +253,14 @@ mod tests {
         async fn send(&self, _: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
             self.started.notify_one();
             self.release.notified().await;
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
             Ok(UpstreamResponse {
                 status: StatusCode::OK,
-                headers: Default::default(),
+                headers,
                 body: Box::pin(stream::once(async { Ok(Bytes::from_static(b"{}")) })),
             })
         }

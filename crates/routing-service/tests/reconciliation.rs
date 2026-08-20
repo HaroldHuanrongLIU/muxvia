@@ -65,7 +65,14 @@ impl UpstreamTransport for HeldUpstream {
         self.release.notified().await;
         Ok(UpstreamResponse {
             status: axum::http::StatusCode::OK,
-            headers: axum::http::HeaderMap::new(),
+            headers: {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                );
+                headers
+            },
             body: Box::pin(stream::once(async {
                 Ok(axum::body::Bytes::from_static(b"{}"))
             })),
@@ -1962,6 +1969,203 @@ async fn claude_restore_reopens_as_valid_unmanaged_v1_without_changing_the_peer(
 
     reopened_handle.shutdown().await.unwrap();
     reopened_activation.shutdown_models().await.unwrap();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn disable_takeover_responds_after_restore_before_waiting_for_an_accepted_request_to_drain() {
+    let root = std::path::PathBuf::from("/tmp").join(format!(
+        "mx-disable-drain-{}",
+        &Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    let store = Arc::new(StateStore::open(&home).await.unwrap());
+    let upstream = Arc::new(HeldUpstream::new());
+    let activation = Arc::new(ActivationService::new(
+        Arc::clone(&store),
+        home.clone(),
+        Arc::new(CommandCodexProbe),
+        probe_executable(&root, Target::Codex),
+        upstream.clone(),
+    ));
+    let handle = ControlServer::bind_with_activation(
+        &home,
+        Arc::clone(&store),
+        "test",
+        Arc::clone(&activation),
+    )
+    .await
+    .unwrap();
+    activate_takeover(
+        handle.socket_path(),
+        Target::Codex,
+        &user_home,
+        ProviderFixture {
+            name: "Draining provider",
+            base_url: "https://draining.example/v1",
+            model: "draining-model",
+            authentication: "openai-bearer",
+            secret: "DRAINING_PROVIDER_SECRET_98101",
+        },
+    )
+    .await;
+    let endpoint = activation.model_endpoint_for(Target::Codex).await.unwrap();
+    let routing_credential = store
+        .routing_credential_for(Target::Codex)
+        .await
+        .unwrap()
+        .unwrap();
+    let request_started = upstream.started.notified();
+    let request_task = tokio::spawn({
+        let routing_credential = routing_credential.expose_secret().to_owned();
+        async move {
+            reqwest::Client::new()
+                .post(format!("http://{endpoint}/v1/responses"))
+                .header("X-Muxvia-Routing-Credential", routing_credential)
+                .body("{}")
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), request_started)
+        .await
+        .unwrap();
+
+    let socket = handle.socket_path().to_path_buf();
+    let action_id = Uuid::new_v4();
+    let mut disable = tokio::spawn({
+        let user_home = user_home.clone();
+        async move {
+            let mut stream = UnixStream::connect(socket).await.unwrap();
+            hello(&mut stream).await;
+            let opened = request(
+                &mut stream,
+                "open-disable",
+                open_operation(Target::Codex, &user_home),
+            )
+            .await;
+            write_frame(
+                &mut stream,
+                &json!({
+                    "type":"request","requestId":"disable",
+                    "operation":{
+                        "kind":"act","target":"codex","actionId":action_id,
+                        "expectedRevision":opened["result"]["view"]["managementRevision"],
+                        "action":{"kind":"disable-takeover"}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+            let response = read_frame(&mut stream).await.unwrap();
+            let push = read_frame(&mut stream).await.unwrap();
+            (response, push)
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if store.target_view_for(Target::Codex).await.unwrap().mode == "unmanaged" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disable did not durably restore Managed Config before drain");
+    let (response, push) = tokio::time::timeout(Duration::from_secs(2), &mut disable)
+        .await
+        .expect("disable did not respond after its durable commit and before request drain")
+        .unwrap();
+    assert_eq!(response["type"], "response", "{response}");
+    assert_eq!(response["result"]["outcome"]["view"]["mode"], "unmanaged");
+    assert_eq!(push["type"], "target-view");
+    assert_eq!(push["view"], response["result"]["outcome"]["view"]);
+    let rejected = reqwest::Client::new()
+        .post(format!("http://{endpoint}/v1/responses"))
+        .header(
+            "X-Muxvia-Routing-Credential",
+            routing_credential.expose_secret(),
+        )
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rejected.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(upstream.urls.lock().await.len(), 1);
+    assert!(tokio::net::TcpStream::connect(endpoint).await.is_ok());
+
+    upstream.release.notify_one();
+    assert_eq!(
+        request_task.await.unwrap(),
+        axum::body::Bytes::from_static(b"{}")
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if tokio::net::TcpListener::bind(endpoint).await.is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disable did not stop the listener after the accepted request drained");
+    assert!(
+        store
+            .receipt_for(Target::Codex, action_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(activation.model_endpoint_for(Target::Codex).await.is_none());
+
+    let mut replay = UnixStream::connect(handle.socket_path()).await.unwrap();
+    hello(&mut replay).await;
+    let _ = request(
+        &mut replay,
+        "open-disable-replay",
+        open_operation(Target::Codex, &user_home),
+    )
+    .await;
+    write_frame(
+        &mut replay,
+        &json!({
+            "type":"request","requestId":"disable-replay",
+            "operation":{
+                "kind":"act","target":"codex","actionId":action_id,
+                "expectedRevision":0,
+                "action":{"kind":"disable-takeover"}
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let replayed = read_frame(&mut replay).await.unwrap();
+    assert_eq!(replayed["type"], "response", "{replayed}");
+    assert_eq!(replayed["result"]["outcome"]["status"], "replayed");
+    assert_eq!(
+        replayed["result"]["outcome"]["view"],
+        response["result"]["outcome"]["view"]
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), read_frame(&mut replay))
+            .await
+            .is_err(),
+        "disable receipt replay published a second Target View"
+    );
+    assert!(activation.model_endpoint_for(Target::Codex).await.is_none());
+
+    handle.shutdown().await.unwrap();
+    activation.shutdown_models().await.unwrap();
     let _ = fs::remove_dir_all(root);
 }
 

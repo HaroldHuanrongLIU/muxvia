@@ -567,6 +567,70 @@ test("Claude slash leader and palette dispatch the existing Direct command ident
   }
 })
 
+test("both Targets confirm safe Takeover disable and cancellation restores the route", async () => {
+  for (const target of ["codex", "claude"] as const) {
+    const active = view({
+      target,
+      managementRevision: 4,
+      viewSequence: 4,
+      mode: "takeover",
+      takeover: { state: "active", endpoint: "http://127.0.0.1:43123/v1" },
+      managedConfiguration: {
+        state: "managed",
+        path: target === "codex" ? "/tmp/.codex/config.toml" : "/tmp/.claude/settings.json",
+        restartRequired: false,
+      },
+    })
+    const disabled = view({
+      ...active,
+      managementRevision: 5,
+      viewSequence: 5,
+      mode: "unmanaged",
+      takeover: { state: "inactive", endpoint: null },
+      managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
+    })
+    const session = new MemoryTargetSession(active, async (action) => {
+      expect(action).toEqual({ kind: "disable-takeover" })
+      return { status: "applied", view: disabled }
+    })
+    const sessions = target === "codex" ? { codex: session } : { claude: session }
+    const setup = await testRender(
+      () => <App sessions={sessions} />,
+      { width: 80, height: 24, useThread: false, kittyKeyboard: true },
+    )
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey(target === "codex" ? "1" : "2")
+      await setup.waitForFrame((frame) => frame.includes("Takeover"))
+
+      await setup.mockInput.typeText("/disable-takeover")
+      setup.mockInput.pressEnter()
+      const confirmation = await setup.waitForFrame((frame) => frame.includes("Disable Target Takeover?"))
+      expect(confirmation).toContain("Restore the pre-Muxvia configuration")
+      setup.mockInput.pressKey("n")
+      await setup.waitForFrame((frame) => frame.includes("Takeover"))
+      expect(session.actions).toEqual([])
+
+      await setup.mockInput.typeText("/disable-takeover")
+      setup.mockInput.pressEnter()
+      await setup.waitForFrame((frame) => frame.includes("Disable Target Takeover?"))
+      setup.mockInput.pressEnter()
+      await waitForSecretFreeCondition(
+        setup,
+        () => session.actions.length === 1,
+        () => auditSecretFreeActions(session.actions, [credentialSentinel], `${target}-disable-takeover-action`),
+        `secret-scan-failed:${target}-disable-takeover-action-action`,
+        `${target}-disable-takeover-action`,
+      )
+      const applied = await setup.waitForFrame((frame) => frame.includes("Target Takeover disabled"))
+      expect(applied).toContain("Unmanaged")
+      expect(session.actions).toEqual([{ kind: "disable-takeover" }])
+    } finally {
+      setup.renderer.destroy()
+    }
+  }
+})
+
 test("Claude Direct chooses Current then first fallback and rejects Incomplete locally", async () => {
   const first = provider({
     id: "claude-first",

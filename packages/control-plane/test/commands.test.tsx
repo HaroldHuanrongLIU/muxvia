@@ -316,6 +316,30 @@ test("Claude accepts Provider Direct and Takeover route commands", () => {
 })
 
 test.each(["codex", "claude"] as const)(
+  "safe Takeover disable has one slash and leader identity for %s",
+  async (scope) => {
+    const executed: string[] = []
+    const setup = await commandHarness({
+      handlers: { "target.takeover.disable": () => executed.push("target.takeover.disable") },
+      onDispatch: () => {},
+      scope,
+    })
+    try {
+      setup.keymap.dispatchCommand(resolveSlash("/disable-takeover", scope)!)
+      setup.mockInput.pressKey("x", { ctrl: true })
+      setup.mockInput.pressKey("x")
+      await setup.renderOnce()
+      expect(executed).toEqual([
+        "target.takeover.disable",
+        "target.takeover.disable",
+      ])
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)
+
+test.each(["codex", "claude"] as const)(
   "Reconciliation uses the exact shared command family through the real %s keymap",
   async (scope) => {
     const executed: string[] = []

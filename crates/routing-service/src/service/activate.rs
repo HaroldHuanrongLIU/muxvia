@@ -515,7 +515,8 @@ impl ActivationService {
                 .await
             }
             Ok(
-                TargetAction::Reconcile { .. }
+                TargetAction::DisableTakeover(_)
+                | TargetAction::Reconcile { .. }
                 | TargetAction::ResolveCompatibility(_)
                 | TargetAction::SaveFailoverDraft(_)
                 | TargetAction::ApplyFailoverChain(_),

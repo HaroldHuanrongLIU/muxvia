@@ -2,10 +2,15 @@ use std::{env, fs, path::PathBuf};
 
 use clap::Parser;
 use muxvia_routing::service::process::{ProcessOptions, run};
+use serde_json::json;
 
 #[derive(Parser)]
 #[command(name = "muxvia-routing", version)]
 struct Args {
+    #[arg(long, hide = true)]
+    lifecycle_metadata: bool,
+    #[arg(long, hide = true)]
+    inherited_service_lock_fd: Option<i32>,
     #[arg(long, value_name = "ABSOLUTE_MUXVIA_HOME")]
     home: Option<PathBuf>,
     #[arg(long, hide = true)]
@@ -14,16 +19,30 @@ struct Args {
     test_codex_executable: Option<PathBuf>,
     #[arg(long, hide = true)]
     test_claude_executable: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    test_release: Option<String>,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args = Args::parse();
+    if args.lifecycle_metadata {
+        println!(
+            "{}",
+            json!({
+                "product": "muxvia-routing",
+                "release": env!("CARGO_PKG_VERSION"),
+                "rpc": { "major": 1, "minor": 0 }
+            })
+        );
+        return;
+    }
     let integration = env::var("MUXVIA_INTEGRATION_TEST").as_deref() == Ok("1");
     if !integration
         && (args.test_shutdown_file.is_some()
             || args.test_codex_executable.is_some()
-            || args.test_claude_executable.is_some())
+            || args.test_claude_executable.is_some()
+            || args.test_release.is_some())
     {
         eprintln!("test-only Routing Service options require integration invocation");
         std::process::exit(64);
@@ -55,7 +74,10 @@ async fn main() {
         test_shutdown_file: args.test_shutdown_file,
         codex_executable,
         claude_executable,
-        release: env!("CARGO_PKG_VERSION").to_owned(),
+        release: args
+            .test_release
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned()),
+        inherited_service_lock_fd: args.inherited_service_lock_fd,
     };
     if let Err(error) = run(options).await {
         eprintln!("{error}");

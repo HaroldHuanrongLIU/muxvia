@@ -1,0 +1,9 @@
+{
+  "type": "request",
+  "requestId": "handover-1",
+  "operation": {
+    "kind": "prepare-handover",
+    "candidatePath": "/opt/muxvia/muxvia-routing",
+    "expectedRelease": "0.2.0"
+  }
+}

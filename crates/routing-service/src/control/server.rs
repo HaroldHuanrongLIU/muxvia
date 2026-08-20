@@ -26,17 +26,21 @@ use crate::{
         protocol::{
             ActionStatus, ClaudePreflightContext, ClientFrame, CompatibilityProbeResult,
             ControlOperation, ControlProblem, ControlResult, DiscoverySource, FrameLimit,
-            ReconciliationStrategy, RpcVersion, ServerFrame, Target, TargetAction, TargetView,
-            UniversalProviderAction, UniversalProviderCatalogView,
+            HandoverPreparedResult, ReconciliationStrategy, RpcVersion, ServerFrame, Target,
+            TargetAction, TargetView, UniversalProviderAction, UniversalProviderCatalogView,
         },
     },
     domain::provider::has_valid_provider_authentication,
     home::MuxviaHome,
     model::ReqwestUpstream,
     service::{
-        activate::ActivationService, provider_inspector::ProviderInspector,
-        provider_synchronization::ProviderSynchronizationService, reconcile::ReconciliationService,
-        reconciliation_adapter::ReconciliationContext, route_plan::RoutePlanCoordinator,
+        activate::ActivationService,
+        handover::{PreparedHandover, probe_candidate},
+        provider_inspector::ProviderInspector,
+        provider_synchronization::ProviderSynchronizationService,
+        reconcile::ReconciliationService,
+        reconciliation_adapter::ReconciliationContext,
+        route_plan::RoutePlanCoordinator,
     },
     state::{ManagedWriteStatus, StateStore},
 };
@@ -66,6 +70,13 @@ pub struct ControlServerHandle {
     completed: watch::Receiver<bool>,
     lifecycle: Arc<ServerLifecycle>,
     reconciliation: Arc<ReconciliationService>,
+    handover: Option<mpsc::Receiver<PreparedHandover>>,
+}
+
+pub(crate) enum ControlLifecycleOutcome {
+    Idle,
+    ExplicitShutdown,
+    Handover(PreparedHandover),
 }
 
 #[derive(Default)]
@@ -155,6 +166,7 @@ struct SessionServices {
     reconciliation: Arc<ReconciliationService>,
     route_plans: Arc<RoutePlanCoordinator>,
     provider_synchronization: Arc<ProviderSynchronizationService>,
+    handover: Option<mpsc::Sender<PreparedHandover>>,
 }
 
 struct InspectionOperation {
@@ -299,6 +311,8 @@ impl ControlServer {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
         let (completed_tx, completed) = watch::channel(false);
+        let (handover_tx, handover_rx) = mpsc::channel(1);
+        let handover = exit_when_idle.then_some(handover_tx);
         let lifecycle = Arc::new(ServerLifecycle::default());
         let handle_lifecycle = Arc::clone(&lifecycle);
         let task_path = socket_path.clone();
@@ -328,6 +342,7 @@ impl ControlServer {
                         let reconciliation = Arc::clone(&reconciliation);
                         let route_plans = Arc::clone(&route_plans);
                         let provider_synchronization = Arc::clone(&provider_synchronization);
+                        let handover = handover.clone();
                         let release = release.clone();
                         let lifecycle = Arc::clone(&lifecycle);
                         let session_shutdown = session_shutdown_rx.clone();
@@ -338,6 +353,7 @@ impl ControlServer {
                             reconciliation,
                             route_plans,
                             provider_synchronization,
+                            handover,
                         };
                         sessions.spawn(async move {
                             let _guard = SessionGuard(Arc::clone(&lifecycle));
@@ -365,6 +381,7 @@ impl ControlServer {
             completed,
             lifecycle: handle_lifecycle,
             reconciliation: handle_reconciliation,
+            handover: exit_when_idle.then_some(handover_rx),
         })
     }
 }
@@ -441,6 +458,33 @@ impl ControlServerHandle {
                 .map_err(|_| ControlServerError::Task)?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn wait_for_lifecycle(
+        &mut self,
+    ) -> Result<ControlLifecycleOutcome, ControlServerError> {
+        let Some(handover) = self.handover.as_mut() else {
+            self.wait_for_exit().await?;
+            return Ok(ControlLifecycleOutcome::Idle);
+        };
+        loop {
+            tokio::select! {
+                biased;
+                prepared = handover.recv() => {
+                    if let Some(prepared) = prepared {
+                        return Ok(ControlLifecycleOutcome::Handover(prepared));
+                    }
+                    self.wait_for_exit().await?;
+                    return Ok(ControlLifecycleOutcome::Idle);
+                }
+                changed = self.completed.changed() => {
+                    changed.map_err(|_| ControlServerError::Task)?;
+                    if *self.completed.borrow() {
+                        return Ok(ControlLifecycleOutcome::Idle);
+                    }
+                }
+            }
+        }
     }
 
     pub async fn shutdown(mut self) -> Result<(), ControlServerError> {
@@ -520,6 +564,7 @@ async fn serve_session(
         reconciliation,
         route_plans,
         provider_synchronization,
+        handover,
     } = services;
     let first = match read_frame(&mut stream).await {
         Ok(first) => first,
@@ -595,6 +640,7 @@ async fn serve_session(
     let mut update_rx = store.subscribe_target_views();
     let mut universal_provider_update_rx = store.subscribe_universal_provider_views();
     let mut inspections = JoinSet::<InspectionCompletion>::new();
+    let mut action_completions = JoinSet::<bool>::new();
     let mut inspection_requests = std::collections::HashMap::<String, InspectionRequest>::new();
     'session: loop {
         tokio::select! {
@@ -615,6 +661,11 @@ async fn serve_session(
                         inspection_requests.retain(|_, request| request.task_id != task_id);
                     }
                     None => {}
+                }
+            }
+            completed = action_completions.join_next(), if !action_completions.is_empty() => {
+                if !matches!(completed, Some(Ok(true))) {
+                    break 'session;
                 }
             }
             incoming = read_frame(&mut reader) => {
@@ -659,6 +710,75 @@ async fn serve_session(
                         continue;
                     }
                 };
+
+                if let ControlOperation::PrepareHandover(operation) = operation {
+                    let prepared = match probe_candidate(
+                        PathBuf::from(operation.candidate_path),
+                        &operation.expected_release,
+                    )
+                    .await
+                    {
+                        Ok(prepared) => prepared,
+                        Err(problem) => {
+                            if !enqueue_response(
+                                &responses,
+                                problem_frame(
+                                    Some(request_id),
+                                    problem.code(),
+                                    problem.message(),
+                                    None,
+                                ),
+                            ) {
+                                break 'session;
+                            }
+                            continue;
+                        }
+                    };
+                    let Some(sender) = handover.as_ref() else {
+                        if !enqueue_response(
+                            &responses,
+                            problem_frame(
+                                Some(request_id),
+                                "unsupported-operation",
+                                "Compatible handover requires process mode",
+                                None,
+                            ),
+                        ) {
+                            break 'session;
+                        }
+                        continue;
+                    };
+                    let Ok(permit) = sender.clone().try_reserve_owned() else {
+                        if !enqueue_response(
+                            &responses,
+                            problem_frame(
+                                Some(request_id),
+                                "handover-in-progress",
+                                "Routing Service handover is already in progress",
+                                None,
+                            ),
+                        ) {
+                            break 'session;
+                        }
+                        continue;
+                    };
+                    let release = prepared.release.clone();
+                    if !enqueue_written_response(
+                        &responses,
+                        ServerFrame::Response {
+                            request_id,
+                            result: ControlResult::HandoverPrepared(HandoverPreparedResult {
+                                release,
+                            }),
+                        },
+                    )
+                    .await
+                    {
+                        break 'session;
+                    }
+                    permit.send(prepared);
+                    break 'session;
+                }
 
                 if matches!(
                     operation,
@@ -889,7 +1009,8 @@ async fn serve_session(
                 }
 
                 match operation {
-                    ControlOperation::OpenUniversalProviders { .. }
+                    ControlOperation::PrepareHandover(_)
+                    | ControlOperation::OpenUniversalProviders { .. }
                     | ControlOperation::UniversalProviderAct { .. } => {
                         unreachable!("catalog operations are handled before target dispatch")
                     }
@@ -914,7 +1035,7 @@ async fn serve_session(
                     }
                     ControlOperation::Act { target, action_id, expected_revision, action } => {
                         lifecycle.pending_actions.fetch_add(1, Ordering::AcqRel);
-                        let _action = ActionGuard(Arc::clone(&lifecycle));
+                        let mut action_guard = Some(ActionGuard(Arc::clone(&lifecycle)));
                         let parsed_action =
                             serde_json::from_value::<TargetAction>(action.clone()).ok();
                         let reconcile_action = parsed_action.as_ref().and_then(|action| match action {
@@ -932,6 +1053,10 @@ async fn serve_session(
                                 }
                                 _ => None,
                             });
+                        let disable_takeover = matches!(
+                            parsed_action.as_ref(),
+                            Some(TargetAction::DisableTakeover(_))
+                        );
                         let failover_draft =
                             parsed_action.as_ref().and_then(|action| match action {
                                 TargetAction::SaveFailoverDraft(action) => {
@@ -956,7 +1081,34 @@ async fn serve_session(
                                     | TargetAction::DuplicateProvider { .. }
                             )
                         );
-                        let (result, publication) = if let Some((strategy, observation_token, acknowledge_version)) = reconcile_action {
+                        let mut disable_completion = None;
+                        let (result, publication) = if disable_takeover {
+                            let context = match target {
+                                Target::Codex => Some(ReconciliationContext::Codex),
+                                Target::Claude => opened_claude_context
+                                    .clone()
+                                    .map(ReconciliationContext::Claude),
+                            };
+                            match context {
+                                Some(context) => {
+                                    let deferred = reconciliation
+                                        .disable_takeover(
+                                            target,
+                                            action_id,
+                                            expected_revision,
+                                            context,
+                                        )
+                                        .await;
+                                    disable_completion = deferred.completion;
+                                    (deferred.result, deferred.publication)
+                                }
+                                None => (Err(store.failure_for(
+                                    target,
+                                    "preflight-context-required",
+                                    "Claude preflight context is required",
+                                ).await), None),
+                            }
+                        } else if let Some((strategy, observation_token, acknowledge_version)) = reconcile_action {
                             match store.receipt_for(target, action_id).await {
                                 Ok(Some(outcome)) => (Ok(outcome), None),
                                 Ok(None) => {
@@ -1094,7 +1246,26 @@ async fn serve_session(
                                 }
                             }
                         };
-                        if !enqueue_action_response(&responses, frame, publication, &store).await {
+                        let response_delivered =
+                            enqueue_action_response(&responses, frame, publication, &store).await;
+                        if let Some(completion) = disable_completion {
+                            let reconciliation = Arc::clone(&reconciliation);
+                            let store = Arc::clone(&store);
+                            let guard = action_guard
+                                .take()
+                                .expect("every action owns one lifecycle guard");
+                            action_completions.spawn(async move {
+                                let _guard = guard;
+                                match reconciliation.complete_disable_takeover(completion).await {
+                                    Ok(Some(recovery_view)) => {
+                                        store.publish_target_view(recovery_view).await.is_ok()
+                                    }
+                                    Ok(None) => true,
+                                    Err(_) => false,
+                                }
+                            });
+                        }
+                        if !response_delivered {
                             break 'session;
                         }
                     }
@@ -1203,6 +1374,7 @@ async fn serve_session(
         request.cancellation.cancel();
     }
     inspection_requests.clear();
+    while action_completions.join_next().await.is_some() {}
     drop(responses);
     let inspections_drained = tokio::time::timeout(Duration::from_millis(250), async {
         while inspections.join_next().await.is_some() {}
@@ -1226,7 +1398,8 @@ async fn serve_session(
 
 fn operation_target(operation: &ControlOperation) -> Option<Target> {
     match operation {
-        ControlOperation::OpenUniversalProviders { .. }
+        ControlOperation::PrepareHandover(_)
+        | ControlOperation::OpenUniversalProviders { .. }
         | ControlOperation::UniversalProviderAct { .. } => None,
         ControlOperation::OpenTarget { target, .. }
         | ControlOperation::Act { target, .. }
@@ -1439,6 +1612,23 @@ async fn enqueue_action_response(
         return false;
     }
     true
+}
+
+async fn enqueue_written_response(
+    responses: &mpsc::Sender<QueuedResponse>,
+    frame: ServerFrame,
+) -> bool {
+    let (written, acknowledged) = oneshot::channel();
+    if responses
+        .try_send(QueuedResponse {
+            frame,
+            written: Some(written),
+        })
+        .is_err()
+    {
+        return false;
+    }
+    acknowledged.await.is_ok()
 }
 
 async fn enqueue_universal_provider_action_response(

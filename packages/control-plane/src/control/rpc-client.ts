@@ -34,6 +34,14 @@ type NonInspectionOperation = Exclude<ControlOperation, InspectionOperation>
 
 type SocketFactory = (socketPath: string) => Socket
 
+export type ServiceMetadata = Readonly<{
+  rpc: Readonly<{ major: 1; minor: 0 }>
+  release: string
+  serviceEpoch: string
+}>
+
+export type PreparedHandover = Readonly<{ release: string }>
+
 export class ControlError extends Error {
   readonly code: string
   readonly retryable: boolean
@@ -83,6 +91,7 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     reject: (error: ControlError) => void
   }
   #closed = false
+  #serviceMetadata?: ServiceMetadata
   readonly #closedPromise: Promise<void>
   readonly #resolveClosed: () => void
 
@@ -102,6 +111,13 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     })
     socket.on("error", (error) => this.#fail(error))
     socket.on("close", () => this.#fail(new ControlError("connection-closed", "Control socket closed")))
+  }
+
+  get serviceMetadata(): ServiceMetadata {
+    if (!this.#serviceMetadata) {
+      throw new ControlError("invalid-response", "Service metadata is unavailable")
+    }
+    return this.#serviceMetadata
   }
 
   static async connect(
@@ -163,6 +179,21 @@ export class RpcClient implements RpcTransport, MuxviaControl {
       throw new ControlError("invalid-response", "Expected a Universal Provider catalog")
     }
     return createUniversalProviderSession(this, result.view, claudeContext)
+  }
+
+  async prepareHandover(
+    candidatePath: string,
+    expectedRelease: string,
+  ): Promise<PreparedHandover> {
+    const result = await this.request({
+      kind: "prepare-handover",
+      candidatePath,
+      expectedRelease,
+    })
+    if (result.kind !== "handover-prepared" || result.release !== expectedRelease) {
+      throw new ControlError("invalid-response", "Handover response did not match request")
+    }
+    return Object.freeze({ release: result.release })
   }
 
   request(operation: InspectionOperation, options?: RequestOptions): Promise<ControlResult>
@@ -241,6 +272,11 @@ export class RpcClient implements RpcTransport, MuxviaControl {
       const handshake = this.#handshake
       this.#handshake = undefined
       if (frame.type === "hello-ack") {
+        this.#serviceMetadata = Object.freeze({
+          rpc: Object.freeze({ major: frame.rpc.major, minor: frame.rpc.minor }),
+          release: frame.release,
+          serviceEpoch: frame.serviceEpoch,
+        })
         handshake.resolve()
       } else if (frame.type === "error") {
         handshake.reject(new ControlError(

@@ -4,6 +4,7 @@ import { render } from "@opentui/solid"
 
 import {
   connectTargetSession,
+  coordinateRoutingService,
   run,
   type RunPorts,
   type SignalName,
@@ -200,7 +201,127 @@ const options = {
   servicePath: "/opt/muxvia/muxvia-routing",
   socketPath: "/tmp/operator-home/.muxvia/run/control.sock",
   release: "test-release",
+  serviceRelease: "routing-next",
 }
+
+test("startup coordinates one compatible service replacement before opening targets", async () => {
+  const closed = deferred<void>()
+  const prepared: Array<{ candidatePath: string; expectedRelease: string }> = []
+  let oldCloseCalls = 0
+  let newCloseCalls = 0
+  const controls = [
+    {
+      serviceMetadata: {
+        rpc: { major: 1 as const, minor: 0 as const },
+        release: "routing-old",
+        serviceEpoch: "00000000-0000-4000-8000-000000000081",
+      },
+      prepareHandover: async (candidatePath: string, expectedRelease: string) => {
+        prepared.push({ candidatePath, expectedRelease })
+        closed.resolve()
+        return { release: expectedRelease }
+      },
+      whenClosed: () => closed.promise,
+      close: async () => { oldCloseCalls++ },
+    },
+    {
+      serviceMetadata: {
+        rpc: { major: 1 as const, minor: 0 as const },
+        release: "routing-next",
+        serviceEpoch: "00000000-0000-4000-8000-000000000082",
+      },
+      prepareHandover: async () => { throw new Error("replacement must not hand over again") },
+      whenClosed: () => new Promise<void>(() => {}),
+      close: async () => { newCloseCalls++ },
+    },
+  ]
+  const connects: string[] = []
+  await coordinateRoutingService(
+    options,
+    new AbortController().signal,
+    new ManualClock(),
+    async (_socketPath, release) => {
+      connects.push(release)
+      const control = controls.shift()
+      if (!control) throw new Error("unexpected extra service connection")
+      return control
+    },
+  )
+
+  expect(prepared).toEqual([{
+    candidatePath: options.servicePath,
+    expectedRelease: options.serviceRelease,
+  }])
+  expect(connects).toEqual([options.release, options.release])
+  expect(oldCloseCalls).toBe(1)
+  expect(newCloseCalls).toBe(1)
+})
+
+test("startup reuses the exact bundled Routing Service release without handover", async () => {
+  let prepareCalls = 0
+  let closeCalls = 0
+  let connectCalls = 0
+  await coordinateRoutingService(
+    options,
+    new AbortController().signal,
+    new ManualClock(),
+    async () => {
+      connectCalls++
+      return {
+        serviceMetadata: {
+          rpc: { major: 1 as const, minor: 0 as const },
+          release: options.serviceRelease,
+          serviceEpoch: "00000000-0000-4000-8000-000000000083",
+        },
+        prepareHandover: async () => {
+          prepareCalls++
+          return { release: options.serviceRelease }
+        },
+        whenClosed: () => new Promise<void>(() => {}),
+        close: async () => { closeCalls++ },
+      }
+    },
+  )
+
+  expect(connectCalls).toBe(1)
+  expect(prepareCalls).toBe(0)
+  expect(closeCalls).toBe(1)
+})
+
+test("failed compatible handover reconnects to the usable old epoch with a fixed diagnostic", async () => {
+  const closed = deferred<void>()
+  const clock = new ManualClock()
+  let connectCalls = 0
+  let prepareCalls = 0
+  const oldMetadata = {
+    rpc: { major: 1 as const, minor: 0 as const },
+    release: "routing-old",
+    serviceEpoch: "00000000-0000-4000-8000-000000000084",
+  }
+  const connect = async () => {
+    connectCalls++
+    return {
+      serviceMetadata: oldMetadata,
+      prepareHandover: async () => {
+        prepareCalls++
+        closed.resolve()
+        return { release: options.serviceRelease }
+      },
+      whenClosed: () => closed.promise,
+      close: async () => {},
+    }
+  }
+
+  const diagnostic = await coordinateRoutingService(
+    options,
+    new AbortController().signal,
+    clock,
+    connect,
+  )
+  expect(diagnostic).toBe("handover-failed")
+  expect(prepareCalls).toBe(1)
+  expect(connectCalls).toBeGreaterThan(1)
+})
 
 test("an available service connects before rendering and never spawns", async () => {
   const { setup, destroyCalls } = await rendererFixture()
@@ -225,6 +346,78 @@ test("an available service connects before rendering and never spawns", async ()
     exitSpy.mockRestore()
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()
   }
+})
+
+test("startup coordination completes once before either target connection", async () => {
+  const { setup } = await rendererFixture()
+  const session = new LifecycleSession()
+  const events: string[] = []
+  const exitSpy = spyOn(process, "exit")
+  const activePorts = ports(setup, session, {
+    coordinateService: async () => { events.push("coordinate"); return undefined },
+    connect: async (_socketPath, _release, _signal, target) => {
+      events.push(`connect:${target}`)
+      return session
+    },
+    spawn: () => { events.push("spawn") },
+    render: async (node, renderer) => { events.push("render"); await render(node, renderer) },
+  })
+  try {
+    const running = run(options, activePorts)
+    await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
+    setup.mockInput.pressCtrlC()
+    await running
+    expect(events[0]).toBe("coordinate")
+    expect(events.filter((event) => event === "coordinate")).toHaveLength(1)
+    expect(events.filter((event) => event.startsWith("connect:")).sort()).toEqual([
+      "connect:claude",
+      "connect:codex",
+    ])
+    expect(events).not.toContain("spawn")
+  } finally {
+    exitSpy.mockRestore()
+  }
+})
+
+test("failed handover keeps old target sessions usable and renders one fixed startup diagnostic", async () => {
+  const { setup } = await rendererFixture()
+  const session = new LifecycleSession()
+  const events: string[] = []
+  const exitSpy = spyOn(process, "exit")
+  const activePorts = ports(setup, session, {
+    coordinateService: async () => "handover-failed",
+    connect: async (_socketPath, _release, _signal, target) => {
+      events.push(`connect:${target}`)
+      return session
+    },
+    spawn: () => { events.push("spawn") },
+  })
+  try {
+    const running = run(options, activePorts)
+    const frame = await setup.waitForFrame((next) => next.includes("previous service remains active"))
+    expect(frame).toContain("Choose a target")
+    expect(events.sort()).toEqual(["connect:claude", "connect:codex"])
+    expect(events).not.toContain("spawn")
+    setup.mockInput.pressCtrlC()
+    await running
+  } finally {
+    exitSpy.mockRestore()
+  }
+})
+
+test("major protocol mismatch aborts startup before target connect or spawn", async () => {
+  const { setup } = await rendererFixture()
+  const session = new LifecycleSession()
+  const events: string[] = []
+  const activePorts = ports(setup, session, {
+    coordinateService: async () => { throw { code: "protocol-mismatch" } },
+    connect: async () => { events.push("connect"); return session },
+    spawn: () => { events.push("spawn") },
+  })
+
+  await expect(run(options, activePorts)).rejects.toMatchObject({ code: "protocol-mismatch" })
+  expect(events).toEqual([])
+  expect(setup.renderer.isDestroyed).toBeTrue()
 })
 
 test("startup opens independent Codex and Claude sessions and closes each exactly once", async () => {

@@ -1491,6 +1491,17 @@ impl StateStore {
                 if !belongs_to_target {
                     return Err(StateError::InvalidActivatedSnapshot);
                 }
+                let target_still_has_an_active_plan: bool = transaction.query_row(
+                    "SELECT active_route_plan_id IS NOT NULL FROM target_route_state
+                     WHERE target = ?1",
+                    [target.as_str()],
+                    |row| row.get(0),
+                )?;
+                if !target_still_has_an_active_plan {
+                    let view = project_target_view_for(&transaction, &service_epoch, target)?;
+                    transaction.commit()?;
+                    return Ok(view);
+                }
                 let mut health_changed = false;
                 for observation in observations {
                     let belongs_to_pinned_plan: bool = transaction.query_row(

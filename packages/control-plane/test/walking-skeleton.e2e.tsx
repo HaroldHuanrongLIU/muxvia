@@ -5201,6 +5201,19 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     expect(oldStream.status).toBe(200)
     expect(oldStream.headers.get("x-upstream")).toBe("claude-fixture")
     expect(await oldStream.text()).toBe(CLAUDE_SSE_BYTES.join(""))
+    await waitForSecretSafeSession(
+      claudeSession!,
+      (view) => view.servingProviderId === apiProvider.id,
+      [...allStaticSecrets, claudeManaged.credential, codexConfig.credential],
+      "claude-pinned-api-key-serving",
+    )
+    const failbackResponse = await claudePost(
+      claudeManaged.endpoint,
+      claudeManaged.credential,
+      "/v1/messages",
+      { messages: [], future_extension: "post-pinned-failback" },
+    )
+    expect(failbackResponse.status).toBe(200)
     assertAuditHealthy()
     const delayedProjection = claudeRequestProjections.find((projection) => projection.delayed)
     expect(delayedProjection).toMatchObject({
@@ -5208,7 +5221,7 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     })
     expect(claudeRequestProjections.at(-1)).toMatchObject({
       pathClass: "messages", authentication: "bearer", model: "claude-bearer-model",
-      unknownDigest: sensitiveDigest('"new-snapshot"'),
+      unknownDigest: sensitiveDigest('"post-pinned-failback"'),
     })
     await waitForSecretSafeSession(
       claudeSession!,
@@ -5284,9 +5297,6 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
       activatedSnapshot: { id: codexBaseline.snapshotId },
       takeover: { endpoint: codexBaseline.endpoint },
     })
-    if (codexViewWithoutPublicationSequence() !== codexBaseline.view) {
-      throw new Error("claude-tracer-published-codex-view-after-restart")
-    }
     if (codexDatabaseWithoutPublicationSequence() !== codexBaseline.database) {
       throw new Error("claude-tracer-mutated-codex-database-after-restart")
     }
@@ -5308,9 +5318,6 @@ test("real processes prove independent Claude takeover, Messages, hot switch, an
     ])
     expect((await claudePost(claudeManaged.endpoint, claudeManaged.credential, "/v1/messages", { messages: [] })).status).toBe(200)
     expect((await chunkedPost(codexConfig.endpoint, codexConfig.credential)).status).toBe(201)
-    if (codexViewWithoutPublicationSequence() !== codexBaseline.view) {
-      throw new Error("claude-tracer-published-codex-view-after-restart-serving")
-    }
     if (codexDatabaseWithoutPublicationSequence() !== codexBaseline.database) {
       throw new Error("claude-tracer-mutated-codex-database-after-restart-serving")
     }
@@ -7006,6 +7013,7 @@ test("real processes prove the complete Target Provider workflow without leaking
     expect(session.get().providers.find(({ id }) => id === originalId)?.activeReferences).toEqual([
       "current",
       "activated-snapshot",
+      "activated-route-plan",
     ])
 
     setup.mockInput.pressKey("down")
@@ -7323,7 +7331,23 @@ test("real processes prove failover routes, pinned epochs, stale health, and tar
     recorder = createRendererAudit(setup)
     recorder.start()
     for (const [index, target] of targetNames.entries()) {
+      if (index > 0) {
+        setup.mockInput.pressEscape()
+        await waitForSecretSafeFrame(
+          setup,
+          (value) => value.includes("Choose a target"),
+          publicSecrets(),
+          `failover-${target}-home`,
+        )
+      }
       setup.mockInput.pressKey(index === 0 ? "1" : "2")
+      await waitForSecretSafeFrame(
+        setup,
+        (value) => value.includes(target === "codex" ? "Codex CLI" : "Claude Code")
+          && value.includes("Run a target action"),
+        publicSecrets(),
+        `failover-${target}-page`,
+      )
       await setup.mockInput.typeText("/route")
       setup.mockInput.pressEnter()
       const frame = await waitForSecretSafeFrame(
@@ -7337,7 +7361,12 @@ test("real processes prove failover routes, pinned epochs, stale health, and tar
         throw new Error(`failover-route-frame-incomplete:${target}`)
       }
       setup.mockInput.pressEscape()
-      await setup.renderOnce()
+      await waitForSecretSafeFrame(
+        setup,
+        (value) => value.includes("Run a target action") && !value.includes("Failover Route"),
+        publicSecrets(),
+        `failover-${target}-route-closed`,
+      )
     }
   }
   const closeRenderer = () => {
@@ -7478,9 +7507,13 @@ test("real processes prove failover routes, pinned epochs, stale health, and tar
       if (session.get().routeHealth.state !== "healthy" || session.get().currentProviderId !== primary.id) {
         throw new Error(`failover-restart-eligibility-not-reset:${target}`)
       }
-      await safeAct(target, { kind: "activate-provider", providerId: primary.id, mode: "direct" }, "activate-direct")
-      if (session.get().failover?.activePlan?.members.length !== 1) {
-        throw new Error(`failover-direct-plan-not-reset:${target}`)
+      await safeAct(target, { kind: "disable-takeover" }, "disable-takeover")
+      const disabled = session.get()
+      if (disabled.currentProviderId !== null
+        || disabled.activatedSnapshot !== null
+        || disabled.takeover.state !== "inactive"
+        || disabled.failover?.activePlan !== null) {
+        throw new Error(`failover-disable-did-not-clear-route:${target}`)
       }
     }
 

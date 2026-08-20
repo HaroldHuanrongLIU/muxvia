@@ -151,6 +151,7 @@ pub enum ServerFrame {
     rename_all_fields = "camelCase"
 )]
 pub enum ControlOperation {
+    PrepareHandover(PrepareHandoverOperation),
     OpenUniversalProviders {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_context: Option<ClaudePreflightContext>,
@@ -188,6 +189,13 @@ pub enum ControlOperation {
         claude_context: Option<ClaudePreflightContext>,
     },
     ProbeCompatibility(ProbeCompatibilityOperation),
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PrepareHandoverOperation {
+    pub candidate_path: String,
+    pub expected_release: String,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -402,6 +410,11 @@ impl fmt::Debug for DraftCredentialSource {
 impl fmt::Debug for ControlOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PrepareHandover(operation) => formatter
+                .debug_struct("PrepareHandover")
+                .field("candidate_path", &Redacted)
+                .field("expected_release", &operation.expected_release)
+                .finish(),
             Self::OpenUniversalProviders { .. } => formatter.write_str("OpenUniversalProviders"),
             Self::UniversalProviderAct {
                 action_id,
@@ -466,6 +479,7 @@ impl fmt::Debug for ControlOperation {
     rename_all_fields = "camelCase"
 )]
 pub enum TargetAction {
+    DisableTakeover(DisableTakeoverAction),
     CreateProvider {
         name: String,
         base_url: String,
@@ -519,6 +533,10 @@ pub enum TargetAction {
     SaveFailoverDraft(SaveFailoverDraftAction),
     ApplyFailoverChain(ApplyFailoverChainAction),
 }
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisableTakeoverAction {}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -616,6 +634,7 @@ where
 impl fmt::Debug for TargetAction {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DisableTakeover(_) => formatter.write_str("DisableTakeover"),
             Self::CreateProvider {
                 name,
                 base_url,
@@ -783,6 +802,7 @@ pub enum ActivationMode {
     rename_all_fields = "camelCase"
 )]
 pub enum ControlResult {
+    HandoverPrepared(HandoverPreparedResult),
     TargetView { view: TargetView },
     UniversalProviderCatalog { view: UniversalProviderCatalogView },
     UniversalProviderOutcome { outcome: UniversalProviderOutcome },
@@ -791,6 +811,12 @@ pub enum ControlResult {
     Reachability { result: ReachabilityResult },
     ReconciliationPreview { preview: ReconciliationPreview },
     CompatibilityProbe(CompatibilityProbeResult),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HandoverPreparedResult {
+    pub release: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

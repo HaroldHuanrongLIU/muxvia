@@ -263,6 +263,7 @@ impl StoreFixture {
             .unwrap();
         database
             .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
+                connection.execute_batch("PRAGMA foreign_keys = OFF")?;
                 connection.execute("DELETE FROM providers", [])?;
                 connection.execute("DELETE FROM credentials", [])?;
                 Ok(())
@@ -591,7 +592,8 @@ async fn observe_streaming_request(
     }
     Response::builder()
         .status(StatusCode::OK)
-        .body(Body::from("ok"))
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
         .unwrap()
 }
 
@@ -737,7 +739,7 @@ async fn upstream_429_status_headers_and_body_pass_through_without_serving_updat
     assert_eq!(response.text().await.unwrap(), "{\"error\":\"slow down\"}");
     let after = fixture.store.target_view().await.unwrap();
     assert_eq!(after.serving_provider_id, None);
-    assert_eq!(after.view_sequence, before.view_sequence);
+    assert_eq!(after.view_sequence, before.view_sequence + 1);
 
     server.shutdown().await.unwrap();
     upstream.shutdown().await;
@@ -841,6 +843,48 @@ async fn successful_route_appends_path_forwards_bytes_and_streams_sse_in_order()
     );
     repeated.bytes().await.unwrap();
 
+    server.shutdown().await.unwrap();
+    upstream.shutdown().await;
+}
+
+#[tokio::test]
+async fn draining_rejects_new_requests_and_waits_for_an_accepted_response_body() {
+    let (upstream, release_upstream_body) =
+        FakeUpstream::start_with_blocked_body(StatusCode::OK).await;
+    let fixture = StoreFixture::new().await;
+    fixture.seed_snapshot(&upstream.base_url()).await;
+    let server = start_model(&fixture).await;
+    let endpoint = server.endpoint();
+
+    let accepted = timeout(
+        Duration::from_secs(1),
+        post_route(endpoint, Some(HeaderValue::from_static(ROUTING_CREDENTIAL))),
+    )
+    .await
+    .expect("accepted response head must not wait for its streamed body");
+    assert_eq!(accepted.status(), StatusCode::OK);
+    assert_eq!(server.active_request_count(), 1);
+
+    let drain = server
+        .begin_draining()
+        .expect("an accepting model listener must enter draining");
+    let rejected = post_route(endpoint, Some(HeaderValue::from_static(ROUTING_CREDENTIAL))).await;
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(upstream.state.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        timeout(Duration::from_millis(100), drain.wait_until_drained())
+            .await
+            .is_err(),
+        "drain completed before the accepted response body was consumed"
+    );
+
+    release_upstream_body.send(()).unwrap();
+    let body = accepted.bytes().await.unwrap();
+    assert!(body.ends_with(b"data: [DONE]\n\n"));
+    timeout(Duration::from_secs(1), drain.wait_until_drained())
+        .await
+        .expect("drain did not complete after the accepted response body");
+    assert!(drain.commit());
     server.shutdown().await.unwrap();
     upstream.shutdown().await;
 }

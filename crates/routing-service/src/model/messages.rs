@@ -32,6 +32,9 @@ pub(crate) async fn route_messages(
     State(state): State<RouteState>,
     request: Request<Body>,
 ) -> Response<Body> {
+    if state.admission.rejects_new_requests() {
+        return local_response(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let expected = match state.store.routing_credential_for(state.target).await {
         Ok(Some(credential)) => credential,
         Ok(None) | Err(_) => return local_response(StatusCode::UNAUTHORIZED),

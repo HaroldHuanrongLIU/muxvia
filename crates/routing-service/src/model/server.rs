@@ -16,7 +16,11 @@ use axum::{
 };
 use futures_util::{StreamExt, stream};
 use reqwest::Body as ReqwestBody;
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::{Notify, oneshot},
+    task::JoinHandle,
+};
 
 use crate::control::protocol::Target;
 use crate::state::StateStore;
@@ -78,9 +82,108 @@ pub struct ModelServerHandle {
     task: Option<JoinHandle<Result<(), io::Error>>>,
     status: Arc<AtomicU8>,
     shutdown_requested: Arc<AtomicBool>,
-    admission: Arc<AtomicUsize>,
+    admission: Arc<ModelAdmission>,
     #[cfg(test)]
     reservation_attempt_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+pub(crate) struct ModelAdmission {
+    state: AtomicUsize,
+    drained: Notify,
+}
+
+impl ModelAdmission {
+    fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+            drained: Notify::new(),
+        }
+    }
+
+    fn active_request_count(&self) -> usize {
+        self.state.load(Ordering::Acquire) / ACTIVE_REQUEST_INCREMENT
+    }
+
+    pub(crate) fn rejects_new_requests(&self) -> bool {
+        self.state.load(Ordering::Acquire) & RESERVED_BIT != 0
+    }
+
+    fn try_reserve_idle(&self) -> bool {
+        self.state
+            .compare_exchange(0, RESERVED_BIT, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn begin_draining(&self) -> bool {
+        let mut observed = self.state.load(Ordering::Acquire);
+        loop {
+            if observed & RESERVED_BIT != 0 {
+                return false;
+            }
+            match self.state.compare_exchange_weak(
+                observed,
+                observed | RESERVED_BIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    fn resume(&self) {
+        let mut observed = self.state.load(Ordering::Acquire);
+        loop {
+            debug_assert_ne!(observed & RESERVED_BIT, 0);
+            match self.state.compare_exchange_weak(
+                observed,
+                observed & !RESERVED_BIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    async fn wait_until_drained(&self) {
+        loop {
+            let drained = self.drained.notified();
+            if self.state.load(Ordering::Acquire) == RESERVED_BIT {
+                return;
+            }
+            drained.await;
+        }
+    }
+}
+
+pub struct ModelDrainReservation {
+    pub(crate) admission: Arc<ModelAdmission>,
+    committed: bool,
+}
+
+impl ModelDrainReservation {
+    pub async fn wait_until_drained(&self) {
+        self.admission.wait_until_drained().await;
+    }
+
+    pub fn commit(mut self) -> bool {
+        if self.admission.state.load(Ordering::Acquire) != RESERVED_BIT {
+            return false;
+        }
+        self.committed = true;
+        true
+    }
+}
+
+impl Drop for ModelDrainReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.admission.resume();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,7 +218,7 @@ pub(crate) struct RouteState {
     pub(crate) target: Target,
     pub(crate) store: Arc<StateStore>,
     pub(crate) upstream: Arc<dyn UpstreamTransport>,
-    pub(crate) admission: Arc<AtomicUsize>,
+    pub(crate) admission: Arc<ModelAdmission>,
     pub(crate) route_health: Arc<RouteHealthRuntime>,
 }
 
@@ -204,7 +307,7 @@ impl ModelServer {
             target,
             store,
             upstream,
-            admission: Arc::new(AtomicUsize::new(0)),
+            admission: Arc::new(ModelAdmission::new()),
             route_health,
         };
         let admission = Arc::clone(&state.admission);
@@ -299,14 +402,20 @@ impl ModelServerHandle {
     }
 
     pub fn active_request_count(&self) -> usize {
-        self.admission.load(Ordering::Acquire) / ACTIVE_REQUEST_INCREMENT
+        self.admission.active_request_count()
+    }
+
+    pub fn begin_draining(&self) -> Option<ModelDrainReservation> {
+        self.admission
+            .begin_draining()
+            .then(|| ModelDrainReservation {
+                admission: Arc::clone(&self.admission),
+                committed: false,
+            })
     }
 
     pub(crate) fn try_reserve_idle(&self) -> bool {
-        let reserved = self
-            .admission
-            .compare_exchange(0, RESERVED_BIT, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
+        let reserved = self.admission.try_reserve_idle();
         #[cfg(test)]
         if let Some(hook) = &self.reservation_attempt_hook {
             hook();
@@ -315,10 +424,8 @@ impl ModelServerHandle {
     }
 
     pub(crate) fn release_idle_reservation(&self) {
-        let released =
-            self.admission
-                .compare_exchange(RESERVED_BIT, 0, Ordering::AcqRel, Ordering::Acquire);
-        debug_assert!(released.is_ok());
+        debug_assert_eq!(self.admission.state.load(Ordering::Acquire), RESERVED_BIT);
+        self.admission.resume();
     }
 
     #[cfg(test)]
@@ -393,6 +500,9 @@ async fn route_responses(
     State(state): State<RouteState>,
     request: Request<Body>,
 ) -> Response<Body> {
+    if state.admission.rejects_new_requests() {
+        return local_response(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let expected = match state.store.routing_credential().await {
         Ok(Some(credential)) => credential,
         Ok(None) | Err(_) => return local_response(StatusCode::UNAUTHORIZED),
@@ -483,18 +593,18 @@ async fn route_responses(
 }
 
 pub(crate) struct ActiveRequestGuard {
-    admission: Arc<AtomicUsize>,
+    admission: Arc<ModelAdmission>,
 }
 
 impl ActiveRequestGuard {
-    pub(crate) fn try_begin(admission: Arc<AtomicUsize>) -> Option<Self> {
-        let mut observed = admission.load(Ordering::Acquire);
+    pub(crate) fn try_begin(admission: Arc<ModelAdmission>) -> Option<Self> {
+        let mut observed = admission.state.load(Ordering::Acquire);
         loop {
             if observed & RESERVED_BIT != 0 {
                 return None;
             }
             let next = observed.checked_add(ACTIVE_REQUEST_INCREMENT)?;
-            match admission.compare_exchange_weak(
+            match admission.state.compare_exchange_weak(
                 observed,
                 next,
                 Ordering::AcqRel,
@@ -509,8 +619,13 @@ impl ActiveRequestGuard {
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
-        self.admission
+        let previous = self
+            .admission
+            .state
             .fetch_sub(ACTIVE_REQUEST_INCREMENT, Ordering::AcqRel);
+        if previous == RESERVED_BIT + ACTIVE_REQUEST_INCREMENT {
+            self.admission.drained.notify_one();
+        }
     }
 }
 

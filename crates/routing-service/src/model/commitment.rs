@@ -109,12 +109,38 @@ async fn prime_compressed_sse(mut response: UpstreamResponse, target: Target) ->
 }
 
 async fn prime_json(mut response: UpstreamResponse, target: Target) -> PrimedResponse {
+    if let Some(encoding) = normalized_header(&response, header::CONTENT_ENCODING)
+        && (encoding == "gzip" || encoding == "x-gzip")
+    {
+        return prime_compressed_json(response, target).await;
+    }
     let bytes = match collect_bounded(&mut response).await {
         BoundedCollection::Complete(bytes) => bytes,
         BoundedCollection::Commit(prefix) => return committed_with_prefix(response, prefix),
         BoundedCollection::Failure => return PrimedResponse::Retry,
     };
     let valid = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .is_some_and(|value| valid_nonstreaming_value(&value, target));
+    if valid {
+        committed_with_prefix(response, vec![Bytes::from(bytes)])
+    } else {
+        PrimedResponse::Retry
+    }
+}
+
+async fn prime_compressed_json(mut response: UpstreamResponse, target: Target) -> PrimedResponse {
+    let bytes = match collect_bounded(&mut response).await {
+        BoundedCollection::Complete(bytes) => bytes,
+        BoundedCollection::Commit(prefix) => return committed_with_prefix(response, prefix),
+        BoundedCollection::Failure => return PrimedResponse::Retry,
+    };
+    let mut decoder = MultiGzDecoder::new(bytes.as_slice()).take((PRIMING_BYTE_LIMIT + 1) as u64);
+    let mut decoded = Vec::new();
+    if decoder.read_to_end(&mut decoded).is_err() || decoded.len() > PRIMING_BYTE_LIMIT {
+        return PrimedResponse::Retry;
+    }
+    let valid = serde_json::from_slice::<Value>(&decoded)
         .ok()
         .is_some_and(|value| valid_nonstreaming_value(&value, target));
     if valid {

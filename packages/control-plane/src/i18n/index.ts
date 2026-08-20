@@ -53,6 +53,7 @@ const problemMessageKeys = new Map<string, MessageKey>([
   ["model-route-unavailable", "error.model-route-unavailable"],
   ["takeover-required", "error.takeover-required"],
   ["takeover-active", "error.takeover-active"],
+  ["handover-failed", "error.handover-failed"],
   ["internal-failure", "error.internal-failure"],
   ["invalid-failover-chain", "error.invalid-failover-chain"],
   ["stale-failover-draft-revision", "error.stale-failover-draft-revision"],

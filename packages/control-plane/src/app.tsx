@@ -4,7 +4,12 @@ import { spawn } from "node:child_process"
 import { dirname, isAbsolute } from "node:path"
 import { createSignal } from "solid-js"
 
-import { RpcClient, ControlError } from "./control/rpc-client"
+import {
+  RpcClient,
+  ControlError,
+  type PreparedHandover,
+  type ServiceMetadata,
+} from "./control/rpc-client"
 import type { TargetSession } from "./control/target-session"
 import type { UniversalProviderSession } from "./control/universal-provider-session"
 import type { ClaudePreflightContext, Target } from "./control/types"
@@ -15,6 +20,7 @@ export interface RunOptions {
   servicePath: string
   socketPath: string
   release: string
+  serviceRelease: string
 }
 
 export interface Clock {
@@ -34,6 +40,7 @@ interface SpawnOptions {
 }
 
 export interface RunPorts {
+  coordinateService?(options: RunOptions, signal: AbortSignal): Promise<"handover-failed" | undefined>
   connect(
     socketPath: string,
     release: string,
@@ -129,6 +136,7 @@ export function createProductionRenderer(): Promise<CliRenderer> {
 }
 
 const productionPorts: RunPorts = {
+  coordinateService: (options, signal) => coordinateRoutingService(options, signal, productionPorts.clock),
   connect: (socketPath, release, signal, target, claudeContext) =>
     connectTargetSession(socketPath, release, signal, target, undefined, claudeContext),
   connectUniversalProviders: async (socketPath, release, signal, claudeContext) => {
@@ -242,6 +250,82 @@ async function connectBeforeDeadline(
 
 class ConnectionCancelledError extends Error {}
 
+interface RoutingServiceControl {
+  readonly serviceMetadata: ServiceMetadata
+  prepareHandover(candidatePath: string, expectedRelease: string): Promise<PreparedHandover>
+  whenClosed(): Promise<void>
+  close(): Promise<void>
+}
+
+type RoutingServiceConnector = (
+  socketPath: string,
+  release: string,
+  signal?: AbortSignal,
+) => Promise<RoutingServiceControl>
+
+export async function coordinateRoutingService(
+  options: RunOptions,
+  cancellation: AbortSignal,
+  clock: Clock,
+  connect: RoutingServiceConnector = RpcClient.connect,
+): Promise<"handover-failed" | undefined> {
+  if (cancellation.aborted) throw new ConnectionCancelledError()
+  let current: RoutingServiceControl
+  try {
+    current = await connect(options.socketPath, options.release, cancellation)
+  } catch (error) {
+    if (socketUnavailable(error)) return
+    throw error
+  }
+  const deadline = clock.now() + readinessTimeoutMs
+  const old = current.serviceMetadata
+  if (old.release === options.serviceRelease) {
+    await current.close()
+    return
+  }
+  if (!isAbsolute(options.servicePath)) {
+    await current.close()
+    throw new Error("Routing Service path must be absolute")
+  }
+  try {
+    await current.prepareHandover(options.servicePath, options.serviceRelease)
+    while (clock.now() < deadline) {
+      if (cancellation.aborted) throw new ConnectionCancelledError()
+      const closed = await Promise.race([
+        current.whenClosed().then(() => true),
+        clock.sleep(retryIntervalMs).then(() => false),
+      ])
+      if (closed) break
+    }
+  } catch (error) {
+    if (cancellation.aborted) throw error
+    return "handover-failed"
+  } finally {
+    await current.close().catch(() => {})
+  }
+  while (clock.now() < deadline) {
+    if (cancellation.aborted) throw new ConnectionCancelledError()
+    try {
+      const replacement = await connect(options.socketPath, options.release, cancellation)
+      const metadata = replacement.serviceMetadata
+      await replacement.close().catch(() => {})
+      if (
+        metadata.release === options.serviceRelease
+        && metadata.serviceEpoch !== old.serviceEpoch
+      ) {
+        return
+      }
+      if (metadata.release === old.release && metadata.serviceEpoch === old.serviceEpoch) {
+        return "handover-failed"
+      }
+    } catch (error) {
+      if (!socketUnavailable(error)) throw error
+    }
+    await clock.sleep(retryIntervalMs)
+  }
+  return "handover-failed"
+}
+
 async function connectOrStart(
   options: RunOptions,
   ports: RunPorts,
@@ -350,7 +434,12 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
   const spawnState = { started: false }
   const claudeContext = claudePreflightContext(process.env)
   let firstConnectionFailure: unknown
+  let startupProblem: "handover-failed" | undefined
   try {
+    if (renderer.isDestroyed) return
+    if (ports.coordinateService) {
+      startupProblem = await ports.coordinateService(options, startup.signal)
+    }
     if (renderer.isDestroyed) return
     await Promise.all((["codex", "claude"] as const).map(async (target) => {
       try {
@@ -387,7 +476,7 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
       }
     }
     if (renderer.isDestroyed) return
-    await ports.render(() => <App sessions={sessions} unavailable={unavailable} universalSession={universalSession} locale={locale} />, renderer)
+    await ports.render(() => <App sessions={sessions} unavailable={unavailable} universalSession={universalSession} startupProblem={startupProblem} locale={locale} />, renderer)
     const opened = sessions()
     const uniqueSessions = [...new Set(Object.values(opened))]
     for (const target of ["codex", "claude"] as const) {

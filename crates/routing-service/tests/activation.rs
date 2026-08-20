@@ -186,10 +186,15 @@ struct SuccessfulUpstream;
 #[async_trait]
 impl UpstreamTransport for SuccessfulUpstream {
     async fn send(&self, _: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
         Ok(UpstreamResponse {
             status: StatusCode::OK,
-            headers: HeaderMap::new(),
-            body: Box::pin(stream::once(async { Ok(Bytes::from_static(b"ok")) })),
+            headers,
+            body: Box::pin(stream::once(async { Ok(Bytes::from_static(b"{}")) })),
         })
     }
 }
@@ -220,10 +225,15 @@ impl UpstreamTransport for PinningUpstream {
             self.first_started.notify_one();
             self.release_first.notified().await;
         }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
         Ok(UpstreamResponse {
             status: StatusCode::OK,
-            headers: HeaderMap::new(),
-            body: Box::pin(stream::once(async { Ok(Bytes::from_static(b"ok")) })),
+            headers,
+            body: Box::pin(stream::once(async { Ok(Bytes::from_static(b"{}")) })),
         })
     }
 }
@@ -5120,7 +5130,7 @@ async fn committed_takeover_bootstraps_exact_endpoint_in_a_new_service_epoch_wit
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.bytes().await.unwrap(), "ok");
+    assert_eq!(response.bytes().await.unwrap(), "{}");
 }
 
 #[tokio::test]

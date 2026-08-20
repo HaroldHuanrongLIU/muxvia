@@ -21,7 +21,10 @@ use crate::{
     },
     domain::activation::ActivatedSnapshot,
     home::MuxviaHome,
-    model::{ModelServerError, ModelServerHandle, auth::routing_credential_value_matches},
+    model::{
+        ModelDrainReservation, ModelServerError, ModelServerHandle,
+        auth::routing_credential_value_matches,
+    },
     state::{
         ActionFailure, AdoptReconciliation, ManagedWriteStatus, ReconciliationCommit,
         ReconciliationCommitFailpoint, ReconciliationCommitInput, StateError, StateStore,
@@ -154,6 +157,59 @@ impl ReconciliationTargetRuntime {
             None => Ok(()),
         }
     }
+
+    async fn reserve_draining(
+        &self,
+        target: Target,
+    ) -> Result<ReservedTargetRuntime, ModelServerError> {
+        let mut slot = self.slot(target).lock().await;
+        let drain = match slot.as_ref() {
+            Some(handle) => Some(handle.begin_draining().ok_or(ModelServerError::Task)?),
+            None => None,
+        };
+        Ok(ReservedTargetRuntime::Draining {
+            handle: slot.take(),
+            drain,
+        })
+    }
+
+    async fn restore_runtime(&self, target: Target, reservation: ReservedTargetRuntime) {
+        match reservation {
+            ReservedTargetRuntime::Idle(handle) => self.restore_reserved(target, handle).await,
+            ReservedTargetRuntime::Draining { handle, drain } => {
+                drop(drain);
+                if let Some(handle) = handle {
+                    *self.slot(target).lock().await = Some(handle);
+                }
+            }
+        }
+    }
+
+    async fn shutdown_runtime(
+        &self,
+        reservation: ReservedTargetRuntime,
+    ) -> Result<(), ModelServerError> {
+        match reservation {
+            ReservedTargetRuntime::Idle(handle) => self.shutdown_reserved(handle).await,
+            ReservedTargetRuntime::Draining { handle, drain } => {
+                if let Some(drain) = drain {
+                    drain.wait_until_drained().await;
+                    if !drain.commit() {
+                        return Err(ModelServerError::Task);
+                    }
+                }
+                self.shutdown_reserved(handle).await
+            }
+        }
+    }
+}
+
+enum ReservedTargetRuntime {
+    Idle(Option<ModelServerHandle>),
+    Draining {
+        handle: Option<ModelServerHandle>,
+        drain: Option<ModelDrainReservation>,
+    },
 }
 
 pub(crate) struct ClaudeRuntimeContext {
@@ -284,6 +340,19 @@ pub(crate) struct PreviewRegistration {
 pub(crate) struct DeferredPublication<T> {
     pub(crate) result: T,
     pub(crate) publication: Option<crate::control::protocol::TargetView>,
+}
+
+pub(crate) struct DeferredDisableTakeover {
+    pub(crate) result: Result<ActionOutcome, ActionFailure>,
+    pub(crate) publication: Option<crate::control::protocol::TargetView>,
+    pub(crate) completion: Option<DisableTakeoverCompletion>,
+}
+
+pub(crate) struct DisableTakeoverCompletion {
+    target: Target,
+    action_id: Uuid,
+    runtime: ReservedTargetRuntime,
+    _gate: OwnedMutexGuard<()>,
 }
 
 impl<T> DeferredPublication<T> {
@@ -641,6 +710,7 @@ impl ReconciliationService {
         acknowledge_version: Option<String>,
         context: ReconciliationContext,
     ) -> DeferredPublication<Result<ActionOutcome, ActionFailure>> {
+        let mut completion = None;
         let result = self
             .apply_result(
                 target,
@@ -650,8 +720,11 @@ impl ReconciliationService {
                 observation_token,
                 acknowledge_version,
                 context,
+                false,
+                &mut completion,
             )
             .await;
+        debug_assert!(completion.is_none());
         let publication = result.as_ref().ok().and_then(|outcome| {
             (outcome.status == ActionStatus::Applied).then(|| outcome.view.clone())
         });
@@ -671,13 +744,15 @@ impl ReconciliationService {
         observation_token: Uuid,
         acknowledge_version: Option<String>,
         context: ReconciliationContext,
+        drain_active_requests: bool,
+        disable_completion: &mut Option<DisableTakeoverCompletion>,
     ) -> Result<ActionOutcome, ActionFailure> {
         match self.state.receipt_for(target, action_id).await {
             Ok(Some(outcome)) => return Ok(outcome),
             Ok(None) => {}
             Err(_) => return Err(self.failure(target, "state-store-error").await),
         }
-        let _gate = self.target_runtime.gate(target).lock().await;
+        let gate = self.target_runtime.gate_arc(target).lock_owned().await;
         let key = ObservationKey(target, strategy);
         let registration_lock = Arc::clone(
             self.registration_locks
@@ -839,10 +914,18 @@ impl ReconciliationService {
         }
         let mut reserved_runtime = None;
         if strategy == ReconciliationStrategy::Restore || adopt_takeover {
-            reserved_runtime = match self.target_runtime.reserve_if_idle(target).await {
-                Ok(runtime) => runtime,
-                Err(_) => return Err(self.failure(target, "target-busy").await),
-            };
+            reserved_runtime =
+                match if drain_active_requests && strategy == ReconciliationStrategy::Restore {
+                    self.target_runtime.reserve_draining(target).await
+                } else {
+                    self.target_runtime
+                        .reserve_if_idle(target)
+                        .await
+                        .map(ReservedTargetRuntime::Idle)
+                } {
+                    Ok(runtime) => Some(runtime),
+                    Err(_) => return Err(self.failure(target, "target-busy").await),
+                };
             #[cfg(test)]
             if let Some(pause) = &self.hooks.pause_after_reserve {
                 pause.reached.notify_one();
@@ -862,9 +945,9 @@ impl ReconciliationService {
             .await
             .is_err()
         {
-            self.target_runtime
-                .restore_reserved(target, reserved_runtime.take())
-                .await;
+            if let Some(runtime) = reserved_runtime.take() {
+                self.target_runtime.restore_runtime(target, runtime).await;
+            }
             return Err(self.failure(target, "state-store-error").await);
         }
 
@@ -878,9 +961,9 @@ impl ReconciliationService {
                     observation_token,
                 )
                 .await;
-            self.target_runtime
-                .restore_reserved(target, reserved_runtime.take())
-                .await;
+            if let Some(runtime) = reserved_runtime.take() {
+                self.target_runtime.restore_runtime(target, runtime).await;
+            }
             return failure;
         }
 
@@ -910,9 +993,9 @@ impl ReconciliationService {
                     observation_token,
                 )
                 .await;
-            self.target_runtime
-                .restore_reserved(target, reserved_runtime.take())
-                .await;
+            if let Some(runtime) = reserved_runtime.take() {
+                self.target_runtime.restore_runtime(target, runtime).await;
+            }
             return failure;
         }
         if self.hooks.failpoint == ReconciliationFailpoint::RollbackVerify {
@@ -925,9 +1008,9 @@ impl ReconciliationService {
                     observation_token,
                 )
                 .await;
-            self.target_runtime
-                .restore_reserved(target, reserved_runtime.take())
-                .await;
+            if let Some(runtime) = reserved_runtime.take() {
+                self.target_runtime.restore_runtime(target, runtime).await;
+            }
             return failure;
         }
         #[cfg(test)]
@@ -947,9 +1030,9 @@ impl ReconciliationService {
                     observation_token,
                 )
                 .await;
-            self.target_runtime
-                .restore_reserved(target, reserved_runtime.take())
-                .await;
+            if let Some(runtime) = reserved_runtime.take() {
+                self.target_runtime.restore_runtime(target, runtime).await;
+            }
             return failure;
         }
         let commit = self
@@ -985,11 +1068,21 @@ impl ReconciliationService {
             .await;
         match commit {
             Ok(ReconciliationCommit::Applied(outcome)) => {
-                if self
-                    .target_runtime
-                    .shutdown_reserved(reserved_runtime.take())
-                    .await
-                    .is_err()
+                if drain_active_requests {
+                    let runtime = reserved_runtime
+                        .take()
+                        .expect("disable Takeover always reserves the target runtime");
+                    self.consume_token(key, observation_token).await;
+                    *disable_completion = Some(DisableTakeoverCompletion {
+                        target,
+                        action_id,
+                        runtime,
+                        _gate: gate,
+                    });
+                    return Ok(outcome);
+                }
+                if let Some(runtime) = reserved_runtime.take()
+                    && self.target_runtime.shutdown_runtime(runtime).await.is_err()
                 {
                     let recovery = match self
                         .state
@@ -1006,10 +1099,9 @@ impl ReconciliationService {
                 Ok(outcome)
             }
             Ok(ReconciliationCommit::Replayed(outcome)) => {
-                let _ = self
-                    .target_runtime
-                    .shutdown_reserved(reserved_runtime.take())
-                    .await;
+                if let Some(runtime) = reserved_runtime.take() {
+                    let _ = self.target_runtime.shutdown_runtime(runtime).await;
+                }
                 Ok(outcome)
             }
             Ok(ReconciliationCommit::Stale) => {
@@ -1023,9 +1115,9 @@ impl ReconciliationService {
                         observation_token,
                     )
                     .await;
-                self.target_runtime
-                    .restore_reserved(target, reserved_runtime.take())
-                    .await;
+                if let Some(runtime) = reserved_runtime.take() {
+                    self.target_runtime.restore_runtime(target, runtime).await;
+                }
                 failure
             }
             Err(_) => {
@@ -1038,12 +1130,101 @@ impl ReconciliationService {
                         observation_token,
                     )
                     .await;
-                self.target_runtime
-                    .restore_reserved(target, reserved_runtime.take())
-                    .await;
+                if let Some(runtime) = reserved_runtime.take() {
+                    self.target_runtime.restore_runtime(target, runtime).await;
+                }
                 failure
             }
         }
+    }
+
+    pub(crate) async fn disable_takeover(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        expected_revision: u64,
+        context: ReconciliationContext,
+    ) -> DeferredDisableTakeover {
+        match self.state.receipt_for(target, action_id).await {
+            Ok(Some(outcome)) => {
+                return DeferredDisableTakeover {
+                    result: Ok(outcome),
+                    publication: None,
+                    completion: None,
+                };
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return DeferredDisableTakeover {
+                    result: Err(self.failure(target, "state-store-error").await),
+                    publication: None,
+                    completion: None,
+                };
+            }
+        }
+        let registration = match self
+            .preview_registered_cancellable(
+                target,
+                ReconciliationStrategy::Restore,
+                context.clone(),
+                CancellationToken::new(),
+            )
+            .await
+        {
+            Ok(registration) => registration,
+            Err(problem) => {
+                let mut failure = self.failure(target, &problem.code).await;
+                failure.problem = problem;
+                return DeferredDisableTakeover {
+                    result: Err(failure),
+                    publication: None,
+                    completion: None,
+                };
+            }
+        };
+        let observation_token = registration.preview.observation_token;
+        drop(registration);
+        let mut completion = None;
+        let result = self
+            .apply_result(
+                target,
+                action_id,
+                expected_revision,
+                ReconciliationStrategy::Restore,
+                observation_token,
+                None,
+                context,
+                true,
+                &mut completion,
+            )
+            .await;
+        let publication = result.as_ref().ok().and_then(|outcome| {
+            (outcome.status == ActionStatus::Applied).then(|| outcome.view.clone())
+        });
+        DeferredDisableTakeover {
+            result,
+            publication,
+            completion,
+        }
+    }
+
+    pub(crate) async fn complete_disable_takeover(
+        &self,
+        completion: DisableTakeoverCompletion,
+    ) -> Result<Option<crate::control::protocol::TargetView>, StateError> {
+        let DisableTakeoverCompletion {
+            target,
+            action_id,
+            runtime,
+            _gate,
+        } = completion;
+        if self.target_runtime.shutdown_runtime(runtime).await.is_ok() {
+            return Ok(None);
+        }
+        self.state
+            .mark_committed_reconciliation_recovery_required(target, action_id)
+            .await
+            .map(|outcome| Some(outcome.view))
     }
 
     pub(crate) async fn ensure_ordinary_write_allowed(
@@ -1733,10 +1914,15 @@ mod tests {
     #[async_trait]
     impl UpstreamTransport for NoopUpstream {
         async fn send(&self, _: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
             Ok(UpstreamResponse {
                 status: StatusCode::OK,
-                headers: Default::default(),
-                body: Box::pin(stream::once(async { Ok(Bytes::new()) })),
+                headers,
+                body: Box::pin(stream::once(async { Ok(Bytes::from_static(b"{}")) })),
             })
         }
     }
@@ -1760,9 +1946,14 @@ mod tests {
         async fn send(&self, _: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
             self.started.notify_one();
             self.release.notified().await;
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
             Ok(UpstreamResponse {
                 status: StatusCode::OK,
-                headers: Default::default(),
+                headers,
                 body: Box::pin(stream::once(async { Ok(Bytes::from_static(b"{}")) })),
             })
         }

@@ -1,0 +1,8 @@
+{
+  "type": "response",
+  "requestId": "handover-1",
+  "result": {
+    "kind": "handover-prepared",
+    "release": "0.2.0"
+  }
+}

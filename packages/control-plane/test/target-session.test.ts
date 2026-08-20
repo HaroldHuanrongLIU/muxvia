@@ -225,6 +225,15 @@ class ScriptedServer {
     })
   }
 
+  replyHandoverPrepared(index: number, release: string): void {
+    const frame = this.requests()[index]!
+    this.send({
+      type: "response",
+      requestId: frame.requestId,
+      result: { kind: "handover-prepared", release },
+    })
+  }
+
   replyWithTargetView(index: number, view: TargetView): void {
     const frame = this.requests()[index]!
     this.send({ type: "response", requestId: frame.requestId, result: { kind: "target-view", view } })
@@ -253,6 +262,41 @@ async function openScriptedSession(initial: TargetView) {
   const session = await opening
   return { session, server }
 }
+
+test("RpcClient exposes exact negotiated service metadata", async () => {
+  const { server, path } = await ScriptedServer.start()
+  const client = await RpcClient.connect(path, "control-test")
+
+  expect(client.serviceMetadata).toEqual({
+    release: "routing-test",
+    serviceEpoch,
+    rpc: { major: 1, minor: 0 },
+  })
+
+  await client.close()
+  await server.close()
+})
+
+test("RpcClient prepares one closed compatible handover request", async () => {
+  const { server, path } = await ScriptedServer.start()
+  const client = await RpcClient.connect(path, "control-test")
+
+  const preparing = client.prepareHandover(
+    "/opt/muxvia/muxvia-routing-next",
+    "routing-next",
+  )
+  await server.waitForRequests(1)
+  expect(server.requests()[0]!.operation).toEqual({
+    kind: "prepare-handover",
+    candidatePath: "/opt/muxvia/muxvia-routing-next",
+    expectedRelease: "routing-next",
+  })
+  server.replyHandoverPrepared(0, "routing-next")
+  await expect(preparing).resolves.toEqual({ release: "routing-next" })
+
+  await client.close()
+  await server.close()
+})
 
 function assertCapturedCreateProvider(
   frame: Extract<ClientFrame, { type: "request" }> | undefined,

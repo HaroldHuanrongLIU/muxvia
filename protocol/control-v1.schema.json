@@ -83,6 +83,7 @@
     },
     "controlOperation": {
       "oneOf": [
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "prepare-handover" }, "candidatePath": { "type": "string" }, "expectedRelease": { "type": "string" } }, "required": ["kind", "candidatePath", "expectedRelease"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "open-universal-providers" }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind"] },
         { "type": "object", "properties": { "kind": { "const": "universal-provider-act" }, "actionId": { "type": "string", "format": "uuid" }, "expectedRevision": { "type": "integer", "minimum": 0 }, "action": {} }, "required": ["kind", "actionId", "expectedRevision", "action"] },
         { "type": "object", "properties": { "kind": { "const": "open-target" }, "target": { "enum": ["codex", "claude"] }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind", "target"] },
@@ -152,6 +153,7 @@
     },
     "controlResult": {
       "oneOf": [
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "handover-prepared" }, "release": { "type": "string" } }, "required": ["kind", "release"] },
         { "type": "object", "properties": { "kind": { "const": "target-view" }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["kind", "view"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "universal-provider-catalog" }, "view": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["kind", "view"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "universal-provider-outcome" }, "outcome": { "type": "object", "additionalProperties": false, "properties": { "status": { "enum": ["applied", "replayed"] }, "view": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["status", "view"] } }, "required": ["kind", "outcome"] },
@@ -184,6 +186,7 @@
     },
     "targetAction": {
       "oneOf": [
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "disable-takeover" } }, "required": ["kind"] },
         { "type": "object", "properties": { "kind": { "const": "create-provider" }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/credentialEdit" }, "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer"] }, "presetKey": { "oneOf": [{ "const": "openai-api-responses" }, { "const": "anthropic-api-messages" }, { "type": "null" }] } }, "required": ["kind", "name", "baseUrl", "model", "credential"] },
         { "type": "object", "properties": { "kind": { "const": "update-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/credentialEdit" }, "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer"] }, "routingRequirement": { "enum": ["direct-compatible", "takeover-required"] } }, "required": ["kind", "providerId", "providerRevision", "name", "baseUrl", "model", "credential"] },
         { "type": "object", "properties": { "kind": { "const": "reorder-providers" }, "providerIds": { "type": "array", "items": { "type": "string", "format": "uuid" } } }, "required": ["kind", "providerIds"] },

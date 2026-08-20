@@ -103,6 +103,7 @@ try {
     servicePath: "/fixture/muxvia-routing",
     socketPath: "/fixture/.muxvia/run/control.sock",
     release: "pty-fixture",
+    serviceRelease: "0.1.0",
   }, ports)
 } catch (error) {
   if (!exceptional || !(error instanceof Error) || error.message !== "injected-render-failure") throw error

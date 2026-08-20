@@ -28,12 +28,15 @@ test.each([
   ["duplicate-provider.json", parseTargetAction],
   ["save-failover-draft.json", parseTargetAction],
   ["apply-failover-chain.json", parseTargetAction],
+  ["disable-takeover.json", parseTargetAction],
   ["discover-models.json", parseClientFrame],
   ["check-reachability.json", parseClientFrame],
   ["cancel-inspection.json", parseClientFrame],
   ["probe-compatibility.json", parseClientFrame],
   ["open-universal-providers.json", parseClientFrame],
+  ["prepare-handover.json", parseClientFrame],
   ["compatibility-probe.json", parseServerFrame],
+  ["handover-prepared.json", parseServerFrame],
   ["universal-provider-catalog.json", parseServerFrame],
   ["universal-provider-act.json", parseClientFrame],
   ["universal-provider-outcome.json", parseServerFrame],
@@ -79,6 +82,31 @@ test("Failover Chain actions are closed and revision bound", async () => {
     )
     expect(branch).toBeDefined()
     expect(branch.additionalProperties).toBeFalse()
+  }
+})
+
+test("lifecycle contracts are closed and secret-free", async () => {
+  const disabled = await readFixture("disable-takeover.json") as any
+  const prepared = await readFixture("prepare-handover.json") as any
+  const accepted = await readFixture("handover-prepared.json") as any
+
+  expect(parseTargetAction(disabled)).toEqual(disabled)
+  expect(parseClientFrame(prepared)).toEqual(prepared)
+  expect(parseServerFrame(accepted)).toEqual(accepted)
+
+  for (const [value, branch, parse] of [
+    [disabled, disabled, parseTargetAction],
+    [prepared, prepared.operation, parseClientFrame],
+    [accepted, accepted.result, parseServerFrame],
+  ] as const) {
+    const invalid = structuredClone(value)
+    const invalidBranch = branch === disabled
+      ? invalid
+      : branch === prepared.operation
+        ? invalid.operation
+        : invalid.result
+    invalidBranch.additiveSecret = "LIFECYCLE_PROTOCOL_SECRET_40391"
+    expect(() => parse(invalid)).toThrow()
   }
 })
 

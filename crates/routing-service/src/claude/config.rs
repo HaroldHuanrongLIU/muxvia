@@ -869,17 +869,27 @@ impl ClaudeConfigCodec {
         owned: &OwnedClaudeState,
         remove_file: bool,
     ) -> Result<(), ClaudeProblem> {
-        let (current, mut document) = self.read_snapshot(expected.ownership_version)?;
+        let (current, mut document, original_bytes) =
+            self.read_snapshot_with_bytes(expected.ownership_version)?;
         if current != *expected {
             return Err(ClaudeProblem::new(
                 "configuration-write-failed",
                 Some(self.settings_path()),
             ));
         }
+        let reversible_bytes = reversible_env_edit(
+            &original_bytes,
+            &document,
+            owned,
+            expected.ownership_version,
+        );
         apply_owned(&mut document, owned, expected.ownership_version);
-        let bytes = serde_json::to_vec_pretty(&document).map_err(|_| {
-            ClaudeProblem::new("configuration-write-failed", Some(self.settings_path()))
-        })?;
+        let bytes = match reversible_bytes {
+            Some(bytes) => bytes,
+            None => serde_json::to_vec_pretty(&document).map_err(|_| {
+                ClaudeProblem::new("configuration-write-failed", Some(self.settings_path()))
+            })?,
+        };
         self.file
             .replace(&expected.identity, &bytes, remove_file)
             .map_err(|error| map_file_error(error, Some(self.settings_path())))
@@ -889,6 +899,14 @@ impl ClaudeConfigCodec {
         &self,
         ownership: ClaudeConfigOwnership,
     ) -> Result<(ClaudeConfigSnapshot, Value), ClaudeProblem> {
+        self.read_snapshot_with_bytes(ownership)
+            .map(|(snapshot, document, _)| (snapshot, document))
+    }
+
+    fn read_snapshot_with_bytes(
+        &self,
+        ownership: ClaudeConfigOwnership,
+    ) -> Result<(ClaudeConfigSnapshot, Value, Vec<u8>), ClaudeProblem> {
         let contents = self
             .file
             .read()
@@ -925,8 +943,136 @@ impl ClaudeConfigCodec {
                 unrelated: Some(unrelated),
             },
             document,
+            contents.bytes,
         ))
     }
+}
+
+fn reversible_env_edit(
+    original: &[u8],
+    document: &Value,
+    desired: &OwnedClaudeState,
+    ownership: ClaudeConfigOwnership,
+) -> Option<Vec<u8>> {
+    let object = document.as_object()?;
+    let desired_has_owned = owned_has_values(desired, ownership);
+    match object.get("env") {
+        None if desired_has_owned => {
+            insert_managed_env(original, object.is_empty(), desired, ownership)
+        }
+        Some(Value::Object(env))
+            if !desired_has_owned
+                && !env.is_empty()
+                && env
+                    .keys()
+                    .all(|key| ownership.owned_keys().contains(&key.as_str())) =>
+        {
+            remove_inserted_managed_env(original, object.len() == 1)
+        }
+        _ => None,
+    }
+}
+
+fn owned_has_values(owned: &OwnedClaudeState, ownership: ClaudeConfigOwnership) -> bool {
+    owned.base_url.is_some()
+        || owned.auth_token.is_some()
+        || owned.model.is_some()
+        || (ownership == ClaudeConfigOwnership::FourField && owned.api_key.is_some())
+}
+
+fn insert_managed_env(
+    original: &[u8],
+    root_is_empty: bool,
+    desired: &OwnedClaudeState,
+    ownership: ClaudeConfigOwnership,
+) -> Option<Vec<u8>> {
+    let (open, close) = root_object_bounds(original)?;
+    let mut managed = Value::Object(Map::new());
+    apply_owned(&mut managed, desired, ownership);
+    let env = serde_json::to_vec(managed.get("env")?).ok()?;
+    let mut member = Vec::with_capacity(env.len() + 8);
+    if !root_is_empty {
+        member.push(b',');
+    }
+    member.extend_from_slice(br#""env":"#);
+    member.extend_from_slice(&env);
+    let insertion = if root_is_empty { open + 1 } else { close };
+    let mut bytes = Vec::with_capacity(original.len() + member.len());
+    bytes.extend_from_slice(&original[..insertion]);
+    bytes.extend_from_slice(&member);
+    bytes.extend_from_slice(&original[insertion..]);
+    Some(bytes)
+}
+
+fn remove_inserted_managed_env(original: &[u8], root_only_env: bool) -> Option<Vec<u8>> {
+    let (open, close) = root_object_bounds(original)?;
+    let (remove_start, value_start) = if root_only_env {
+        let member_start = skip_json_whitespace(original, open + 1);
+        let value_start = exact_env_value_start(original, member_start)?;
+        (member_start, value_start)
+    } else {
+        let member = br#","env":"#;
+        let relative = find_last_subslice(&original[open + 1..close], member)?;
+        let member_start = open + 1 + relative;
+        let value_start = exact_env_value_start(original, member_start + 1)?;
+        (member_start, value_start)
+    };
+    let value_end = json_value_end(original, value_start)?;
+    if original[value_end..close]
+        .iter()
+        .any(|byte| !byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(original.len() - (value_end - remove_start));
+    bytes.extend_from_slice(&original[..remove_start]);
+    bytes.extend_from_slice(&original[value_end..]);
+    Some(bytes)
+}
+
+fn root_object_bounds(bytes: &[u8]) -> Option<(usize, usize)> {
+    let open = bytes.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    let close = bytes.iter().rposition(|byte| !byte.is_ascii_whitespace())?;
+    (bytes.get(open) == Some(&b'{') && bytes.get(close) == Some(&b'}')).then_some((open, close))
+}
+
+fn exact_env_value_start(bytes: &[u8], member_start: usize) -> Option<usize> {
+    let mut cursor = member_start;
+    if bytes.get(cursor) != Some(&b'"') {
+        return None;
+    }
+    cursor += 1;
+    if bytes.get(cursor..cursor + 3)? != b"env" {
+        return None;
+    }
+    cursor += 3;
+    if bytes.get(cursor) != Some(&b'"') {
+        return None;
+    }
+    cursor = skip_json_whitespace(bytes, cursor + 1);
+    if bytes.get(cursor) != Some(&b':') {
+        return None;
+    }
+    Some(skip_json_whitespace(bytes, cursor + 1))
+}
+
+fn skip_json_whitespace(bytes: &[u8], mut cursor: usize) -> usize {
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    cursor
+}
+
+fn json_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut stream = serde_json::Deserializer::from_slice(bytes.get(start..)?).into_iter::<Value>();
+    stream.next()?.ok()?;
+    Some(start + stream.byte_offset())
+}
+
+fn find_last_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
 }
 
 fn semantic_fingerprint(value: &impl Serialize) -> Result<String, serde_json::Error> {

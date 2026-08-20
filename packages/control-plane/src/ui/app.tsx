@@ -24,6 +24,7 @@ import { RouteEditor } from "./route-editor"
 import { TargetSidebar } from "./target-sidebar"
 import { TargetView, type ActivityEntry } from "./target-view"
 import { TakeoverRequiredConfirm } from "./takeover-required-confirm"
+import { TakeoverDisableConfirmation } from "./takeover-disable-confirmation"
 import { UniversalProviderConfirmation } from "./universal-provider-confirmation"
 import { UniversalProviderEditor } from "./universal-provider-editor"
 import { UniversalProviderPicker } from "./universal-provider-picker"
@@ -38,6 +39,7 @@ export interface AppProps {
   sessions?: Partial<Record<Target, TargetSession>> | Accessor<Partial<Record<Target, TargetSession>>>
   unavailable?: Partial<Record<Target, string>> | Accessor<Partial<Record<Target, string>>>
   universalSession?: UniversalProviderSession | Accessor<UniversalProviderSession | undefined>
+  startupProblem?: "handover-failed"
   locale?: Locale
 }
 
@@ -240,6 +242,7 @@ function Shell(props: {
   sessions: Accessor<Partial<Record<Target, TargetSession>>>
   unavailable: Accessor<Partial<Record<Target, string>>>
   universalSession: Accessor<UniversalProviderSession | undefined>
+  startupProblem?: "handover-failed"
   t: Translator
 }) {
   const renderer = useRenderer()
@@ -263,10 +266,15 @@ function Shell(props: {
   }
   const [reachabilityByTarget, setReachabilityByTarget] = createSignal<Partial<Record<Target, ReachabilityState>>>({})
   const [applyingByTarget, setApplyingByTarget] = createSignal<Record<Target, "direct" | "takeover" | undefined>>({ codex: undefined, claude: undefined })
+  const [disablingByTarget, setDisablingByTarget] = createSignal<Record<Target, boolean>>({ codex: false, claude: false })
   const [reconciliationByTarget, setReconciliationByTarget] = createSignal<Partial<Record<Target, ReconciliationWorkflowState>>>({})
   const [routeWorkflowByTarget, setRouteWorkflowByTarget] = createSignal<Partial<Record<Target, RouteWorkflowState>>>({})
   const showCommandPalette = useCommandPaletteOpener(props.t, () => applying() === undefined)
-  const [notices, setNotices] = createSignal<Partial<Record<Target | "home", Notice>>>({})
+  const [notices, setNotices] = createSignal<Partial<Record<Target | "home", Notice>>>(
+    props.startupProblem
+      ? { home: { kind: "error", text: props.t(messageKeyForProblem(props.startupProblem)) } }
+      : {},
+  )
   const [activitiesByTarget, setActivitiesByTarget] = createSignal<Record<Target, ActivityEntry[]>>({ codex: [], claude: [] })
   const [sidebarOpenByTarget, setSidebarOpenByTarget] = createSignal<Record<Target, boolean>>({ codex: true, claude: true })
   const [universalView, setUniversalView] = createSignal<UniversalProviderCatalogView | undefined>(props.universalSession()?.get() as UniversalProviderCatalogView | undefined)
@@ -371,6 +379,8 @@ function Shell(props: {
   const applying = () => activeTarget() ? applyingByTarget()[activeTarget()!] : undefined
   const setTargetApplying = (target: Target, value: "direct" | "takeover" | undefined) =>
     setApplyingByTarget((current) => ({ ...current, [target]: value }))
+  const setTargetDisabling = (target: Target, value: boolean) =>
+    setDisablingByTarget((current) => ({ ...current, [target]: value }))
   const session = (target = activeTarget()) => target ? props.sessions()[target] : undefined
   const view = () => {
     const target = activeTarget()
@@ -1269,6 +1279,54 @@ function Shell(props: {
     void activateProvider(provider.id, mode)
   }
 
+  const openDisableTakeoverConfirmation = () => {
+    const target = activeTarget()
+    const originSession = session(target)
+    const current = target ? views()[target] : undefined
+    if (
+      !target
+      || !originSession
+      || current?.takeover.state !== "active"
+      || disablingByTarget()[target]
+      || overlay.depth > 0
+    ) return
+    const token = Symbol(`takeover-disable-${target}`)
+    overlay.push({
+      id: "takeover-disable-confirmation",
+      token,
+      dismissOnEscape: () => !disablingByTarget()[target],
+      render: () => <TakeoverDisableConfirmation
+        pending={disablingByTarget()[target]}
+        t={props.t}
+        onCancel={() => overlay.close(token)}
+        onConfirm={() => { void (async () => {
+          if (disablingByTarget()[target]) return
+          setTargetDisabling(target, true)
+          setNotice(undefined, target)
+          try {
+            const outcome = await originSession.act({ kind: "disable-takeover" })
+            if (disposed || exiting) return
+            installView(outcome.view, "action")
+            if (activeTarget() !== target) return
+            const activity: ActivityDraft = { kind: "success", messageKey: "activity.takeover.disabled" }
+            appendActivity(activity, target)
+            setNotice({ kind: "success", text: props.t(activity.messageKey) }, target)
+            overlay.close(token)
+          } catch (error) {
+            if (disposed || exiting) return
+            installView(originSession.get() as TargetViewProjection, "action")
+            if (activeTarget() !== target) return
+            const activity = actionProblem(error)
+            appendActivity(activity, target)
+            setNotice({ kind: "error", text: props.t(activity.messageKey, activity.values) }, target)
+          } finally {
+            if (!disposed && !exiting) setTargetDisabling(target, false)
+          }
+        })() }}
+      />,
+    })
+  }
+
   const selectedUniversalProvider = () => universalView()?.providers.find((provider) =>
     provider.id === selectedUniversalProviderId()) ?? universalView()?.providers[0]
 
@@ -1462,6 +1520,7 @@ function Shell(props: {
       "universal-provider.list": openUniversalProviders,
       "target.direct.apply": () => applyDefaultProvider("direct"),
       "target.takeover.apply": () => applyDefaultProvider("takeover"),
+      "target.takeover.disable": openDisableTakeoverConfirmation,
       "target.reconciliation.open": openReconciliation,
       "route.open": openRouteEditor,
     },
@@ -1478,6 +1537,7 @@ function Shell(props: {
       "universal-provider.list": openUniversalProviders,
       "target.direct.apply": () => applyDefaultProvider("direct"),
       "target.takeover.apply": () => applyDefaultProvider("takeover"),
+      "target.takeover.disable": openDisableTakeoverConfirmation,
       "target.reconciliation.open": openReconciliation,
       "route.open": openRouteEditor,
     },
@@ -1606,7 +1666,7 @@ export function App(props: AppProps) {
   return (
     <MuxviaKeymapProvider presenter={createCommandPresenter(t)}>
       <OverlayProvider>
-        <Shell sessions={sessions} unavailable={unavailable} universalSession={universalSession} t={t} />
+        <Shell sessions={sessions} unavailable={unavailable} universalSession={universalSession} startupProblem={props.startupProblem} t={t} />
       </OverlayProvider>
     </MuxviaKeymapProvider>
   )

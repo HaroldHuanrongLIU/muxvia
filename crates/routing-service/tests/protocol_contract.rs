@@ -48,6 +48,7 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "duplicate-provider.json",
         "save-failover-draft.json",
         "apply-failover-chain.json",
+        "disable-takeover.json",
     ] {
         let action = fixture(name);
         let parsed: TargetAction = serde_json::from_value(action.clone()).unwrap();
@@ -60,6 +61,7 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "cancel-inspection.json",
         "probe-compatibility.json",
         "open-universal-providers.json",
+        "prepare-handover.json",
     ] {
         let frame = fixture(name);
         let parsed: ClientFrame = serde_json::from_value(frame.clone()).unwrap();
@@ -69,6 +71,10 @@ fn fixtures_round_trip_as_their_protocol_types() {
     let compatibility_probe = fixture("compatibility-probe.json");
     let parsed: ServerFrame = serde_json::from_value(compatibility_probe.clone()).unwrap();
     assert_eq!(serde_json::to_value(parsed).unwrap(), compatibility_probe);
+
+    let handover_prepared = fixture("handover-prepared.json");
+    let parsed: ServerFrame = serde_json::from_value(handover_prepared.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), handover_prepared);
 
     let universal_catalog = fixture("universal-provider-catalog.json");
     let parsed: ServerFrame = serde_json::from_value(universal_catalog.clone()).unwrap();
@@ -106,6 +112,41 @@ fn fixtures_round_trip_as_their_protocol_types() {
     let resolve_compatibility = fixture("resolve-compatibility.json");
     let parsed: TargetAction = serde_json::from_value(resolve_compatibility.clone()).unwrap();
     assert_eq!(serde_json::to_value(parsed).unwrap(), resolve_compatibility);
+}
+
+#[test]
+fn lifecycle_contracts_are_closed_and_secret_free() {
+    let disabled = fixture("disable-takeover.json");
+    let prepared = fixture("prepare-handover.json");
+    let accepted = fixture("handover-prepared.json");
+
+    assert!(serde_json::from_value::<TargetAction>(disabled.clone()).is_ok());
+    assert!(serde_json::from_value::<ClientFrame>(prepared.clone()).is_ok());
+    assert!(serde_json::from_value::<ServerFrame>(accepted.clone()).is_ok());
+
+    for (mut value, label) in [
+        (disabled, "disable"),
+        (prepared, "prepare"),
+        (accepted, "accepted"),
+    ] {
+        let object = if label == "disable" {
+            value.as_object_mut().unwrap()
+        } else if label == "prepare" {
+            value["operation"].as_object_mut().unwrap()
+        } else {
+            value["result"].as_object_mut().unwrap()
+        };
+        object.insert(
+            "additiveSecret".to_owned(),
+            serde_json::json!("LIFECYCLE_PROTOCOL_SECRET_40391"),
+        );
+        let rejected = match label {
+            "disable" => serde_json::from_value::<TargetAction>(value).is_err(),
+            "prepare" => serde_json::from_value::<ClientFrame>(value).is_err(),
+            _ => serde_json::from_value::<ServerFrame>(value).is_err(),
+        };
+        assert!(rejected, "accepted additive lifecycle field");
+    }
 }
 
 #[test]

@@ -8,7 +8,8 @@ mod upstream;
 
 pub(crate) use router::RouteHealthRuntime;
 pub use server::{
-    ModelServer, ModelServerError, ModelServerHandle, ModelServerStatus, ReservedListener,
+    ModelDrainReservation, ModelServer, ModelServerError, ModelServerHandle, ModelServerStatus,
+    ReservedListener,
 };
 pub use upstream::{
     ReqwestUpstream, UpstreamError, UpstreamRequest, UpstreamResponse, UpstreamTransport,

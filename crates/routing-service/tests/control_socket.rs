@@ -1327,7 +1327,7 @@ async fn generated_activation_advances_catalog_references_and_disable_returns_au
     assert!(catalog_push["view"]["viewSequence"].as_u64().unwrap() > catalog_sequence);
     assert_eq!(
         catalog_push["view"]["providers"][0]["targets"][0]["activeReferences"],
-        json!(["current", "activated-snapshot"])
+        json!(["current", "activated-snapshot", "activated-route-plan"])
     );
 
     let blocked_disable = request(
@@ -1364,7 +1364,7 @@ async fn generated_activation_advances_catalog_references_and_disable_returns_au
     );
     assert_eq!(
         blocked_disable["authoritativeUniversalProviderView"]["providers"][0]["targets"][0]["activeReferences"],
-        json!(["current", "activated-snapshot"])
+        json!(["current", "activated-snapshot", "activated-route-plan"])
     );
     let restore_preview = request(
         &mut codex,
@@ -1606,7 +1606,7 @@ async fn catalog_delete_waits_for_target_activation_and_observes_the_committed_r
     assert_eq!(blocked["problem"]["code"], "generated-provider-referenced");
     assert_eq!(
         blocked["authoritativeUniversalProviderView"]["providers"][0]["targets"][0]["activeReferences"],
-        json!(["current", "activated-snapshot"])
+        json!(["current", "activated-snapshot", "activated-route-plan"])
     );
 }
 
@@ -4136,12 +4136,15 @@ async fn failover_draft_save_responds_before_one_push_and_changes_no_live_route(
         push["view"] == *view,
         "draft save push did not match its response"
     );
-    assert!(
-        view["failover"]["draftRevision"] == 2
-            && view["failover"]["draftMembers"]
-                .as_array()
-                .is_some_and(|members| members.len() == 2),
-        "saved draft was not projected"
+    assert_eq!(
+        view["failover"]["draftRevision"].as_u64(),
+        Some(before.failover.draft_revision + 1),
+        "saved draft revision was not projected"
+    );
+    assert_eq!(
+        view["failover"]["draftMembers"].as_array().map(Vec::len),
+        Some(2),
+        "saved draft members were not projected"
     );
     assert!(
         view["currentProviderId"] == serde_json::to_value(&before.current_provider_id).unwrap()
@@ -4194,7 +4197,10 @@ async fn failover_draft_save_responds_before_one_push_and_changes_no_live_route(
         json!({
             "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
             "expectedRevision": 0,
-            "action": { "kind": "apply-failover-chain", "draftRevision": 2 }
+            "action": {
+                "kind": "apply-failover-chain",
+                "draftRevision": before.failover.draft_revision + 1
+            }
         }),
     )
     .await;
@@ -4223,7 +4229,10 @@ async fn failover_draft_save_responds_before_one_push_and_changes_no_live_route(
             "operation": {
                 "kind": "act", "target": "codex", "actionId": apply_action_id,
                 "expectedRevision": view["managementRevision"],
-                "action": { "kind": "apply-failover-chain", "draftRevision": 2 }
+                "action": {
+                    "kind": "apply-failover-chain",
+                    "draftRevision": before.failover.draft_revision + 1
+                }
             }
         }),
     )

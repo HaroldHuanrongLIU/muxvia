@@ -19,4 +19,5 @@ await run({
   servicePath,
   socketPath,
   release: "muxvia-dev",
+  serviceRelease: "0.1.0",
 })

@@ -29,6 +29,9 @@ export type CommandId =
   | "provider.activate.takeover-cancel"
   | "target.direct.apply"
   | "target.takeover.apply"
+  | "target.takeover.disable"
+  | "target.takeover.disable-confirm"
+  | "target.takeover.disable-cancel"
   | "target.reconciliation.open"
   | "target.reconciliation.preview.adopt"
   | "target.reconciliation.preview.reapply"
@@ -56,7 +59,7 @@ export type CommandId =
   | "app.exit.confirm"
   | "app.exit.cancel"
 
-export type CommandScope = "global" | "home" | "codex" | "claude" | "editor" | "provider-picker" | "provider-picker-claude" | "provider-source-picker" | "provider-model-picker" | "provider-credential-confirm" | "provider-delete-confirm" | "takeover-required-confirm" | "reconciliation" | "route-editor" | "universal-provider-picker" | "universal-provider-editor" | "universal-provider-confirm" | "overlay" | "confirm"
+export type CommandScope = "global" | "home" | "codex" | "claude" | "editor" | "provider-picker" | "provider-picker-claude" | "provider-source-picker" | "provider-model-picker" | "provider-credential-confirm" | "provider-delete-confirm" | "takeover-required-confirm" | "takeover-disable-confirm" | "reconciliation" | "route-editor" | "universal-provider-picker" | "universal-provider-editor" | "universal-provider-confirm" | "overlay" | "confirm"
 
 export type CommandTextKey = `command.${string}`
 

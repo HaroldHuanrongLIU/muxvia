@@ -253,6 +253,7 @@ const reconciliationPreviewSchema = z.object({
 })
 
 const targetActionSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("disable-takeover") }).strict(),
   z.object({
     kind: z.literal("create-provider"),
     name: z.string(),
@@ -320,6 +321,11 @@ const targetActionSchema = z.discriminatedUnion("kind", [
 ])
 
 const controlOperationSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("prepare-handover"),
+    candidatePath: z.string(),
+    expectedRelease: z.string(),
+  }).strict(),
   z.object({
     kind: z.literal("open-universal-providers"),
     claudeContext: claudePreflightContextSchema.optional(),
@@ -523,6 +529,7 @@ const reachabilityResultSchema = z.discriminatedUnion("status", [
 ])
 
 const controlResultSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("handover-prepared"), release: z.string() }).strict(),
   z.object({ kind: z.literal("target-view"), view: targetViewSchema }),
   z.object({ kind: z.literal("universal-provider-catalog"), view: universalProviderCatalogSchema }).strict(),
   z.object({

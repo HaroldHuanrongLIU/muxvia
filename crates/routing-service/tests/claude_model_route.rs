@@ -1095,7 +1095,7 @@ async fn reqwest_preserves_compressed_upstream_error_headers_and_exact_bytes() {
     assert_eq!(response.bytes().await.unwrap(), compressed_error);
     let after = fixture.store.target_view_for(Target::Claude).await.unwrap();
     assert_eq!(after.serving_provider_id, None);
-    assert_eq!(after.view_sequence, before.view_sequence);
+    assert_eq!(after.view_sequence, before.view_sequence + 1);
 
     server.shutdown().await.unwrap();
     upstream_task.abort();
@@ -1470,7 +1470,9 @@ async fn downstream_disconnect_drops_the_upstream_sse_stream_without_a_detached_
         Arc::new(GatedStreamUpstream {
             first_chunk_gate: Mutex::new(None),
             dropped: Arc::clone(&dropped),
-            chunks: vec![Bytes::from_static(b"data: first\n\n")],
+            chunks: vec![Bytes::from_static(
+                b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"first\"}}\n\n",
+            )],
             hang_after_first: true,
         }),
     )

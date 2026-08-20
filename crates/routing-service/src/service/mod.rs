@@ -1,4 +1,5 @@
 pub mod activate;
+pub(crate) mod handover;
 pub mod process;
 pub mod provider_inspector;
 pub(crate) mod provider_synchronization;

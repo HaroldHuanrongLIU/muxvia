@@ -1,4 +1,8 @@
-use std::{net::Ipv4Addr, path::PathBuf, sync::Arc};
+use std::{
+    net::Ipv4Addr,
+    path::PathBuf,
+    sync::{Arc, RwLock as StdRwLock},
+};
 
 use secrecy::{ExposeSecret, SecretString};
 use tokio::{
@@ -347,6 +351,8 @@ pub struct ActivationService {
     claude_model: Arc<Mutex<Option<ModelServerHandle>>>,
     codex_route_health: Arc<RouteHealthRuntime>,
     claude_route_health: Arc<RouteHealthRuntime>,
+    subscription_resolver:
+        Arc<StdRwLock<Option<Arc<dyn crate::subscription::resolver::SubscriptionAccountResolver>>>>,
     hooks: ActivationHooks,
     configuration_home_override: Option<PathBuf>,
 }
@@ -373,6 +379,7 @@ impl ActivationService {
             claude_model: Arc::new(Mutex::new(None)),
             codex_route_health: Arc::new(RouteHealthRuntime::default()),
             claude_route_health: Arc::new(RouteHealthRuntime::default()),
+            subscription_resolver: Arc::new(StdRwLock::new(None)),
             hooks: ActivationHooks::default(),
             configuration_home_override: None,
         }
@@ -392,6 +399,20 @@ impl ActivationService {
     pub fn with_configuration_home_override(mut self, home: Option<PathBuf>) -> Self {
         self.configuration_home_override = home;
         self
+    }
+
+    pub(crate) fn install_subscription_resolver(
+        &self,
+        resolver: Arc<dyn crate::subscription::resolver::SubscriptionAccountResolver>,
+    ) -> Result<(), ()> {
+        *self.subscription_resolver.write().map_err(|_| ())? = Some(resolver);
+        Ok(())
+    }
+
+    fn subscription_resolver(
+        &self,
+    ) -> Option<Arc<dyn crate::subscription::resolver::SubscriptionAccountResolver>> {
+        self.subscription_resolver.read().ok()?.clone()
     }
 
     pub(crate) fn reconciliation_runtime(&self) -> ReconciliationRuntime {
@@ -1103,6 +1124,7 @@ impl ActivationService {
             Arc::clone(&self.store),
             Arc::clone(&self.upstream),
             Arc::clone(self.route_health_for(target)),
+            self.subscription_resolver(),
         )
         .await?;
         if handle.endpoint().port() != takeover.route_port || !handle.is_running() {
@@ -1619,6 +1641,7 @@ impl ActivationService {
             Arc::clone(&self.store),
             Arc::clone(&self.upstream),
             Arc::clone(self.route_health_for(target)),
+            self.subscription_resolver(),
         )
         .await
         .map_err(|_| ())?;

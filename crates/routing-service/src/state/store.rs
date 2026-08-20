@@ -166,8 +166,6 @@ pub(crate) struct RoutePlanMemberSnapshot {
     pub(crate) provider_credential: Option<SecretString>,
     pub(crate) protocol: ProviderProtocol,
     pub(crate) authentication: ProviderAuthentication,
-    // Task 4 consumes the pinned binding when a Bridge member is attempted.
-    #[allow(dead_code)]
     pub(crate) subscription_binding: Option<SubscriptionProviderBinding>,
 }
 

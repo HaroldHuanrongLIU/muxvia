@@ -334,6 +334,9 @@ impl ControlServer {
             Arc::clone(&subscription_account_coordinator),
             device_authority,
         ));
+        activation
+            .install_subscription_resolver(device_authorization.clone())
+            .map_err(|_| ControlServerError::State)?;
         subscription_account_coordinator
             .recover_pending_intents()
             .await

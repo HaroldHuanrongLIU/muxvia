@@ -1,6 +1,7 @@
 pub(crate) mod accounts;
 mod coordinator;
 pub(crate) mod device_authorization;
+pub(crate) mod resolver;
 
 pub(crate) use accounts::{
     AccountAuthorizationState, SubscriptionAccountDocument, SubscriptionAccountStore,

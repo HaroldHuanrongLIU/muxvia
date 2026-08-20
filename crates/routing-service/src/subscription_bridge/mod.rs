@@ -129,6 +129,13 @@ impl SubscriptionBridgeAdapter {
             event: bridge_error_event("subscription-bridge-upstream-error"),
         })
     }
+
+    pub(crate) fn invalid_response(status: StatusCode) -> PreparedBridgeFailure {
+        PreparedBridgeFailure {
+            status,
+            event: bridge_error_event("subscription-bridge-invalid-response"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]

@@ -24,12 +24,16 @@ use tokio::{
 
 use crate::control::protocol::Target;
 use crate::state::StateStore;
+use crate::subscription::resolver::SubscriptionAccountResolver;
 
 use super::messages::route_messages;
 use super::{
     auth::routing_credential_matches,
     headers::{forward_request_headers, forward_response_headers},
-    router::{RouteHealthRuntime, pin_route_plan, route_pinned_plan},
+    router::{
+        PreparedRouteAttempt, RouteAttemptFailure, RouteHealthRuntime, RouteResponseKind,
+        pin_route_plan, route_pinned_plan,
+    },
     upstream::{UpstreamRequest, UpstreamTransport, responses_url},
 };
 
@@ -220,6 +224,7 @@ pub(crate) struct RouteState {
     pub(crate) upstream: Arc<dyn UpstreamTransport>,
     pub(crate) admission: Arc<ModelAdmission>,
     pub(crate) route_health: Arc<RouteHealthRuntime>,
+    pub(crate) subscription_resolver: Option<Arc<dyn SubscriptionAccountResolver>>,
 }
 
 impl Clone for RouteState {
@@ -230,6 +235,7 @@ impl Clone for RouteState {
             upstream: Arc::clone(&self.upstream),
             admission: Arc::clone(&self.admission),
             route_health: Arc::clone(&self.route_health),
+            subscription_resolver: self.subscription_resolver.clone(),
         }
     }
 }
@@ -255,6 +261,7 @@ impl ModelServer {
             store,
             upstream,
             Arc::new(RouteHealthRuntime::default()),
+            None,
         )
         .await?;
         Ok(handle)
@@ -266,6 +273,7 @@ impl ModelServer {
         store: Arc<StateStore>,
         upstream: Arc<dyn UpstreamTransport>,
         route_health: Arc<RouteHealthRuntime>,
+        subscription_resolver: Option<Arc<dyn SubscriptionAccountResolver>>,
     ) -> Result<ModelServerHandle, ModelServerError> {
         let mut handle = Self::bind_reserved_staged_for_with_health(
             reserved,
@@ -273,6 +281,7 @@ impl ModelServer {
             store,
             upstream,
             route_health,
+            subscription_resolver,
         )
         .await?;
         handle.activate().await?;
@@ -291,6 +300,7 @@ impl ModelServer {
             store,
             upstream,
             Arc::new(RouteHealthRuntime::default()),
+            None,
         )
         .await
     }
@@ -301,6 +311,7 @@ impl ModelServer {
         store: Arc<StateStore>,
         upstream: Arc<dyn UpstreamTransport>,
         route_health: Arc<RouteHealthRuntime>,
+        subscription_resolver: Option<Arc<dyn SubscriptionAccountResolver>>,
     ) -> Result<ModelServerHandle, ModelServerError> {
         let endpoint = reserved.endpoint;
         let state = RouteState {
@@ -309,6 +320,7 @@ impl ModelServer {
             upstream,
             admission: Arc::new(ModelAdmission::new()),
             route_health,
+            subscription_resolver,
         };
         let admission = Arc::clone(&state.admission);
         let router = match target {
@@ -536,19 +548,26 @@ async fn route_responses(
         &state.route_health,
         &state.upstream,
         |member| {
-            if member.protocol != crate::control::protocol::ProviderProtocol::OpenaiResponses {
-                return None;
-            }
-            Some(UpstreamRequest {
-                method: Method::POST,
-                url: responses_url(&member.base_url).ok()?,
-                headers: forward_request_headers(
-                    &request_headers,
-                    member.provider_credential.as_ref()?,
-                )
-                .ok()?,
-                body: ReqwestBody::from(request_body.clone()),
-            })
+            let prepared = (|| {
+                if member.protocol != crate::control::protocol::ProviderProtocol::OpenaiResponses {
+                    return None;
+                }
+                Some(PreparedRouteAttempt {
+                    request: UpstreamRequest {
+                        method: Method::POST,
+                        url: responses_url(&member.base_url).ok()?,
+                        headers: forward_request_headers(
+                            &request_headers,
+                            member.provider_credential.as_ref()?,
+                        )
+                        .ok()?,
+                        body: ReqwestBody::from(request_body.clone()),
+                    },
+                    response_kind: RouteResponseKind::Native,
+                })
+            })()
+            .ok_or(RouteAttemptFailure::Configuration);
+            std::future::ready(prepared)
         },
     )
     .await;

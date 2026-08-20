@@ -7,6 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use secrecy::SecretString;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock};
@@ -16,7 +17,11 @@ use uuid::Uuid;
 use super::{
     accounts::{AccountAuthorizationState, SubscriptionAccountRecord, SubscriptionAccountStore},
     coordinator::SubscriptionAccountCoordinator,
+    resolver::{
+        ResolvedSubscriptionAccess, SubscriptionAccountResolution, SubscriptionAccountResolver,
+    },
 };
+use crate::control::protocol::SubscriptionProviderBinding;
 
 const DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
 const DEVICE_AUTHORIZATION_ORIGIN: &str = "https://auth.openai.com";
@@ -585,6 +590,41 @@ impl DeviceAuthorizationManager {
     }
 }
 
+#[async_trait]
+impl SubscriptionAccountResolver for DeviceAuthorizationManager {
+    async fn resolve_subscription_account(
+        &self,
+        binding: &SubscriptionProviderBinding,
+    ) -> Result<ResolvedSubscriptionAccess, SubscriptionAccountResolution> {
+        let account_id = match binding {
+            SubscriptionProviderBinding::Fixed { account_id } => account_id.clone(),
+            SubscriptionProviderBinding::FollowDefault => self
+                .accounts
+                .read()
+                .ok()
+                .and_then(|snapshot| snapshot.document.default_account_id)
+                .ok_or(SubscriptionAccountResolution::Unavailable)?,
+        };
+        let access_token = self
+            .access_token_for_account(&account_id)
+            .await
+            .map_err(|error| match error {
+                DeviceAuthorizationError::NeedsReauthorization => {
+                    SubscriptionAccountResolution::NeedsReauthorization
+                }
+                DeviceAuthorizationError::Failed
+                | DeviceAuthorizationError::FlowNotFound
+                | DeviceAuthorizationError::IdentityMismatch => {
+                    SubscriptionAccountResolution::Unavailable
+                }
+            })?;
+        Ok(ResolvedSubscriptionAccess::new(
+            account_id,
+            SecretString::from(access_token),
+        ))
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct AuthorizedSubscriptionAccount {
     pub(crate) account: SubscriptionAccountRecord,
@@ -703,6 +743,7 @@ mod tests {
 
     use async_trait::async_trait;
     use base64::Engine as _;
+    use secrecy::ExposeSecret;
     use tempfile::TempDir;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -715,6 +756,7 @@ mod tests {
         RemoteRefreshError, ReqwestDeviceAuthorizationAuthority,
     };
     use crate::{
+        control::protocol::SubscriptionProviderBinding,
         home::MuxviaHome,
         state::StateStore,
         subscription::accounts::{
@@ -722,6 +764,7 @@ mod tests {
             SubscriptionAccountStore,
         },
         subscription::coordinator::SubscriptionAccountCoordinator,
+        subscription::resolver::{SubscriptionAccountResolution, SubscriptionAccountResolver},
     };
 
     struct StartAuthority {
@@ -1289,6 +1332,70 @@ mod tests {
             repeated == DeviceAuthorizationError::NeedsReauthorization
                 && *authority.refresh_calls.lock().expect("refresh calls") == 1,
             "reauthorization state retried the rejected refresh token"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscription_binding_resolution_is_exact_redacted_and_request_scoped() {
+        let temp = TempDir::new().expect("temporary home");
+        let home = MuxviaHome::from_user_home(temp.path());
+        let accounts = Arc::new(SubscriptionAccountStore::open(&home).expect("account store"));
+        install_authorized_account(&accounts);
+        let authority = Arc::new(RefreshAuthority {
+            result: Mutex::new(Some(Ok(RemoteOAuthTokens {
+                access_token: "RESOLVED_ACCESS_TOKEN_SECRET_11901".to_owned(),
+                refresh_token: None,
+                id_token: None,
+                expires_in: Some(3600),
+            }))),
+            refresh_calls: Mutex::new(0),
+        });
+        let manager = DeviceAuthorizationManager::new(
+            accounts.clone(),
+            account_coordinator(&home, accounts.clone()).await,
+            authority,
+        );
+
+        let fixed = manager
+            .resolve_subscription_account(&SubscriptionProviderBinding::Fixed {
+                account_id: "account-primary".to_owned(),
+            })
+            .await
+            .expect("fixed binding resolution");
+        assert!(
+            fixed.account_id() == "account-primary"
+                && fixed.access_token().expose_secret() == "RESOLVED_ACCESS_TOKEN_SECRET_11901",
+            "fixed binding resolved a different identity or token"
+        );
+        let diagnostic = format!("{fixed:?}");
+        assert!(
+            !diagnostic.contains("account-primary")
+                && !diagnostic.contains("RESOLVED_ACCESS_TOKEN_SECRET_11901"),
+            "resolved subscription access diagnostic exposed private material"
+        );
+
+        let missing = manager
+            .resolve_subscription_account(&SubscriptionProviderBinding::Fixed {
+                account_id: "missing-account".to_owned(),
+            })
+            .await;
+        assert!(
+            matches!(missing, Err(SubscriptionAccountResolution::Unavailable)),
+            "dangling fixed binding did not fail without account substitution"
+        );
+
+        let snapshot = accounts.read().expect("account document");
+        let mut no_default = snapshot.document.clone();
+        no_default.default_account_id = None;
+        accounts
+            .replace(&snapshot, &no_default)
+            .expect("remove default account");
+        let follow = manager
+            .resolve_subscription_account(&SubscriptionProviderBinding::FollowDefault)
+            .await;
+        assert!(
+            matches!(follow, Err(SubscriptionAccountResolution::Unavailable)),
+            "follow-default binding did not reread the missing default"
         );
     }
 

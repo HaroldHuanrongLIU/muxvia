@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -20,6 +21,50 @@ use super::{
 pub(crate) struct RoutedUpstream {
     pub(crate) response: UpstreamResponse,
     pub(crate) provider_id: Uuid,
+    pub(crate) response_kind: RouteResponseKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RouteResponseKind {
+    Native,
+    SubscriptionBridge,
+}
+
+pub(crate) struct PreparedRouteAttempt {
+    pub(crate) request: UpstreamRequest,
+    pub(crate) response_kind: RouteResponseKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RouteAttemptFailure {
+    Configuration,
+    SubscriptionAccountUnavailable,
+    SubscriptionAccountNeedsReauthorization,
+    SubscriptionBridgeInvalidRequest,
+}
+
+impl RouteAttemptFailure {
+    fn is_terminal(self) -> bool {
+        self == Self::SubscriptionBridgeInvalidRequest
+    }
+
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Configuration => "model-route-unavailable",
+            Self::SubscriptionAccountUnavailable => "subscription-account-unavailable",
+            Self::SubscriptionAccountNeedsReauthorization => {
+                "subscription-account-needs-reauthorization"
+            }
+            Self::SubscriptionBridgeInvalidRequest => "subscription-bridge-invalid-request",
+        }
+    }
+
+    fn observation(self) -> &'static str {
+        match self {
+            Self::Configuration => "configuration-failure",
+            _ => self.code(),
+        }
+    }
 }
 
 pub(crate) struct PinnedRouteResult {
@@ -27,6 +72,7 @@ pub(crate) struct PinnedRouteResult {
     pub(crate) plan_epoch: Uuid,
     pub(crate) routed: Option<RoutedUpstream>,
     pub(crate) observations: Vec<RouteHealthObservation>,
+    pub(crate) failure: Option<RouteAttemptFailure>,
 }
 
 pub(crate) struct RouteHealthObservation {
@@ -236,26 +282,49 @@ pub(crate) async fn pin_route_plan(
     store.activated_route_plan_for(target).await.ok()?
 }
 
-pub(crate) async fn route_pinned_plan(
+pub(crate) async fn route_pinned_plan<F, Fut>(
     plan: ActivatedRoutePlanSnapshot,
     target: Target,
     health: &RouteHealthRuntime,
     upstream: &Arc<dyn UpstreamTransport>,
-    build: impl Fn(&RoutePlanMemberSnapshot) -> Option<UpstreamRequest>,
-) -> PinnedRouteResult {
+    build: F,
+) -> PinnedRouteResult
+where
+    F: Fn(&RoutePlanMemberSnapshot) -> Fut,
+    Fut: Future<Output = Result<PreparedRouteAttempt, RouteAttemptFailure>>,
+{
     let plan_id = plan.id;
     let plan_epoch = plan.epoch;
     let member_count = plan.members.len();
     let mut last_response = None;
+    let mut last_failure = None;
     let mut observations = Vec::new();
     for (index, member) in plan.members.iter().enumerate() {
         let Some(attempt) = health.admit(target, member.provider_id, Instant::now()) else {
             continue;
         };
-        let Some(request) = build(member) else {
-            observations.push(attempt.failure(Instant::now(), "configuration-failure"));
-            continue;
+        let prepared = match build(member).await {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                observations.push(attempt.failure(Instant::now(), failure.observation()));
+                last_failure = Some(failure);
+                if failure.is_terminal() {
+                    return PinnedRouteResult {
+                        plan_id,
+                        plan_epoch,
+                        routed: None,
+                        observations,
+                        failure: Some(failure),
+                    };
+                }
+                continue;
+            }
         };
+        let PreparedRouteAttempt {
+            request,
+            response_kind,
+        } = prepared;
+        last_failure = None;
         let mut response = match upstream.send(request).await {
             Ok(response) => response,
             Err(_) => {
@@ -264,7 +333,11 @@ pub(crate) async fn route_pinned_plan(
             }
         };
         if response.status.is_success() {
-            response = match prime_success_response(response, target).await {
+            let response_target = match response_kind {
+                RouteResponseKind::Native => target,
+                RouteResponseKind::SubscriptionBridge => Target::Codex,
+            };
+            response = match prime_success_response(response, response_target).await {
                 PrimedResponse::Committed(response) => response,
                 PrimedResponse::Retry => {
                     observations.push(attempt.failure(Instant::now(), "semantic-failure"));
@@ -275,6 +348,7 @@ pub(crate) async fn route_pinned_plan(
         let routed = RoutedUpstream {
             response,
             provider_id: member.provider_id,
+            response_kind,
         };
         if routed.response.status.is_success() {
             observations.push(attempt.success());
@@ -287,6 +361,7 @@ pub(crate) async fn route_pinned_plan(
                 plan_epoch,
                 routed: Some(routed),
                 observations,
+                failure: None,
             };
         }
         last_response = Some(routed);
@@ -296,6 +371,7 @@ pub(crate) async fn route_pinned_plan(
         plan_epoch,
         routed: last_response,
         observations,
+        failure: last_failure,
     }
 }
 
@@ -309,7 +385,10 @@ fn retryable_status(status: StatusCode) -> bool {
 mod tests {
     use std::{
         collections::VecDeque,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use async_trait::async_trait;
@@ -321,7 +400,10 @@ mod tests {
     use reqwest::{Body, Url};
     use secrecy::SecretString;
 
-    use super::{RouteHealthRuntime, retryable_status, route_pinned_plan};
+    use super::{
+        PreparedRouteAttempt, RouteAttemptFailure, RouteHealthRuntime, RouteResponseKind,
+        retryable_status, route_pinned_plan,
+    };
     use crate::{
         control::protocol::{ProviderAuthentication, ProviderProtocol, Target},
         model::{UpstreamError, UpstreamRequest, UpstreamResponse, UpstreamTransport},
@@ -417,13 +499,21 @@ mod tests {
         }
     }
 
-    fn request_for(member: &RoutePlanMemberSnapshot) -> Option<UpstreamRequest> {
-        Some(UpstreamRequest {
-            method: Method::POST,
-            url: Url::parse(&format!("{}/responses", member.base_url)).ok()?,
-            headers: HeaderMap::new(),
-            body: Body::from("request"),
-        })
+    fn request_for(
+        member: &RoutePlanMemberSnapshot,
+    ) -> std::future::Ready<Result<PreparedRouteAttempt, RouteAttemptFailure>> {
+        let prepared = Url::parse(&format!("{}/responses", member.base_url))
+            .map(|url| PreparedRouteAttempt {
+                request: UpstreamRequest {
+                    method: Method::POST,
+                    url,
+                    headers: HeaderMap::new(),
+                    body: Body::from("request"),
+                },
+                response_kind: RouteResponseKind::Native,
+            })
+            .map_err(|_| RouteAttemptFailure::Configuration);
+        std::future::ready(prepared)
     }
 
     #[tokio::test]
@@ -481,6 +571,40 @@ mod tests {
         .unwrap();
         assert_eq!(routed.provider_id, primary_id);
         assert_eq!(upstream.urls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn open_circuit_skips_async_request_building_before_account_resolution() {
+        let plan = plan();
+        let primary_id = plan.members[0].provider_id;
+        let fallback_id = plan.members[1].provider_id;
+        let health = RouteHealthRuntime::default();
+        let now = std::time::Instant::now();
+        for _ in 0..4 {
+            let _ = health
+                .admit(Target::Claude, primary_id, now)
+                .expect("closed primary circuit")
+                .failure(now, "subscription-account-unavailable");
+        }
+        let builds = Arc::new(AtomicUsize::new(0));
+        let upstream: Arc<dyn UpstreamTransport> = Arc::new(SequencedUpstream {
+            outcomes: Mutex::new(VecDeque::from([Ok(StatusCode::OK)])),
+            urls: Mutex::new(Vec::new()),
+        });
+        let routed = route_pinned_plan(plan, Target::Claude, &health, &upstream, {
+            let builds = builds.clone();
+            move |member| {
+                builds.fetch_add(1, Ordering::SeqCst);
+                request_for(member)
+            }
+        })
+        .await
+        .routed
+        .expect("fallback route");
+        assert!(
+            routed.provider_id == fallback_id && builds.load(Ordering::SeqCst) == 1,
+            "open-circuit member built a request or resolved an account before admission"
+        );
     }
 
     #[tokio::test]

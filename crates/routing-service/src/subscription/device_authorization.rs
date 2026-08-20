@@ -514,24 +514,22 @@ impl DeviceAuthorizationManager {
         account_id: &str,
     ) -> Result<String, DeviceAuthorizationError> {
         let now = now_seconds();
-        if let Some(cached) = self.access_tokens.read().await.get(account_id)
-            && cached.expires_at_seconds > now.saturating_add(60)
-        {
-            return Ok(cached.token.clone());
-        }
-
         let snapshot = self
             .accounts
             .read()
             .map_err(|_| DeviceAuthorizationError::Failed)?;
-        let account = snapshot
-            .document
-            .accounts
-            .get(account_id)
-            .cloned()
-            .ok_or(DeviceAuthorizationError::Failed)?;
+        let Some(account) = snapshot.document.accounts.get(account_id).cloned() else {
+            self.access_tokens.write().await.remove(account_id);
+            return Err(DeviceAuthorizationError::Failed);
+        };
         if account.state == AccountAuthorizationState::NeedsReauthorization {
+            self.access_tokens.write().await.remove(account_id);
             return Err(DeviceAuthorizationError::NeedsReauthorization);
+        }
+        if let Some(cached) = self.access_tokens.read().await.get(account_id)
+            && cached.expires_at_seconds > now.saturating_add(60)
+        {
+            return Ok(cached.token.clone());
         }
         let tokens = match self.authority.refresh(&account.refresh_token).await {
             Ok(tokens) => tokens,
@@ -749,6 +747,7 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+    use uuid::Uuid;
 
     use super::{
         DeviceAuthorizationAuthority, DeviceAuthorizationError, DeviceAuthorizationManager,
@@ -1274,6 +1273,46 @@ mod tests {
         assert!(
             publication == catalog,
             "refresh published a non-authoritative catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_an_account_invalidates_its_cached_access_token() {
+        let temp = TempDir::new().expect("temporary home");
+        let home = MuxviaHome::from_user_home(temp.path());
+        let accounts = Arc::new(SubscriptionAccountStore::open(&home).expect("account store"));
+        install_authorized_account(&accounts);
+        let authority = Arc::new(RefreshAuthority {
+            result: Mutex::new(Some(Ok(RemoteOAuthTokens {
+                access_token: "DELETED_ACCOUNT_ACCESS_SECRET_12211".to_owned(),
+                refresh_token: None,
+                id_token: None,
+                expires_in: Some(3600),
+            }))),
+            refresh_calls: Mutex::new(0),
+        });
+        let state = Arc::new(StateStore::open(&home).await.expect("state store"));
+        let coordinator = Arc::new(SubscriptionAccountCoordinator::new(state, accounts.clone()));
+        let manager = DeviceAuthorizationManager::new(accounts, coordinator.clone(), authority);
+
+        manager
+            .access_token_for_account("account-primary")
+            .await
+            .expect("prime access-token cache");
+        coordinator
+            .apply(
+                Uuid::new_v4(),
+                1,
+                crate::control::protocol::SubscriptionAccountAction::DeleteAccount {
+                    account_id: "account-primary".to_owned(),
+                },
+            )
+            .await
+            .expect("delete cached account");
+        let result = manager.access_token_for_account("account-primary").await;
+        assert!(
+            matches!(result, Err(DeviceAuthorizationError::Failed)),
+            "deleted account retained a usable cached access token"
         );
     }
 

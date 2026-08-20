@@ -658,14 +658,20 @@ impl ActivationService {
             if preparation.routing_requirement
                 == crate::control::protocol::ProviderRoutingRequirement::TakeoverRequired
             {
-                return Err(self
-                    .store
-                    .failure_for(
-                        target,
+                let (code, message) = if preparation.authentication
+                    == crate::control::protocol::ProviderAuthentication::CodexSubscription
+                {
+                    (
+                        "unsupported-activation-mode",
+                        "Subscription Bridge requires Target Takeover",
+                    )
+                } else {
+                    (
                         "takeover-required",
                         "Provider requires Target Takeover for activation",
                     )
-                    .await);
+                };
+                return Err(self.store.failure_for(target, code, message).await);
             }
             if preparation.prior_route_runtime.is_some() {
                 return Err(self

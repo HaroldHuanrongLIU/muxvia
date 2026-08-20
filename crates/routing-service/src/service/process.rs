@@ -56,6 +56,7 @@ pub struct ProcessOptions {
     pub inherited_service_lock_fd: Option<i32>,
     pub test_device_authority_origin: Option<String>,
     pub test_refresh_subscription_account: Option<String>,
+    pub test_subscription_bridge_origin: Option<String>,
 }
 
 struct ServiceLock {
@@ -137,8 +138,12 @@ pub async fn run(options: ProcessOptions) -> Result<(), ProcessError> {
             .await
             .map_err(|_| ProcessError::State)?,
     );
-    let upstream: Arc<dyn UpstreamTransport> =
-        Arc::new(ReqwestUpstream::new().map_err(|_| ProcessError::State)?);
+    let upstream: Arc<dyn UpstreamTransport> = Arc::new(
+        ReqwestUpstream::new_with_subscription_bridge_test_origin(
+            options.test_subscription_bridge_origin.as_deref(),
+        )
+        .map_err(|_| ProcessError::State)?,
+    );
     let probe: Arc<dyn CodexProbe> = Arc::new(CommandCodexProbe);
     let activation = Arc::new(
         ActivationService::new(
@@ -231,6 +236,9 @@ fn exec_candidate(
             command
                 .arg("--test-refresh-subscription-account")
                 .arg(account_id);
+        }
+        if let Some(origin) = &options.test_subscription_bridge_origin {
+            command.arg("--test-subscription-bridge-origin").arg(origin);
         }
     }
     command.exec()

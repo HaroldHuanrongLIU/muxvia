@@ -2951,7 +2951,7 @@ async fn subscription_bridge_update_duplicate_and_direct_boundaries_are_closed()
         .await
         .unwrap_err();
     assert!(
-        failure.problem.code == "takeover-required",
+        failure.problem.code == "unsupported-activation-mode",
         "Bridge Direct activation did not fail at the routing boundary"
     );
     let after = store.target_view_for(Target::Claude).await.unwrap();

@@ -1,0 +1,10 @@
+{
+  "authorization": "Bearer FIXTURE_ACCESS_TOKEN_9471",
+  "chatgpt-account-id": "FIXTURE_ACCOUNT_ID_8127",
+  "originator": "codex_cli_rs",
+  "version": "0.144.1",
+  "content-type": "application/json",
+  "session_id": "metadata-session",
+  "x-client-request-id": "metadata-session",
+  "x-codex-window-id": "metadata-session:0"
+}

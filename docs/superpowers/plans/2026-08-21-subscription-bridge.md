@@ -17,9 +17,9 @@
 - Do not claim unsupported model families or full CC-Switch compatibility.
 - Use `apply_patch`, stage exact files, commit locally, and do not push, merge, close #13, or remove the worktree.
 
-## Task 1: Declare the Bridge Provider and migration
+## Task 1: Declare the Subscription Bridge Target Provider and migration
 
-**Tracer bullet:** A Claude Bridge Provider can be created from the closed preset without a credential, requires Takeover plus a binding, migrates an unchanged v11 database atomically, and round-trips through Rust/Zod/JSON Schema without widening Universal Providers.
+**Tracer bullet:** A Claude Target Provider using the Subscription Bridge can be created from the closed preset without a credential, requires Takeover plus a binding, migrates an unchanged v11 database atomically, and round-trips through Rust/Zod/JSON Schema without widening Universal Providers.
 
 1. Add protocol/schema/preset fixture REDs for `codex-subscription`, `codex-subscription-bridge`, fixed base URL, no credential, and Takeover requirement.
 2. Add v11→v12 migration REDs preserving all existing table fingerprints and rejecting invalid Bridge rows.
@@ -81,7 +81,7 @@
 
 **Tracer:** With a temporary Muxvia Home, real binary, real UDS, real SQLite/private account file, real Claude listener, deterministic Device Authority/upstream, and OpenTUI renderer:
 
-1. authorize two accounts and create/bind a Bridge Provider;
+1. authorize two accounts and create/bind the Target Provider using the Subscription Bridge;
 2. activate Takeover and send `gpt-5.6` text plus tool traffic through exact request/stream fixtures;
 3. change Follow Default and prove the next request uses the new identity;
 4. switch to Fixed, delete that account, and prove only Provider failover occurs;

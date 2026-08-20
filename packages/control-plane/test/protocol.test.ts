@@ -67,7 +67,7 @@ test.each([
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)
 })
 
-test("Subscription Bridge Provider contract is closed and credentialless", async () => {
+test("Subscription Bridge Target Provider contract is closed and credentialless", async () => {
   const action = await readFixture("create-subscription-bridge-provider.json") as any
   expect(parseTargetAction(action)).toEqual(action)
 
@@ -84,6 +84,42 @@ test("Subscription Bridge Provider contract is closed and credentialless", async
   )
   expect(branch.properties.authentication.enum).toContain("codex-subscription")
   expect(branch.properties.presetKey.oneOf).toContainEqual({ const: "codex-subscription-bridge" })
+  expect(schema.$defs.activatedSnapshot.properties.authentication.enum).toContain("codex-subscription")
+  expect(schema.$defs.providerPreset.oneOf).toEqual([
+    {
+      type: "object",
+      properties: {
+        key: { const: "openai-api-responses" },
+        baseUrl: { const: "https://api.openai.com/v1" },
+        model: { const: "" },
+        protocol: { const: "openai-responses" },
+        authentication: { const: "openai-bearer" },
+      },
+      required: ["key", "baseUrl", "model", "protocol", "authentication"],
+    },
+    {
+      type: "object",
+      properties: {
+        key: { const: "anthropic-api-messages" },
+        baseUrl: { const: "https://api.anthropic.com/v1" },
+        model: { const: "" },
+        protocol: { const: "anthropic-messages" },
+        authentication: { const: "anthropic-api-key" },
+      },
+      required: ["key", "baseUrl", "model", "protocol", "authentication"],
+    },
+    {
+      type: "object",
+      properties: {
+        key: { const: "codex-subscription-bridge" },
+        baseUrl: { const: "https://chatgpt.com/backend-api/codex" },
+        model: { const: "" },
+        protocol: { const: "anthropic-messages" },
+        authentication: { const: "codex-subscription" },
+      },
+      required: ["key", "baseUrl", "model", "protocol", "authentication"],
+    },
+  ])
 })
 
 test("Subscription Account contracts reject secret-bearing additive fields", async () => {

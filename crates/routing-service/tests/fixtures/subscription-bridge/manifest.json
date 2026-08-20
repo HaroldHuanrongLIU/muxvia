@@ -41,6 +41,41 @@
       "file": "anthropic-stream.expected.sse",
       "behavior": "Anthropic text, tool, usage, and completion stream",
       "sha256": "ca380b42f6ff8b26adc07d4e497a0c4c64fb92a882d52684a4f1d767e9e90b41"
+    },
+    {
+      "file": "identity-headers.expected.json",
+      "behavior": "source-derived identity headers",
+      "sha256": "cbde4bde080f7f14e5491b4fddcf839608b4e97ac315e82b26d028f0e353a079"
+    },
+    {
+      "file": "responses-error.input.sse",
+      "behavior": "failed upstream stream and fixed Anthropic error",
+      "sha256": "21f5b9da9c83f80c1b787c85c0fda2936806a155278b0846c2c26b28e3896736"
+    },
+    {
+      "file": "anthropic-error.expected.sse",
+      "behavior": "failed upstream stream and fixed Anthropic error",
+      "sha256": "e64af746539d7b3a407f3c17eb2df27e727c0fb54d904be862eac7ab2f7aa313"
+    },
+    {
+      "file": "cancellation-created.input.sse",
+      "behavior": "cancellation ownership after the first converted frame",
+      "sha256": "ae1bd08700e9d8652b2f733b93b6e19cf3219c99753be7e2e7319e477aa303fd"
+    },
+    {
+      "file": "cancellation-message-start.expected.sse",
+      "behavior": "cancellation ownership after the first converted frame",
+      "sha256": "a165a91c95ead6a26f58a13a91764236c4b9d09dafdb064ca5c42502b4d4af26"
+    },
+    {
+      "file": "responses-incomplete.input.sse",
+      "behavior": "incomplete response and max-token completion",
+      "sha256": "3a9a340f79f49f3dc136d6ddd8d74b4fa335ae832a1417bbafd1f0d23eb1be48"
+    },
+    {
+      "file": "anthropic-incomplete.expected.sse",
+      "behavior": "incomplete response and max-token completion",
+      "sha256": "b0da456242a1761e74c6dedd50d5ba2f318f500069a294db6c75043abd8eecf4"
     }
   ]
 }

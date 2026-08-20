@@ -31,7 +31,7 @@ T12 does not add native Codex CLI authentication import, pasted refresh tokens, 
 
 1. The Bridge is a Claude Target Provider only. Its closed declaration is `anthropic-messages` plus `codex-subscription`, a fixed internal base URL, no static Provider credential, and `takeover-required`.
 2. The preset key is `codex-subscription-bridge`. The fixed production base is `https://chatgpt.com/backend-api/codex`; the form may display it but cannot redirect account tokens to another origin.
-3. A Bridge Provider is complete only when it has one T11 Subscription Account binding. The bound account does not have to be currently usable for activation or Failover Chain application; an unusable account is a request-time Provider failure so later Providers remain eligible.
+3. A Target Provider using the Subscription Bridge is complete only when it has one T11 Subscription Account binding. The bound account does not have to be currently usable for activation or Failover Chain application; an unusable account is a request-time Provider failure so later Providers remain eligible.
 4. The active route plan pins Provider identity and declaration. The binding row is read when the request is pinned. Fixed then resolves only that exact account. Follow Default resolves the current default on every attempted request. Neither path substitutes another identity.
 5. Access-token acquisition occurs only after the Provider member is admitted for an attempt. Skipped circuit members do not refresh accounts. Refresh rotation and Needs Reauthorization remain owned by T11.
 6. The model listener receives a narrow account resolver installed before committed Takeover bootstrap. It does not read the private account file, call the Device Authority, or understand refresh persistence directly.
@@ -52,7 +52,7 @@ Existing Claude Anthropic declarations continue to require a static credential. 
 
 Schema v12 widens only the closed authentication checks and makes an activated route member credential reference nullable for this one declaration. Activated snapshots keep their existing private credential column but store an empty value for the credentialless Bridge; all validation treats that value as valid only for `codex-subscription`. Migration preserves every existing table fingerprint and fails closed on a Bridge-shaped row that violates the declaration.
 
-The Target Provider form exposes the preset, fixes the endpoint/authentication/routing requirement, hides static credential entry, and directs the Operator to the existing Subscription Accounts binding workflow. Update and duplicate operations cannot turn a Bridge Provider into a credential-bearing or redirectable declaration.
+The Target Provider form exposes the preset, fixes the endpoint/authentication/routing requirement, hides static credential entry, and directs the Operator to the existing Subscription Accounts binding workflow. Update and duplicate operations cannot turn the Target Provider using the Subscription Bridge into a credential-bearing or redirectable declaration.
 
 ## Per-Request Account Resolution
 
@@ -131,7 +131,7 @@ Each deviation has a regression test. Unsupported features fail locally or remai
 
 The Claude Target Provider picker identifies the Bridge as requiring Takeover and a Subscription Account binding. The form discloses that it uses an undocumented ChatGPT Codex interface, consumes the selected account's shared subscription quota, may stop working without notice, and may be subject to the Operator's applicable terms. It does not use OpenAI or Anthropic logos or imply endorsement.
 
-The existing Subscription Accounts overlay remains the only place to select Fixed or Follow Default. A Bridge Provider with no binding is visibly incomplete. A dangling or Needs Reauthorization binding remains explicit. English and Simplified Chinese use the same closed localization keys and render at every supported terminal size.
+The existing Subscription Accounts overlay remains the only place to select Fixed or Follow Default. A Target Provider using the Subscription Bridge with no binding is visibly incomplete. A dangling or Needs Reauthorization binding remains explicit. English and Simplified Chinese use the same closed localization keys and render at every supported terminal size.
 
 The public documentation repeats the endpoint/support/continuity/account/quota/terms disclosures, the tested model names and capabilities, and every Compatibility Deviation.
 

@@ -6,7 +6,7 @@ This bridge uses an undocumented ChatGPT Codex interface derived from the pinned
 
 The Provider is credentialless: it must use the fixed endpoint, `codex-subscription` authentication, Claude Takeover, and a Subscription Account binding. Select either an exact Fixed account or Follow Default in the Subscription Accounts workflow. Missing accounts, no default account, Needs Reauthorization, and refresh failure make only that Provider attempt fail; Muxvia never substitutes another account identity. A later eligible Provider in the Target failover route may still run.
 
-The pinned release tests `gpt-5.6` and `gpt-5.4` for text and tool traffic. This is not a claim that arbitrary model names or capabilities work.
+The pinned release tests `gpt-5.6` and `gpt-5.6-luna` for text and tool traffic. This is not a claim that arbitrary model names or capabilities work.
 
 ## Compatibility Deviations
 

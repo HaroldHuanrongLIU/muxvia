@@ -1,0 +1,9 @@
+event: message_start
+data: {"type":"message_start","message":{"id":"resp_incomplete","type":"message","role":"assistant","model":"gpt-5.6","usage":{"input_tokens":0,"output_tokens":0}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"input_tokens":2,"output_tokens":3}}
+
+event: message_stop
+data: {"type":"message_stop"}
+

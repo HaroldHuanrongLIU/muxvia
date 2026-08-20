@@ -290,7 +290,7 @@ export const en = {
   "subscription-bridge.risk.continuity": "May stop working without notice.",
   "subscription-bridge.risk.terms": "Use may be subject to applicable account and subscription terms.",
   "subscription-bridge.risk.support": "Not officially supported or endorsed by OpenAI or Anthropic.",
-  "subscription-bridge.tested-models": "Tested models · gpt-5.6 and gpt-5.4 · text and tools",
+  "subscription-bridge.tested-models": "Tested models · gpt-5.6 and gpt-5.6-luna · text and tools",
   "subscription-bridge.deviations": "Compatibility Deviations · no count_tokens, multimodal/PDF, WebSearch, FAST tier, quota/model catalog/cache-key/price projection, model aliases, or arbitrary-model claim · stricter bounded parsing and fixed diagnostics",
   "subscription-bridge.accounts-help": "Save this Provider, then use ctrl+x i to select Fixed or Follow Default in Subscription Accounts.",
   "subscription-bridge.picker-requirement": "Takeover required",

@@ -531,15 +531,41 @@
       "enum": ["target-provider", "universal-provider", "target-overlay", "target-fixed"]
     },
     "providerPreset": {
-      "type": "object",
-      "properties": {
-        "key": { "enum": ["openai-api-responses", "anthropic-api-messages", "codex-subscription-bridge"] },
-        "baseUrl": { "type": "string" },
-        "model": { "const": "" },
-        "protocol": { "enum": ["openai-responses", "anthropic-messages"] },
-        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"] }
-      },
-      "required": ["key", "baseUrl", "model", "protocol", "authentication"]
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "key": { "const": "openai-api-responses" },
+            "baseUrl": { "const": "https://api.openai.com/v1" },
+            "model": { "const": "" },
+            "protocol": { "const": "openai-responses" },
+            "authentication": { "const": "openai-bearer" }
+          },
+          "required": ["key", "baseUrl", "model", "protocol", "authentication"]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "key": { "const": "anthropic-api-messages" },
+            "baseUrl": { "const": "https://api.anthropic.com/v1" },
+            "model": { "const": "" },
+            "protocol": { "const": "anthropic-messages" },
+            "authentication": { "const": "anthropic-api-key" }
+          },
+          "required": ["key", "baseUrl", "model", "protocol", "authentication"]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "key": { "const": "codex-subscription-bridge" },
+            "baseUrl": { "const": "https://chatgpt.com/backend-api/codex" },
+            "model": { "const": "" },
+            "protocol": { "const": "anthropic-messages" },
+            "authentication": { "const": "codex-subscription" }
+          },
+          "required": ["key", "baseUrl", "model", "protocol", "authentication"]
+        }
+      ]
     },
     "controlProblem": {
       "type": "object",
@@ -558,7 +584,7 @@
         "providerId": { "type": "string", "format": "uuid" },
         "model": { "type": "string" },
         "protocol": { "enum": ["openai-responses", "anthropic-messages"] },
-        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer"] },
+        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"] },
         "epoch": { "type": "string", "format": "uuid" }
       },
       "required": ["id", "providerId", "model", "protocol", "authentication", "epoch"],

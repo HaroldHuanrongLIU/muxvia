@@ -1595,7 +1595,7 @@ test("Claude Subscription Bridge preset is fixed credentialless and discloses it
     expect(editor).toContain("May stop working without notice")
     expect(editor).toContain("applicable account and subscription terms")
     expect(editor).toContain("Not officially supported or endorsed")
-    expect(editor).toContain("Tested models · gpt-5.6 and gpt-5.4 · text and tools")
+    expect(editor).toContain("Tested models · gpt-5.6 and gpt-5.6-luna · text and tools")
     expect(editor).toContain("Compatibility Deviations")
     expect(editor).toContain("count_tokens")
     expect(editor).not.toContain("API credential")
@@ -2049,7 +2049,7 @@ test("Claude Direct uses the same projected and authoritative Takeover-required 
   assertControlledSecretSource(controlledSources, claudeDirectSecrets, "claude-takeover-confirm-source")
   const selected = provider({
     id: "00000000-0000-4000-8000-000000000073",
-    name: "Claude Bridge Provider",
+    name: "Claude Subscription Target",
     protocol: "anthropic-messages",
     authentication: "anthropic-bearer",
     routingRequirement: "takeover-required",
@@ -2419,7 +2419,7 @@ test("picker Direct failures close onto localized stable guidance without raw ba
 test("a Takeover-required Provider offers only Takeover or cancel with scoped single dispatch", async () => {
   const selected = provider({
     id: "00000000-0000-4000-8000-000000000011",
-    name: "Bridge Provider",
+    name: "Subscription Target",
     routingRequirement: "takeover-required",
   })
   const initial = view({ providers: [selected], currentProviderId: selected.id })
@@ -2430,13 +2430,14 @@ test("a Takeover-required Provider offers only Takeover or cancel with scoped si
     setup.mockInput.pressKey("1")
     await setup.mockInput.typeText("/providers")
     setup.mockInput.pressEnter()
-    await setup.waitForFrame((frame) => frame.includes("Bridge Provider"))
+    await setup.waitForFrame((frame) => frame.includes("Subscription Target"))
     const pickerFocus = setup.renderer.currentFocusedRenderable as InputRenderable
 
     setup.mockInput.pressKey("x", { ctrl: true })
     setup.mockInput.pressKey("a")
     const confirmation = await setup.waitForFrame((frame) => frame.includes("Enable Target Takeover?"))
-    expect(confirmation).toContain("Bridge Provider requires Target Takeover for activation.")
+    expect(confirmation).toContain("Subscription Target requires Target Takeover for")
+    expect(confirmation).toContain("activation.")
     expect(confirmation).toContain("Enable Takeover")
     expect(confirmation).toContain("Cancel")
     expect(confirmation).not.toContain(credentialSecret)

@@ -14,6 +14,7 @@ const PRIMING_TIME_LIMIT: Duration = Duration::from_millis(250);
 
 pub(crate) enum PrimedResponse {
     Committed(UpstreamResponse),
+    CommittedFailure(UpstreamResponse),
     Retry,
 }
 
@@ -21,11 +22,25 @@ pub(crate) async fn prime_success_response(
     response: UpstreamResponse,
     target: Target,
 ) -> PrimedResponse {
+    prime_response(response, target, false).await
+}
+
+pub(crate) async fn prime_subscription_bridge_response(
+    response: UpstreamResponse,
+) -> PrimedResponse {
+    prime_response(response, Target::Codex, true).await
+}
+
+async fn prime_response(
+    response: UpstreamResponse,
+    target: Target,
+    bridge_terminal_events_are_convertible: bool,
+) -> PrimedResponse {
     let Some(content_type) = normalized_header(&response, header::CONTENT_TYPE) else {
         return PrimedResponse::Retry;
     };
     if content_type == "text/event-stream" {
-        prime_sse(response, target).await
+        prime_sse(response, target, bridge_terminal_events_are_convertible).await
     } else if content_type == "application/json" || content_type.ends_with("+json") {
         prime_json(response, target).await
     } else {
@@ -38,10 +53,15 @@ fn normalized_header(response: &UpstreamResponse, name: header::HeaderName) -> O
     Some(raw.split(';').next()?.trim().to_ascii_lowercase())
 }
 
-async fn prime_sse(mut response: UpstreamResponse, target: Target) -> PrimedResponse {
+async fn prime_sse(
+    mut response: UpstreamResponse,
+    target: Target,
+    bridge_terminal_events_are_convertible: bool,
+) -> PrimedResponse {
     if let Some(encoding) = normalized_header(&response, header::CONTENT_ENCODING) {
         if encoding == "gzip" || encoding == "x-gzip" {
-            return prime_compressed_sse(response, target).await;
+            return prime_compressed_sse(response, target, bridge_terminal_events_are_convertible)
+                .await;
         }
         if encoding != "identity" {
             return PrimedResponse::Committed(response);
@@ -76,10 +96,13 @@ async fn prime_sse(mut response: UpstreamResponse, target: Target) -> PrimedResp
         while let Some((event_end, separator_len)) = next_event(&semantic, parsed) {
             let event = &semantic[parsed..event_end];
             parsed = event_end + separator_len;
-            match classify_sse_event(event, target) {
+            match classify_sse_event(event, target, bridge_terminal_events_are_convertible) {
                 EventClass::Lifecycle => {}
                 EventClass::Productive | EventClass::NonFailureTerminal => {
                     return committed_with_prefix(response, buffered);
+                }
+                EventClass::ConvertibleFailure => {
+                    return committed_failure_with_prefix(response, buffered);
                 }
                 EventClass::Failure | EventClass::Malformed => return PrimedResponse::Retry,
             }
@@ -87,7 +110,11 @@ async fn prime_sse(mut response: UpstreamResponse, target: Target) -> PrimedResp
     }
 }
 
-async fn prime_compressed_sse(mut response: UpstreamResponse, target: Target) -> PrimedResponse {
+async fn prime_compressed_sse(
+    mut response: UpstreamResponse,
+    target: Target,
+    bridge_terminal_events_are_convertible: bool,
+) -> PrimedResponse {
     let bytes = match collect_bounded(&mut response).await {
         BoundedCollection::Complete(bytes) => bytes,
         BoundedCollection::Commit(prefix) => return committed_with_prefix(response, prefix),
@@ -98,9 +125,12 @@ async fn prime_compressed_sse(mut response: UpstreamResponse, target: Target) ->
     if decoder.read_to_end(&mut decoded).is_err() || decoded.len() > PRIMING_BYTE_LIMIT {
         return PrimedResponse::Retry;
     }
-    match classify_complete_sse(&decoded, target) {
+    match classify_complete_sse(&decoded, target, bridge_terminal_events_are_convertible) {
         EventClass::Failure | EventClass::Malformed | EventClass::Lifecycle => {
             PrimedResponse::Retry
+        }
+        EventClass::ConvertibleFailure => {
+            committed_failure_with_prefix(response, vec![Bytes::from(bytes)])
         }
         EventClass::Productive | EventClass::NonFailureTerminal => {
             committed_with_prefix(response, vec![Bytes::from(bytes)])
@@ -200,11 +230,19 @@ fn valid_nonstreaming_value(value: &Value, target: Target) -> bool {
     }
 }
 
-fn classify_complete_sse(bytes: &[u8], target: Target) -> EventClass {
+fn classify_complete_sse(
+    bytes: &[u8],
+    target: Target,
+    bridge_terminal_events_are_convertible: bool,
+) -> EventClass {
     let mut parsed = 0;
     let mut last = EventClass::Lifecycle;
     while let Some((event_end, separator_len)) = next_event(bytes, parsed) {
-        last = classify_sse_event(&bytes[parsed..event_end], target);
+        last = classify_sse_event(
+            &bytes[parsed..event_end],
+            target,
+            bridge_terminal_events_are_convertible,
+        );
         if !matches!(last, EventClass::Lifecycle) {
             return last;
         }
@@ -235,11 +273,16 @@ enum EventClass {
     Lifecycle,
     Productive,
     NonFailureTerminal,
+    ConvertibleFailure,
     Failure,
     Malformed,
 }
 
-fn classify_sse_event(bytes: &[u8], target: Target) -> EventClass {
+fn classify_sse_event(
+    bytes: &[u8],
+    target: Target,
+    bridge_terminal_events_are_convertible: bool,
+) -> EventClass {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return EventClass::Malformed;
     };
@@ -282,6 +325,12 @@ fn classify_sse_event(bytes: &[u8], target: Target) -> EventClass {
     };
     match target {
         Target::Codex => match event_type {
+            "error" | "response.failed" if bridge_terminal_events_are_convertible => {
+                EventClass::ConvertibleFailure
+            }
+            "response.incomplete" if bridge_terminal_events_are_convertible => {
+                EventClass::NonFailureTerminal
+            }
             "error" | "response.failed" | "response.incomplete" => EventClass::Failure,
             "response.created" | "response.in_progress" | "response.queued" => {
                 EventClass::Lifecycle
@@ -308,6 +357,15 @@ fn committed_with_prefix(mut response: UpstreamResponse, prefix: Vec<Bytes>) -> 
     PrimedResponse::Committed(response)
 }
 
+fn committed_failure_with_prefix(
+    mut response: UpstreamResponse,
+    prefix: Vec<Bytes>,
+) -> PrimedResponse {
+    let body = stream::iter(prefix.into_iter().map(Ok::<_, UpstreamError>)).chain(response.body);
+    response.body = Box::pin(body);
+    PrimedResponse::CommittedFailure(response)
+}
+
 #[cfg(test)]
 mod tests {
     use axum::{
@@ -316,7 +374,7 @@ mod tests {
     };
     use futures_util::stream;
 
-    use super::{PrimedResponse, prime_success_response};
+    use super::{PrimedResponse, prime_subscription_bridge_response, prime_success_response};
     use crate::{control::protocol::Target, model::UpstreamResponse};
 
     fn response(
@@ -363,6 +421,39 @@ mod tests {
             prime_success_response(committed, Target::Claude).await,
             PrimedResponse::Committed(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn subscription_bridge_terminal_events_commit_for_target_native_conversion() {
+        for event in [
+            b"event: error\ndata: {\"type\":\"error\"}\n\n".as_slice(),
+            b"event: response.failed\ndata: {\"type\":\"response.failed\"}\n\n".as_slice(),
+        ] {
+            assert!(
+                matches!(
+                    prime_subscription_bridge_response(response(
+                        Some("text/event-stream"),
+                        vec![event],
+                    ))
+                    .await,
+                    PrimedResponse::CommittedFailure(_)
+                ),
+                "Subscription Bridge failure event lost its committed failure classification"
+            );
+        }
+        assert!(
+            matches!(
+                prime_subscription_bridge_response(response(
+                    Some("text/event-stream"),
+                    vec![
+                        b"event: response.incomplete\ndata: {\"type\":\"response.incomplete\"}\n\n"
+                    ],
+                ))
+                .await,
+                PrimedResponse::Committed(_)
+            ),
+            "Subscription Bridge incomplete event was not committed for conversion"
+        );
     }
 
     #[tokio::test]

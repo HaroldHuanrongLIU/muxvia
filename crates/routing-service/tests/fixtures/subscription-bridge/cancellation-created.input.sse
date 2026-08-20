@@ -1,0 +1,3 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"cancel","model":"gpt-5.6"}}
+

@@ -15,7 +15,7 @@ use crate::{
 
 use super::{
     UpstreamRequest, UpstreamResponse, UpstreamTransport,
-    commitment::{PrimedResponse, prime_success_response},
+    commitment::{PrimedResponse, prime_subscription_bridge_response, prime_success_response},
 };
 
 pub(crate) struct RoutedUpstream {
@@ -41,11 +41,15 @@ pub(crate) enum RouteAttemptFailure {
     SubscriptionAccountUnavailable,
     SubscriptionAccountNeedsReauthorization,
     SubscriptionBridgeInvalidRequest,
+    SubscriptionBridgeCountTokensUnsupported,
 }
 
 impl RouteAttemptFailure {
     fn is_terminal(self) -> bool {
-        self == Self::SubscriptionBridgeInvalidRequest
+        matches!(
+            self,
+            Self::SubscriptionBridgeInvalidRequest | Self::SubscriptionBridgeCountTokensUnsupported
+        )
     }
 
     pub(crate) fn code(self) -> &'static str {
@@ -56,6 +60,9 @@ impl RouteAttemptFailure {
                 "subscription-account-needs-reauthorization"
             }
             Self::SubscriptionBridgeInvalidRequest => "subscription-bridge-invalid-request",
+            Self::SubscriptionBridgeCountTokensUnsupported => {
+                "subscription-bridge-count-tokens-unsupported"
+            }
         }
     }
 
@@ -332,13 +339,26 @@ where
                 continue;
             }
         };
+        let mut committed_failure = false;
         if response.status.is_success() {
             let response_target = match response_kind {
                 RouteResponseKind::Native => target,
                 RouteResponseKind::SubscriptionBridge => Target::Codex,
             };
-            response = match prime_success_response(response, response_target).await {
+            let primed = match response_kind {
+                RouteResponseKind::Native => {
+                    prime_success_response(response, response_target).await
+                }
+                RouteResponseKind::SubscriptionBridge => {
+                    prime_subscription_bridge_response(response).await
+                }
+            };
+            response = match primed {
                 PrimedResponse::Committed(response) => response,
+                PrimedResponse::CommittedFailure(response) => {
+                    committed_failure = true;
+                    response
+                }
                 PrimedResponse::Retry => {
                     observations.push(attempt.failure(Instant::now(), "semantic-failure"));
                     continue;
@@ -350,7 +370,9 @@ where
             provider_id: member.provider_id,
             response_kind,
         };
-        if routed.response.status.is_success() {
+        if committed_failure {
+            observations.push(attempt.failure(Instant::now(), "semantic-failure"));
+        } else if routed.response.status.is_success() {
             observations.push(attempt.success());
         } else if retryable_status(routed.response.status) {
             observations.push(attempt.failure(Instant::now(), "retryable-upstream-status"));

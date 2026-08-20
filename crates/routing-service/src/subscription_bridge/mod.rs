@@ -1190,6 +1190,39 @@ mod tests {
                     "../../tests/fixtures/subscription-bridge/anthropic-stream.expected.sse"
                 )
             }
+            "identity-headers.expected.json" => {
+                include_str!(
+                    "../../tests/fixtures/subscription-bridge/identity-headers.expected.json"
+                )
+            }
+            "responses-error.input.sse" => {
+                include_str!("../../tests/fixtures/subscription-bridge/responses-error.input.sse")
+            }
+            "anthropic-error.expected.sse" => {
+                include_str!(
+                    "../../tests/fixtures/subscription-bridge/anthropic-error.expected.sse"
+                )
+            }
+            "cancellation-created.input.sse" => {
+                include_str!(
+                    "../../tests/fixtures/subscription-bridge/cancellation-created.input.sse"
+                )
+            }
+            "cancellation-message-start.expected.sse" => {
+                include_str!(
+                    "../../tests/fixtures/subscription-bridge/cancellation-message-start.expected.sse"
+                )
+            }
+            "responses-incomplete.input.sse" => {
+                include_str!(
+                    "../../tests/fixtures/subscription-bridge/responses-incomplete.input.sse"
+                )
+            }
+            "anthropic-incomplete.expected.sse" => {
+                include_str!(
+                    "../../tests/fixtures/subscription-bridge/anthropic-incomplete.expected.sse"
+                )
+            }
             _ => panic!("unknown subscription bridge fixture source"),
         }
     }
@@ -1278,9 +1311,17 @@ mod tests {
             .get("fixtures")
             .and_then(Value::as_array)
             .expect("fixture manifest must contain fixtures");
+        let behaviors = entries
+            .iter()
+            .filter_map(|entry| entry.get("behavior").and_then(Value::as_str))
+            .collect::<Vec<_>>();
         assert!(
-            entries.len() == 6,
-            "subscription bridge fixture count mismatch"
+            entries.len() == 13
+                && behaviors.contains(&"source-derived identity headers")
+                && behaviors.contains(&"failed upstream stream and fixed Anthropic error")
+                && behaviors.contains(&"cancellation ownership after the first converted frame")
+                && behaviors.contains(&"incomplete response and max-token completion"),
+            "subscription bridge fixture provenance coverage mismatch"
         );
         for entry in entries {
             let name = entry
@@ -1324,33 +1365,16 @@ mod tests {
             &fixture("messages-text.expected.json"),
             "text",
         );
-        assert_header_eq_redacted(
-            &prepared,
-            "authorization",
-            Some("Bearer FIXTURE_ACCESS_TOKEN_9471"),
-            "authorization",
-        );
-        assert_header_eq_redacted(&prepared, "chatgpt-account-id", Some(ACCOUNT_ID), "account");
-        assert_header_eq_redacted(&prepared, "originator", Some("codex_cli_rs"), "originator");
-        assert_header_eq_redacted(&prepared, "version", Some("0.144.1"), "version");
-        assert_header_eq_redacted(
-            &prepared,
-            "content-type",
-            Some("application/json"),
-            "content-type",
-        );
-        assert_header_eq_redacted(&prepared, "session_id", Some("metadata-session"), "session");
-        assert_header_eq_redacted(
-            &prepared,
-            "x-client-request-id",
-            Some("metadata-session"),
-            "request-id",
-        );
-        assert_header_eq_redacted(
-            &prepared,
-            "x-codex-window-id",
-            Some("metadata-session:0"),
-            "window-id",
+        let expected_headers = fixture("identity-headers.expected.json");
+        let expected_headers = expected_headers
+            .as_object()
+            .expect("identity header fixture must be an object");
+        assert!(
+            prepared.headers.len() == expected_headers.len()
+                && expected_headers
+                    .iter()
+                    .all(|(name, value)| { prepared.header(name) == value.as_str() }),
+            "subscription bridge identity header fixture mismatch"
         );
     }
 
@@ -1521,13 +1545,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn converts_incomplete_fixture_to_exact_max_token_completion() {
+        let actual =
+            SubscriptionBridgeAdapter::convert_stream(stream::iter([Ok::<_, std::io::Error>(
+                Bytes::from_static(fixture_source("responses-incomplete.input.sse").as_bytes()),
+            )]))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|chunk| String::from_utf8(chunk.to_vec()).expect("bridge SSE must be UTF-8"))
+            .collect::<String>();
+        assert!(
+            parse_sse(&actual) == parse_sse(fixture_source("anthropic-incomplete.expected.sse")),
+            "subscription bridge incomplete fixture mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn converts_failed_fixture_to_fixed_error_fixture() {
+        let response_secret = "FIXTURE_RESPONSE_SECRET_7319";
+        let actual =
+            SubscriptionBridgeAdapter::convert_stream(stream::iter([Ok::<_, std::io::Error>(
+                Bytes::from_static(fixture_source("responses-error.input.sse").as_bytes()),
+            )]))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|chunk| String::from_utf8(chunk.to_vec()).expect("bridge SSE must be UTF-8"))
+            .collect::<String>();
+        assert!(
+            !actual.contains(response_secret)
+                && parse_sse(&actual) == parse_sse(fixture_source("anthropic-error.expected.sse")),
+            "subscription bridge error fixture mismatch"
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_failed_malformed_contradictory_oversized_and_incomplete_streams() {
         let response_secret = "FIXTURE_RESPONSE_SECRET_7319";
         let cases = [
-            format!(
-                "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{\"message\":\"{response_secret}\"}}}}}}\n\n"
-            )
-            .into_bytes(),
             format!(
                 "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"message\":\"{response_secret}\"}}}}\n\n"
             )
@@ -1612,7 +1668,7 @@ mod tests {
             } else {
                 self.yielded = true;
                 std::task::Poll::Ready(Some(Ok(Bytes::from_static(
-                    b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"cancel\",\"model\":\"gpt-5.6\"}}\n\n",
+                    fixture_source("cancellation-created.input.sse").as_bytes(),
                 ))))
             }
         }
@@ -1638,7 +1694,8 @@ mod tests {
             .await
             .expect("created must produce a frame");
         assert!(
-            String::from_utf8_lossy(&first).contains("message_start"),
+            parse_sse(&String::from_utf8_lossy(&first))
+                == parse_sse(fixture_source("cancellation-message-start.expected.sse")),
             "subscription bridge cancellation fixture did not start"
         );
         drop(converted);

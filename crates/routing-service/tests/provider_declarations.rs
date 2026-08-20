@@ -2684,7 +2684,11 @@ async fn subscription_bridge_preset_requires_binding_but_never_a_static_credenti
         )
         .await
         .unwrap();
-    let provider = created.view.providers.first().expect("Bridge Provider");
+    let provider = created
+        .view
+        .providers
+        .first()
+        .expect("Subscription Bridge Target Provider");
     assert!(
         provider.authentication == ProviderAuthentication::CodexSubscription,
         "Bridge authentication changed"
@@ -2699,12 +2703,12 @@ async fn subscription_bridge_preset_requires_binding_but_never_a_static_credenti
     );
     assert!(
         provider.completeness == ProviderCompleteness::Incomplete,
-        "unbound Bridge Provider was reported complete"
+        "unbound Subscription Bridge Target Provider was reported complete"
     );
     assert!(
         serde_json::to_value(&provider.missing_fields).unwrap()
             == serde_json::json!(["subscription-account-binding"]),
-        "unbound Bridge Provider requirements changed"
+        "unbound Subscription Bridge Target Provider requirements changed"
     );
     let provider_id = provider.id;
     drop(created);
@@ -2725,11 +2729,14 @@ async fn subscription_bridge_preset_requires_binding_but_never_a_static_credenti
         .unwrap();
 
     let bound = store.target_view_for(Target::Claude).await.unwrap();
-    let provider = bound.providers.first().expect("bound Bridge Provider");
+    let provider = bound
+        .providers
+        .first()
+        .expect("bound Subscription Bridge Target Provider");
     assert!(
         provider.completeness == ProviderCompleteness::Complete
             && provider.missing_fields.is_empty(),
-        "bound Bridge Provider remained incomplete"
+        "bound Subscription Bridge Target Provider remained incomplete"
     );
     assert!(
         bound.provider_presets.iter().any(|preset| {

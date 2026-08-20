@@ -7,7 +7,10 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -22,7 +25,10 @@ use muxvia_routing::{
     codex::{CodexCapability, CodexProbe, CodexProblem, CommandCodexProbe},
     control::{
         framing::{read_frame, write_frame},
-        protocol::{ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState, Target},
+        protocol::{
+            ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState, RouteHealthState,
+            Target,
+        },
         server::ControlServer,
     },
     home::MuxviaHome,
@@ -100,6 +106,9 @@ struct CapturedBridgeRequest {
 struct BridgeUpstream {
     requests: Mutex<Vec<CapturedBridgeRequest>>,
     bridge_statuses: Mutex<VecDeque<StatusCode>>,
+    native_statuses: Mutex<VecDeque<StatusCode>>,
+    incomplete_bridge_response: AtomicBool,
+    failed_bridge_response: AtomicBool,
 }
 
 #[tokio::test]
@@ -131,6 +140,9 @@ async fn bridge_listener_without_installed_account_runtime_fails_closed() {
     let upstream = Arc::new(BridgeUpstream {
         requests: Mutex::new(Vec::new()),
         bridge_statuses: Mutex::new(VecDeque::new()),
+        native_statuses: Mutex::new(VecDeque::new()),
+        incomplete_bridge_response: AtomicBool::new(false),
+        failed_bridge_response: AtomicBool::new(false),
     });
     let activation = ActivationService::new(
         store,
@@ -219,22 +231,40 @@ impl UpstreamTransport for BridgeUpstream {
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("text/event-stream"),
             );
+            let body = if self.failed_bridge_response.swap(false, Ordering::SeqCst) {
+                Bytes::from_static(include_bytes!(
+                    "fixtures/subscription-bridge/responses-error.input.sse"
+                ))
+            } else if self
+                .incomplete_bridge_response
+                .swap(false, Ordering::SeqCst)
+            {
+                Bytes::from_static(include_bytes!(
+                    "fixtures/subscription-bridge/responses-incomplete.input.sse"
+                ))
+            } else {
+                Bytes::from_static(include_bytes!(
+                    "fixtures/subscription-bridge/responses-stream.input.sse"
+                ))
+            };
             Ok(UpstreamResponse {
                 status: StatusCode::OK,
                 headers,
-                body: Box::pin(stream::once(async {
-                    Ok(Bytes::from_static(include_bytes!(
-                        "fixtures/subscription-bridge/responses-stream.input.sse"
-                    )))
-                })),
+                body: Box::pin(stream::once(async move { Ok(body) })),
             })
         } else {
+            let status = self
+                .native_statuses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(StatusCode::OK);
             headers.insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             );
             Ok(UpstreamResponse {
-                status: StatusCode::OK,
+                status,
                 headers,
                 body: Box::pin(stream::once(async {
                     Ok(Bytes::from_static(
@@ -301,7 +331,7 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
                 "kind": "create-provider",
                 "name": "Codex Subscription Bridge",
                 "baseUrl": "https://chatgpt.com/backend-api/codex",
-                "model": "gpt-5.6",
+                "model": "gpt-5.6-luna",
                 "credential": {"kind": "remove"},
                 "authentication": "codex-subscription",
                 "presetKey": "codex-subscription-bridge"
@@ -339,6 +369,9 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
     let upstream = Arc::new(BridgeUpstream {
         requests: Mutex::new(Vec::new()),
         bridge_statuses: Mutex::new(VecDeque::new()),
+        native_statuses: Mutex::new(VecDeque::new()),
+        incomplete_bridge_response: AtomicBool::new(false),
+        failed_bridge_response: AtomicBool::new(false),
     });
     let activation = Arc::new(
         ActivationService::new(
@@ -558,10 +591,62 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
     );
     install_binding(&home, bridge_id, "fixed", Some("account-fixed")).await;
     send_and_assert_bridge_success(&client, endpoint, &routing_token, &upstream).await;
+
+    upstream
+        .incomplete_bridge_response
+        .store(true, Ordering::SeqCst);
+    let before_incomplete = upstream.requests.lock().unwrap().len();
+    let incomplete = send_message(&client, endpoint, &routing_token).await;
+    let incomplete_status = incomplete.status();
+    let incomplete_content_type = incomplete
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let incomplete_body = incomplete.bytes().await.unwrap();
+    assert!(
+        incomplete_status == StatusCode::OK
+            && incomplete_content_type.as_deref() == Some("text/event-stream")
+            && sse_data_values(&incomplete_body).iter().any(|event| {
+                event.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens")
+            })
+            && upstream.requests.lock().unwrap().len() == before_incomplete + 1,
+        "pre-output incomplete Bridge response bypassed its Anthropic conversion"
+    );
+
+    upstream
+        .failed_bridge_response
+        .store(true, Ordering::SeqCst);
+    let before_failed = upstream.requests.lock().unwrap().len();
+    let failed = send_message(&client, endpoint, &routing_token).await;
+    let failed_status = failed.status();
+    let failed_content_type = failed
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let failed_body = failed.bytes().await.unwrap();
+    assert!(
+        failed_status == StatusCode::OK
+            && failed_content_type.as_deref() == Some("text/event-stream")
+            && sse_data_values(&failed_body).iter().any(|event| {
+                event.pointer("/error/message").and_then(Value::as_str)
+                    == Some("subscription-bridge-upstream-error")
+            })
+            && !failed_body
+                .windows("FIXTURE_RESPONSE_SECRET_7319".len())
+                .any(|window| window == b"FIXTURE_RESPONSE_SECRET_7319")
+            && upstream.requests.lock().unwrap().len() == before_failed + 1,
+        "pre-output failed Bridge response bypassed its fixed Anthropic conversion"
+    );
     let after_recovery = store.target_view_for(Target::Claude).await.unwrap();
     assert!(
-        after_recovery.serving_provider_id.as_deref() == Some(&bridge_id.to_string()),
-        "successful Bridge request did not restore its serving Provider projection"
+        after_recovery.serving_provider_id.as_deref() == Some(&bridge_id.to_string())
+            && after_recovery.providers.iter().any(|provider| {
+                provider.id == bridge_id
+                    && provider.route_health.state == RouteHealthState::Degraded
+            }),
+        "converted Bridge failure was not retained as a real Route Health failure"
     );
 
     install_binding(&home, bridge_id, "fixed", Some("missing-account")).await;
@@ -638,6 +723,105 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
         "Bridge count_tokens contacted an account/upstream or returned the wrong deviation"
     );
 
+    let mut replanning = UnixStream::connect(restarted.socket_path()).await.unwrap();
+    hello(&mut replanning).await;
+    let reopened = request(
+        &mut replanning,
+        "reopen-for-count-tokens",
+        json!({
+            "kind": "open-target", "target": "claude",
+            "claudeContext": {
+                "claudeConfigDir": null,
+                "selectorState": "unset",
+                "hostManagedState": "unmanaged",
+                "cwd": user_home
+            }
+        }),
+    )
+    .await;
+    let native_current = request(
+        &mut replanning,
+        "activate-native-for-count-tokens",
+        json!({
+            "kind": "act", "target": "claude", "actionId": Uuid::new_v4(),
+            "expectedRevision": reopened["result"]["view"]["managementRevision"],
+            "action": {
+                "kind": "activate-provider",
+                "providerId": native_id,
+                "mode": "takeover"
+            }
+        }),
+    )
+    .await;
+    assert!(
+        native_current["type"] == "response",
+        "native Provider did not become Current before the reversed route"
+    );
+    let _native_current_push = read_frame(&mut replanning).await.unwrap();
+    let reversed = request(
+        &mut replanning,
+        "reverse-plan",
+        json!({
+            "kind": "act", "target": "claude", "actionId": Uuid::new_v4(),
+            "expectedRevision": native_current["result"]["outcome"]["view"]["managementRevision"],
+            "action": {
+                "kind": "save-failover-draft",
+                "members": [
+                    {"providerId": native_id, "providerRevision": native_provider.provider_revision},
+                    {"providerId": bridge_id, "providerRevision": 1}
+                ]
+            }
+        }),
+    )
+    .await;
+    assert!(
+        reversed["type"] == "response",
+        "native-first failover draft did not save"
+    );
+    let _reverse_push = read_frame(&mut replanning).await.unwrap();
+    let reversed_applied = request(
+        &mut replanning,
+        "apply-reversed-plan",
+        json!({
+            "kind": "act", "target": "claude", "actionId": Uuid::new_v4(),
+            "expectedRevision": reversed["result"]["outcome"]["view"]["managementRevision"],
+            "action": {
+                "kind": "apply-failover-chain",
+                "draftRevision": reversed["result"]["outcome"]["view"]["failover"]["draftRevision"]
+            }
+        }),
+    )
+    .await;
+    assert!(
+        reversed_applied["type"] == "response",
+        "native-first Failover Chain did not apply"
+    );
+    let _reversed_push = read_frame(&mut replanning).await.unwrap();
+    drop(replanning);
+    install_binding(&home, bridge_id, "fixed", Some("account-transient")).await;
+    upstream
+        .native_statuses
+        .lock()
+        .unwrap()
+        .push_back(StatusCode::SERVICE_UNAVAILABLE);
+    let before_fallback_count = upstream.requests.lock().unwrap().len();
+    let before_fallback_refresh = refreshes.lock().unwrap().len();
+    let fallback_count = client
+        .post(format!("http://{endpoint}/v1/messages/count_tokens"))
+        .header(header::AUTHORIZATION, format!("Bearer {routing_token}"))
+        .body(include_bytes!("fixtures/subscription-bridge/messages-text.input.json").as_slice())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        fallback_count.status() == StatusCode::NOT_IMPLEMENTED
+            && fallback_count.text().await.unwrap()
+                == "subscription-bridge-count-tokens-unsupported"
+            && upstream.requests.lock().unwrap().len() == before_fallback_count + 1
+            && refreshes.lock().unwrap().len() == before_fallback_refresh,
+        "fallback Bridge count_tokens contacted its account/upstream or lost the named deviation"
+    );
+
     let refresh_kinds = refreshes.lock().unwrap().clone();
     assert!(
         refresh_kinds
@@ -666,7 +850,7 @@ async fn send_message(
         .post(format!("http://{endpoint}/v1/messages"))
         .header(header::AUTHORIZATION, format!("Bearer {routing_token}"))
         .header("x-session-id", "BRIDGE_SESSION_SECRET_12905")
-        .body(include_bytes!("fixtures/subscription-bridge/messages-text.input.json").as_slice())
+        .body(include_bytes!("fixtures/subscription-bridge/messages-tools.input.json").as_slice())
         .send()
         .await
         .unwrap()
@@ -729,6 +913,10 @@ fn assert_bridge_request(
         panic!("Bridge request was not captured");
     };
     let body = serde_json::from_slice::<Value>(&request.body).ok();
+    let expected_body = serde_json::from_slice::<Value>(include_bytes!(
+        "fixtures/subscription-bridge/messages-tools.expected.json"
+    ))
+    .ok();
     let exact = request.url == "https://chatgpt.com/backend-api/codex/responses"
         && request
             .headers
@@ -744,7 +932,8 @@ fn assert_bridge_request(
             .as_ref()
             .and_then(|value| value.get("model"))
             .and_then(Value::as_str)
-            == Some("gpt-5.6");
+            == Some("gpt-5.6-luna")
+        && body == expected_body;
     assert!(
         exact,
         "Bridge endpoint, identity headers, or converted body changed"

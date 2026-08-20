@@ -292,7 +292,7 @@ export const zhCN = {
   "subscription-bridge.risk.continuity": "接口可能随时停止工作，恕不另行通知。",
   "subscription-bridge.risk.terms": "使用行为可能受适用的账户及订阅条款约束。",
   "subscription-bridge.risk.support": "不受 OpenAI 或 Anthropic 官方支持或认可。",
-  "subscription-bridge.tested-models": "已测试模型 · gpt-5.6 和 gpt-5.4 · 文本与工具",
+  "subscription-bridge.tested-models": "已测试模型 · gpt-5.6 和 gpt-5.6-luna · 文本与工具",
   "subscription-bridge.deviations": "兼容性差异 · 不支持 count_tokens、多模态/PDF、WebSearch、FAST 服务层、配额/模型目录/缓存键/价格投影、模型别名或任意模型声明 · 使用更严格的有界解析和固定诊断",
   "subscription-bridge.accounts-help": "保存此 Provider 后，使用 ctrl+x i 在订阅账户中选择固定或跟随默认。",
   "subscription-bridge.picker-requirement": "需要 Takeover",

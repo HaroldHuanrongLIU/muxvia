@@ -172,6 +172,9 @@ pub(crate) async fn route_messages(
                     return Err(RouteAttemptFailure::Configuration);
                 }
                 if authentication == ProviderAuthentication::CodexSubscription {
+                    if count_tokens {
+                        return Err(RouteAttemptFailure::SubscriptionBridgeCountTokensUnsupported);
+                    }
                     let resolver =
                         resolver.ok_or(RouteAttemptFailure::SubscriptionAccountUnavailable)?;
                     let binding = binding
@@ -269,10 +272,14 @@ pub(crate) async fn route_messages(
     }
     let Some(routed) = route.routed else {
         return fixed_failure_response(
-            if route.failure == Some(RouteAttemptFailure::SubscriptionBridgeInvalidRequest) {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::BAD_GATEWAY
+            match route.failure {
+                Some(RouteAttemptFailure::SubscriptionBridgeInvalidRequest) => {
+                    StatusCode::BAD_REQUEST
+                }
+                Some(RouteAttemptFailure::SubscriptionBridgeCountTokensUnsupported) => {
+                    StatusCode::NOT_IMPLEMENTED
+                }
+                _ => StatusCode::BAD_GATEWAY,
             },
             route
                 .failure

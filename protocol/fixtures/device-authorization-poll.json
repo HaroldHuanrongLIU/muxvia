@@ -1,0 +1,11 @@
+{
+  "type": "response",
+  "requestId": "subscription-device-poll-1",
+  "result": {
+    "kind": "device-authorization-poll",
+    "poll": {
+      "status": "authorized",
+      "accountId": "account-primary"
+    }
+  }
+}

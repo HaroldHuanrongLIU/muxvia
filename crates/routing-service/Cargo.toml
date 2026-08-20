@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 async-trait = "0.1.89"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+base64 = "0.22.1"
 clap = { version = "4.6.6", features = ["derive"] }
 flate2 = "1.1.2"
 fs2 = "0.4.3"

@@ -76,8 +76,8 @@ async fn new_database_target_view_matches_the_canonical_protocol_fixture() {
 }
 
 #[tokio::test]
-async fn fresh_schema_v7_reopens_with_codex_and_claude_route_rows() {
-    let root = std::env::temp_dir().join(format!("muxvia-v7-reopen-{}", Uuid::new_v4()));
+async fn fresh_schema_reopens_with_codex_and_claude_route_rows() {
+    let root = std::env::temp_dir().join(format!("muxvia-schema-reopen-{}", Uuid::new_v4()));
     let user_home = root.join("home");
     fs::create_dir_all(&user_home).unwrap();
     let home = MuxviaHome::from_user_home(&user_home);
@@ -104,7 +104,7 @@ async fn fresh_schema_v7_reopens_with_codex_and_claude_route_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, "10");
+    assert_eq!(version, "11");
     assert_eq!(targets, ["claude", "codex"]);
     let _ = fs::remove_dir_all(root);
 }

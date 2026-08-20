@@ -1,0 +1,8 @@
+{
+  "type": "request",
+  "requestId": "subscription-device-start-1",
+  "operation": {
+    "kind": "start-device-authorization",
+    "reauthorizeAccountId": null
+  }
+}

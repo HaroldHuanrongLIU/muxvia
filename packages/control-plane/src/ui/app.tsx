@@ -3,8 +3,12 @@ import { createSignal, Match, onCleanup, onMount, Show, Switch, type Accessor } 
 
 import { MuxviaKeymapProvider, useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
 import type { TargetSession } from "../control/target-session"
+import type {
+  SubscriptionAccountSession,
+  SubscriptionPlatformEffects,
+} from "../control/subscription-account-session"
 import type { UniversalProviderSession } from "../control/universal-provider-session"
-import type { ReachabilityResult, ReconciliationStrategy, Target, TargetAction, TargetView as TargetViewProjection, UniversalProviderAction, UniversalProviderCatalogView } from "../control/types"
+import type { ReachabilityResult, ReconciliationStrategy, SubscriptionAccountAction, SubscriptionAccountCatalogView, SubscriptionDefaultPreview, Target, TargetAction, TargetView as TargetViewProjection, UniversalProviderAction, UniversalProviderCatalogView } from "../control/types"
 import { createCommandPresenter, createTranslator, messageKeyForProblem, type Locale, type Translator } from "../i18n"
 import { theme } from "../theme"
 import { ActionPrompt } from "./action-prompt"
@@ -21,6 +25,7 @@ import { ProviderPicker } from "./provider-picker"
 import { ProviderSourcePicker, type ProviderSource } from "./provider-source-picker"
 import { Reconciliation, type ReconciliationUiState } from "./reconciliation"
 import { RouteEditor } from "./route-editor"
+import { SubscriptionAccountPicker, type SubscriptionAuthorizationState } from "./subscription-account-picker"
 import { TargetSidebar } from "./target-sidebar"
 import { TargetView, type ActivityEntry } from "./target-view"
 import { TakeoverRequiredConfirm } from "./takeover-required-confirm"
@@ -39,6 +44,8 @@ export interface AppProps {
   sessions?: Partial<Record<Target, TargetSession>> | Accessor<Partial<Record<Target, TargetSession>>>
   unavailable?: Partial<Record<Target, string>> | Accessor<Partial<Record<Target, string>>>
   universalSession?: UniversalProviderSession | Accessor<UniversalProviderSession | undefined>
+  subscriptionAccountSession?: SubscriptionAccountSession | Accessor<SubscriptionAccountSession | undefined>
+  subscriptionEffects?: SubscriptionPlatformEffects
   startupProblem?: "handover-failed"
   locale?: Locale
 }
@@ -175,6 +182,26 @@ function safeUniversalProblem(error: unknown): string {
   }
 }
 
+function safeSubscriptionProblem(error: unknown): string {
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String(error.code)
+    : "internal-failure"
+  switch (code) {
+    case "device-authorization-failed":
+    case "invalid-action-replay":
+    case "invalid-subscription-account":
+    case "invalid-subscription-binding":
+    case "recovery-required":
+    case "stale-default-preview":
+    case "stale-revision":
+    case "subscription-account-file-invalid":
+    case "subscription-account-write-failed":
+      return code
+    default:
+      return "internal-failure"
+  }
+}
+
 function moveIdentity(ids: readonly string[], id: string | undefined, delta: -1 | 1): string[] | undefined {
   if (!id) return undefined
   const index = ids.indexOf(id)
@@ -242,6 +269,8 @@ function Shell(props: {
   sessions: Accessor<Partial<Record<Target, TargetSession>>>
   unavailable: Accessor<Partial<Record<Target, string>>>
   universalSession: Accessor<UniversalProviderSession | undefined>
+  subscriptionAccountSession: Accessor<SubscriptionAccountSession | undefined>
+  subscriptionEffects: SubscriptionPlatformEffects
   startupProblem?: "handover-failed"
   t: Translator
 }) {
@@ -282,6 +311,21 @@ function Shell(props: {
   const [universalNotice, setUniversalNotice] = createSignal<string>()
   const [universalNoticeKind, setUniversalNoticeKind] = createSignal<"error" | "success">()
   const [selectedUniversalProviderId, setSelectedUniversalProviderId] = createSignal<string>()
+  const [subscriptionAccountView, setSubscriptionAccountView] = createSignal<SubscriptionAccountCatalogView>(
+    props.subscriptionAccountSession()?.get() as SubscriptionAccountCatalogView ?? {
+      revision: 0,
+      viewSequence: 0,
+      defaultAccountId: null,
+      accounts: [],
+      bindings: [],
+      recovery: { state: "clean" },
+    },
+  )
+  const [selectedSubscriptionAccountId, setSelectedSubscriptionAccountId] = createSignal<string>()
+  const [subscriptionAccountPending, setSubscriptionAccountPending] = createSignal(false)
+  const [subscriptionAccountNotice, setSubscriptionAccountNotice] = createSignal<string>()
+  const [subscriptionAuthorization, setSubscriptionAuthorization] = createSignal<SubscriptionAuthorizationState>()
+  const [subscriptionDefaultPreview, setSubscriptionDefaultPreview] = createSignal<SubscriptionDefaultPreview>()
   const providerFormRefs: Partial<Record<Target, ProviderFormRef>> = {}
   const providerFormRefCallbacks = Object.fromEntries(
     (["codex", "claude"] as const).map((target) => [target, (value: ProviderFormRef | undefined) => {
@@ -304,6 +348,8 @@ function Shell(props: {
   const reconciliationAborts: Partial<Record<Target, AbortController>> = {}
   const reachabilityAborts: Partial<Record<Target, AbortController>> = {}
   const reachabilityGenerations: Record<Target, number> = { codex: 0, claude: 0 }
+  let subscriptionAuthorizationGeneration = 0
+  let subscriptionAuthorizationAbort: AbortController | undefined
   let exiting = false
   let disposed = false
 
@@ -311,6 +357,7 @@ function Shell(props: {
     disposed = true
     reconciliationAborts.codex?.abort()
     reconciliationAborts.claude?.abort()
+    subscriptionAuthorizationAbort?.abort()
   })
 
   const activeTarget = (): Target | undefined => {
@@ -805,6 +852,8 @@ function Shell(props: {
       targetSession.subscribe((next) => installView(next, "subscription")))
     const catalog = props.universalSession()
     if (catalog) unsubscribes.push(catalog.subscribe((next) => setUniversalView(next)))
+    const accounts = props.subscriptionAccountSession()
+    if (accounts) unsubscribes.push(accounts.subscribe((next) => setSubscriptionAccountView(next)))
     onCleanup(() => { for (const unsubscribe of unsubscribes) unsubscribe() })
   })
 
@@ -1479,6 +1528,193 @@ function Shell(props: {
     })
   }
 
+  const runSubscriptionAccountAction = async (
+    originSession: SubscriptionAccountSession,
+    action: SubscriptionAccountAction,
+  ): Promise<boolean> => {
+    if (subscriptionAccountPending()) return false
+    setSubscriptionAccountPending(true)
+    setSubscriptionAccountNotice()
+    try {
+      const outcome = await originSession.act(action)
+      if (disposed || exiting || props.subscriptionAccountSession() !== originSession) return false
+      setSubscriptionAccountView(outcome.view)
+      setSubscriptionDefaultPreview()
+      setSubscriptionAccountNotice(props.t("subscription-account.applied"))
+      return true
+    } catch (error) {
+      if (disposed || exiting || props.subscriptionAccountSession() !== originSession) return false
+      setSubscriptionAccountView(originSession.get() as SubscriptionAccountCatalogView)
+      setSubscriptionAccountNotice(props.t("subscription-account.error", {
+        code: safeSubscriptionProblem(error),
+      }))
+      return false
+    } finally {
+      if (!disposed && !exiting) setSubscriptionAccountPending(false)
+    }
+  }
+
+  const beginSubscriptionAuthorization = async (
+    originSession: SubscriptionAccountSession,
+    reauthorizeAccountId?: string,
+  ) => {
+    if (subscriptionAccountPending()) return
+    subscriptionAuthorizationAbort?.abort()
+    const controller = new AbortController()
+    subscriptionAuthorizationAbort = controller
+    const generation = ++subscriptionAuthorizationGeneration
+    setSubscriptionAccountPending(true)
+    setSubscriptionAccountNotice()
+    setSubscriptionDefaultPreview()
+    try {
+      const challenge = await originSession.startDeviceAuthorization(reauthorizeAccountId)
+      if (disposed || controller.signal.aborted || generation !== subscriptionAuthorizationGeneration) return
+      const [copySucceeded, openSucceeded] = await Promise.all([
+        props.subscriptionEffects.copyUserCode(challenge.userCode).catch(() => false),
+        props.subscriptionEffects.openVerificationUrl(challenge.verificationUrl).catch(() => false),
+      ])
+      if (disposed || controller.signal.aborted || generation !== subscriptionAuthorizationGeneration) return
+      setSubscriptionAuthorization({ challenge, copySucceeded, openSucceeded })
+      while (!controller.signal.aborted) {
+        await props.subscriptionEffects.wait(
+          challenge.pollIntervalSeconds * 1_000,
+          controller.signal,
+        )
+        const poll = await originSession.pollDeviceAuthorization(challenge.flowId, controller.signal)
+        if (controller.signal.aborted || generation !== subscriptionAuthorizationGeneration) return
+        if (poll.status === "pending") continue
+        setSubscriptionAuthorization()
+        setSubscriptionAccountPending(false)
+        if (poll.status === "expired") {
+          setSubscriptionAccountNotice(props.t("subscription-account.device.expired"))
+          return
+        }
+        setSubscriptionAccountView(originSession.get() as SubscriptionAccountCatalogView)
+        setSelectedSubscriptionAccountId(poll.accountId)
+        setSubscriptionAccountNotice(props.t("subscription-account.device.authorized"))
+        return
+      }
+    } catch (error) {
+      if (controller.signal.aborted || generation !== subscriptionAuthorizationGeneration) return
+      setSubscriptionAuthorization()
+      setSubscriptionAccountNotice(props.t("subscription-account.error", {
+        code: safeSubscriptionProblem(error),
+      }))
+    } finally {
+      if (subscriptionAuthorizationAbort === controller) subscriptionAuthorizationAbort = undefined
+      if (generation === subscriptionAuthorizationGeneration && !disposed) {
+        setSubscriptionAccountPending(false)
+      }
+    }
+  }
+
+  const cancelSubscriptionAuthorization = () => {
+    subscriptionAuthorizationGeneration++
+    subscriptionAuthorizationAbort?.abort()
+    subscriptionAuthorizationAbort = undefined
+    setSubscriptionAuthorization()
+    setSubscriptionAccountPending(false)
+    setSubscriptionAccountNotice(props.t("subscription-account.device.cancelled"))
+  }
+
+  const openSubscriptionAccounts = () => {
+    const originSession = props.subscriptionAccountSession()
+    if (!originSession || overlay.depth > 0 || subscriptionAccountPending()) return
+    setSubscriptionAccountView(originSession.get() as SubscriptionAccountCatalogView)
+    setSubscriptionAccountNotice()
+    setSubscriptionDefaultPreview()
+    const preferred = originSession.get().accounts.find((account) =>
+      account.accountId === selectedSubscriptionAccountId()) ?? originSession.get().accounts[0]
+    setSelectedSubscriptionAccountId(preferred?.accountId)
+    const activeProvider = () => {
+      const target = activeTarget()
+      const current = view()
+      if (!target || !current) return undefined
+      const provider = current.providers.find((candidate) => candidate.id === current.currentProviderId)
+        ?? current.providers[0]
+      return provider ? {
+        target,
+        providerId: provider.id,
+        providerRevision: provider.providerRevision,
+        providerName: provider.name,
+      } : undefined
+    }
+    overlay.replace({
+      id: "subscription-account-picker",
+      dismissOnEscape: () => !subscriptionAccountPending(),
+      render: () => <SubscriptionAccountPicker
+        view={subscriptionAccountView}
+        selectedId={selectedSubscriptionAccountId}
+        pending={subscriptionAccountPending}
+        notice={subscriptionAccountNotice}
+        authorization={subscriptionAuthorization}
+        defaultPreview={subscriptionDefaultPreview}
+        activeProvider={activeProvider}
+        t={props.t}
+        onSelectedIdChange={setSelectedSubscriptionAccountId}
+        onAuthorize={() => { void beginSubscriptionAuthorization(originSession) }}
+        onReauthorize={() => {
+          const accountId = selectedSubscriptionAccountId()
+          if (accountId) void beginSubscriptionAuthorization(originSession, accountId)
+        }}
+        onCancelAuthorization={cancelSubscriptionAuthorization}
+        onPreviewDefault={() => { void (async () => {
+          const accountId = selectedSubscriptionAccountId()
+          if (!accountId || subscriptionAccountPending()) return
+          setSubscriptionAccountPending(true)
+          try {
+            const preview = await originSession.previewDefault(accountId)
+            if (!disposed && props.subscriptionAccountSession() === originSession) {
+              setSubscriptionDefaultPreview(preview)
+            }
+          } catch (error) {
+            setSubscriptionAccountNotice(props.t("subscription-account.error", {
+              code: safeSubscriptionProblem(error),
+            }))
+          } finally {
+            if (!disposed) setSubscriptionAccountPending(false)
+          }
+        })() }}
+        onConfirmDefault={() => {
+          const preview = subscriptionDefaultPreview()
+          if (preview) void runSubscriptionAccountAction(originSession, {
+            kind: "set-default-account",
+            accountId: preview.accountId,
+            previewToken: preview.previewToken,
+          })
+        }}
+        onBindFixed={() => {
+          const provider = activeProvider()
+          const accountId = selectedSubscriptionAccountId()
+          if (provider && accountId) void runSubscriptionAccountAction(originSession, {
+            kind: "bind-provider-fixed",
+            target: provider.target,
+            providerId: provider.providerId,
+            providerRevision: provider.providerRevision,
+            accountId,
+          })
+        }}
+        onBindFollowDefault={() => {
+          const provider = activeProvider()
+          if (provider) void runSubscriptionAccountAction(originSession, {
+            kind: "bind-provider-follow-default",
+            target: provider.target,
+            providerId: provider.providerId,
+            providerRevision: provider.providerRevision,
+          })
+        }}
+        onDelete={() => {
+          const accountId = selectedSubscriptionAccountId()
+          if (accountId) void runSubscriptionAccountAction(originSession, {
+            kind: "delete-account",
+            accountId,
+          })
+        }}
+      />,
+      onClose: cancelSubscriptionAuthorization,
+    })
+  }
+
   useCommandLayer({
     scope: "global",
     priority: 0,
@@ -1518,6 +1754,7 @@ function Shell(props: {
       },
       "provider.list": openProviderPicker,
       "universal-provider.list": openUniversalProviders,
+      "subscription-account.list": openSubscriptionAccounts,
       "target.direct.apply": () => applyDefaultProvider("direct"),
       "target.takeover.apply": () => applyDefaultProvider("takeover"),
       "target.takeover.disable": openDisableTakeoverConfirmation,
@@ -1535,6 +1772,7 @@ function Shell(props: {
       "provider.create": openProviderSourcePicker,
       "provider.list": openProviderPicker,
       "universal-provider.list": openUniversalProviders,
+      "subscription-account.list": openSubscriptionAccounts,
       "target.direct.apply": () => applyDefaultProvider("direct"),
       "target.takeover.apply": () => applyDefaultProvider("takeover"),
       "target.takeover.disable": openDisableTakeoverConfirmation,
@@ -1654,6 +1892,7 @@ export function App(props: AppProps) {
   const sessionSource = props.sessions
   const unavailableSource = props.unavailable
   const universalSessionSource = props.universalSession
+  const subscriptionAccountSessionSource = props.subscriptionAccountSession
   const sessions: Accessor<Partial<Record<Target, TargetSession>>> = typeof sessionSource === "function"
     ? sessionSource
     : () => sessionSource ?? (props.session ? { [props.session.get().target]: props.session } : {})
@@ -1663,10 +1902,29 @@ export function App(props: AppProps) {
   const universalSession: Accessor<UniversalProviderSession | undefined> = typeof universalSessionSource === "function"
     ? universalSessionSource
     : () => universalSessionSource
+  const subscriptionAccountSession: Accessor<SubscriptionAccountSession | undefined> = typeof subscriptionAccountSessionSource === "function"
+    ? subscriptionAccountSessionSource
+    : () => subscriptionAccountSessionSource
+  const subscriptionEffects: SubscriptionPlatformEffects = props.subscriptionEffects ?? {
+    copyUserCode: async () => false,
+    openVerificationUrl: async () => false,
+    wait: async (milliseconds, signal) => {
+      if (signal.aborted) throw new Error("cancelled")
+      await Bun.sleep(milliseconds)
+    },
+  }
   return (
     <MuxviaKeymapProvider presenter={createCommandPresenter(t)}>
       <OverlayProvider>
-        <Shell sessions={sessions} unavailable={unavailable} universalSession={universalSession} startupProblem={props.startupProblem} t={t} />
+        <Shell
+          sessions={sessions}
+          unavailable={unavailable}
+          universalSession={universalSession}
+          subscriptionAccountSession={subscriptionAccountSession}
+          subscriptionEffects={subscriptionEffects}
+          startupProblem={props.startupProblem}
+          t={t}
+        />
       </OverlayProvider>
     </MuxviaKeymapProvider>
   )

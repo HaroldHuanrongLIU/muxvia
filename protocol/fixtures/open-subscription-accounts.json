@@ -1,0 +1,7 @@
+{
+  "type": "request",
+  "requestId": "subscription-open-1",
+  "operation": {
+    "kind": "open-subscription-accounts"
+  }
+}

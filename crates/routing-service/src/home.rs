@@ -69,6 +69,10 @@ impl MuxviaHome {
         &self.database
     }
 
+    pub fn subscription_accounts_path(&self) -> PathBuf {
+        self.state.join("subscription-accounts.json")
+    }
+
     pub(crate) fn prepare_database(&self) -> io::Result<()> {
         create_private_dir(&self.root)?;
         create_private_dir(&self.state)?;

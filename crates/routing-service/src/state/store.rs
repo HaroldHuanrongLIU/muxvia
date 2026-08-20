@@ -2752,7 +2752,9 @@ struct RoutePlanSnapshotMember {
     enabled: Option<bool>,
 }
 
-fn map_call_error(error: tokio_rusqlite::Error<tokio_rusqlite::rusqlite::Error>) -> StateError {
+pub(super) fn map_call_error(
+    error: tokio_rusqlite::Error<tokio_rusqlite::rusqlite::Error>,
+) -> StateError {
     match error {
         tokio_rusqlite::Error::ConnectionClosed => StateError::Unavailable,
         tokio_rusqlite::Error::Error(error) => StateError::Sqlite(error),

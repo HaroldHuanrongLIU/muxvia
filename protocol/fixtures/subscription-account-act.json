@@ -1,0 +1,14 @@
+{
+  "type": "request",
+  "requestId": "subscription-account-act-1",
+  "operation": {
+    "kind": "subscription-account-act",
+    "actionId": "00000000-0000-4000-8000-000000001113",
+    "expectedRevision": 2,
+    "action": {
+      "kind": "set-default-account",
+      "accountId": "account-primary",
+      "previewToken": "00000000-0000-4000-8000-000000001112"
+    }
+  }
+}

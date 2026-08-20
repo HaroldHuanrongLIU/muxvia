@@ -11,6 +11,10 @@ import {
   type ServiceMetadata,
 } from "./control/rpc-client"
 import type { TargetSession } from "./control/target-session"
+import type {
+  SubscriptionAccountSession,
+  SubscriptionPlatformEffects,
+} from "./control/subscription-account-session"
 import type { UniversalProviderSession } from "./control/universal-provider-session"
 import type { ClaudePreflightContext, Target } from "./control/types"
 import { resolveLocale } from "./i18n"
@@ -54,6 +58,12 @@ export interface RunPorts {
     signal: AbortSignal,
     claudeContext: ClaudePreflightContext,
   ): Promise<UniversalProviderSession>
+  connectSubscriptionAccounts?(
+    socketPath: string,
+    release: string,
+    signal: AbortSignal,
+  ): Promise<SubscriptionAccountSession>
+  subscriptionEffects?: SubscriptionPlatformEffects
   spawn(path: string, args: string[], options: SpawnOptions): void
   createRenderer(): Promise<CliRenderer>
   render(node: () => JSX.Element, renderer: CliRenderer): Promise<void>
@@ -148,6 +158,50 @@ const productionPorts: RunPorts = {
       await control.close().catch(() => {})
       throw error
     }
+  },
+  connectSubscriptionAccounts: async (socketPath, release, signal) => {
+    const control = await RpcClient.connect(socketPath, release, signal)
+    try {
+      if (signal.aborted) throw new ConnectionDeadlineError()
+      return await control.openSubscriptionAccounts()
+    } catch (error) {
+      await control.close().catch(() => {})
+      throw error
+    }
+  },
+  subscriptionEffects: {
+    copyUserCode: async (userCode) => {
+      try {
+        process.stdout.write(`\u001b]52;c;${Buffer.from(userCode).toString("base64")}\u0007`)
+        return true
+      } catch {
+        return false
+      }
+    },
+    openVerificationUrl: async (url) => await new Promise<boolean>((resolve) => {
+      const command = process.platform === "darwin" ? "open" : "xdg-open"
+      const child = spawn(command, [url], { shell: false, detached: true, stdio: "ignore" })
+      child.once("spawn", () => {
+        child.unref()
+        resolve(true)
+      })
+      child.once("error", () => resolve(false))
+    }),
+    wait: async (milliseconds, signal) => {
+      if (signal.aborted) throw new ControlError("cancelled", "Device authorization was cancelled")
+      await new Promise<void>((resolve, reject) => {
+        const finish = () => {
+          signal.removeEventListener("abort", cancel)
+          resolve()
+        }
+        const timer = setTimeout(finish, milliseconds)
+        const cancel = () => {
+          clearTimeout(timer)
+          reject(new ControlError("cancelled", "Device authorization was cancelled"))
+        }
+        signal.addEventListener("abort", cancel, { once: true })
+      })
+    },
   },
   spawn: (path, args) => {
     const child = spawn(path, args, { shell: false, detached: true, stdio: "ignore" })
@@ -409,6 +463,43 @@ async function connectUniversalCatalog(
   }
 }
 
+async function connectSubscriptionCatalog(
+  options: RunOptions,
+  ports: RunPorts,
+  cancellation: AbortSignal,
+): Promise<SubscriptionAccountSession | undefined> {
+  const connect = ports.connectSubscriptionAccounts
+  if (!connect || cancellation.aborted) return undefined
+  const controller = new AbortController()
+  let expired = false
+  let cancelTimeout = () => {}
+  let rejectTimeout!: (error: ConnectionDeadlineError) => void
+  const timeout = new Promise<never>((_, reject) => { rejectTimeout = reject })
+  cancelTimeout = ports.clock.timeout(readinessTimeoutMs, () => {
+    expired = true
+    controller.abort()
+    rejectTimeout(new ConnectionDeadlineError())
+  })
+  let rejectCancelled!: (error: ConnectionCancelledError) => void
+  const cancelled = new Promise<never>((_, reject) => { rejectCancelled = reject })
+  const onCancel = () => {
+    controller.abort()
+    rejectCancelled(new ConnectionCancelledError())
+  }
+  cancellation.addEventListener("abort", onCancel, { once: true })
+  const connection = connect(options.socketPath, options.release, controller.signal).then(async (session) => {
+    if (!expired && !cancellation.aborted) return session
+    await session.close().catch(() => {})
+    throw new ConnectionDeadlineError()
+  })
+  try {
+    return await Promise.race([connection, timeout, cancelled])
+  } finally {
+    cancelTimeout()
+    cancellation.removeEventListener("abort", onCancel)
+  }
+}
+
 export async function run(options: RunOptions, ports: RunPorts = productionPorts): Promise<void> {
   const locale = resolveLocale(process.env)
   const renderer = await ports.createRenderer()
@@ -425,6 +516,7 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
   const [sessions, setSessions] = createSignal<Partial<Record<Target, TargetSession>>>({})
   const [unavailable, setUnavailable] = createSignal<Partial<Record<Target, string>>>({})
   const [universalSession, setUniversalSession] = createSignal<UniversalProviderSession>()
+  const [subscriptionAccountSession, setSubscriptionAccountSession] = createSignal<SubscriptionAccountSession>()
   const closedSessions = new Set<TargetSession>()
   const closeSessionOnce = async (session: TargetSession): Promise<void> => {
     if (closedSessions.has(session)) return
@@ -475,8 +567,25 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
         // Target management remains available if the independent catalog session is unavailable.
       }
     }
+    if (ports.connectSubscriptionAccounts && !startup.signal.aborted) {
+      try {
+        const catalog = await connectSubscriptionCatalog(options, ports, startup.signal)
+        if (catalog && !startup.signal.aborted) setSubscriptionAccountSession(catalog)
+        else await catalog?.close().catch(() => {})
+      } catch {
+        // Target management remains available if the independent account session is unavailable.
+      }
+    }
     if (renderer.isDestroyed) return
-    await ports.render(() => <App sessions={sessions} unavailable={unavailable} universalSession={universalSession} startupProblem={startupProblem} locale={locale} />, renderer)
+    await ports.render(() => <App
+      sessions={sessions}
+      unavailable={unavailable}
+      universalSession={universalSession}
+      subscriptionAccountSession={subscriptionAccountSession}
+      subscriptionEffects={ports.subscriptionEffects}
+      startupProblem={startupProblem}
+      locale={locale}
+    />, renderer)
     const opened = sessions()
     const uniqueSessions = [...new Set(Object.values(opened))]
     for (const target of ["codex", "claude"] as const) {
@@ -497,6 +606,7 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
       await Promise.all([
         ...[...new Set(Object.values(sessions()))].map((session) => closeSessionOnce(session).catch(() => {})),
         universalSession()?.close().catch(() => {}),
+        subscriptionAccountSession()?.close().catch(() => {}),
       ])
     } finally {
       if (!renderer.isDestroyed) renderer.destroy()

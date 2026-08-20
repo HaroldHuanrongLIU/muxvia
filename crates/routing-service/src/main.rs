@@ -21,6 +21,10 @@ struct Args {
     test_claude_executable: Option<PathBuf>,
     #[arg(long, hide = true)]
     test_release: Option<String>,
+    #[arg(long, hide = true)]
+    test_device_authority_origin: Option<String>,
+    #[arg(long, hide = true)]
+    test_refresh_subscription_account: Option<String>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -42,7 +46,9 @@ async fn main() {
         && (args.test_shutdown_file.is_some()
             || args.test_codex_executable.is_some()
             || args.test_claude_executable.is_some()
-            || args.test_release.is_some())
+            || args.test_release.is_some()
+            || args.test_device_authority_origin.is_some()
+            || args.test_refresh_subscription_account.is_some())
     {
         eprintln!("test-only Routing Service options require integration invocation");
         std::process::exit(64);
@@ -78,6 +84,8 @@ async fn main() {
             .test_release
             .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned()),
         inherited_service_lock_fd: args.inherited_service_lock_fd,
+        test_device_authority_origin: args.test_device_authority_origin,
+        test_refresh_subscription_account: args.test_refresh_subscription_account,
     };
     if let Err(error) = run(options).await {
         eprintln!("{error}");

@@ -135,12 +135,17 @@ pub enum ServerFrame {
         authoritative_view: Option<TargetView>,
         #[serde(skip_serializing_if = "Option::is_none")]
         authoritative_universal_provider_view: Option<UniversalProviderCatalogView>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        authoritative_subscription_account_view: Option<Box<SubscriptionAccountCatalogView>>,
     },
     TargetView {
         view: TargetView,
     },
     UniversalProviderView {
         view: UniversalProviderCatalogView,
+    },
+    SubscriptionAccountView {
+        view: SubscriptionAccountCatalogView,
     },
 }
 
@@ -155,6 +160,15 @@ pub enum ControlOperation {
     OpenUniversalProviders {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_context: Option<ClaudePreflightContext>,
+    },
+    OpenSubscriptionAccounts(OpenSubscriptionAccountsOperation),
+    StartDeviceAuthorization(StartDeviceAuthorizationOperation),
+    PollDeviceAuthorization(PollDeviceAuthorizationOperation),
+    PreviewDefaultSubscriptionAccount(PreviewDefaultSubscriptionAccountOperation),
+    SubscriptionAccountAct {
+        action_id: Uuid,
+        expected_revision: u64,
+        action: Value,
     },
     UniversalProviderAct {
         action_id: Uuid,
@@ -196,6 +210,28 @@ pub enum ControlOperation {
 pub struct PrepareHandoverOperation {
     pub candidate_path: String,
     pub expected_release: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenSubscriptionAccountsOperation {}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StartDeviceAuthorizationOperation {
+    pub reauthorize_account_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PollDeviceAuthorizationOperation {
+    pub flow_id: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewDefaultSubscriptionAccountOperation {
+    pub account_id: String,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -416,6 +452,29 @@ impl fmt::Debug for ControlOperation {
                 .field("expected_release", &operation.expected_release)
                 .finish(),
             Self::OpenUniversalProviders { .. } => formatter.write_str("OpenUniversalProviders"),
+            Self::OpenSubscriptionAccounts(_) => formatter.write_str("OpenSubscriptionAccounts"),
+            Self::StartDeviceAuthorization(operation) => formatter
+                .debug_struct("StartDeviceAuthorization")
+                .field("reauthorize_account_id", &operation.reauthorize_account_id)
+                .finish(),
+            Self::PollDeviceAuthorization(operation) => formatter
+                .debug_struct("PollDeviceAuthorization")
+                .field("flow_id", &operation.flow_id)
+                .finish(),
+            Self::PreviewDefaultSubscriptionAccount(operation) => formatter
+                .debug_struct("PreviewDefaultSubscriptionAccount")
+                .field("account_id", &operation.account_id)
+                .finish(),
+            Self::SubscriptionAccountAct {
+                action_id,
+                expected_revision,
+                ..
+            } => formatter
+                .debug_struct("SubscriptionAccountAct")
+                .field("action_id", action_id)
+                .field("expected_revision", expected_revision)
+                .field("action", &Redacted)
+                .finish(),
             Self::UniversalProviderAct {
                 action_id,
                 expected_revision,
@@ -601,6 +660,36 @@ pub enum UniversalProviderAction {
         provider_id: Uuid,
         #[serde(deserialize_with = "deserialize_positive_provider_revision")]
         provider_revision: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum SubscriptionAccountAction {
+    SetDefaultAccount {
+        account_id: String,
+        preview_token: Uuid,
+    },
+    BindProviderFixed {
+        target: Target,
+        provider_id: Uuid,
+        #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+        provider_revision: u64,
+        account_id: String,
+    },
+    BindProviderFollowDefault {
+        target: Target,
+        provider_id: Uuid,
+        #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+        provider_revision: u64,
+    },
+    DeleteAccount {
+        account_id: String,
     },
 }
 
@@ -803,14 +892,175 @@ pub enum ActivationMode {
 )]
 pub enum ControlResult {
     HandoverPrepared(HandoverPreparedResult),
-    TargetView { view: TargetView },
-    UniversalProviderCatalog { view: UniversalProviderCatalogView },
-    UniversalProviderOutcome { outcome: UniversalProviderOutcome },
-    ActionOutcome { outcome: ActionOutcome },
-    ModelDiscovery { result: ModelDiscoveryResult },
-    Reachability { result: ReachabilityResult },
-    ReconciliationPreview { preview: ReconciliationPreview },
+    TargetView {
+        view: TargetView,
+    },
+    UniversalProviderCatalog {
+        view: UniversalProviderCatalogView,
+    },
+    UniversalProviderOutcome {
+        outcome: UniversalProviderOutcome,
+    },
+    SubscriptionAccountCatalog {
+        view: SubscriptionAccountCatalogView,
+    },
+    DeviceAuthorizationChallenge {
+        challenge: DeviceAuthorizationChallengeView,
+    },
+    DeviceAuthorizationPoll {
+        poll: DeviceAuthorizationPollView,
+    },
+    SubscriptionDefaultPreview {
+        preview: SubscriptionDefaultPreview,
+    },
+    SubscriptionAccountOutcome {
+        outcome: SubscriptionAccountOutcome,
+    },
+    ActionOutcome {
+        outcome: ActionOutcome,
+    },
+    ModelDiscovery {
+        result: ModelDiscoveryResult,
+    },
+    Reachability {
+        result: ReachabilityResult,
+    },
+    ReconciliationPreview {
+        preview: ReconciliationPreview,
+    },
     CompatibilityProbe(CompatibilityProbeResult),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubscriptionAccountCatalogView {
+    pub revision: u64,
+    pub view_sequence: u64,
+    pub default_account_id: Option<String>,
+    pub accounts: Vec<SubscriptionAccountView>,
+    pub bindings: Vec<SubscriptionProviderBindingView>,
+    pub recovery: SubscriptionAccountRecoveryView,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeviceAuthorizationChallengeView {
+    pub flow_id: Uuid,
+    pub user_code: String,
+    pub verification_url: String,
+    pub expires_in_seconds: u64,
+    pub poll_interval_seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(
+    tag = "status",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum DeviceAuthorizationPollView {
+    Pending,
+    Expired,
+    Authorized { account_id: String },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubscriptionDefaultPreview {
+    pub preview_token: Uuid,
+    pub account_id: String,
+    pub effects: Vec<SubscriptionDefaultEffect>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubscriptionDefaultEffect {
+    pub target: Target,
+    pub provider_id: Uuid,
+    #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+    pub provider_revision: u64,
+    pub provider_name: String,
+    pub current_account_id: Option<String>,
+    pub next_resolution: SubscriptionBindingResolutionState,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubscriptionAccountOutcome {
+    pub status: ActionStatus,
+    pub view: SubscriptionAccountCatalogView,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubscriptionAccountView {
+    pub account_id: String,
+    pub email: Option<String>,
+    pub authenticated_at: i64,
+    pub state: SubscriptionAccountState,
+    #[serde(rename = "default")]
+    pub is_default: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubscriptionAccountState {
+    Authorized,
+    NeedsReauthorization,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubscriptionProviderBindingView {
+    pub target: Target,
+    pub provider_id: Uuid,
+    #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+    pub provider_revision: u64,
+    pub provider_name: String,
+    pub binding: SubscriptionProviderBinding,
+    pub resolution: SubscriptionBindingResolution,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum SubscriptionProviderBinding {
+    Fixed { account_id: String },
+    FollowDefault,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubscriptionBindingResolution {
+    pub state: SubscriptionBindingResolutionState,
+    pub account_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubscriptionBindingResolutionState {
+    Available,
+    NeedsReauthorization,
+    Missing,
+    NoDefault,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubscriptionAccountRecoveryView {
+    pub state: SubscriptionAccountRecoveryState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubscriptionAccountRecoveryState {
+    Clean,
+    RecoveryRequired,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

@@ -330,6 +330,25 @@ const controlOperationSchema = z.discriminatedUnion("kind", [
     kind: z.literal("open-universal-providers"),
     claudeContext: claudePreflightContextSchema.optional(),
   }).strict(),
+  z.object({ kind: z.literal("open-subscription-accounts") }).strict(),
+  z.object({
+    kind: z.literal("start-device-authorization"),
+    reauthorizeAccountId: z.string().nullable(),
+  }).strict(),
+  z.object({
+    kind: z.literal("poll-device-authorization"),
+    flowId: z.string().uuid(),
+  }).strict(),
+  z.object({
+    kind: z.literal("preview-default-subscription-account"),
+    accountId: z.string(),
+  }).strict(),
+  z.object({
+    kind: z.literal("subscription-account-act"),
+    actionId: z.string().uuid(),
+    expectedRevision: z.number().int().nonnegative(),
+    action: z.unknown(),
+  }).strict(),
   z.object({
     kind: z.literal("universal-provider-act"),
     actionId: z.string().uuid(),
@@ -466,6 +485,90 @@ const universalProviderActionSchema = z.discriminatedUnion("kind", [
   }).strict(),
 ])
 
+const subscriptionAccountActionSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("set-default-account"),
+    accountId: z.string(),
+    previewToken: z.string().uuid(),
+  }).strict(),
+  z.object({
+    kind: z.literal("bind-provider-fixed"),
+    target: targetSchema,
+    providerId: z.string().uuid(),
+    providerRevision: z.number().int().positive(),
+    accountId: z.string(),
+  }).strict(),
+  z.object({
+    kind: z.literal("bind-provider-follow-default"),
+    target: targetSchema,
+    providerId: z.string().uuid(),
+    providerRevision: z.number().int().positive(),
+  }).strict(),
+  z.object({
+    kind: z.literal("delete-account"),
+    accountId: z.string(),
+  }).strict(),
+])
+
+const subscriptionProviderBindingSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("fixed"), accountId: z.string() }).strict(),
+  z.object({ kind: z.literal("follow-default") }).strict(),
+])
+
+const subscriptionAccountCatalogSchema = z.object({
+  revision: z.number().int().nonnegative(),
+  viewSequence: z.number().int().nonnegative(),
+  defaultAccountId: z.string().nullable(),
+  accounts: z.array(z.object({
+    accountId: z.string(),
+    email: z.string().nullable(),
+    authenticatedAt: z.number().int(),
+    state: z.enum(["authorized", "needs-reauthorization"]),
+    default: z.boolean(),
+  }).strict()),
+  bindings: z.array(z.object({
+    target: targetSchema,
+    providerId: z.string().uuid(),
+    providerRevision: z.number().int().positive(),
+    providerName: z.string(),
+    binding: subscriptionProviderBindingSchema,
+    resolution: z.object({
+      state: z.enum(["available", "needs-reauthorization", "missing", "no-default"]),
+      accountId: z.string().nullable(),
+    }).strict(),
+  }).strict()),
+  recovery: z.object({
+    state: z.enum(["clean", "recovery-required"]),
+  }).strict(),
+}).strict()
+
+const deviceAuthorizationChallengeSchema = z.object({
+  flowId: z.string().uuid(),
+  userCode: z.string(),
+  verificationUrl: z.string(),
+  expiresInSeconds: z.number().int().nonnegative(),
+  pollIntervalSeconds: z.number().int().positive(),
+}).strict()
+
+const deviceAuthorizationPollSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("pending") }).strict(),
+  z.object({ status: z.literal("expired") }).strict(),
+  z.object({ status: z.literal("authorized"), accountId: z.string() }).strict(),
+])
+
+const subscriptionDefaultPreviewSchema = z.object({
+  previewToken: z.string().uuid(),
+  accountId: z.string(),
+  effects: z.array(z.object({
+    target: targetSchema,
+    providerId: z.string().uuid(),
+    providerRevision: z.number().int().positive(),
+    providerName: z.string(),
+    currentAccountId: z.string().nullable(),
+    nextResolution: z.enum(["available", "needs-reauthorization", "missing", "no-default"]),
+  }).strict()),
+}).strict()
+
 const inspectionCategorySchema = z.enum([
   "invalid-endpoint",
   "missing-credential",
@@ -532,6 +635,26 @@ const controlResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("handover-prepared"), release: z.string() }).strict(),
   z.object({ kind: z.literal("target-view"), view: targetViewSchema }),
   z.object({ kind: z.literal("universal-provider-catalog"), view: universalProviderCatalogSchema }).strict(),
+  z.object({ kind: z.literal("subscription-account-catalog"), view: subscriptionAccountCatalogSchema }).strict(),
+  z.object({
+    kind: z.literal("device-authorization-challenge"),
+    challenge: deviceAuthorizationChallengeSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("device-authorization-poll"),
+    poll: deviceAuthorizationPollSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("subscription-default-preview"),
+    preview: subscriptionDefaultPreviewSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("subscription-account-outcome"),
+    outcome: z.object({
+      status: z.enum(["applied", "replayed"]),
+      view: subscriptionAccountCatalogSchema,
+    }).strict(),
+  }).strict(),
   z.object({
     kind: z.literal("universal-provider-outcome"),
     outcome: z.object({
@@ -567,9 +690,11 @@ const serverFrameSchema = z.discriminatedUnion("type", [
     problem: controlProblemSchema,
     authoritativeView: targetViewSchema.optional(),
     authoritativeUniversalProviderView: universalProviderCatalogSchema.optional(),
+    authoritativeSubscriptionAccountView: subscriptionAccountCatalogSchema.optional(),
   }),
   z.object({ type: z.literal("target-view"), view: targetViewSchema }),
   z.object({ type: z.literal("universal-provider-view"), view: universalProviderCatalogSchema }).strict(),
+  z.object({ type: z.literal("subscription-account-view"), view: subscriptionAccountCatalogSchema }).strict(),
 ])
 
 export type ClientFrame = z.infer<typeof clientFrameSchema>
@@ -580,6 +705,15 @@ export type ClaudePreflightContext = z.infer<typeof claudePreflightContextSchema
 export type ClaudeBlockingSelector = z.infer<typeof claudeBlockingSelectorSchema>
 export type TargetAction = z.infer<typeof targetActionSchema>
 export type UniversalProviderAction = z.infer<typeof universalProviderActionSchema>
+export type SubscriptionAccountAction = z.infer<typeof subscriptionAccountActionSchema>
+export type SubscriptionAccountCatalogView = z.infer<typeof subscriptionAccountCatalogSchema>
+export type DeviceAuthorizationChallenge = z.infer<typeof deviceAuthorizationChallengeSchema>
+export type DeviceAuthorizationPoll = z.infer<typeof deviceAuthorizationPollSchema>
+export type SubscriptionDefaultPreview = z.infer<typeof subscriptionDefaultPreviewSchema>
+export type SubscriptionAccountOutcome = Extract<
+  ControlResult,
+  { kind: "subscription-account-outcome" }
+>["outcome"]
 export type UniversalProviderCatalogView = z.infer<typeof universalProviderCatalogSchema>
 export type OrdinaryTargetAction = Exclude<TargetAction, { kind: "resolve-compatibility" }>
 export type ActionOutcome = z.infer<typeof actionOutcomeSchema>
@@ -604,3 +738,5 @@ export const parseTargetView = (value: unknown): TargetView => targetViewSchema.
 export const parseTargetAction = (value: unknown): TargetAction => targetActionSchema.parse(value)
 export const parseUniversalProviderAction = (value: unknown): UniversalProviderAction =>
   universalProviderActionSchema.parse(value)
+export const parseSubscriptionAccountAction = (value: unknown): SubscriptionAccountAction =>
+  subscriptionAccountActionSchema.parse(value)

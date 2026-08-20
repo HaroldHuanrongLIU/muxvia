@@ -8,7 +8,8 @@
     { "$ref": "#/$defs/targetView" },
     { "$ref": "#/$defs/targetAction" },
     { "$ref": "#/$defs/universalProviderCatalog" },
-    { "$ref": "#/$defs/universalProviderAction" }
+    { "$ref": "#/$defs/universalProviderAction" },
+    { "$ref": "#/$defs/subscriptionAccountAction" }
   ],
   "$defs": {
     "rpc": {
@@ -76,15 +77,21 @@
       "oneOf": [
         { "type": "object", "properties": { "type": { "const": "hello-ack" }, "rpc": { "$ref": "#/$defs/rpc" }, "release": { "type": "string" }, "serviceEpoch": { "type": "string", "format": "uuid" }, "frameLimit": { "const": 1048576 } }, "required": ["type", "rpc", "release", "serviceEpoch", "frameLimit"] },
         { "type": "object", "properties": { "type": { "const": "response" }, "requestId": { "type": "string" }, "result": { "$ref": "#/$defs/controlResult" } }, "required": ["type", "requestId", "result"] },
-        { "type": "object", "properties": { "type": { "const": "error" }, "requestId": { "type": ["string", "null"] }, "problem": { "$ref": "#/$defs/controlProblem" }, "authoritativeView": { "$ref": "#/$defs/targetView" }, "authoritativeUniversalProviderView": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["type", "requestId", "problem"] },
+        { "type": "object", "properties": { "type": { "const": "error" }, "requestId": { "type": ["string", "null"] }, "problem": { "$ref": "#/$defs/controlProblem" }, "authoritativeView": { "$ref": "#/$defs/targetView" }, "authoritativeUniversalProviderView": { "$ref": "#/$defs/universalProviderCatalog" }, "authoritativeSubscriptionAccountView": { "$ref": "#/$defs/subscriptionAccountCatalog" } }, "required": ["type", "requestId", "problem"] },
         { "type": "object", "properties": { "type": { "const": "target-view" }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["type", "view"] },
-        { "type": "object", "additionalProperties": false, "properties": { "type": { "const": "universal-provider-view" }, "view": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["type", "view"] }
+        { "type": "object", "additionalProperties": false, "properties": { "type": { "const": "universal-provider-view" }, "view": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["type", "view"] },
+        { "type": "object", "additionalProperties": false, "properties": { "type": { "const": "subscription-account-view" }, "view": { "$ref": "#/$defs/subscriptionAccountCatalog" } }, "required": ["type", "view"] }
       ]
     },
     "controlOperation": {
       "oneOf": [
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "prepare-handover" }, "candidatePath": { "type": "string" }, "expectedRelease": { "type": "string" } }, "required": ["kind", "candidatePath", "expectedRelease"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "open-universal-providers" }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "open-subscription-accounts" } }, "required": ["kind"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "start-device-authorization" }, "reauthorizeAccountId": { "type": ["string", "null"] } }, "required": ["kind", "reauthorizeAccountId"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "poll-device-authorization" }, "flowId": { "type": "string", "format": "uuid" } }, "required": ["kind", "flowId"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "preview-default-subscription-account" }, "accountId": { "type": "string" } }, "required": ["kind", "accountId"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "subscription-account-act" }, "actionId": { "type": "string", "format": "uuid" }, "expectedRevision": { "type": "integer", "minimum": 0 }, "action": {} }, "required": ["kind", "actionId", "expectedRevision", "action"] },
         { "type": "object", "properties": { "kind": { "const": "universal-provider-act" }, "actionId": { "type": "string", "format": "uuid" }, "expectedRevision": { "type": "integer", "minimum": 0 }, "action": {} }, "required": ["kind", "actionId", "expectedRevision", "action"] },
         { "type": "object", "properties": { "kind": { "const": "open-target" }, "target": { "enum": ["codex", "claude"] }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind", "target"] },
         { "type": "object", "properties": { "kind": { "const": "act" }, "target": { "enum": ["codex", "claude"] }, "actionId": { "type": "string", "format": "uuid" }, "expectedRevision": { "type": "integer", "minimum": 0 }, "action": {} }, "required": ["kind", "target", "actionId", "expectedRevision", "action"] },
@@ -156,6 +163,11 @@
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "handover-prepared" }, "release": { "type": "string" } }, "required": ["kind", "release"] },
         { "type": "object", "properties": { "kind": { "const": "target-view" }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["kind", "view"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "universal-provider-catalog" }, "view": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["kind", "view"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "subscription-account-catalog" }, "view": { "$ref": "#/$defs/subscriptionAccountCatalog" } }, "required": ["kind", "view"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "device-authorization-challenge" }, "challenge": { "$ref": "#/$defs/deviceAuthorizationChallenge" } }, "required": ["kind", "challenge"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "device-authorization-poll" }, "poll": { "$ref": "#/$defs/deviceAuthorizationPoll" } }, "required": ["kind", "poll"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "subscription-default-preview" }, "preview": { "$ref": "#/$defs/subscriptionDefaultPreview" } }, "required": ["kind", "preview"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "subscription-account-outcome" }, "outcome": { "type": "object", "additionalProperties": false, "properties": { "status": { "enum": ["applied", "replayed"] }, "view": { "$ref": "#/$defs/subscriptionAccountCatalog" } }, "required": ["status", "view"] } }, "required": ["kind", "outcome"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "universal-provider-outcome" }, "outcome": { "type": "object", "additionalProperties": false, "properties": { "status": { "enum": ["applied", "replayed"] }, "view": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["status", "view"] } }, "required": ["kind", "outcome"] },
         { "type": "object", "properties": { "kind": { "const": "action-outcome" }, "outcome": { "type": "object", "properties": { "status": { "enum": ["applied", "replayed"] }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["status", "view"] } }, "required": ["kind", "outcome"] },
         { "type": "object", "properties": { "kind": { "const": "model-discovery" }, "result": { "$ref": "#/$defs/modelDiscoveryResult" } }, "required": ["kind", "result"] },
@@ -272,6 +284,122 @@
         { "type": "object", "properties": { "kind": { "const": "delete-universal-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"], "additionalProperties": false },
         { "type": "object", "properties": { "kind": { "const": "synchronize-universal-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"], "additionalProperties": false }
       ]
+    },
+    "subscriptionAccountState": {
+      "enum": ["authorized", "needs-reauthorization"]
+    },
+    "subscriptionProviderBinding": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "fixed" }, "accountId": { "type": "string" } }, "required": ["kind", "accountId"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "follow-default" } }, "required": ["kind"] }
+      ]
+    },
+    "subscriptionAccountCatalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "revision": { "type": "integer", "minimum": 0 },
+        "viewSequence": { "type": "integer", "minimum": 0 },
+        "defaultAccountId": { "type": ["string", "null"] },
+        "accounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "accountId": { "type": "string" },
+              "email": { "type": ["string", "null"] },
+              "authenticatedAt": { "type": "integer" },
+              "state": { "$ref": "#/$defs/subscriptionAccountState" },
+              "default": { "type": "boolean" }
+            },
+            "required": ["accountId", "email", "authenticatedAt", "state", "default"]
+          }
+        },
+        "bindings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "target": { "enum": ["codex", "claude"] },
+              "providerId": { "type": "string", "format": "uuid" },
+              "providerRevision": { "type": "integer", "minimum": 1 },
+              "providerName": { "type": "string" },
+              "binding": { "$ref": "#/$defs/subscriptionProviderBinding" },
+              "resolution": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "state": { "enum": ["available", "needs-reauthorization", "missing", "no-default"] },
+                  "accountId": { "type": ["string", "null"] }
+                },
+                "required": ["state", "accountId"]
+              }
+            },
+            "required": ["target", "providerId", "providerRevision", "providerName", "binding", "resolution"]
+          }
+        },
+        "recovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "state": { "enum": ["clean", "recovery-required"] } },
+          "required": ["state"]
+        }
+      },
+      "required": ["revision", "viewSequence", "defaultAccountId", "accounts", "bindings", "recovery"]
+    },
+    "subscriptionAccountAction": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "set-default-account" }, "accountId": { "type": "string" }, "previewToken": { "type": "string", "format": "uuid" } }, "required": ["kind", "accountId", "previewToken"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "bind-provider-fixed" }, "target": { "enum": ["codex", "claude"] }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 }, "accountId": { "type": "string" } }, "required": ["kind", "target", "providerId", "providerRevision", "accountId"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "bind-provider-follow-default" }, "target": { "enum": ["codex", "claude"] }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "target", "providerId", "providerRevision"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "delete-account" }, "accountId": { "type": "string" } }, "required": ["kind", "accountId"] }
+      ]
+    },
+    "deviceAuthorizationChallenge": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "flowId": { "type": "string", "format": "uuid" },
+        "userCode": { "type": "string" },
+        "verificationUrl": { "type": "string" },
+        "expiresInSeconds": { "type": "integer", "minimum": 0 },
+        "pollIntervalSeconds": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["flowId", "userCode", "verificationUrl", "expiresInSeconds", "pollIntervalSeconds"]
+    },
+    "deviceAuthorizationPoll": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "properties": { "status": { "const": "pending" } }, "required": ["status"] },
+        { "type": "object", "additionalProperties": false, "properties": { "status": { "const": "expired" } }, "required": ["status"] },
+        { "type": "object", "additionalProperties": false, "properties": { "status": { "const": "authorized" }, "accountId": { "type": "string" } }, "required": ["status", "accountId"] }
+      ]
+    },
+    "subscriptionDefaultPreview": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "previewToken": { "type": "string", "format": "uuid" },
+        "accountId": { "type": "string" },
+        "effects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "target": { "enum": ["codex", "claude"] },
+              "providerId": { "type": "string", "format": "uuid" },
+              "providerRevision": { "type": "integer", "minimum": 1 },
+              "providerName": { "type": "string" },
+              "currentAccountId": { "type": ["string", "null"] },
+              "nextResolution": { "enum": ["available", "needs-reauthorization", "missing", "no-default"] }
+            },
+            "required": ["target", "providerId", "providerRevision", "providerName", "currentAccountId", "nextResolution"]
+          }
+        }
+      },
+      "required": ["previewToken", "accountId", "effects"]
     },
     "routeHealth": {
       "type": "object",

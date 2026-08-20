@@ -1,0 +1,8 @@
+{
+  "type": "request",
+  "requestId": "subscription-device-poll-1",
+  "operation": {
+    "kind": "poll-device-authorization",
+    "flowId": "00000000-0000-4000-8000-000000001111"
+  }
+}

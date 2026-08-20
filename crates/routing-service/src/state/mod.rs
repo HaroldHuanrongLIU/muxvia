@@ -3,6 +3,7 @@ pub(crate) mod providers;
 mod reconciliation;
 mod recovery;
 mod store;
+mod subscription_accounts;
 mod universal_providers;
 
 pub use crate::control::protocol::CompatibilityClassification;
@@ -18,6 +19,7 @@ pub use store::{
     StateError, StateStore,
 };
 pub(crate) use store::{ActivatedRoutePlanSnapshot, RouteObservation, RoutePlanMemberSnapshot};
+pub(crate) use subscription_accounts::SubscriptionAccountActionFailure;
 pub use universal_providers::{
     UniversalProviderActionFailure, UniversalProviderSynchronizationCommit,
     UniversalSynchronizationFailpoint,

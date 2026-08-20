@@ -54,12 +54,21 @@ export type CommandId =
   | "universal-provider.cancel"
   | "universal-provider.confirm"
   | "universal-provider.confirm.cancel"
+  | "subscription-account.list"
+  | "subscription-account.authorize"
+  | "subscription-account.reauthorize"
+  | "subscription-account.default"
+  | "subscription-account.bind.fixed"
+  | "subscription-account.bind.follow-default"
+  | "subscription-account.delete"
+  | "subscription-account.confirm"
+  | "subscription-account.cancel"
   | "app.exit.request"
   | "overlay.close"
   | "app.exit.confirm"
   | "app.exit.cancel"
 
-export type CommandScope = "global" | "home" | "codex" | "claude" | "editor" | "provider-picker" | "provider-picker-claude" | "provider-source-picker" | "provider-model-picker" | "provider-credential-confirm" | "provider-delete-confirm" | "takeover-required-confirm" | "takeover-disable-confirm" | "reconciliation" | "route-editor" | "universal-provider-picker" | "universal-provider-editor" | "universal-provider-confirm" | "overlay" | "confirm"
+export type CommandScope = "global" | "home" | "codex" | "claude" | "editor" | "provider-picker" | "provider-picker-claude" | "provider-source-picker" | "provider-model-picker" | "provider-credential-confirm" | "provider-delete-confirm" | "takeover-required-confirm" | "takeover-disable-confirm" | "reconciliation" | "route-editor" | "universal-provider-picker" | "universal-provider-editor" | "universal-provider-confirm" | "subscription-account-picker" | "overlay" | "confirm"
 
 export type CommandTextKey = `command.${string}`
 

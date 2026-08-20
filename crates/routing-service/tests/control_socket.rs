@@ -539,6 +539,38 @@ impl ControlFixture {
         }
     }
 
+    async fn start_with_device_authority_origin(authority_origin: &str) -> Self {
+        let root = short_temp_root("mx-sub");
+        let user_home = root.join("home");
+        fs::create_dir_all(&user_home).unwrap();
+        let home = MuxviaHome::from_user_home(&user_home);
+        let store = Arc::new(StateStore::open(&home).await.unwrap());
+        let activation = Arc::new(
+            ActivationService::new(
+                Arc::clone(&store),
+                home.clone(),
+                Arc::new(ControlCodexProbe),
+                "/usr/bin/codex".into(),
+                Arc::new(ControlNoopUpstream),
+            )
+            .with_claude_runtime(Arc::new(ControlClaudeProbe), "/usr/bin/claude".into()),
+        );
+        let handle = ControlServer::bind_with_activation_and_device_authority_origin(
+            &home,
+            Arc::clone(&store),
+            "routing-test",
+            activation,
+            authority_origin,
+        )
+        .await
+        .unwrap();
+        Self {
+            root,
+            store,
+            handle: Some(handle),
+        }
+    }
+
     fn socket(&self) -> &Path {
         self.handle.as_ref().unwrap().socket_path()
     }
@@ -780,6 +812,542 @@ async fn request(stream: &mut UnixStream, request_id: &str, operation: Value) ->
     .await
     .unwrap();
     read_frame(stream).await.unwrap()
+}
+
+#[tokio::test]
+async fn subscription_device_authorization_survives_disconnect_and_responds_before_one_push() {
+    let authority = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", authority.local_addr().unwrap());
+    let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let captured_requests = Arc::clone(&captured);
+    let authority_task = tokio::spawn(async move {
+        for (status, body) in [
+            (
+                "200 OK",
+                r#"{"device_auth_id":"REMOTE_DEVICE_UDS_SECRET_11801","user_code":"WXYZ-1234","interval":5,"expires_in":900}"#,
+            ),
+            ("403 Forbidden", ""),
+            (
+                "200 OK",
+                r#"{"authorization_code":"AUTHORIZATION_UDS_SECRET_11802","code_verifier":"SERVER_VERIFIER_UDS_SECRET_11803"}"#,
+            ),
+            (
+                "200 OK",
+                concat!(
+                    "{\"access_token\":\"ACCESS_TOKEN_UDS_SECRET_11804\",",
+                    "\"refresh_token\":\"REFRESH_TOKEN_UDS_SECRET_11805\",",
+                    "\"id_token\":\"e30.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2NvdW50LXVkcyIsImVtYWlsIjoib3BlcmF0b3JAZXhhbXBsZS50ZXN0In0.signature\",",
+                    "\"expires_in\":3600}"
+                ),
+            ),
+        ] {
+            let (mut socket, _) = authority.accept().await.unwrap();
+            let request = read_subscription_http_request(&mut socket).await;
+            captured_requests.lock().unwrap().push(request);
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let mut fixture = ControlFixture::start_with_device_authority_origin(&origin).await;
+    let mut initiator = fixture.connect().await;
+    let mut subscriber = fixture.connect().await;
+    hello(&mut initiator).await;
+    hello(&mut subscriber).await;
+    for (stream, label) in [
+        (&mut initiator, "initiator"),
+        (&mut subscriber, "subscriber"),
+    ] {
+        let opened = request(
+            stream,
+            &format!("open-{label}"),
+            json!({"kind": "open-subscription-accounts"}),
+        )
+        .await;
+        assert!(
+            opened["result"]["kind"] == "subscription-account-catalog",
+            "subscription account session did not open"
+        );
+    }
+    let started = request(
+        &mut initiator,
+        "start-device",
+        json!({
+            "kind": "start-device-authorization",
+            "reauthorizeAccountId": null
+        }),
+    )
+    .await;
+    let started_text = serde_json::to_string(&started).unwrap();
+    for secret in [
+        "REMOTE_DEVICE_UDS_SECRET_11801",
+        "SERVER_VERIFIER_UDS_SECRET_11803",
+        "ACCESS_TOKEN_UDS_SECRET_11804",
+        "REFRESH_TOKEN_UDS_SECRET_11805",
+    ] {
+        assert!(
+            !started_text.contains(secret),
+            "device authorization start frame exposed a private value"
+        );
+    }
+    let flow_id = started["result"]["challenge"]["flowId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(initiator);
+
+    let mut poller = fixture.connect().await;
+    hello(&mut poller).await;
+    request(
+        &mut poller,
+        "open-poller",
+        json!({"kind": "open-subscription-accounts"}),
+    )
+    .await;
+    let pending = request(
+        &mut poller,
+        "poll-pending",
+        json!({"kind": "poll-device-authorization", "flowId": flow_id}),
+    )
+    .await;
+    assert!(
+        pending["result"]["poll"]["status"] == "pending",
+        "pending device authorization changed state"
+    );
+    let authorized = request(
+        &mut poller,
+        "poll-authorized",
+        json!({"kind": "poll-device-authorization", "flowId": flow_id}),
+    )
+    .await;
+    assert!(
+        authorized["result"]["poll"]["status"] == "authorized",
+        "authorized device poll returned the wrong result"
+    );
+    let poller_push = read_frame(&mut poller).await.unwrap();
+    let subscriber_push = read_frame(&mut subscriber).await.unwrap();
+    assert!(
+        poller_push["type"] == "subscription-account-view"
+            && subscriber_push == poller_push
+            && poller_push["view"]["revision"] == 1
+            && poller_push["view"]["accounts"][0]["accountId"] == "account-uds",
+        "authorized poll did not publish exactly the committed account catalog"
+    );
+    let home = MuxviaHome::from_user_home(&fixture.root.join("home"));
+    let private_file = fs::read_to_string(home.subscription_accounts_path()).unwrap();
+    assert!(
+        private_file.contains("REFRESH_TOKEN_UDS_SECRET_11805")
+            && !private_file.contains("ACCESS_TOKEN_UDS_SECRET_11804")
+            && !private_file.contains("SERVER_VERIFIER_UDS_SECRET_11803"),
+        "private account file stored the wrong token material"
+    );
+    authority_task.await.unwrap();
+    let pinned_contract_observed = {
+        let requests = captured.lock().unwrap();
+        requests.len() == 4
+            && requests[3].contains("code_verifier=SERVER_VERIFIER_UDS_SECRET_11803")
+    };
+    assert!(
+        pinned_contract_observed,
+        "real UDS flow departed from the pinned remote contract"
+    );
+    fixture.shutdown().await;
+}
+
+async fn read_subscription_http_request(stream: &mut tokio::net::TcpStream) -> String {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(read != 0, "subscription authority request ended early");
+        bytes.extend_from_slice(&chunk[..read]);
+        let Some(header_end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+            continue;
+        };
+        let header_end = header_end + 4;
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(str::trim)
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        if bytes.len() >= header_end + content_length {
+            return String::from_utf8(bytes).unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn subscription_bindings_default_preview_delete_and_replay_are_authoritative() {
+    let mut fixture = ControlFixture::start().await;
+    let home = MuxviaHome::from_user_home(&fixture.root.join("home"));
+    fs::create_dir_all(home.subscription_accounts_path().parent().unwrap()).unwrap();
+    fs::write(
+        home.subscription_accounts_path(),
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "accounts": {
+                "account-primary": {
+                    "account_id": "account-primary",
+                    "email": "primary@example.test",
+                    "refresh_token": "ACCOUNT_PRIMARY_SECRET_11811",
+                    "authenticated_at": 1,
+                    "state": "authorized"
+                },
+                "account-secondary": {
+                    "account_id": "account-secondary",
+                    "email": "secondary@example.test",
+                    "refresh_token": "ACCOUNT_SECONDARY_SECRET_11812",
+                    "authenticated_at": 2,
+                    "state": "authorized"
+                }
+            },
+            "default_account_id": "account-primary"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(
+        home.subscription_accounts_path(),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let provider = fixture
+        .store
+        .apply_provider_action_for(
+            Target::Codex,
+            Uuid::new_v4(),
+            0,
+            json!({
+                "kind": "create-provider",
+                "name": "Subscription metadata",
+                "baseUrl": "https://example.test/v1",
+                "model": "subscription-model",
+                "credential": {"kind": "replace", "value": "PROVIDER_SECRET_11813"},
+                "authentication": "openai-bearer",
+                "presetKey": null
+            }),
+        )
+        .await
+        .unwrap()
+        .view
+        .providers
+        .remove(0);
+    let mut initiator = fixture.connect().await;
+    let mut subscriber = fixture.connect().await;
+    hello(&mut initiator).await;
+    hello(&mut subscriber).await;
+    for (stream, label) in [
+        (&mut initiator, "initiator"),
+        (&mut subscriber, "subscriber"),
+    ] {
+        request(
+            stream,
+            &format!("open-binding-{label}"),
+            json!({"kind": "open-subscription-accounts"}),
+        )
+        .await;
+    }
+
+    let fixed_action_id = Uuid::new_v4();
+    let fixed_action = json!({
+        "kind": "bind-provider-fixed",
+        "target": "codex",
+        "providerId": provider.id,
+        "providerRevision": provider.provider_revision,
+        "accountId": "account-primary"
+    });
+    let fixed = request(
+        &mut initiator,
+        "bind-fixed",
+        json!({
+            "kind": "subscription-account-act",
+            "actionId": fixed_action_id,
+            "expectedRevision": 0,
+            "action": fixed_action
+        }),
+    )
+    .await;
+    let fixed_push = read_frame(&mut initiator).await.unwrap();
+    let fixed_subscriber = read_frame(&mut subscriber).await.unwrap();
+    assert!(
+        fixed["result"]["outcome"]["view"]["revision"] == 1
+            && fixed_push["view"] == fixed["result"]["outcome"]["view"]
+            && fixed_subscriber == fixed_push,
+        "fixed binding response/push ordering changed"
+    );
+
+    let deleted = request(
+        &mut initiator,
+        "delete-account",
+        json!({
+            "kind": "subscription-account-act",
+            "actionId": Uuid::new_v4(),
+            "expectedRevision": 1,
+            "action": {"kind": "delete-account", "accountId": "account-primary"}
+        }),
+    )
+    .await;
+    let delete_push = read_frame(&mut initiator).await.unwrap();
+    let delete_subscriber = read_frame(&mut subscriber).await.unwrap();
+    assert!(
+        deleted["result"]["outcome"]["view"]["bindings"][0]["binding"]["accountId"]
+            == "account-primary"
+            && deleted["result"]["outcome"]["view"]["bindings"][0]["resolution"]["state"]
+                == "missing"
+            && deleted["result"]["outcome"]["view"]["defaultAccountId"] == "account-secondary"
+            && delete_push["view"] == deleted["result"]["outcome"]["view"]
+            && delete_subscriber == delete_push,
+        "deleting a fixed account substituted or removed its binding"
+    );
+
+    let followed = request(
+        &mut initiator,
+        "bind-follow",
+        json!({
+            "kind": "subscription-account-act",
+            "actionId": Uuid::new_v4(),
+            "expectedRevision": 2,
+            "action": {
+                "kind": "bind-provider-follow-default",
+                "target": "codex",
+                "providerId": provider.id,
+                "providerRevision": provider.provider_revision
+            }
+        }),
+    )
+    .await;
+    let _follow_push = read_frame(&mut initiator).await.unwrap();
+    let _follow_subscriber = read_frame(&mut subscriber).await.unwrap();
+    assert!(
+        followed["result"]["outcome"]["view"]["bindings"][0]["resolution"]["state"] == "available",
+        "follow-default binding did not resolve the deterministic fallback default"
+    );
+    let preview = request(
+        &mut initiator,
+        "preview-default",
+        json!({
+            "kind": "preview-default-subscription-account",
+            "accountId": "account-secondary"
+        }),
+    )
+    .await;
+    assert!(
+        preview["result"]["preview"]["effects"][0]["currentAccountId"] == "account-secondary"
+            && preview["result"]["preview"]["effects"][0]["nextResolution"] == "available",
+        "default preview omitted the follow-default consequence"
+    );
+    let default_action_id = Uuid::new_v4();
+    let default_action = json!({
+        "kind": "set-default-account",
+        "accountId": "account-secondary",
+        "previewToken": preview["result"]["preview"]["previewToken"]
+    });
+    let applied = request(
+        &mut initiator,
+        "set-default",
+        json!({
+            "kind": "subscription-account-act",
+            "actionId": default_action_id,
+            "expectedRevision": 3,
+            "action": default_action
+        }),
+    )
+    .await;
+    let _default_push = read_frame(&mut initiator).await.unwrap();
+    let _default_subscriber = read_frame(&mut subscriber).await.unwrap();
+    assert!(
+        applied["result"]["outcome"]["view"]["defaultAccountId"] == "account-secondary"
+            && applied["result"]["outcome"]["view"]["bindings"][0]["resolution"]["state"]
+                == "available",
+        "default confirmation did not apply the previewed resolution"
+    );
+    let replay = request(
+        &mut initiator,
+        "set-default-replay",
+        json!({
+            "kind": "subscription-account-act",
+            "actionId": default_action_id,
+            "expectedRevision": 999,
+            "action": default_action
+        }),
+    )
+    .await;
+    assert!(
+        replay["result"]["outcome"]["status"] == "replayed"
+            && replay["result"]["outcome"]["view"] == applied["result"]["outcome"]["view"],
+        "default action replay was not receipt-first"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), read_frame(&mut subscriber))
+            .await
+            .is_err(),
+        "receipt replay published a duplicate catalog view"
+    );
+    let stale = request(
+        &mut initiator,
+        "stale-account-delete",
+        json!({
+            "kind": "subscription-account-act",
+            "actionId": Uuid::new_v4(),
+            "expectedRevision": 3,
+            "action": {"kind": "delete-account", "accountId": "account-secondary"}
+        }),
+    )
+    .await;
+    assert!(
+        stale["problem"]["code"] == "stale-revision"
+            && stale["authoritativeSubscriptionAccountView"]["revision"] == 4
+            && stale["authoritativeSubscriptionAccountView"]["accounts"]
+                .as_array()
+                .is_some_and(|accounts| accounts.len() == 1),
+        "stale Subscription Account action did not return the authoritative catalog"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), read_frame(&mut subscriber))
+            .await
+            .is_err(),
+        "stale Subscription Account action published a catalog view"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn subscription_account_writer_failure_suppresses_publication_but_reopen_reads_durable_state()
+{
+    let mut fixture = ControlFixture::start().await;
+    let home = MuxviaHome::from_user_home(&fixture.root.join("home"));
+    let accounts = (0..1_024)
+        .map(|index| {
+            let account_id = format!("account-{index:04}");
+            (
+                account_id.clone(),
+                json!({
+                    "account_id": account_id,
+                    "email": format!("operator-{index:04}@example.test"),
+                    "refresh_token": format!("PRIVATE_ACCOUNT_WRITER_SECRET_{index:04}"),
+                    "authenticated_at": index + 1,
+                    "state": "authorized"
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    fs::write(
+        home.subscription_accounts_path(),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "accounts": accounts,
+            "default_account_id": "account-0000"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(
+        home.subscription_accounts_path(),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    let mut initiator = fixture.connect().await;
+    let mut subscriber = fixture.connect().await;
+    hello(&mut initiator).await;
+    hello(&mut subscriber).await;
+    for (stream, request_id) in [
+        (&mut initiator, "account-writer-initiator"),
+        (&mut subscriber, "account-writer-subscriber"),
+    ] {
+        request(
+            stream,
+            request_id,
+            json!({"kind": "open-subscription-accounts"}),
+        )
+        .await;
+    }
+
+    for index in 0..8 {
+        write_frame(
+            &mut initiator,
+            &json!({
+                "type": "request",
+                "requestId": format!("account-writer-fill-{index}"),
+                "operation": {"kind": "open-subscription-accounts"}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let action_id = Uuid::new_v4();
+    write_frame(
+        &mut initiator,
+        &json!({
+            "type": "request",
+            "requestId": "account-writer-delete",
+            "operation": {
+                "kind": "subscription-account-act",
+                "actionId": action_id,
+                "expectedRevision": 0,
+                "action": {"kind": "delete-account", "accountId": "account-0000"}
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let database = tokio_rusqlite::rusqlite::Connection::open(home.database_path()).unwrap();
+    tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            let committed: bool = database
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM subscription_account_action_receipts WHERE action_id = ?1)",
+                    [action_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if committed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Subscription Account action did not commit behind the blocked writer");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), read_frame(&mut subscriber))
+            .await
+            .is_err(),
+        "failed Subscription Account response writer emitted a misleading catalog push"
+    );
+
+    let mut reopened = fixture.connect().await;
+    hello(&mut reopened).await;
+    let visible = request(
+        &mut reopened,
+        "account-open-after-writer-failure",
+        json!({"kind": "open-subscription-accounts"}),
+    )
+    .await;
+    assert!(
+        visible["result"]["view"]["revision"] == 1
+            && visible["result"]["view"]["defaultAccountId"] == "account-1023"
+            && visible["result"]["view"]["accounts"]
+                .as_array()
+                .is_some_and(|values| values.len() == 1_023),
+        "reopen did not read the durable Subscription Account state after writer failure"
+    );
+    drop(initiator);
+    fixture.shutdown().await;
 }
 
 #[tokio::test]

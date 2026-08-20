@@ -54,6 +54,8 @@ pub struct ProcessOptions {
     pub claude_executable: PathBuf,
     pub release: String,
     pub inherited_service_lock_fd: Option<i32>,
+    pub test_device_authority_origin: Option<String>,
+    pub test_refresh_subscription_account: Option<String>,
 }
 
 struct ServiceLock {
@@ -153,13 +155,28 @@ pub async fn run(options: ProcessOptions) -> Result<(), ProcessError> {
         .with_configuration_home_override(std::env::var_os("CODEX_HOME").map(PathBuf::from)),
     );
     loop {
-        let mut control = ControlServer::bind_process(
-            &home,
-            Arc::clone(&store),
-            options.release.clone(),
-            Arc::clone(&activation),
-        )
-        .await?;
+        let mut control = match &options.test_device_authority_origin {
+            Some(origin) => {
+                ControlServer::bind_process_with_device_authority_origin(
+                    &home,
+                    Arc::clone(&store),
+                    options.release.clone(),
+                    Arc::clone(&activation),
+                    origin,
+                    options.test_refresh_subscription_account.clone(),
+                )
+                .await?
+            }
+            None => {
+                ControlServer::bind_process(
+                    &home,
+                    Arc::clone(&store),
+                    options.release.clone(),
+                    Arc::clone(&activation),
+                )
+                .await?
+            }
+        };
         let outcome = if let Some(path) = &options.test_shutdown_file {
             tokio::select! {
                 result = control.wait_for_lifecycle() => result?,
@@ -207,6 +224,14 @@ fn exec_candidate(
             .arg(&options.codex_executable)
             .arg("--test-claude-executable")
             .arg(&options.claude_executable);
+        if let Some(origin) = &options.test_device_authority_origin {
+            command.arg("--test-device-authority-origin").arg(origin);
+        }
+        if let Some(account_id) = &options.test_refresh_subscription_account {
+            command
+                .arg("--test-refresh-subscription-account")
+                .arg(account_id);
+        }
     }
     command.exec()
 }

@@ -8,3 +8,4 @@ pub mod model;
 mod probe_process;
 pub mod service;
 pub mod state;
+mod subscription;

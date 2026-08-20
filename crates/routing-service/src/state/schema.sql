@@ -98,6 +98,43 @@ CREATE TABLE IF NOT EXISTS universal_provider_seeds (
   seeded_provider_id TEXT
 );
 
+CREATE TABLE IF NOT EXISTS subscription_account_catalog_state (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  revision INTEGER NOT NULL CHECK (revision >= 0),
+  view_sequence INTEGER NOT NULL CHECK (view_sequence >= 0),
+  recovery_state TEXT NOT NULL CHECK (recovery_state IN ('clean', 'recovery-required'))
+);
+
+CREATE TABLE IF NOT EXISTS subscription_provider_bindings (
+  target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+  provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+  binding_kind TEXT NOT NULL CHECK (binding_kind IN ('fixed', 'follow-default')),
+  account_id TEXT,
+  CHECK (
+    (binding_kind = 'fixed' AND account_id IS NOT NULL AND length(account_id) > 0)
+    OR (binding_kind = 'follow-default' AND account_id IS NULL)
+  ),
+  PRIMARY KEY (target, provider_id)
+);
+
+CREATE TABLE IF NOT EXISTS subscription_account_recovery_intents (
+  id TEXT PRIMARY KEY,
+  action_id TEXT NOT NULL UNIQUE,
+  operation TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'rolled-back', 'recovery-required')),
+  before_sha256 TEXT NOT NULL,
+  desired_sha256 TEXT NOT NULL,
+  created_revision INTEGER NOT NULL CHECK (created_revision >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS subscription_account_action_receipts (
+  action_id TEXT PRIMARY KEY,
+  action_kind TEXT NOT NULL,
+  action_json TEXT NOT NULL,
+  committed_revision INTEGER NOT NULL CHECK (committed_revision >= 0),
+  outcome_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS failover_drafts (
   target TEXT PRIMARY KEY CHECK (target IN ('codex', 'claude')),
   draft_revision INTEGER NOT NULL CHECK (draft_revision >= 1)
@@ -238,7 +275,11 @@ CREATE TABLE IF NOT EXISTS reconciliation_intents (
   PRIMARY KEY (target, action_id)
 );
 
-INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '10');
+INSERT OR IGNORE INTO subscription_account_catalog_state
+  (singleton, revision, view_sequence, recovery_state)
+VALUES (1, 0, 0, 'clean');
+
+INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '11');
 INSERT OR IGNORE INTO universal_provider_catalog_state (
   singleton, revision, view_sequence
 ) VALUES (1, 0, 0);

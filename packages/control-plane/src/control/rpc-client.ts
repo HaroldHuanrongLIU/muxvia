@@ -8,6 +8,10 @@ import {
   type UniversalProviderSession,
 } from "./universal-provider-session"
 import {
+  createSubscriptionAccountSession,
+  type SubscriptionAccountSession,
+} from "./subscription-account-session"
+import {
   parseServerFrame,
   type ControlOperation,
   type ClaudePreflightContext,
@@ -16,6 +20,7 @@ import {
   type TargetView,
   type Target,
   type UniversalProviderCatalogView,
+  type SubscriptionAccountCatalogView,
 } from "./types"
 
 type Pending = {
@@ -28,7 +33,7 @@ type Pending = {
 export type RequestOptions = { signal?: AbortSignal }
 export type InspectionOperation = Extract<
   ControlOperation,
-  { kind: "discover-models" | "check-reachability" | "preview-reconciliation" | "probe-compatibility" }
+  { kind: "discover-models" | "check-reachability" | "preview-reconciliation" | "probe-compatibility" | "poll-device-authorization" }
 >
 type NonInspectionOperation = Exclude<ControlOperation, InspectionOperation>
 
@@ -47,6 +52,7 @@ export class ControlError extends Error {
   readonly retryable: boolean
   readonly authoritativeView?: TargetView
   readonly authoritativeUniversalProviderView?: UniversalProviderCatalogView
+  readonly authoritativeSubscriptionAccountView?: SubscriptionAccountCatalogView
   readonly source?: string
   readonly selector?: string
 
@@ -57,6 +63,7 @@ export class ControlError extends Error {
     source?: string,
     selector?: string,
     authoritativeUniversalProviderView?: UniversalProviderCatalogView,
+    authoritativeSubscriptionAccountView?: SubscriptionAccountCatalogView,
   ) {
     super(message)
     this.name = "ControlError"
@@ -64,6 +71,7 @@ export class ControlError extends Error {
     this.retryable = code === "stale-revision"
     this.authoritativeView = authoritativeView
     this.authoritativeUniversalProviderView = authoritativeUniversalProviderView
+    this.authoritativeSubscriptionAccountView = authoritativeSubscriptionAccountView
     this.source = source
     this.selector = selector
   }
@@ -74,6 +82,7 @@ export interface RpcTransport {
   request(operation: NonInspectionOperation): Promise<ControlResult>
   onTargetView(listener: (view: TargetView) => void): () => void
   onUniversalProviderView(listener: (view: UniversalProviderCatalogView) => void): () => void
+  onSubscriptionAccountView(listener: (view: SubscriptionAccountCatalogView) => void): () => void
   whenClosed(): Promise<void>
   close(): Promise<void>
 }
@@ -85,6 +94,9 @@ export class RpcClient implements RpcTransport, MuxviaControl {
   readonly #viewListeners = new Set<(view: TargetView) => void>()
   readonly #universalProviderViewListeners = new Set<
     (view: UniversalProviderCatalogView) => void
+  >()
+  readonly #subscriptionAccountViewListeners = new Set<
+    (view: SubscriptionAccountCatalogView) => void
   >()
   #handshake?: {
     resolve: () => void
@@ -181,6 +193,14 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     return createUniversalProviderSession(this, result.view, claudeContext)
   }
 
+  async openSubscriptionAccounts(): Promise<SubscriptionAccountSession> {
+    const result = await this.request({ kind: "open-subscription-accounts" })
+    if (result.kind !== "subscription-account-catalog") {
+      throw new ControlError("invalid-response", "Expected a Subscription Account catalog")
+    }
+    return createSubscriptionAccountSession(this, result.view)
+  }
+
   async prepareHandover(
     candidatePath: string,
     expectedRelease: string,
@@ -245,6 +265,13 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     return () => this.#universalProviderViewListeners.delete(listener)
   }
 
+  onSubscriptionAccountView(
+    listener: (view: SubscriptionAccountCatalogView) => void,
+  ): () => void {
+    this.#subscriptionAccountViewListeners.add(listener)
+    return () => this.#subscriptionAccountViewListeners.delete(listener)
+  }
+
   whenClosed(): Promise<void> {
     return this.#closedPromise
   }
@@ -283,6 +310,7 @@ export class RpcClient implements RpcTransport, MuxviaControl {
           frame.problem.code, frame.problem.message, frame.authoritativeView,
           frame.problem.source, frame.problem.selector,
           frame.authoritativeUniversalProviderView,
+          frame.authoritativeSubscriptionAccountView,
         ))
       } else {
         handshake.reject(new ControlError("invalid-response", "Expected hello acknowledgement"))
@@ -304,6 +332,13 @@ export class RpcClient implements RpcTransport, MuxviaControl {
       }, 0)
       return
     }
+    if (frame.type === "subscription-account-view") {
+      setTimeout(() => {
+        if (this.#closed) return
+        for (const listener of this.#subscriptionAccountViewListeners) listener(frame.view)
+      }, 0)
+      return
+    }
     if (frame.type === "response") {
       const pending = this.#takePending(frame.requestId)
       if (!pending) return
@@ -315,6 +350,7 @@ export class RpcClient implements RpcTransport, MuxviaControl {
         frame.problem.code, frame.problem.message, frame.authoritativeView,
         frame.problem.source, frame.problem.selector,
         frame.authoritativeUniversalProviderView,
+        frame.authoritativeSubscriptionAccountView,
       )
       if (frame.requestId === null) {
         this.#socket.destroy()
@@ -338,6 +374,7 @@ export class RpcClient implements RpcTransport, MuxviaControl {
     this.#pending.clear()
     this.#viewListeners.clear()
     this.#universalProviderViewListeners.clear()
+    this.#subscriptionAccountViewListeners.clear()
     this.#resolveClosed()
   }
 
@@ -356,6 +393,8 @@ function isInspectionOperation(operation: ControlOperation): operation is Inspec
   return operation.kind === "discover-models"
     || operation.kind === "check-reachability"
     || operation.kind === "preview-reconciliation"
+    || operation.kind === "probe-compatibility"
+    || operation.kind === "poll-device-authorization"
 }
 
 function asControlError(error: unknown): ControlError {

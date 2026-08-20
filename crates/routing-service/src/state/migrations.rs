@@ -14,7 +14,7 @@ use crate::control::protocol::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -49,6 +49,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v7(connection)?;
             migrate_v8(connection)?;
             migrate_v9(connection)?;
+            migrate_v10(connection)?;
         }
         Some(2) => {
             migrate_v2(connection)?;
@@ -59,6 +60,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v7(connection)?;
             migrate_v8(connection)?;
             migrate_v9(connection)?;
+            migrate_v10(connection)?;
         }
         Some(3) => {
             migrate_v3(connection)?;
@@ -68,6 +70,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v7(connection)?;
             migrate_v8(connection)?;
             migrate_v9(connection)?;
+            migrate_v10(connection)?;
         }
         Some(4) => {
             migrate_v4(connection)?;
@@ -76,6 +79,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v7(connection)?;
             migrate_v8(connection)?;
             migrate_v9(connection)?;
+            migrate_v10(connection)?;
         }
         Some(5) => {
             migrate_v5(connection)?;
@@ -83,27 +87,87 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v7(connection)?;
             migrate_v8(connection)?;
             migrate_v9(connection)?;
+            migrate_v10(connection)?;
         }
         Some(6) => {
             migrate_v6(connection)?;
             migrate_v7(connection)?;
             migrate_v8(connection)?;
             migrate_v9(connection)?;
+            migrate_v10(connection)?;
         }
         Some(7) => {
             migrate_v7(connection)?;
             migrate_v8(connection)?;
             migrate_v9(connection)?;
+            migrate_v10(connection)?;
         }
         Some(8) => {
             migrate_v8(connection)?;
             migrate_v9(connection)?;
+            migrate_v10(connection)?;
         }
-        Some(9) => migrate_v9(connection)?,
+        Some(9) => {
+            migrate_v9(connection)?;
+            migrate_v10(connection)?;
+        }
+        Some(10) => migrate_v10(connection)?,
         Some(_) => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v10(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE subscription_account_catalog_state (
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+           revision INTEGER NOT NULL CHECK (revision >= 0),
+           view_sequence INTEGER NOT NULL CHECK (view_sequence >= 0),
+           recovery_state TEXT NOT NULL CHECK (recovery_state IN ('clean', 'recovery-required'))
+         );
+         CREATE TABLE subscription_provider_bindings (
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
+           binding_kind TEXT NOT NULL CHECK (binding_kind IN ('fixed', 'follow-default')),
+           account_id TEXT,
+           CHECK (
+             (binding_kind = 'fixed' AND account_id IS NOT NULL AND length(account_id) > 0)
+             OR (binding_kind = 'follow-default' AND account_id IS NULL)
+           ),
+           PRIMARY KEY (target, provider_id)
+         );
+         CREATE TABLE subscription_account_recovery_intents (
+           id TEXT PRIMARY KEY,
+           action_id TEXT NOT NULL UNIQUE,
+           operation TEXT NOT NULL,
+           state TEXT NOT NULL CHECK (state IN ('pending', 'committed', 'rolled-back', 'recovery-required')),
+           before_sha256 TEXT NOT NULL,
+           desired_sha256 TEXT NOT NULL,
+           created_revision INTEGER NOT NULL CHECK (created_revision >= 0)
+         );
+         CREATE TABLE subscription_account_action_receipts (
+           action_id TEXT PRIMARY KEY,
+           action_kind TEXT NOT NULL,
+           action_json TEXT NOT NULL,
+           committed_revision INTEGER NOT NULL CHECK (committed_revision >= 0),
+           outcome_json TEXT NOT NULL
+         );
+         INSERT INTO subscription_account_catalog_state
+           (singleton, revision, view_sequence, recovery_state)
+         VALUES (1, 0, 0, 'clean');",
+    )?;
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.execute(
+        "UPDATE metadata SET value = '11' WHERE key = 'schema-version'",
+        [],
+    )?;
+    transaction.commit()
 }
 
 fn migrate_v9(connection: &mut Connection) -> Result<()> {

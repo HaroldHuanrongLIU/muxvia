@@ -1,0 +1,40 @@
+{
+  "type": "response",
+  "requestId": "subscription-open-1",
+  "result": {
+    "kind": "subscription-account-catalog",
+    "view": {
+      "revision": 2,
+      "viewSequence": 3,
+      "defaultAccountId": "account-primary",
+      "accounts": [
+        {
+          "accountId": "account-primary",
+          "email": "operator@example.test",
+          "authenticatedAt": 1700000000,
+          "state": "authorized",
+          "default": true
+        }
+      ],
+      "bindings": [
+        {
+          "target": "claude",
+          "providerId": "00000000-0000-4000-8000-000000001101",
+          "providerRevision": 2,
+          "providerName": "Subscription Bridge",
+          "binding": {
+            "kind": "fixed",
+            "accountId": "account-primary"
+          },
+          "resolution": {
+            "state": "available",
+            "accountId": "account-primary"
+          }
+        }
+      ],
+      "recovery": {
+        "state": "clean"
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "type": "response",
+  "requestId": "subscription-device-start-1",
+  "result": {
+    "kind": "device-authorization-challenge",
+    "challenge": {
+      "flowId": "00000000-0000-4000-8000-000000001111",
+      "userCode": "ABCD-EFGH",
+      "verificationUrl": "https://auth.openai.com/codex/device",
+      "expiresInSeconds": 900,
+      "pollIntervalSeconds": 11
+    }
+  }
+}

@@ -298,7 +298,7 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
         .await
         .unwrap();
 
-    assert_eq!(version, "10");
+    assert_eq!(version, "11");
     assert_eq!(not_null, 1);
     assert_eq!(default_value.as_deref(), Some("1"));
     assert!(table_sql.contains("CHECK (managed_config_version IN (1,2))"));
@@ -353,7 +353,7 @@ async fn schema_v8_failed_migration_rolls_back_then_reruns() {
         connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'target_compatibility'", [], |row| row.get::<_, i64>(0)).unwrap(),
         connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'reconciliation_intents'", [], |row| row.get::<_, i64>(0)).unwrap(),
     );
-    assert_eq!(rerun, ("10".into(), 1, 1));
+    assert_eq!(rerun, ("11".into(), 1, 1));
 }
 
 fn v7_projection_fingerprint(connection: &Connection) -> Vec<u64> {
@@ -453,7 +453,7 @@ async fn schema_v9_migrates_real_v8_state_and_adds_universal_provider_tables() {
         })
         .unwrap();
 
-    assert_eq!(version, "10");
+    assert_eq!(version, "11");
     assert_eq!(present, [1, 1, 1, 1, 1, 1]);
     assert_eq!(catalog_state, (0, 0));
     assert_eq!(foreign_key_failures, 0);
@@ -509,7 +509,7 @@ async fn schema_v9_failed_migration_rolls_back_all_catalog_changes_then_reruns()
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(rerun, ("10".to_owned(), 2, 1));
+    assert_eq!(rerun, ("11".to_owned(), 2, 1));
 }
 
 fn upgrade_v8_fixture_to_v9(connection: &Connection) {
@@ -745,7 +745,7 @@ async fn schema_v10_migrates_v9_current_snapshot_into_one_member_plan() {
         )
         .unwrap();
 
-    assert_eq!(version, "10");
+    assert_eq!(version, "11");
     assert_eq!(present, [1, 1, 1, 1, 1]);
     assert_eq!(
         drafts,
@@ -939,7 +939,7 @@ async fn schema_v10_failed_migration_rolls_back_then_reruns() {
         )
         .unwrap();
     assert!(
-        rerun == ("10".into(), 1, 1),
+        rerun == ("11".into(), 1, 1),
         "migration rerun was incomplete"
     );
 }
@@ -970,7 +970,7 @@ async fn schema_v10_fresh_store_has_two_empty_drafts_and_no_active_plan() {
         )
         .unwrap();
     assert!(
-        state == ("10".into(), 2, 0, 0, 0),
+        state == ("11".into(), 2, 0, 0, 0),
         "fresh route-plan state was not empty"
     );
     let foreign_key_failures: i64 = connection
@@ -981,6 +981,89 @@ async fn schema_v10_fresh_store_has_two_empty_drafts_and_no_active_plan() {
     assert!(
         foreign_key_failures == 0,
         "fresh route-plan schema has invalid foreign keys"
+    );
+}
+
+#[tokio::test]
+async fn schema_v11_migrates_v10_without_changing_existing_provider_state() {
+    let fixture = StoreFixture::new();
+    drop(StateStore::open(&fixture.home).await.unwrap());
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO credentials (id, target, bearer_token)
+               VALUES ('00000000-0000-4000-8000-000000001111', 'codex',
+                       'SUBSCRIPTION_MIGRATION_SECRET_11731');
+             INSERT INTO providers
+               (id, target, position, provider_revision, name, base_url, model, protocol,
+                authentication, credential_id, routing_requirement)
+             VALUES
+               ('00000000-0000-4000-8000-000000001112', 'codex', 0, 4, 'Existing',
+                'https://existing.example/v1', 'existing-model', 'openai-responses',
+                'openai-bearer', '00000000-0000-4000-8000-000000001111',
+                'direct-compatible');
+             DROP TABLE IF EXISTS subscription_account_action_receipts;
+             DROP TABLE IF EXISTS subscription_account_recovery_intents;
+             DROP TABLE IF EXISTS subscription_provider_bindings;
+             DROP TABLE IF EXISTS subscription_account_catalog_state;
+             UPDATE metadata SET value = '10' WHERE key = 'schema-version';",
+        )
+        .unwrap();
+    let before: (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM providers),
+               (SELECT COUNT(*) FROM credentials),
+               (SELECT SUM(provider_revision) FROM providers),
+               (SELECT COUNT(*) FROM target_route_state)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    drop(connection);
+
+    drop(StateStore::open(&fixture.home).await.unwrap());
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    let migrated: (String, i64, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+               (SELECT value FROM metadata WHERE key = 'schema-version'),
+               (SELECT COUNT(*) FROM subscription_account_catalog_state),
+               (SELECT COUNT(*) FROM subscription_provider_bindings),
+               (SELECT COUNT(*) FROM subscription_account_recovery_intents),
+               (SELECT COUNT(*) FROM subscription_account_action_receipts),
+               (SELECT COUNT(*) FROM pragma_foreign_key_check)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    let after: (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM providers),
+               (SELECT COUNT(*) FROM credentials),
+               (SELECT SUM(provider_revision) FROM providers),
+               (SELECT COUNT(*) FROM target_route_state)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert!(
+        migrated == ("11".into(), 1, 0, 0, 0, 0),
+        "schema v11 subscription state was incomplete"
+    );
+    assert!(
+        after == before,
+        "schema v11 changed existing provider state"
     );
 }
 
@@ -1101,7 +1184,7 @@ async fn schema_v7_migrates_real_v5_claude_states_and_binds_the_unique_committed
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "10"
+            "11"
         );
         let route: (
             i64,
@@ -1495,7 +1578,7 @@ async fn schema_v7_does_not_guess_between_multiple_legacy_committed_intents() {
         .unwrap();
     assert_eq!(
         migrated,
-        ("10".to_owned(), None, "recovery-required".to_owned())
+        ("11".to_owned(), None, "recovery-required".to_owned())
     );
 }
 
@@ -2030,7 +2113,7 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "10");
+    assert_eq!(schema_version, "11");
     assert_eq!(
         view.providers[0].id,
         Uuid::parse_str(existing_provider_id).unwrap()
@@ -2260,7 +2343,7 @@ async fn schema_v4_migrates_v2_routing_requirement_and_historical_receipts() {
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "10");
+    assert_eq!(schema_version, "11");
     assert_eq!(
         store.target_view().await.unwrap().providers[0].routing_requirement,
         ProviderRoutingRequirement::DirectCompatible

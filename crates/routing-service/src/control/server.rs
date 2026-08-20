@@ -43,6 +43,10 @@ use crate::{
         route_plan::RoutePlanCoordinator,
     },
     state::{ManagedWriteStatus, StateStore},
+    subscription::{
+        DeviceAuthorizationManager, ReqwestDeviceAuthorizationAuthority,
+        SubscriptionAccountCoordinator, SubscriptionAccountStore,
+    },
 };
 
 const RESPONSE_QUEUE_CAPACITY: usize = 32;
@@ -166,6 +170,8 @@ struct SessionServices {
     reconciliation: Arc<ReconciliationService>,
     route_plans: Arc<RoutePlanCoordinator>,
     provider_synchronization: Arc<ProviderSynchronizationService>,
+    device_authorization: Arc<DeviceAuthorizationManager>,
+    subscription_account_coordinator: Arc<SubscriptionAccountCoordinator>,
     handover: Option<mpsc::Sender<PreparedHandover>>,
 }
 
@@ -193,7 +199,7 @@ impl ControlServer {
             )
             .with_configuration_home_override(std::env::var_os("CODEX_HOME").map(PathBuf::from)),
         );
-        Self::bind_configured(home, store, release, activation, false).await
+        Self::bind_configured(home, store, release, activation, false, None, None).await
     }
 
     pub async fn bind_with_activation(
@@ -202,7 +208,31 @@ impl ControlServer {
         release: impl Into<String>,
         activation: Arc<ActivationService>,
     ) -> Result<ControlServerHandle, ControlServerError> {
-        Self::bind_configured(home, store, release, activation, false).await
+        Self::bind_configured(home, store, release, activation, false, None, None).await
+    }
+
+    #[doc(hidden)]
+    pub async fn bind_with_activation_and_device_authority_origin(
+        home: &MuxviaHome,
+        store: Arc<StateStore>,
+        release: impl Into<String>,
+        activation: Arc<ActivationService>,
+        authority_origin: &str,
+    ) -> Result<ControlServerHandle, ControlServerError> {
+        let authority = Arc::new(
+            ReqwestDeviceAuthorizationAuthority::for_origin(authority_origin)
+                .map_err(|_| ControlServerError::State)?,
+        );
+        Self::bind_configured(
+            home,
+            store,
+            release,
+            activation,
+            false,
+            Some(authority),
+            None,
+        )
+        .await
     }
 
     pub async fn bind_process(
@@ -211,7 +241,32 @@ impl ControlServer {
         release: impl Into<String>,
         activation: Arc<ActivationService>,
     ) -> Result<ControlServerHandle, ControlServerError> {
-        Self::bind_configured(home, store, release, activation, true).await
+        Self::bind_configured(home, store, release, activation, true, None, None).await
+    }
+
+    #[doc(hidden)]
+    pub async fn bind_process_with_device_authority_origin(
+        home: &MuxviaHome,
+        store: Arc<StateStore>,
+        release: impl Into<String>,
+        activation: Arc<ActivationService>,
+        authority_origin: &str,
+        refresh_account_id: Option<String>,
+    ) -> Result<ControlServerHandle, ControlServerError> {
+        let authority = Arc::new(
+            ReqwestDeviceAuthorizationAuthority::for_origin(authority_origin)
+                .map_err(|_| ControlServerError::State)?,
+        );
+        Self::bind_configured(
+            home,
+            store,
+            release,
+            activation,
+            true,
+            Some(authority),
+            refresh_account_id,
+        )
+        .await
     }
 
     async fn bind_configured(
@@ -220,6 +275,10 @@ impl ControlServer {
         release: impl Into<String>,
         activation: Arc<ActivationService>,
         exit_when_idle: bool,
+        device_authority: Option<
+            Arc<dyn crate::subscription::device_authorization::DeviceAuthorizationAuthority>,
+        >,
+        startup_refresh_account_id: Option<String>,
     ) -> Result<ControlServerHandle, ControlServerError> {
         let reconciliation_runtime = activation.reconciliation_runtime();
         if reconciliation_runtime.home.root() != home.root() {
@@ -240,6 +299,39 @@ impl ControlServer {
             Arc::clone(&store),
             Arc::clone(&reconciliation),
         ));
+        let subscription_accounts =
+            Arc::new(SubscriptionAccountStore::open(home).map_err(|_| ControlServerError::State)?);
+        let device_authority = match device_authority {
+            Some(authority) => authority,
+            None => Arc::new(
+                ReqwestDeviceAuthorizationAuthority::new()
+                    .map_err(|_| ControlServerError::State)?,
+            ),
+        };
+        let device_authorization = Arc::new(DeviceAuthorizationManager::new(
+            Arc::clone(&subscription_accounts),
+            device_authority,
+        ));
+        let subscription_account_coordinator = Arc::new(SubscriptionAccountCoordinator::new(
+            Arc::clone(&store),
+            Arc::clone(&subscription_accounts),
+        ));
+        subscription_account_coordinator
+            .recover_pending_intents()
+            .await
+            .map_err(|_| ControlServerError::State)?;
+        if let Some(account_id) = startup_refresh_account_id {
+            match device_authorization
+                .access_token_for_account(&account_id)
+                .await
+            {
+                Ok(_)
+                | Err(
+                    crate::subscription::device_authorization::DeviceAuthorizationError::NeedsReauthorization,
+                ) => {}
+                Err(_) => return Err(ControlServerError::State),
+            }
+        }
         reconciliation
             .recover_pending_intents()
             .await
@@ -342,6 +434,9 @@ impl ControlServer {
                         let reconciliation = Arc::clone(&reconciliation);
                         let route_plans = Arc::clone(&route_plans);
                         let provider_synchronization = Arc::clone(&provider_synchronization);
+                        let device_authorization = Arc::clone(&device_authorization);
+                        let subscription_account_coordinator =
+                            Arc::clone(&subscription_account_coordinator);
                         let handover = handover.clone();
                         let release = release.clone();
                         let lifecycle = Arc::clone(&lifecycle);
@@ -353,6 +448,8 @@ impl ControlServer {
                             reconciliation,
                             route_plans,
                             provider_synchronization,
+                            device_authorization,
+                            subscription_account_coordinator,
                             handover,
                         };
                         sessions.spawn(async move {
@@ -564,6 +661,8 @@ async fn serve_session(
         reconciliation,
         route_plans,
         provider_synchronization,
+        device_authorization,
+        subscription_account_coordinator,
         handover,
     } = services;
     let first = match read_frame(&mut stream).await {
@@ -636,9 +735,11 @@ async fn serve_session(
     let mut writer_task = tokio::spawn(write_responses(writer, response_rx, writer_guard));
     let mut opened_target = None;
     let mut opened_universal_providers = false;
+    let mut opened_subscription_accounts = false;
     let mut opened_claude_context = None;
     let mut update_rx = store.subscribe_target_views();
     let mut universal_provider_update_rx = store.subscribe_universal_provider_views();
+    let mut subscription_account_update_rx = subscription_account_coordinator.subscribe();
     let mut inspections = JoinSet::<InspectionCompletion>::new();
     let mut action_completions = JoinSet::<bool>::new();
     let mut inspection_requests = std::collections::HashMap::<String, InspectionRequest>::new();
@@ -950,6 +1051,7 @@ async fn serve_session(
                                     authoritative_universal_provider_view: Some(
                                         failure.authoritative_view,
                                     ),
+                                    authoritative_subscription_account_view: None,
                                 },
                             };
                             if !enqueue_universal_provider_action_response(
@@ -966,6 +1068,250 @@ async fn serve_session(
                             }
                         }
                         _ => unreachable!("catalog operation was matched above"),
+                    }
+                    continue;
+                }
+                if matches!(operation, ControlOperation::OpenSubscriptionAccounts(_)) {
+                    if opened_target.is_some() || opened_universal_providers {
+                        if !enqueue_response(&responses, problem_frame(
+                            Some(request_id),
+                            "catalog-session-kind-mismatch",
+                            "Subscription Account operations require an account session",
+                            None,
+                        )) {
+                            break 'session;
+                        }
+                        continue;
+                    }
+                    let Ok(view) = subscription_account_coordinator.catalog().await else {
+                        if !enqueue_response(&responses, problem_frame(
+                            Some(request_id),
+                            "state-store-error",
+                            "Subscription Account state is unavailable",
+                            None,
+                        )) {
+                            break 'session;
+                        }
+                        continue;
+                    };
+                    opened_subscription_accounts = true;
+                    if !enqueue_response(&responses, ServerFrame::Response {
+                        request_id,
+                        result: ControlResult::SubscriptionAccountCatalog { view },
+                    }) {
+                        break 'session;
+                    }
+                    continue;
+                }
+                if matches!(
+                    operation,
+                    ControlOperation::StartDeviceAuthorization(_)
+                        | ControlOperation::PollDeviceAuthorization(_)
+                        | ControlOperation::PreviewDefaultSubscriptionAccount(_)
+                        | ControlOperation::SubscriptionAccountAct { .. }
+                ) {
+                    if !opened_subscription_accounts
+                        || opened_target.is_some()
+                        || opened_universal_providers
+                    {
+                        if !enqueue_response(&responses, problem_frame(
+                            Some(request_id),
+                            "catalog-session-kind-mismatch",
+                            "Subscription Account operations require an account session",
+                            None,
+                        )) {
+                            break 'session;
+                        }
+                        continue;
+                    }
+                    let (frame, publication) = match operation {
+                        ControlOperation::StartDeviceAuthorization(operation) => {
+                            match device_authorization
+                                .start(operation.reauthorize_account_id)
+                                .await
+                            {
+                                Ok(challenge) => (
+                                    ServerFrame::Response {
+                                        request_id,
+                                        result: ControlResult::DeviceAuthorizationChallenge {
+                                            challenge: crate::control::protocol::DeviceAuthorizationChallengeView {
+                                                flow_id: challenge.flow_id,
+                                                user_code: challenge.user_code,
+                                                verification_url: challenge.verification_url.to_owned(),
+                                                expires_in_seconds: challenge.expires_in_seconds,
+                                                poll_interval_seconds: challenge.poll_interval_seconds,
+                                            },
+                                        },
+                                    },
+                                    None,
+                                ),
+                                Err(_) => (
+                                    problem_frame(
+                                        Some(request_id),
+                                        "device-authorization-failed",
+                                        "Device authorization could not be started",
+                                        None,
+                                    ),
+                                    None,
+                                ),
+                            }
+                        }
+                        ControlOperation::PollDeviceAuthorization(operation) => {
+                            match device_authorization.poll(operation.flow_id).await {
+                                Ok(crate::subscription::DeviceAuthorizationPoll::Pending) => (
+                                    ServerFrame::Response {
+                                        request_id,
+                                        result: ControlResult::DeviceAuthorizationPoll {
+                                            poll: crate::control::protocol::DeviceAuthorizationPollView::Pending,
+                                        },
+                                    },
+                                    None,
+                                ),
+                                Ok(crate::subscription::DeviceAuthorizationPoll::Expired) => (
+                                    ServerFrame::Response {
+                                        request_id,
+                                        result: ControlResult::DeviceAuthorizationPoll {
+                                            poll: crate::control::protocol::DeviceAuthorizationPollView::Expired,
+                                        },
+                                    },
+                                    None,
+                                ),
+                                Ok(crate::subscription::DeviceAuthorizationPoll::Authorized { authorization }) => {
+                                    let account = authorization.account.clone();
+                                    match subscription_account_coordinator
+                                        .record_authorization(operation.flow_id, account)
+                                        .await
+                                    {
+                                        Ok(publication) => match device_authorization
+                                            .complete_authorization(operation.flow_id, authorization)
+                                            .await
+                                        {
+                                            Ok(account_id) => (
+                                                ServerFrame::Response {
+                                                    request_id,
+                                                    result: ControlResult::DeviceAuthorizationPoll {
+                                                        poll: crate::control::protocol::DeviceAuthorizationPollView::Authorized { account_id },
+                                                    },
+                                                },
+                                                Some(publication),
+                                            ),
+                                            Err(_) => (
+                                                problem_frame(
+                                                    Some(request_id),
+                                                    "device-authorization-failed",
+                                                    "Device authorization could not be finalized",
+                                                    None,
+                                                ),
+                                                None,
+                                            ),
+                                        },
+                                        Err(failure) => (
+                                            ServerFrame::Error {
+                                                request_id: Some(request_id),
+                                                problem: failure.problem,
+                                                authoritative_view: None,
+                                                authoritative_universal_provider_view: None,
+                                                authoritative_subscription_account_view: Some(
+                                                    Box::new(failure.authoritative_view),
+                                                ),
+                                            },
+                                            None,
+                                        ),
+                                    }
+                                }
+                                Err(_) => (
+                                    problem_frame(
+                                        Some(request_id),
+                                        "device-authorization-failed",
+                                        "Device authorization could not be polled",
+                                        None,
+                                    ),
+                                    None,
+                                ),
+                            }
+                        }
+                        ControlOperation::PreviewDefaultSubscriptionAccount(operation) => {
+                            match subscription_account_coordinator
+                                .preview_default(&operation.account_id)
+                                .await
+                            {
+                                Ok(preview) => (
+                                    ServerFrame::Response {
+                                        request_id,
+                                        result: ControlResult::SubscriptionDefaultPreview { preview },
+                                    },
+                                    None,
+                                ),
+                                Err(failure) => (
+                                    ServerFrame::Error {
+                                        request_id: Some(request_id),
+                                        problem: failure.problem,
+                                        authoritative_view: None,
+                                        authoritative_universal_provider_view: None,
+                                        authoritative_subscription_account_view: Some(Box::new(
+                                            failure.authoritative_view,
+                                        )),
+                                    },
+                                    None,
+                                ),
+                            }
+                        }
+                        ControlOperation::SubscriptionAccountAct {
+                            action_id,
+                            expected_revision,
+                            action,
+                        } => match serde_json::from_value(action) {
+                            Ok(action) => match subscription_account_coordinator
+                                .apply(action_id, expected_revision, action)
+                                .await
+                            {
+                                Ok(outcome) => {
+                                    let publication = (outcome.status == ActionStatus::Applied)
+                                        .then(|| outcome.view.clone());
+                                    (
+                                        ServerFrame::Response {
+                                            request_id,
+                                            result: ControlResult::SubscriptionAccountOutcome {
+                                                outcome,
+                                            },
+                                        },
+                                        publication,
+                                    )
+                                }
+                                Err(failure) => (
+                                    ServerFrame::Error {
+                                        request_id: Some(request_id),
+                                        problem: failure.problem,
+                                        authoritative_view: None,
+                                        authoritative_universal_provider_view: None,
+                                        authoritative_subscription_account_view: Some(Box::new(
+                                            failure.authoritative_view,
+                                        )),
+                                    },
+                                    None,
+                                ),
+                            },
+                            Err(_) => (
+                                problem_frame(
+                                    Some(request_id),
+                                    "invalid-request",
+                                    "Subscription Account action is malformed",
+                                    None,
+                                ),
+                                None,
+                            ),
+                        },
+                        _ => unreachable!("account operation was matched above"),
+                    };
+                    if !enqueue_subscription_account_response(
+                        &responses,
+                        frame,
+                        publication,
+                        &subscription_account_coordinator,
+                    )
+                    .await
+                    {
+                        break 'session;
                     }
                     continue;
                 }
@@ -1011,6 +1357,11 @@ async fn serve_session(
                 match operation {
                     ControlOperation::PrepareHandover(_)
                     | ControlOperation::OpenUniversalProviders { .. }
+                    | ControlOperation::OpenSubscriptionAccounts(_)
+                    | ControlOperation::StartDeviceAuthorization(_)
+                    | ControlOperation::PollDeviceAuthorization(_)
+                    | ControlOperation::PreviewDefaultSubscriptionAccount(_)
+                    | ControlOperation::SubscriptionAccountAct { .. }
                     | ControlOperation::UniversalProviderAct { .. } => {
                         unreachable!("catalog operations are handled before target dispatch")
                     }
@@ -1243,6 +1594,7 @@ async fn serve_session(
                                     problem: failure.problem,
                                     authoritative_view: Some(failure.authoritative_view),
                                     authoritative_universal_provider_view: None,
+                                    authoritative_subscription_account_view: None,
                                 }
                             }
                         };
@@ -1367,6 +1719,22 @@ async fn serve_session(
                     Err(broadcast::error::RecvError::Closed) => break 'session,
                 }
             }
+            update = subscription_account_update_rx.recv(), if opened_subscription_accounts => {
+                match update {
+                    Ok(view) => {
+                        if !enqueue_response(&responses, ServerFrame::SubscriptionAccountView { view }) {
+                            break 'session;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Ok(view) = subscription_account_coordinator.catalog().await else { continue };
+                        if !enqueue_response(&responses, ServerFrame::SubscriptionAccountView { view }) {
+                            break 'session;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break 'session,
+                }
+            }
         }
     }
 
@@ -1400,6 +1768,11 @@ fn operation_target(operation: &ControlOperation) -> Option<Target> {
     match operation {
         ControlOperation::PrepareHandover(_)
         | ControlOperation::OpenUniversalProviders { .. }
+        | ControlOperation::OpenSubscriptionAccounts(_)
+        | ControlOperation::StartDeviceAuthorization(_)
+        | ControlOperation::PollDeviceAuthorization(_)
+        | ControlOperation::PreviewDefaultSubscriptionAccount(_)
+        | ControlOperation::SubscriptionAccountAct { .. }
         | ControlOperation::UniversalProviderAct { .. } => None,
         ControlOperation::OpenTarget { target, .. }
         | ControlOperation::Act { target, .. }
@@ -1535,6 +1908,7 @@ async fn inspect_and_queue(
                 problem,
                 authoritative_view: None,
                 authoritative_universal_provider_view: None,
+                authoritative_subscription_account_view: None,
             },
             None,
         ),
@@ -1631,6 +2005,31 @@ async fn enqueue_written_response(
     acknowledged.await.is_ok()
 }
 
+async fn enqueue_subscription_account_response(
+    responses: &mpsc::Sender<QueuedResponse>,
+    frame: ServerFrame,
+    publication: Option<crate::control::protocol::SubscriptionAccountCatalogView>,
+    coordinator: &SubscriptionAccountCoordinator,
+) -> bool {
+    let (written, acknowledged) = oneshot::channel();
+    if responses
+        .try_send(QueuedResponse {
+            frame,
+            written: Some(written),
+        })
+        .is_err()
+    {
+        return false;
+    }
+    if acknowledged.await.is_err() {
+        return false;
+    }
+    if let Some(view) = publication {
+        coordinator.publish(view).await;
+    }
+    true
+}
+
 async fn enqueue_universal_provider_action_response(
     responses: &mpsc::Sender<QueuedResponse>,
     frame: ServerFrame,
@@ -1709,6 +2108,7 @@ fn problem_frame(
         },
         authoritative_view,
         authoritative_universal_provider_view: None,
+        authoritative_subscription_account_view: None,
     }
 }
 
@@ -1770,6 +2170,7 @@ async fn write_problem(
             },
             authoritative_view,
             authoritative_universal_provider_view: None,
+            authoritative_subscription_account_view: None,
         },
     )
     .await

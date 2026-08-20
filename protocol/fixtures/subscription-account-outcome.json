@@ -1,0 +1,28 @@
+{
+  "type": "response",
+  "requestId": "subscription-account-act-1",
+  "result": {
+    "kind": "subscription-account-outcome",
+    "outcome": {
+      "status": "applied",
+      "view": {
+        "revision": 3,
+        "viewSequence": 4,
+        "defaultAccountId": "account-primary",
+        "accounts": [
+          {
+            "accountId": "account-primary",
+            "email": "operator@example.test",
+            "authenticatedAt": 1700000000,
+            "state": "authorized",
+            "default": true
+          }
+        ],
+        "bindings": [],
+        "recovery": {
+          "state": "clean"
+        }
+      }
+    }
+  }
+}

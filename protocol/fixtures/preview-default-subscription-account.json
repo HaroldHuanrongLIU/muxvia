@@ -1,0 +1,8 @@
+{
+  "type": "request",
+  "requestId": "subscription-default-preview-1",
+  "operation": {
+    "kind": "preview-default-subscription-account",
+    "accountId": "account-primary"
+  }
+}

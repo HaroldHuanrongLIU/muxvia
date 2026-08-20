@@ -7,8 +7,8 @@ use muxvia_routing::{
             ActivationMode, ClientFrame, ControlResult, CredentialEdit, DiscoverySource,
             DraftCredentialSource, DuplicateCredential, ProviderAuthentication,
             ProviderCompleteness, ProviderProtocol, ProviderRequirement,
-            ProviderRoutingRequirement, ServerFrame, Target, TargetAction, TargetView,
-            UniversalProviderAction,
+            ProviderRoutingRequirement, ServerFrame, SubscriptionAccountAction, Target,
+            TargetAction, TargetView, UniversalProviderAction,
         },
     },
     domain::provider::has_valid_provider_declaration,
@@ -112,6 +112,51 @@ fn fixtures_round_trip_as_their_protocol_types() {
     let resolve_compatibility = fixture("resolve-compatibility.json");
     let parsed: TargetAction = serde_json::from_value(resolve_compatibility.clone()).unwrap();
     assert_eq!(serde_json::to_value(parsed).unwrap(), resolve_compatibility);
+
+    let account_open = fixture("open-subscription-accounts.json");
+    let parsed: ClientFrame = serde_json::from_value(account_open.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), account_open);
+
+    let account_catalog = fixture("subscription-account-catalog.json");
+    let parsed: ServerFrame = serde_json::from_value(account_catalog.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), account_catalog);
+
+    let account_action = fixture("set-default-subscription-account.json");
+    let parsed: SubscriptionAccountAction = serde_json::from_value(account_action.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), account_action);
+
+    for name in [
+        "start-device-authorization.json",
+        "poll-device-authorization.json",
+        "preview-default-subscription-account.json",
+        "subscription-account-act.json",
+    ] {
+        let frame = fixture(name);
+        let parsed: ClientFrame = serde_json::from_value(frame.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), frame);
+    }
+    for name in [
+        "device-authorization-challenge.json",
+        "device-authorization-poll.json",
+        "subscription-default-preview.json",
+        "subscription-account-outcome.json",
+    ] {
+        let frame = fixture(name);
+        let parsed: ServerFrame = serde_json::from_value(frame.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), frame);
+    }
+}
+
+#[test]
+fn subscription_account_contract_is_closed_and_secret_free() {
+    let mut action = fixture("set-default-subscription-account.json");
+    action["refreshToken"] = serde_json::json!("SUBSCRIPTION_PROTOCOL_SECRET_11701");
+    assert!(serde_json::from_value::<SubscriptionAccountAction>(action).is_err());
+
+    let mut catalog = fixture("subscription-account-catalog.json");
+    catalog["result"]["view"]["accounts"][0]["refreshToken"] =
+        serde_json::json!("SUBSCRIPTION_PROTOCOL_SECRET_11701");
+    assert!(serde_json::from_value::<ServerFrame>(catalog).is_err());
 }
 
 #[test]

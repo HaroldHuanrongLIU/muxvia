@@ -8,6 +8,7 @@ import {
   parseServerFrame,
   parseTargetAction,
   parseTargetView,
+  parseSubscriptionAccountAction,
   parseUniversalProviderAction,
 } from "../src/control/types"
 import type { TargetAction, TargetView } from "../src/control/types"
@@ -49,9 +50,30 @@ test.each([
   ["duplicate-universal-provider.json", parseUniversalProviderAction],
   ["delete-universal-provider.json", parseUniversalProviderAction],
   ["synchronize-universal-provider.json", parseUniversalProviderAction],
+  ["open-subscription-accounts.json", parseClientFrame],
+  ["subscription-account-catalog.json", parseServerFrame],
+  ["set-default-subscription-account.json", parseSubscriptionAccountAction],
+  ["start-device-authorization.json", parseClientFrame],
+  ["device-authorization-challenge.json", parseServerFrame],
+  ["poll-device-authorization.json", parseClientFrame],
+  ["device-authorization-poll.json", parseServerFrame],
+  ["preview-default-subscription-account.json", parseClientFrame],
+  ["subscription-default-preview.json", parseServerFrame],
+  ["subscription-account-act.json", parseClientFrame],
+  ["subscription-account-outcome.json", parseServerFrame],
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)
+})
+
+test("Subscription Account contracts reject secret-bearing additive fields", async () => {
+  const action = await readFixture("set-default-subscription-account.json") as any
+  action.refreshToken = "SUBSCRIPTION_PROTOCOL_SECRET_11701"
+  expect(() => parseSubscriptionAccountAction(action)).toThrow()
+
+  const catalog = await readFixture("subscription-account-catalog.json") as any
+  catalog.result.view.accounts[0].accessToken = "SUBSCRIPTION_PROTOCOL_SECRET_11702"
+  expect(() => parseServerFrame(catalog)).toThrow()
 })
 
 test("Failover Chain actions are closed and revision bound", async () => {

@@ -11,6 +11,7 @@ import {
   type SignalSource,
 } from "../src/app"
 import type { TargetSession } from "../src/control/target-session"
+import type { SubscriptionAccountSession } from "../src/control/subscription-account-session"
 import type { UniversalProviderSession } from "../src/control/universal-provider-session"
 import type { ActionOutcome, ClaudePreflightContext, TargetAction, TargetView, UniversalProviderAction, UniversalProviderCatalogView, UniversalProviderOutcome } from "../src/control/types"
 
@@ -475,6 +476,34 @@ test("startup mounts and closes one independent Universal Provider catalog sessi
     expect(catalog.closeCalls).toBe(1)
   } finally {
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("a stalled Subscription Account catalog is bounded without blocking Target management", async () => {
+  const { setup } = await rendererFixture()
+  const target = new LifecycleSession()
+  const accountConnection = deferred<SubscriptionAccountSession>()
+  const accountStarted = deferred<void>()
+  const clock = new ManualClock()
+  const running = run(options, ports(setup, target, {
+    connectSubscriptionAccounts: () => {
+      accountStarted.resolve()
+      return accountConnection.promise
+    },
+    clock,
+  }))
+  try {
+    await accountStarted.promise
+    expect(clock.pendingTimers()).toBe(1)
+    clock.advance(2_000)
+    await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
+    setup.mockInput.pressCtrlC()
+    await running
+    expect(target.closeCalls).toBe(1)
+    expect(clock.pendingTimers()).toBe(0)
+  } finally {
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+    await running.catch(() => {})
   }
 })
 

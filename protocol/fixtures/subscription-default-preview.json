@@ -1,0 +1,21 @@
+{
+  "type": "response",
+  "requestId": "subscription-default-preview-1",
+  "result": {
+    "kind": "subscription-default-preview",
+    "preview": {
+      "previewToken": "00000000-0000-4000-8000-000000001112",
+      "accountId": "account-primary",
+      "effects": [
+        {
+          "target": "claude",
+          "providerId": "00000000-0000-4000-8000-000000001101",
+          "providerRevision": 2,
+          "providerName": "Subscription Bridge",
+          "currentAccountId": null,
+          "nextResolution": "available"
+        }
+      ]
+    }
+  }
+}

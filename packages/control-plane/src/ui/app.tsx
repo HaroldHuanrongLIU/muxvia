@@ -189,11 +189,11 @@ function safeSubscriptionProblem(error: unknown): string {
   switch (code) {
     case "device-authorization-failed":
     case "invalid-action-replay":
-    case "invalid-subscription-account":
+    case "subscription-account-not-found":
     case "invalid-subscription-binding":
-    case "recovery-required":
-    case "stale-default-preview":
-    case "stale-revision":
+    case "subscription-account-recovery-required":
+    case "stale-default-account-preview":
+    case "stale-subscription-catalog-revision":
     case "subscription-account-file-invalid":
     case "subscription-account-write-failed":
       return code

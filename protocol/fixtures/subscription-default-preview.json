@@ -13,6 +13,7 @@
           "providerRevision": 2,
           "providerName": "Subscription Bridge",
           "currentAccountId": null,
+          "nextAccountId": "account-primary",
           "nextResolution": "available"
         }
       ]

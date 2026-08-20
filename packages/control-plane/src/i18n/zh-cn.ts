@@ -275,7 +275,7 @@ export const zhCN = {
   "subscription-account.device.expired": "设备授权已过期。按 A 或 R 重新开始。",
   "subscription-account.device.authorized": "授权完成。",
   "subscription-account.default.preview": "默认账户预览 · 影响 {count} 个跟随默认的 Provider",
-  "subscription-account.default.effect": "{target} · {provider} → {state}",
+  "subscription-account.default.effect": "{target} · {provider} · {oldAccount} → {newAccount} · {state}",
   "subscription-account.default.confirm": "Enter/Y 确认 · Esc 取消",
   "subscription-account.applied": "订阅账户目录已更新。",
   "subscription-account.error": "订阅账户操作失败：{code}",

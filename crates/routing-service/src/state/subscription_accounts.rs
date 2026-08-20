@@ -78,6 +78,34 @@ impl StateStore {
             .map_err(map_state_call_error)
     }
 
+    pub(crate) async fn subscription_account_receipt_by_id(
+        &self,
+        action_id: Uuid,
+    ) -> Result<Option<SubscriptionAccountOutcome>, StateError> {
+        self.connection
+            .call(
+                move |connection| -> Result<Option<SubscriptionAccountOutcome>, StateError> {
+                    let outcome_json = connection
+                        .query_row(
+                            "SELECT outcome_json FROM subscription_account_action_receipts
+                             WHERE action_id = ?1",
+                            params![action_id.to_string()],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?;
+                    let Some(outcome_json) = outcome_json else {
+                        return Ok(None);
+                    };
+                    let mut outcome: SubscriptionAccountOutcome =
+                        serde_json::from_str(&outcome_json)?;
+                    outcome.status = ActionStatus::Replayed;
+                    Ok(Some(outcome))
+                },
+            )
+            .await
+            .map_err(map_state_call_error)
+    }
+
     pub(crate) async fn record_subscription_account_change(
         &self,
         document: SubscriptionAccountDocument,
@@ -314,7 +342,7 @@ impl StateStore {
                     return Ok(Err(subscription_failure(
                         &transaction,
                         document,
-                        "recovery-required",
+                        "subscription-account-recovery-required",
                         "Subscription Account writes are blocked until recovery is resolved",
                     )?));
                 }
@@ -322,7 +350,7 @@ impl StateStore {
                     return Ok(Err(subscription_failure(
                         &transaction,
                         document,
-                        "stale-revision",
+                        "stale-subscription-catalog-revision",
                         "Subscription Account state changed; refresh and retry",
                     )?));
                 }
@@ -334,7 +362,7 @@ impl StateStore {
                             return Ok(Err(subscription_failure(
                                 &transaction,
                                 document,
-                                "invalid-subscription-account",
+                                "subscription-account-not-found",
                                 "Subscription Account does not exist",
                             )?));
                         }
@@ -345,7 +373,7 @@ impl StateStore {
                             return Ok(Err(subscription_failure(
                                 &transaction,
                                 document,
-                                "invalid-subscription-account",
+                                "subscription-account-not-found",
                                 "Subscription Account deletion was not applied",
                             )?));
                         }

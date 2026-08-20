@@ -273,7 +273,7 @@ export const en = {
   "subscription-account.device.expired": "Device authorization expired. Press A or R to restart.",
   "subscription-account.device.authorized": "Authorization complete.",
   "subscription-account.default.preview": "Default preview · {count} Follow Default Provider(s) affected",
-  "subscription-account.default.effect": "{target} · {provider} → {state}",
+  "subscription-account.default.effect": "{target} · {provider} · {oldAccount} → {newAccount} · {state}",
   "subscription-account.default.confirm": "Enter/Y confirm · Esc cancel",
   "subscription-account.applied": "Subscription Account catalog updated.",
   "subscription-account.error": "Subscription Account action failed: {code}",

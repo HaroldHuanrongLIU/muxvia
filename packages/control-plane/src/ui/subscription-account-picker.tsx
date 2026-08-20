@@ -165,6 +165,8 @@ export function SubscriptionAccountPicker(props: SubscriptionAccountPickerProps)
             {props.t("subscription-account.default.effect", {
               target: props.t(`target.${effect.target}`),
               provider: effect.providerName,
+              oldAccount: effect.currentAccountId ?? "—",
+              newAccount: effect.nextAccountId ?? "—",
               state: props.t(`subscription-account.resolution.${effect.nextResolution}`),
             })}
           </text>}</For>

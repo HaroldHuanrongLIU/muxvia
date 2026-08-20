@@ -565,6 +565,7 @@ const subscriptionDefaultPreviewSchema = z.object({
     providerRevision: z.number().int().positive(),
     providerName: z.string(),
     currentAccountId: z.string().nullable(),
+    nextAccountId: z.string().nullable(),
     nextResolution: z.enum(["available", "needs-reauthorization", "missing", "no-default"]),
   }).strict()),
 }).strict()

@@ -10,6 +10,8 @@ T11 lets the Operator authorize and manage multiple Codex Subscription Accounts 
 
 The Routing Service owns the fixed remote protocol, refresh-token persistence, account identities, defaults, and Provider bindings. The Control Plane owns terminal effects and presentation. Refresh tokens, authorization codes, server-returned verifiers, and access tokens never cross the control protocol.
 
+This compatibility behavior depends on undocumented interfaces and is not an officially supported OpenAI integration.
+
 ## Scope
 
 T11 delivers:

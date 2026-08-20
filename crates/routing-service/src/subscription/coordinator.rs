@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, OwnedMutexGuard, broadcast};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -12,12 +13,47 @@ use crate::{
     state::{StateStore, SubscriptionAccountActionFailure},
 };
 
-use super::accounts::SubscriptionAccountRecord;
+use super::accounts::{SubscriptionAccountFileSnapshot, SubscriptionAccountRecord};
 use super::{AccountAuthorizationState, SubscriptionAccountStore};
 
 struct DefaultPreviewBinding {
     account_id: String,
     revision: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct SubscriptionAuthorizationCancellation {
+    token: CancellationToken,
+    gate: Arc<Mutex<()>>,
+}
+
+impl SubscriptionAuthorizationCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            gate: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub(crate) fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    pub(crate) async fn cancel(&self) {
+        let _guard = self.gate.lock().await;
+        self.token.cancel();
+    }
+
+    async fn begin_commit(&self) -> Option<OwnedMutexGuard<()>> {
+        let guard = self.gate.clone().lock_owned().await;
+        (!self.token.is_cancelled()).then_some(guard)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum SubscriptionAuthorizationCommit {
+    Cancelled,
+    Committed(SubscriptionAccountCatalogView),
 }
 
 pub(crate) struct SubscriptionAccountCoordinator {
@@ -61,10 +97,71 @@ impl SubscriptionAccountCoordinator {
         let _ = self.views.send(view);
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_authorization(
         &self,
         flow_id: Uuid,
         account: SubscriptionAccountRecord,
+    ) -> Result<SubscriptionAccountCatalogView, SubscriptionAccountActionFailure> {
+        match self
+            .record_authorization_inner(flow_id, account, None)
+            .await?
+        {
+            SubscriptionAuthorizationCommit::Committed(view) => Ok(view),
+            SubscriptionAuthorizationCommit::Cancelled => {
+                unreachable!("uncancellable authorization was cancelled")
+            }
+        }
+    }
+
+    pub(crate) async fn record_authorization_cancellable(
+        &self,
+        flow_id: Uuid,
+        account: SubscriptionAccountRecord,
+        cancellation: &SubscriptionAuthorizationCancellation,
+    ) -> Result<SubscriptionAuthorizationCommit, SubscriptionAccountActionFailure> {
+        self.record_authorization_inner(flow_id, account, Some(cancellation))
+            .await
+    }
+
+    async fn record_authorization_inner(
+        &self,
+        flow_id: Uuid,
+        account: SubscriptionAccountRecord,
+        cancellation: Option<&SubscriptionAuthorizationCancellation>,
+    ) -> Result<SubscriptionAuthorizationCommit, SubscriptionAccountActionFailure> {
+        let _guard = self.gate.lock().await;
+        let _commit_guard = match cancellation {
+            Some(cancellation) => match cancellation.begin_commit().await {
+                Some(guard) => Some(guard),
+                None => return Ok(SubscriptionAuthorizationCommit::Cancelled),
+            },
+            None => None,
+        };
+        let before = self.accounts.read().map_err(|_| {
+            self.empty_failure(
+                "subscription-account-file-invalid",
+                "Subscription Account state is unavailable",
+            )
+        })?;
+        let mut desired = before.document.clone();
+        let account_id = account.account_id.clone();
+        desired.accounts.insert(account_id.clone(), account);
+        if desired.default_account_id.is_none() {
+            desired.default_account_id = Some(account_id);
+        }
+        self.commit_private_mutation(flow_id, "authorize-account", before, desired)
+            .await
+            .map(SubscriptionAuthorizationCommit::Committed)
+    }
+
+    pub(crate) async fn record_refresh(
+        &self,
+        action_id: Uuid,
+        expected_account: &SubscriptionAccountRecord,
+        refresh_token: Option<&str>,
+        authenticated_at: Option<i64>,
+        state: AccountAuthorizationState,
     ) -> Result<SubscriptionAccountCatalogView, SubscriptionAccountActionFailure> {
         let _guard = self.gate.lock().await;
         let before = self.accounts.read().map_err(|_| {
@@ -73,6 +170,45 @@ impl SubscriptionAccountCoordinator {
                 "Subscription Account state is unavailable",
             )
         })?;
+        let Some(current_account) = before.document.accounts.get(&expected_account.account_id)
+        else {
+            return Err(self.empty_failure(
+                "subscription-account-not-found",
+                "Subscription Account does not exist",
+            ));
+        };
+        if current_account != expected_account {
+            return Err(self
+                .failure(
+                    before.document,
+                    "stale-subscription-catalog-revision",
+                    "Subscription Account state changed; refresh and retry",
+                )
+                .await);
+        }
+        let mut desired = before.document.clone();
+        let desired_account = desired
+            .accounts
+            .get_mut(&expected_account.account_id)
+            .expect("validated account disappeared from cloned document");
+        if let Some(refresh_token) = refresh_token {
+            desired_account.refresh_token = refresh_token.to_owned();
+        }
+        if let Some(authenticated_at) = authenticated_at {
+            desired_account.authenticated_at = authenticated_at;
+        }
+        desired_account.state = state;
+        self.commit_private_mutation(action_id, "refresh-account", before, desired)
+            .await
+    }
+
+    async fn commit_private_mutation(
+        &self,
+        action_id: Uuid,
+        operation: &'static str,
+        before: SubscriptionAccountFileSnapshot,
+        desired: super::accounts::SubscriptionAccountDocument,
+    ) -> Result<SubscriptionAccountCatalogView, SubscriptionAccountActionFailure> {
         let initial = self
             .state
             .subscription_account_catalog(before.document.clone())
@@ -87,26 +223,14 @@ impl SubscriptionAccountCoordinator {
             == crate::control::protocol::SubscriptionAccountRecoveryState::RecoveryRequired
         {
             return Err(self.empty_failure(
-                "recovery-required",
+                "subscription-account-recovery-required",
                 "Subscription Account writes are blocked until recovery is resolved",
             ));
-        }
-        let mut desired = before.document.clone();
-        let account_id = account.account_id.clone();
-        desired.accounts.insert(account_id.clone(), account);
-        if desired.default_account_id.is_none() {
-            desired.default_account_id = Some(account_id);
         }
         let intent_id = Uuid::new_v4();
         let staged = self
             .accounts
-            .stage_mutation(
-                intent_id,
-                flow_id,
-                "authorize-account",
-                &before.document,
-                &desired,
-            )
+            .stage_mutation(intent_id, action_id, operation, &before.document, &desired)
             .map_err(|_| {
                 self.empty_failure(
                     "subscription-account-write-failed",
@@ -117,8 +241,8 @@ impl SubscriptionAccountCoordinator {
             .state
             .begin_subscription_account_recovery(
                 intent_id,
-                flow_id,
-                "authorize-account",
+                action_id,
+                operation,
                 initial.revision,
                 staged.before_sha256,
                 staged.desired_sha256,
@@ -171,7 +295,7 @@ impl SubscriptionAccountCoordinator {
                     .await
                     .map_err(|_| {
                         self.empty_failure(
-                            "recovery-required",
+                            "subscription-account-recovery-required",
                             "Subscription Account recovery state could not be persisted",
                         )
                     })?;
@@ -184,7 +308,7 @@ impl SubscriptionAccountCoordinator {
             .await
             .map_err(|_| {
                 self.empty_failure(
-                    "recovery-required",
+                    "subscription-account-recovery-required",
                     "Subscription Account recovery state is invalid",
                 )
             })?;
@@ -197,13 +321,13 @@ impl SubscriptionAccountCoordinator {
                     .await
                     .map_err(|_| {
                         self.empty_failure(
-                            "recovery-required",
+                            "subscription-account-recovery-required",
                             "Subscription Account recovery state is invalid",
                         )
                     })?;
                 let current = self.accounts.read().map_err(|_| {
                     self.empty_failure(
-                        "recovery-required",
+                        "subscription-account-recovery-required",
                         "Subscription Account recovery could not inspect the private file",
                     )
                 })?;
@@ -214,7 +338,7 @@ impl SubscriptionAccountCoordinator {
                         .clear_staged_mutation(staged.intent_id)
                         .map_err(|_| {
                             self.empty_failure(
-                                "recovery-required",
+                                "subscription-account-recovery-required",
                                 "Subscription Account recovery material could not be cleared",
                             )
                         })?;
@@ -225,7 +349,7 @@ impl SubscriptionAccountCoordinator {
                     .await
                     .map_err(|_| {
                         self.empty_failure(
-                            "recovery-required",
+                            "subscription-account-recovery-required",
                             "Subscription Account recovery state could not be persisted",
                         )
                     })?;
@@ -293,7 +417,7 @@ impl SubscriptionAccountCoordinator {
                     .await
                     .map_err(|_| {
                         self.empty_failure(
-                            "recovery-required",
+                            "subscription-account-recovery-required",
                             "Subscription Account recovery state could not be finalized",
                         )
                     })?;
@@ -307,7 +431,7 @@ impl SubscriptionAccountCoordinator {
                         .await
                         .map_err(|_| {
                             self.empty_failure(
-                                "recovery-required",
+                                "subscription-account-recovery-required",
                                 "Subscription Account recovery state could not be persisted",
                             )
                         })?;
@@ -352,7 +476,7 @@ impl SubscriptionAccountCoordinator {
             return Err(self
                 .failure(
                     snapshot.document,
-                    "invalid-subscription-account",
+                    "subscription-account-not-found",
                     "Subscription Account does not exist",
                 )
                 .await);
@@ -383,6 +507,7 @@ impl SubscriptionAccountCoordinator {
                 provider_revision: binding.provider_revision,
                 provider_name: binding.provider_name.clone(),
                 current_account_id: binding.resolution.account_id.clone(),
+                next_account_id: Some(account_id.to_owned()),
                 next_resolution,
             })
             .collect();
@@ -455,7 +580,7 @@ impl SubscriptionAccountCoordinator {
             return Err(self
                 .failure(
                     before.document,
-                    "recovery-required",
+                    "subscription-account-recovery-required",
                     "Subscription Account writes are blocked until recovery is resolved",
                 )
                 .await);
@@ -464,7 +589,7 @@ impl SubscriptionAccountCoordinator {
             return Err(self
                 .failure(
                     before.document,
-                    "stale-revision",
+                    "stale-subscription-catalog-revision",
                     "Subscription Account state changed; refresh and retry",
                 )
                 .await);
@@ -484,7 +609,7 @@ impl SubscriptionAccountCoordinator {
                     return Err(self
                         .failure(
                             desired,
-                            "stale-default-preview",
+                            "stale-default-account-preview",
                             "Default Account preview changed; preview and retry",
                         )
                         .await);
@@ -497,7 +622,7 @@ impl SubscriptionAccountCoordinator {
                     return Err(self
                         .failure(
                             desired,
-                            "invalid-subscription-account",
+                            "subscription-account-not-found",
                             "Subscription Account does not exist",
                         )
                         .await);
@@ -601,6 +726,35 @@ impl SubscriptionAccountCoordinator {
         }
     }
 
+    pub(crate) async fn apply_raw(
+        &self,
+        action_id: Uuid,
+        expected_revision: u64,
+        action: serde_json::Value,
+    ) -> Result<SubscriptionAccountOutcome, SubscriptionAccountActionFailure> {
+        match self
+            .state
+            .subscription_account_receipt_by_id(action_id)
+            .await
+        {
+            Ok(Some(outcome)) => return Ok(outcome),
+            Ok(None) => {}
+            Err(_) => {
+                return Err(self.empty_failure(
+                    "state-store-error",
+                    "Subscription Account receipt could not be read",
+                ));
+            }
+        }
+        let action = serde_json::from_value(action).map_err(|_| {
+            self.empty_failure(
+                "invalid-request",
+                "Subscription Account action is malformed",
+            )
+        })?;
+        self.apply(action_id, expected_revision, action).await
+    }
+
     async fn rollback_intent(
         &self,
         intent_id: Uuid,
@@ -619,7 +773,7 @@ impl SubscriptionAccountCoordinator {
                 .finish_subscription_account_recovery(intent_id, "recovery-required")
                 .await;
             return Err(self.empty_failure(
-                "recovery-required",
+                "subscription-account-recovery-required",
                 "Subscription Account rollback found an external file change",
             ));
         }
@@ -629,7 +783,7 @@ impl SubscriptionAccountCoordinator {
                 .await
                 .map_err(|_| {
                     self.empty_failure(
-                        "recovery-required",
+                        "subscription-account-recovery-required",
                         "Subscription Account rollback state could not be finalized",
                     )
                 })?;
@@ -637,7 +791,7 @@ impl SubscriptionAccountCoordinator {
                 .clear_staged_mutation(intent_id)
                 .map_err(|_| {
                     self.empty_failure(
-                        "recovery-required",
+                        "subscription-account-recovery-required",
                         "Subscription Account rollback material could not be cleared",
                     )
                 })?;
@@ -659,7 +813,7 @@ impl SubscriptionAccountCoordinator {
             .await
             .map_err(|_| {
                 self.empty_failure(
-                    "recovery-required",
+                    "subscription-account-recovery-required",
                     "Subscription Account rollback state could not be finalized",
                 )
             })?;
@@ -667,7 +821,7 @@ impl SubscriptionAccountCoordinator {
             .clear_staged_mutation(intent_id)
             .map_err(|_| {
                 self.empty_failure(
-                    "recovery-required",
+                    "subscription-account-recovery-required",
                     "Subscription Account rollback material could not be cleared",
                 )
             })?;
@@ -740,7 +894,10 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    use super::SubscriptionAccountCoordinator;
+    use super::{
+        SubscriptionAccountCoordinator, SubscriptionAuthorizationCancellation,
+        SubscriptionAuthorizationCommit,
+    };
     use crate::{
         control::protocol::{
             ActionStatus, SubscriptionAccountAction, SubscriptionProviderBinding, Target,
@@ -783,6 +940,14 @@ mod tests {
             .first()
             .expect("provider fixture");
         let coordinator = SubscriptionAccountCoordinator::new(state, accounts);
+        let missing = coordinator
+            .preview_default("account-missing")
+            .await
+            .expect_err("missing account produced a default preview");
+        assert!(
+            missing.problem.code == "subscription-account-not-found",
+            "missing account did not use the stable Subscription Account problem code"
+        );
         let follow = SubscriptionAccountAction::BindProviderFollowDefault {
             target: Target::Codex,
             provider_id: provider.id,
@@ -801,13 +966,29 @@ mod tests {
         assert!(
             preview.effects.len() == 1
                 && preview.effects[0].provider_id == provider.id
-                && preview.effects[0].current_account_id.as_deref() == Some("account-primary"),
-            "default preview did not disclose the follow-default effect"
+                && preview.effects[0].current_account_id.as_deref() == Some("account-primary")
+                && preview.effects[0].next_account_id.as_deref() == Some("account-secondary"),
+            "default preview did not disclose the old and new resolved account identities"
         );
         let action = SubscriptionAccountAction::SetDefaultAccount {
             account_id: "account-secondary".to_owned(),
             preview_token: preview.preview_token,
         };
+        let stale_preview = coordinator
+            .apply(
+                Uuid::new_v4(),
+                1,
+                SubscriptionAccountAction::SetDefaultAccount {
+                    account_id: "account-secondary".to_owned(),
+                    preview_token: Uuid::new_v4(),
+                },
+            )
+            .await
+            .expect_err("unbound default preview token was accepted");
+        assert!(
+            stale_preview.problem.code == "stale-default-account-preview",
+            "stale default preview did not use the stable problem code"
+        );
         let action_id = Uuid::new_v4();
         let applied = coordinator
             .apply(action_id, 1, action.clone())
@@ -830,6 +1011,53 @@ mod tests {
         assert!(
             replay.view.bindings[0].binding == SubscriptionProviderBinding::FollowDefault,
             "default change rewrote binding metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_authorization_waits_for_the_account_gate_commits_nothing() {
+        let temp = TempDir::new().expect("temporary home");
+        let home = MuxviaHome::from_user_home(temp.path());
+        let state = Arc::new(StateStore::open(&home).await.expect("state store"));
+        let accounts = Arc::new(SubscriptionAccountStore::open(&home).expect("account store"));
+        let coordinator = Arc::new(SubscriptionAccountCoordinator::new(state, accounts.clone()));
+        let cancellation = SubscriptionAuthorizationCancellation::new();
+        let held_gate = coordinator.gate.lock().await;
+        let commit = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                coordinator
+                    .record_authorization_cancellable(
+                        Uuid::new_v4(),
+                        SubscriptionAccountRecord {
+                            account_id: "account-cancelled".to_owned(),
+                            email: None,
+                            refresh_token: "CANCELLED_REFRESH_SECRET_11841".to_owned(),
+                            authenticated_at: 1,
+                            state: AccountAuthorizationState::Authorized,
+                        },
+                        &cancellation,
+                    )
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel().await;
+        drop(held_gate);
+
+        let result = commit.await.expect("authorization commit task");
+        assert!(
+            matches!(result, Ok(SubscriptionAuthorizationCommit::Cancelled)),
+            "cancelled authorization waiting on the account gate was committed"
+        );
+        let catalog = coordinator.catalog().await.expect("cancelled catalog");
+        assert!(
+            catalog.revision == 0
+                && catalog.view_sequence == 0
+                && catalog.accounts.is_empty()
+                && !home.subscription_accounts_path().exists(),
+            "cancelled authorization mutated the account catalog or private file"
         );
     }
 
@@ -955,6 +1183,20 @@ mod tests {
             view.recovery.state
                 == crate::control::protocol::SubscriptionAccountRecoveryState::RecoveryRequired,
             "missing recovery material did not persist account-local Recovery Required"
+        );
+        let blocked = coordinator
+            .apply(
+                Uuid::new_v4(),
+                view.revision,
+                SubscriptionAccountAction::DeleteAccount {
+                    account_id: "account-secondary".to_owned(),
+                },
+            )
+            .await
+            .expect_err("Recovery Required allowed a Subscription Account mutation");
+        assert!(
+            blocked.problem.code == "subscription-account-recovery-required",
+            "Recovery Required did not use the stable Subscription Account problem code"
         );
     }
 

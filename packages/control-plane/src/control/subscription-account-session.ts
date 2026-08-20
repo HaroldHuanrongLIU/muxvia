@@ -122,7 +122,10 @@ class SubscriptionAccountSessionImpl implements SubscriptionAccountSession {
             this.#replace(error.authoritativeSubscriptionAccountView)
           }
         }
-        if (error instanceof ControlError && error.code === "stale-revision") {
+        if (
+          error instanceof ControlError
+          && error.code === "stale-subscription-catalog-revision"
+        ) {
           await this.#refreshCatalog()
         }
         throw error

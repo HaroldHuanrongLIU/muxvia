@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UnixStream},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -961,6 +961,136 @@ async fn subscription_device_authorization_survives_disconnect_and_responds_befo
     fixture.shutdown().await;
 }
 
+#[tokio::test]
+async fn cancelled_subscription_poll_cannot_exchange_or_persist_late_authorization() {
+    let authority = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", authority.local_addr().unwrap());
+    let (poll_seen_tx, poll_seen_rx) = oneshot::channel();
+    let (release_poll_tx, release_poll_rx) = oneshot::channel();
+    let exchange_count = Arc::new(AtomicUsize::new(0));
+    let authority_exchange_count = Arc::clone(&exchange_count);
+    let authority_task = tokio::spawn(async move {
+        let (mut start, _) = authority.accept().await.unwrap();
+        let _ = read_subscription_http_request(&mut start).await;
+        let start_body = r#"{"device_auth_id":"CANCELLED_REMOTE_DEVICE_SECRET_11831","user_code":"CANCEL-1234","interval":5,"expires_in":900}"#;
+        start
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{start_body}",
+                    start_body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let (mut poll, _) = authority.accept().await.unwrap();
+        let _ = read_subscription_http_request(&mut poll).await;
+        let _ = poll_seen_tx.send(());
+        let _ = release_poll_rx.await;
+        let poll_body = r#"{"authorization_code":"CANCELLED_AUTHORIZATION_SECRET_11832","code_verifier":"CANCELLED_VERIFIER_SECRET_11833"}"#;
+        let _ = poll
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{poll_body}",
+                    poll_body.len()
+                )
+                .as_bytes(),
+            )
+            .await;
+
+        if let Ok(Ok((mut exchange, _))) =
+            tokio::time::timeout(Duration::from_millis(250), authority.accept()).await
+        {
+            authority_exchange_count.fetch_add(1, Ordering::SeqCst);
+            let _ = read_subscription_http_request(&mut exchange).await;
+            let token_body = concat!(
+                "{\"access_token\":\"CANCELLED_ACCESS_SECRET_11834\",",
+                "\"refresh_token\":\"CANCELLED_REFRESH_SECRET_11835\",",
+                "\"id_token\":\"e30.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2NvdW50LWNhbmNlbGxlZCJ9.signature\",",
+                "\"expires_in\":3600}"
+            );
+            let _ = exchange
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{token_body}",
+                        token_body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+    });
+
+    let mut fixture = ControlFixture::start_with_device_authority_origin(&origin).await;
+    let mut poller = fixture.connect().await;
+    hello(&mut poller).await;
+    request(
+        &mut poller,
+        "open-cancelled-poll",
+        json!({"kind": "open-subscription-accounts"}),
+    )
+    .await;
+    let started = request(
+        &mut poller,
+        "start-cancelled-poll",
+        json!({
+            "kind": "start-device-authorization",
+            "reauthorizeAccountId": null
+        }),
+    )
+    .await;
+    let flow_id = started["result"]["challenge"]["flowId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    write_frame(
+        &mut poller,
+        &json!({
+            "type": "request",
+            "requestId": "cancelled-poll",
+            "operation": {"kind": "poll-device-authorization", "flowId": flow_id}
+        }),
+    )
+    .await
+    .unwrap();
+    poll_seen_rx.await.unwrap();
+    write_frame(
+        &mut poller,
+        &json!({"type": "cancel", "requestId": "cancelled-poll"}),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if fixture.handle.as_ref().unwrap().tracked_inspections() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled account poll did not leave inspection tracking");
+    let _ = release_poll_tx.send(());
+    authority_task.await.unwrap();
+
+    let mut observer = fixture.connect().await;
+    hello(&mut observer).await;
+    let catalog = request(
+        &mut observer,
+        "open-after-cancelled-poll",
+        json!({"kind": "open-subscription-accounts"}),
+    )
+    .await;
+    assert!(
+        exchange_count.load(Ordering::SeqCst) == 0
+            && catalog["result"]["view"]["revision"] == 0
+            && catalog["result"]["view"]["accounts"] == json!([]),
+        "cancelled device poll exchanged or persisted a late authorization"
+    );
+    fixture.shutdown().await;
+}
+
 async fn read_subscription_http_request(stream: &mut tokio::net::TcpStream) -> String {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 1024];
@@ -1145,8 +1275,9 @@ async fn subscription_bindings_default_preview_delete_and_replay_are_authoritati
     .await;
     assert!(
         preview["result"]["preview"]["effects"][0]["currentAccountId"] == "account-secondary"
+            && preview["result"]["preview"]["effects"][0]["nextAccountId"] == "account-secondary"
             && preview["result"]["preview"]["effects"][0]["nextResolution"] == "available",
-        "default preview omitted the follow-default consequence"
+        "default preview omitted the old and new resolved account identities"
     );
     let default_action_id = Uuid::new_v4();
     let default_action = json!({
@@ -1189,6 +1320,23 @@ async fn subscription_bindings_default_preview_delete_and_replay_are_authoritati
             && replay["result"]["outcome"]["view"] == applied["result"]["outcome"]["view"],
         "default action replay was not receipt-first"
     );
+    let malformed_replay = request(
+        &mut initiator,
+        "set-default-malformed-replay",
+        json!({
+            "kind": "subscription-account-act",
+            "actionId": default_action_id,
+            "expectedRevision": 1000,
+            "action": {"kind": "malformed-replay"}
+        }),
+    )
+    .await;
+    assert!(
+        malformed_replay["result"]["outcome"]["status"] == "replayed"
+            && malformed_replay["result"]["outcome"]["view"]
+                == applied["result"]["outcome"]["view"],
+        "malformed Subscription Account replay was parsed before its durable receipt"
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(100), read_frame(&mut subscriber))
             .await
@@ -1207,7 +1355,7 @@ async fn subscription_bindings_default_preview_delete_and_replay_are_authoritati
     )
     .await;
     assert!(
-        stale["problem"]["code"] == "stale-revision"
+        stale["problem"]["code"] == "stale-subscription-catalog-revision"
             && stale["authoritativeSubscriptionAccountView"]["revision"] == 4
             && stale["authoritativeSubscriptionAccountView"]["accounts"]
                 .as_array()

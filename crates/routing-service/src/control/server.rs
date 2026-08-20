@@ -17,6 +17,7 @@ use tokio::{
     task::{Id, JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::{
     claude::ClaudeConfigCodec,
@@ -46,6 +47,7 @@ use crate::{
     subscription::{
         DeviceAuthorizationManager, ReqwestDeviceAuthorizationAuthority,
         SubscriptionAccountCoordinator, SubscriptionAccountStore,
+        SubscriptionAuthorizationCancellation, SubscriptionAuthorizationCommit,
     },
 };
 
@@ -143,7 +145,22 @@ impl Drop for InspectionGuard {
 
 struct InspectionRequest {
     task_id: Id,
-    cancellation: CancellationToken,
+    cancellation: InspectionCancellation,
+}
+
+#[derive(Clone)]
+enum InspectionCancellation {
+    Standard(CancellationToken),
+    SubscriptionAuthorization(SubscriptionAuthorizationCancellation),
+}
+
+impl InspectionCancellation {
+    async fn cancel(&self) {
+        match self {
+            Self::Standard(cancellation) => cancellation.cancel(),
+            Self::SubscriptionAuthorization(cancellation) => cancellation.cancel().await,
+        }
+    }
 }
 
 struct InspectionCompletion {
@@ -308,13 +325,14 @@ impl ControlServer {
                     .map_err(|_| ControlServerError::State)?,
             ),
         };
-        let device_authorization = Arc::new(DeviceAuthorizationManager::new(
-            Arc::clone(&subscription_accounts),
-            device_authority,
-        ));
         let subscription_account_coordinator = Arc::new(SubscriptionAccountCoordinator::new(
             Arc::clone(&store),
             Arc::clone(&subscription_accounts),
+        ));
+        let device_authorization = Arc::new(DeviceAuthorizationManager::new(
+            Arc::clone(&subscription_accounts),
+            Arc::clone(&subscription_account_coordinator),
+            device_authority,
         ));
         subscription_account_coordinator
             .recover_pending_intents()
@@ -788,8 +806,11 @@ async fn serve_session(
                 let parsed = serde_json::from_value::<ClientFrame>(raw.clone());
                 let (request_id, operation) = match parsed {
                     Ok(ClientFrame::Cancel { request_id }) => {
-                        if let Some(request) = inspection_requests.get(&request_id) {
-                            request.cancellation.cancel();
+                        if let Some(cancellation) = inspection_requests
+                            .get(&request_id)
+                            .map(|request| request.cancellation.clone())
+                        {
+                            cancellation.cancel().await;
                         }
                         continue;
                     }
@@ -1124,6 +1145,59 @@ async fn serve_session(
                         }
                         continue;
                     }
+                    if let ControlOperation::PollDeviceAuthorization(operation) = &operation {
+                        if inspection_requests.contains_key(&request_id) {
+                            let _ = enqueue_response(
+                                &responses,
+                                problem_frame(
+                                    Some(request_id),
+                                    "request-in-progress",
+                                    "Request identifier is already in progress",
+                                    None,
+                                ),
+                            );
+                            break 'session;
+                        }
+                        if inspections.len() >= MAX_IN_FLIGHT_INSPECTIONS_PER_SESSION {
+                            if !enqueue_response(
+                                &responses,
+                                problem_frame(
+                                    Some(request_id),
+                                    "inspection-limit-reached",
+                                    "Too many inspections are already in progress",
+                                    None,
+                                ),
+                            ) {
+                                break 'session;
+                            }
+                            continue;
+                        }
+                        lifecycle
+                            .pending_inspections
+                            .fetch_add(1, Ordering::AcqRel);
+                        let guard = InspectionGuard(Arc::clone(&lifecycle));
+                        let cancellation = SubscriptionAuthorizationCancellation::new();
+                        let task_request_id = request_id.clone();
+                        let abort = inspections.spawn(poll_subscription_account_and_queue(
+                            task_request_id,
+                            operation.flow_id,
+                            Arc::clone(&device_authorization),
+                            Arc::clone(&subscription_account_coordinator),
+                            responses.clone(),
+                            cancellation.clone(),
+                            guard,
+                        ));
+                        inspection_requests.insert(
+                            request_id,
+                            InspectionRequest {
+                                task_id: abort.id(),
+                                cancellation: InspectionCancellation::SubscriptionAuthorization(
+                                    cancellation,
+                                ),
+                            },
+                        );
+                        continue;
+                    }
                     let (frame, publication) = match operation {
                         ControlOperation::StartDeviceAuthorization(operation) => {
                             match device_authorization
@@ -1156,79 +1230,8 @@ async fn serve_session(
                                 ),
                             }
                         }
-                        ControlOperation::PollDeviceAuthorization(operation) => {
-                            match device_authorization.poll(operation.flow_id).await {
-                                Ok(crate::subscription::DeviceAuthorizationPoll::Pending) => (
-                                    ServerFrame::Response {
-                                        request_id,
-                                        result: ControlResult::DeviceAuthorizationPoll {
-                                            poll: crate::control::protocol::DeviceAuthorizationPollView::Pending,
-                                        },
-                                    },
-                                    None,
-                                ),
-                                Ok(crate::subscription::DeviceAuthorizationPoll::Expired) => (
-                                    ServerFrame::Response {
-                                        request_id,
-                                        result: ControlResult::DeviceAuthorizationPoll {
-                                            poll: crate::control::protocol::DeviceAuthorizationPollView::Expired,
-                                        },
-                                    },
-                                    None,
-                                ),
-                                Ok(crate::subscription::DeviceAuthorizationPoll::Authorized { authorization }) => {
-                                    let account = authorization.account.clone();
-                                    match subscription_account_coordinator
-                                        .record_authorization(operation.flow_id, account)
-                                        .await
-                                    {
-                                        Ok(publication) => match device_authorization
-                                            .complete_authorization(operation.flow_id, authorization)
-                                            .await
-                                        {
-                                            Ok(account_id) => (
-                                                ServerFrame::Response {
-                                                    request_id,
-                                                    result: ControlResult::DeviceAuthorizationPoll {
-                                                        poll: crate::control::protocol::DeviceAuthorizationPollView::Authorized { account_id },
-                                                    },
-                                                },
-                                                Some(publication),
-                                            ),
-                                            Err(_) => (
-                                                problem_frame(
-                                                    Some(request_id),
-                                                    "device-authorization-failed",
-                                                    "Device authorization could not be finalized",
-                                                    None,
-                                                ),
-                                                None,
-                                            ),
-                                        },
-                                        Err(failure) => (
-                                            ServerFrame::Error {
-                                                request_id: Some(request_id),
-                                                problem: failure.problem,
-                                                authoritative_view: None,
-                                                authoritative_universal_provider_view: None,
-                                                authoritative_subscription_account_view: Some(
-                                                    Box::new(failure.authoritative_view),
-                                                ),
-                                            },
-                                            None,
-                                        ),
-                                    }
-                                }
-                                Err(_) => (
-                                    problem_frame(
-                                        Some(request_id),
-                                        "device-authorization-failed",
-                                        "Device authorization could not be polled",
-                                        None,
-                                    ),
-                                    None,
-                                ),
-                            }
+                        ControlOperation::PollDeviceAuthorization(_) => {
+                            unreachable!("poll operations are spawned as cancellable inspections")
                         }
                         ControlOperation::PreviewDefaultSubscriptionAccount(operation) => {
                             match subscription_account_coordinator
@@ -1260,11 +1263,10 @@ async fn serve_session(
                             action_id,
                             expected_revision,
                             action,
-                        } => match serde_json::from_value(action) {
-                            Ok(action) => match subscription_account_coordinator
-                                .apply(action_id, expected_revision, action)
-                                .await
-                            {
+                        } => match subscription_account_coordinator
+                            .apply_raw(action_id, expected_revision, action)
+                            .await
+                        {
                                 Ok(outcome) => {
                                     let publication = (outcome.status == ActionStatus::Applied)
                                         .then(|| outcome.view.clone());
@@ -1290,16 +1292,6 @@ async fn serve_session(
                                     },
                                     None,
                                 ),
-                            },
-                            Err(_) => (
-                                problem_frame(
-                                    Some(request_id),
-                                    "invalid-request",
-                                    "Subscription Account action is malformed",
-                                    None,
-                                ),
-                                None,
-                            ),
                         },
                         _ => unreachable!("account operation was matched above"),
                     };
@@ -1684,7 +1676,7 @@ async fn serve_session(
                         ));
                         inspection_requests.insert(request_id, InspectionRequest {
                             task_id: abort.id(),
-                            cancellation,
+                            cancellation: InspectionCancellation::Standard(cancellation),
                         });
                     }
                 }
@@ -1738,8 +1730,12 @@ async fn serve_session(
         }
     }
 
-    for request in inspection_requests.values() {
-        request.cancellation.cancel();
+    let cancellations = inspection_requests
+        .values()
+        .map(|request| request.cancellation.clone())
+        .collect::<Vec<_>>();
+    for cancellation in cancellations {
+        cancellation.cancel().await;
     }
     inspection_requests.clear();
     while action_completions.join_next().await.is_some() {}
@@ -1780,6 +1776,131 @@ fn operation_target(operation: &ControlOperation) -> Option<Target> {
         | ControlOperation::CheckReachability { target, .. }
         | ControlOperation::PreviewReconciliation { target, .. } => Some(*target),
         ControlOperation::ProbeCompatibility(operation) => Some(operation.target),
+    }
+}
+
+async fn poll_subscription_account_and_queue(
+    request_id: String,
+    flow_id: Uuid,
+    device_authorization: Arc<DeviceAuthorizationManager>,
+    coordinator: Arc<SubscriptionAccountCoordinator>,
+    responses: mpsc::Sender<QueuedResponse>,
+    cancellation: SubscriptionAuthorizationCancellation,
+    guard: InspectionGuard,
+) -> InspectionCompletion {
+    let _guard = guard;
+    let cancellation_token = cancellation.token();
+    let polled = tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => {
+            return InspectionCompletion {
+                request_id,
+                disposition: InspectionDisposition::Cancelled,
+            };
+        }
+        result = device_authorization.poll(flow_id) => result,
+    };
+    if cancellation_token.is_cancelled() {
+        return InspectionCompletion {
+            request_id,
+            disposition: InspectionDisposition::Cancelled,
+        };
+    }
+    let (frame, publication) = match polled {
+        Ok(crate::subscription::DeviceAuthorizationPoll::Pending) => (
+            ServerFrame::Response {
+                request_id: request_id.clone(),
+                result: ControlResult::DeviceAuthorizationPoll {
+                    poll: crate::control::protocol::DeviceAuthorizationPollView::Pending,
+                },
+            },
+            None,
+        ),
+        Ok(crate::subscription::DeviceAuthorizationPoll::Expired) => (
+            ServerFrame::Response {
+                request_id: request_id.clone(),
+                result: ControlResult::DeviceAuthorizationPoll {
+                    poll: crate::control::protocol::DeviceAuthorizationPollView::Expired,
+                },
+            },
+            None,
+        ),
+        Ok(crate::subscription::DeviceAuthorizationPoll::Authorized { authorization }) => {
+            let account = authorization.account.clone();
+            match coordinator
+                .record_authorization_cancellable(flow_id, account, &cancellation)
+                .await
+            {
+                Ok(SubscriptionAuthorizationCommit::Cancelled) => {
+                    return InspectionCompletion {
+                        request_id,
+                        disposition: InspectionDisposition::Cancelled,
+                    };
+                }
+                Ok(SubscriptionAuthorizationCommit::Committed(publication)) => match device_authorization
+                    .complete_authorization(flow_id, authorization)
+                    .await
+                {
+                    Ok(account_id) => (
+                        ServerFrame::Response {
+                            request_id: request_id.clone(),
+                            result: ControlResult::DeviceAuthorizationPoll {
+                                poll: crate::control::protocol::DeviceAuthorizationPollView::Authorized {
+                                    account_id,
+                                },
+                            },
+                        },
+                        Some(publication),
+                    ),
+                    Err(_) => (
+                        problem_frame(
+                            Some(request_id.clone()),
+                            "device-authorization-failed",
+                            "Device authorization could not be finalized",
+                            None,
+                        ),
+                        None,
+                    ),
+                },
+                Err(failure) => (
+                    ServerFrame::Error {
+                        request_id: Some(request_id.clone()),
+                        problem: failure.problem,
+                        authoritative_view: None,
+                        authoritative_universal_provider_view: None,
+                        authoritative_subscription_account_view: Some(Box::new(
+                            failure.authoritative_view,
+                        )),
+                    },
+                    None,
+                ),
+            }
+        }
+        Err(_) => (
+            problem_frame(
+                Some(request_id.clone()),
+                "device-authorization-failed",
+                "Device authorization could not be polled",
+                None,
+            ),
+            None,
+        ),
+    };
+    let disposition = if enqueue_subscription_account_response(
+        &responses,
+        frame,
+        publication,
+        &coordinator,
+    )
+    .await
+    {
+        InspectionDisposition::Written
+    } else {
+        InspectionDisposition::CloseSession
+    };
+    InspectionCompletion {
+        request_id,
+        disposition,
     }
 }
 

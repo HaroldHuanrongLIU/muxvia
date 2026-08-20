@@ -68,7 +68,7 @@ export class ControlError extends Error {
     super(message)
     this.name = "ControlError"
     this.code = code
-    this.retryable = code === "stale-revision"
+    this.retryable = code === "stale-revision" || code === "stale-subscription-catalog-revision"
     this.authoritativeView = authoritativeView
     this.authoritativeUniversalProviderView = authoritativeUniversalProviderView
     this.authoritativeSubscriptionAccountView = authoritativeSubscriptionAccountView

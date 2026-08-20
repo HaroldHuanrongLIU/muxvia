@@ -982,6 +982,7 @@ pub struct SubscriptionDefaultEffect {
     pub provider_revision: u64,
     pub provider_name: String,
     pub current_account_id: Option<String>,
+    pub next_account_id: Option<String>,
     pub next_resolution: SubscriptionBindingResolutionState,
 }
 

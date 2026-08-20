@@ -217,6 +217,26 @@ test("Subscription Account session owns its catalog, device flow, and queued act
   await Bun.sleep(0)
   expect(session.get()).toEqual(catalog(5))
 
+  const stale = session.act({ kind: "delete-account", accountId: "account-stale" })
+  await server.waitForRequests(9)
+  server.send({
+    type: "error",
+    requestId: server.requests()[8]!.requestId,
+    problem: {
+      code: "stale-subscription-catalog-revision",
+      message: "catalog changed",
+    },
+    authoritativeSubscriptionAccountView: catalog(6),
+  })
+  await server.waitForRequests(10)
+  expect(server.requests()[9]!.operation).toEqual({ kind: "open-subscription-accounts" })
+  server.reply(9, { kind: "subscription-account-catalog", view: catalog(6) })
+  await expect(stale).rejects.toMatchObject({
+    code: "stale-subscription-catalog-revision",
+    retryable: true,
+  })
+  expect(session.get()).toEqual(catalog(6))
+
   await session.close()
   await expect(session.act({ kind: "delete-account", accountId: "closed" }))
     .rejects.toMatchObject({ code: "connection-closed" })

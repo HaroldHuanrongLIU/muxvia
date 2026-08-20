@@ -136,6 +136,7 @@ class MemorySubscriptionSession implements SubscriptionAccountSession {
         providerRevision: 1,
         providerName: "Account-backed Provider",
         currentAccountId: null,
+        nextAccountId: accountId,
         nextResolution: "available",
       }],
     }
@@ -190,6 +191,7 @@ test("either Target opens one account workflow and browser failure does not stop
     setup.mockInput.pressKey("s")
     const preview = await setup.waitForFrame((frame) => frame.includes("Default preview"))
     expect(preview).toContain("Follow Default")
+    expect(preview).toContain("— → account-primary")
     setup.mockInput.pressEnter()
     await setup.waitFor(() => accounts.actions.length === 1)
     expect(accounts.actions[0]).toEqual({

@@ -13,8 +13,9 @@ use tokio::sync::{Mutex, RwLock};
 use url::Url;
 use uuid::Uuid;
 
-use super::accounts::{
-    AccountAuthorizationState, SubscriptionAccountRecord, SubscriptionAccountStore,
+use super::{
+    accounts::{AccountAuthorizationState, SubscriptionAccountRecord, SubscriptionAccountStore},
+    coordinator::SubscriptionAccountCoordinator,
 };
 
 const DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
@@ -38,7 +39,7 @@ impl fmt::Debug for RemoteDeviceChallenge {
             .debug_struct("RemoteDeviceChallenge")
             .field("device_auth_id", &"<redacted>")
             .field("user_code_present", &!self.user_code.is_empty())
-            .field("interval", &self.interval)
+            .field("interval_present", &self.interval.is_some())
             .field("expires_in", &self.expires_in)
             .finish()
     }
@@ -352,6 +353,7 @@ impl fmt::Debug for PendingFlow {
 
 pub(crate) struct DeviceAuthorizationManager {
     accounts: Arc<SubscriptionAccountStore>,
+    coordinator: Arc<SubscriptionAccountCoordinator>,
     authority: Arc<dyn DeviceAuthorizationAuthority>,
     pending: Mutex<HashMap<Uuid, PendingFlow>>,
     access_tokens: RwLock<HashMap<String, CachedAccessToken>>,
@@ -375,10 +377,12 @@ impl fmt::Debug for CachedAccessToken {
 impl DeviceAuthorizationManager {
     pub(crate) fn new(
         accounts: Arc<SubscriptionAccountStore>,
+        coordinator: Arc<SubscriptionAccountCoordinator>,
         authority: Arc<dyn DeviceAuthorizationAuthority>,
     ) -> Self {
         Self {
             accounts,
+            coordinator,
             authority,
             pending: Mutex::new(HashMap::new()),
             access_tokens: RwLock::new(HashMap::new()),
@@ -528,15 +532,18 @@ impl DeviceAuthorizationManager {
             Ok(tokens) => tokens,
             Err(RemoteRefreshError::Failed) => return Err(DeviceAuthorizationError::Failed),
             Err(RemoteRefreshError::PermanentRejection) => {
-                let mut desired = snapshot.document.clone();
-                let desired_account = desired
-                    .accounts
-                    .get_mut(account_id)
-                    .ok_or(DeviceAuthorizationError::Failed)?;
-                desired_account.state = AccountAuthorizationState::NeedsReauthorization;
-                self.accounts
-                    .replace(&snapshot, &desired)
+                let publication = self
+                    .coordinator
+                    .record_refresh(
+                        Uuid::new_v4(),
+                        &account,
+                        None,
+                        None,
+                        AccountAuthorizationState::NeedsReauthorization,
+                    )
+                    .await
                     .map_err(|_| DeviceAuthorizationError::Failed)?;
+                self.coordinator.publish(publication).await;
                 self.access_tokens.write().await.remove(account_id);
                 return Err(DeviceAuthorizationError::NeedsReauthorization);
             }
@@ -548,23 +555,23 @@ impl DeviceAuthorizationManager {
             return Err(DeviceAuthorizationError::IdentityMismatch);
         }
 
-        let mut desired = snapshot.document.clone();
-        let desired_account = desired
-            .accounts
-            .get_mut(account_id)
-            .ok_or(DeviceAuthorizationError::Failed)?;
-        if let Some(rotated) = tokens
+        let rotated_refresh_token = tokens
             .refresh_token
             .as_ref()
             .filter(|value| !value.is_empty())
-        {
-            desired_account.refresh_token.clone_from(rotated);
-        }
-        desired_account.authenticated_at = now as i64;
-        desired_account.state = AccountAuthorizationState::Authorized;
-        self.accounts
-            .replace(&snapshot, &desired)
+            .map(String::as_str);
+        let publication = self
+            .coordinator
+            .record_refresh(
+                Uuid::new_v4(),
+                &account,
+                rotated_refresh_token,
+                Some(now as i64),
+                AccountAuthorizationState::Authorized,
+            )
+            .await
             .map_err(|_| DeviceAuthorizationError::Failed)?;
+        self.coordinator.publish(publication).await;
 
         let expires_in = tokens.expires_in.unwrap_or(3600).max(0) as u64;
         self.access_tokens.write().await.insert(
@@ -728,7 +735,7 @@ mod tests {
             Ok(RemoteDeviceChallenge {
                 device_auth_id: "REMOTE_DEVICE_ID_SECRET_11741".to_owned(),
                 user_code: "ABCD-EFGH".to_owned(),
-                interval: Some(serde_json::json!(5)),
+                interval: Some(serde_json::json!("REMOTE_INTERVAL_SECRET_11742")),
                 expires_in: Some(900),
             })
         }
@@ -769,6 +776,26 @@ mod tests {
 
     struct ReauthorizationAuthority {
         account_id: &'static str,
+    }
+
+    #[test]
+    fn remote_challenge_debug_redacts_raw_polling_metadata() {
+        let challenge = RemoteDeviceChallenge {
+            device_auth_id: "REMOTE_DEVICE_DEBUG_SECRET_11743".to_owned(),
+            user_code: "DEBUG-CODE".to_owned(),
+            interval: Some(serde_json::json!("REMOTE_INTERVAL_DEBUG_SECRET_11744")),
+            expires_in: Some(900),
+        };
+        let diagnostic = format!("{challenge:?}");
+        for secret in [
+            "REMOTE_DEVICE_DEBUG_SECRET_11743",
+            "REMOTE_INTERVAL_DEBUG_SECRET_11744",
+        ] {
+            assert!(
+                !diagnostic.contains(secret),
+                "remote challenge diagnostic exposed upstream authorization material"
+            );
+        }
     }
 
     #[async_trait]
@@ -927,7 +954,8 @@ mod tests {
         let authority = Arc::new(StartAuthority {
             starts: Mutex::new(0),
         });
-        let manager = DeviceAuthorizationManager::new(accounts, authority.clone());
+        let coordinator = account_coordinator(&home, accounts.clone()).await;
+        let manager = DeviceAuthorizationManager::new(accounts, coordinator, authority.clone());
 
         let challenge = manager.start(None).await.expect("start authorization");
         assert!(
@@ -954,6 +982,10 @@ mod tests {
             !diagnostic.contains("REMOTE_DEVICE_ID_SECRET_11741"),
             "public challenge exposed the remote device identity"
         );
+        assert!(
+            !diagnostic.contains("REMOTE_INTERVAL_SECRET_11742"),
+            "public challenge exposed raw upstream polling metadata"
+        );
     }
 
     #[tokio::test]
@@ -971,7 +1003,12 @@ mod tests {
             ])),
             exchanged_verifier: Mutex::new(None),
         });
-        let manager = DeviceAuthorizationManager::new(accounts.clone(), authority.clone());
+        let coordinator = account_coordinator(&home, accounts.clone()).await;
+        let manager = DeviceAuthorizationManager::new(
+            accounts.clone(),
+            coordinator.clone(),
+            authority.clone(),
+        );
         let challenge = manager.start(None).await.expect("start authorization");
 
         let pending = manager.poll(challenge.flow_id).await.expect("pending poll");
@@ -1146,7 +1183,14 @@ mod tests {
             }))),
             refresh_calls: Mutex::new(0),
         });
-        let manager = DeviceAuthorizationManager::new(accounts.clone(), authority.clone());
+        let state = Arc::new(StateStore::open(&home).await.expect("state store"));
+        let coordinator = Arc::new(SubscriptionAccountCoordinator::new(state, accounts.clone()));
+        let mut publications = coordinator.subscribe();
+        let manager = DeviceAuthorizationManager::new(
+            accounts.clone(),
+            coordinator.clone(),
+            authority.clone(),
+        );
 
         let access = manager
             .access_token_for_account("account-primary")
@@ -1174,6 +1218,20 @@ mod tests {
             !file.contains("ACCESS_TOKEN_ROTATED_SECRET_11772"),
             "access token was persisted"
         );
+        let catalog = coordinator.catalog().await.expect("refreshed catalog");
+        assert!(
+            catalog.revision == 1 && catalog.view_sequence == 1,
+            "refresh did not commit through the durable account coordinator"
+        );
+        let publication =
+            tokio::time::timeout(std::time::Duration::from_secs(1), publications.recv())
+                .await
+                .expect("refresh did not publish the committed catalog")
+                .expect("refresh publication channel closed");
+        assert!(
+            publication == catalog,
+            "refresh published a non-authoritative catalog"
+        );
     }
 
     #[tokio::test]
@@ -1186,7 +1244,12 @@ mod tests {
             result: Mutex::new(Some(Err(RemoteRefreshError::PermanentRejection))),
             refresh_calls: Mutex::new(0),
         });
-        let manager = DeviceAuthorizationManager::new(accounts.clone(), authority.clone());
+        let coordinator = account_coordinator(&home, accounts.clone()).await;
+        let manager = DeviceAuthorizationManager::new(
+            accounts.clone(),
+            coordinator.clone(),
+            authority.clone(),
+        );
 
         let error = manager
             .access_token_for_account("account-primary")
@@ -1206,6 +1269,17 @@ mod tests {
             account.state == AccountAuthorizationState::NeedsReauthorization
                 && snapshot.document.default_account_id.as_deref() == Some("account-primary"),
             "permanent rejection changed identity/default instead of requiring reauthorization"
+        );
+        let catalog = coordinator
+            .catalog()
+            .await
+            .expect("reauthorization catalog");
+        assert!(
+            catalog.revision == 1
+                && catalog.view_sequence == 1
+                && catalog.accounts[0].state
+                    == crate::control::protocol::SubscriptionAccountState::NeedsReauthorization,
+            "permanent rejection did not commit through the durable account coordinator"
         );
         let repeated = manager
             .access_token_for_account("account-primary")
@@ -1239,6 +1313,7 @@ mod tests {
                 .expect("mark reauthorization state");
             let manager = DeviceAuthorizationManager::new(
                 accounts.clone(),
+                account_coordinator(&home, accounts.clone()).await,
                 Arc::new(ReauthorizationAuthority {
                     account_id: remote_account,
                 }),
@@ -1319,6 +1394,16 @@ mod tests {
         accounts
             .replace(&snapshot, &desired)
             .expect("install authorized account");
+    }
+
+    async fn account_coordinator(
+        home: &MuxviaHome,
+        accounts: Arc<SubscriptionAccountStore>,
+    ) -> Arc<SubscriptionAccountCoordinator> {
+        Arc::new(SubscriptionAccountCoordinator::new(
+            Arc::new(StateStore::open(home).await.expect("state store")),
+            accounts,
+        ))
     }
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {

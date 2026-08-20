@@ -393,9 +393,10 @@
               "providerRevision": { "type": "integer", "minimum": 1 },
               "providerName": { "type": "string" },
               "currentAccountId": { "type": ["string", "null"] },
+              "nextAccountId": { "type": ["string", "null"] },
               "nextResolution": { "enum": ["available", "needs-reauthorization", "missing", "no-default"] }
             },
-            "required": ["target", "providerId", "providerRevision", "providerName", "currentAccountId", "nextResolution"]
+            "required": ["target", "providerId", "providerRevision", "providerName", "currentAccountId", "nextAccountId", "nextResolution"]
           }
         }
       },

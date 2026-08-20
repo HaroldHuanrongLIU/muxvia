@@ -1,12 +1,21 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    fmt,
+};
 
-use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
+use axum::{
+    body::Bytes,
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+};
+use futures_util::{Stream, StreamExt, stream};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Map, Value, json};
 
 pub(crate) const SUBSCRIPTION_BRIDGE_RESPONSES_URL: &str =
     "https://chatgpt.com/backend-api/codex/responses";
 pub(crate) const MAX_BRIDGE_BODY_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_BRIDGE_SSE_EVENT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_BRIDGE_ERROR_BODY_BYTES: usize = 256 * 1024;
 
 const ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_VERSION: &str = "0.144.1";
@@ -96,6 +105,658 @@ impl SubscriptionBridgeAdapter {
 
         Ok(PreparedBridgeRequest { headers, body })
     }
+
+    pub(crate) fn convert_stream<S, E>(upstream: S) -> impl Stream<Item = Bytes> + Send
+    where
+        S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+        E: Send + 'static,
+    {
+        stream::unfold(BridgeSseState::new(upstream), |mut state| async move {
+            let output = state.next_output().await?;
+            Some((output, state))
+        })
+    }
+
+    pub(crate) fn map_non_success(
+        status: StatusCode,
+        body: &[u8],
+    ) -> Result<PreparedBridgeFailure, BridgeResponseError> {
+        if status.is_success() || body.len() > MAX_BRIDGE_ERROR_BODY_BYTES {
+            return Err(BridgeResponseError::InvalidResponse);
+        }
+        Ok(PreparedBridgeFailure {
+            status,
+            event: bridge_error_event("subscription-bridge-upstream-error"),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum BridgeResponseError {
+    #[error("subscription bridge response is invalid")]
+    InvalidResponse,
+}
+
+pub(crate) struct PreparedBridgeFailure {
+    status: StatusCode,
+    event: Bytes,
+}
+
+impl PreparedBridgeFailure {
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(crate) fn event(&self) -> &Bytes {
+        &self.event
+    }
+}
+
+impl fmt::Debug for PreparedBridgeFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedBridgeFailure")
+            .field("status", &self.status)
+            .field("event", &"[redacted]")
+            .finish()
+    }
+}
+
+struct ToolBlock {
+    index: u64,
+    arguments: String,
+    had_delta: bool,
+}
+
+struct ReasoningBlock {
+    index: u64,
+    open: bool,
+}
+
+struct BridgeSseState<S> {
+    upstream: S,
+    buffer: Vec<u8>,
+    output: VecDeque<Bytes>,
+    terminated: bool,
+    message_started: bool,
+    next_index: u64,
+    text_index: Option<u64>,
+    tools: HashMap<String, ToolBlock>,
+    reasoning: HashMap<String, ReasoningBlock>,
+    has_tool_use: bool,
+}
+
+impl<S, E> BridgeSseState<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    fn new(upstream: S) -> Self {
+        Self {
+            upstream,
+            buffer: Vec::new(),
+            output: VecDeque::new(),
+            terminated: false,
+            message_started: false,
+            next_index: 0,
+            text_index: None,
+            tools: HashMap::new(),
+            reasoning: HashMap::new(),
+            has_tool_use: false,
+        }
+    }
+
+    async fn next_output(&mut self) -> Option<Bytes> {
+        loop {
+            if let Some(output) = self.output.pop_front() {
+                return Some(output);
+            }
+            if self.terminated {
+                return None;
+            }
+            match self.upstream.next().await {
+                Some(Ok(chunk)) => {
+                    self.buffer.extend_from_slice(&chunk);
+                    self.process_buffer();
+                    if !self.terminated && self.buffer.len() > MAX_BRIDGE_SSE_EVENT_BYTES {
+                        self.fail_invalid();
+                    }
+                }
+                Some(Err(_)) => self.fail_invalid(),
+                None => self.fail_invalid(),
+            }
+        }
+    }
+
+    fn process_buffer(&mut self) {
+        while !self.terminated {
+            let Some(block) = take_sse_block(&mut self.buffer) else {
+                break;
+            };
+            if block.len() > MAX_BRIDGE_SSE_EVENT_BYTES || self.process_block(&block).is_err() {
+                self.fail_invalid();
+            }
+        }
+    }
+
+    fn process_block(&mut self, block: &[u8]) -> Result<(), BridgeResponseError> {
+        let block = std::str::from_utf8(block).map_err(|_| BridgeResponseError::InvalidResponse)?;
+        let mut event_name = None;
+        let mut data = Vec::new();
+        for line in block.lines() {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.starts_with(':') || line.is_empty() {
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("event:") {
+                event_name = Some(value.trim().to_owned());
+            } else if let Some(value) = line.strip_prefix("data:") {
+                data.push(value.strip_prefix(' ').unwrap_or(value));
+            }
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let payload = serde_json::from_str::<Value>(&data.join("\n"))
+            .map_err(|_| BridgeResponseError::InvalidResponse)?;
+        let payload_type = payload
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or(BridgeResponseError::InvalidResponse)?;
+        if event_name
+            .as_deref()
+            .is_some_and(|event_name| event_name != payload_type)
+        {
+            return Err(BridgeResponseError::InvalidResponse);
+        }
+        self.process_event(payload_type, &payload)
+    }
+
+    fn process_event(
+        &mut self,
+        event_name: &str,
+        payload: &Value,
+    ) -> Result<(), BridgeResponseError> {
+        match event_name {
+            "response.created" => self.start_message(payload),
+            "response.content_part.added" => self.start_text(payload),
+            "response.output_text.delta" | "response.refusal.delta" => self.text_delta(payload),
+            "response.output_text.done" | "response.refusal.done" => self.stop_text(),
+            "response.content_part.done" => Ok(()),
+            "response.output_item.added" => self.start_output_item(payload),
+            "response.function_call_arguments.delta" => self.tool_arguments_delta(payload),
+            "response.function_call_arguments.done" => self.stop_tool(payload),
+            "response.reasoning_summary_text.delta"
+            | "response.reasoning_text.delta"
+            | "response.reasoning.delta" => self.reasoning_delta(payload),
+            "response.output_item.done" => self.stop_output_item(payload),
+            "response.completed" | "response.incomplete" => {
+                self.complete_message(event_name, payload)
+            }
+            "response.failed" | "error" => {
+                self.output
+                    .push_back(bridge_error_event("subscription-bridge-upstream-error"));
+                self.terminated = true;
+                Ok(())
+            }
+            _ => Err(BridgeResponseError::InvalidResponse),
+        }
+    }
+
+    fn start_message(&mut self, payload: &Value) -> Result<(), BridgeResponseError> {
+        if self.message_started {
+            return Err(BridgeResponseError::InvalidResponse);
+        }
+        let response = response_object(payload);
+        let id = required_response_string(response, "id")?;
+        let model = required_response_string(response, "model")?;
+        let mut usage = response_usage(response.get("usage"))?;
+        usage["output_tokens"] = Value::Number(0.into());
+        self.output.push_back(anthropic_event(
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "usage": usage
+                }
+            }),
+        ));
+        self.message_started = true;
+        Ok(())
+    }
+
+    fn start_text(&mut self, payload: &Value) -> Result<(), BridgeResponseError> {
+        self.require_started()?;
+        let part_type = payload
+            .get("part")
+            .and_then(|part| part.get("type"))
+            .and_then(Value::as_str)
+            .ok_or(BridgeResponseError::InvalidResponse)?;
+        if !matches!(part_type, "output_text" | "refusal") {
+            return Err(BridgeResponseError::InvalidResponse);
+        }
+        if self.text_index.is_some() {
+            return Ok(());
+        }
+        let index = self.allocate_index();
+        self.text_index = Some(index);
+        self.output.push_back(anthropic_event(
+            "content_block_start",
+            json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        ));
+        Ok(())
+    }
+
+    fn text_delta(&mut self, payload: &Value) -> Result<(), BridgeResponseError> {
+        self.require_started()?;
+        let index = self
+            .text_index
+            .ok_or(BridgeResponseError::InvalidResponse)?;
+        let delta = required_response_string(payload, "delta")?;
+        self.output.push_back(anthropic_event(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "text_delta", "text": delta}
+            }),
+        ));
+        Ok(())
+    }
+
+    fn stop_text(&mut self) -> Result<(), BridgeResponseError> {
+        let index = self
+            .text_index
+            .take()
+            .ok_or(BridgeResponseError::InvalidResponse)?;
+        self.push_block_stop(index);
+        Ok(())
+    }
+
+    fn start_output_item(&mut self, payload: &Value) -> Result<(), BridgeResponseError> {
+        self.require_started()?;
+        let item = payload
+            .get("item")
+            .and_then(Value::as_object)
+            .ok_or(BridgeResponseError::InvalidResponse)?;
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                if let Some(index) = self.text_index.take() {
+                    self.push_block_stop(index);
+                }
+                let item_id = required_response_object_string(item, "id")?.to_owned();
+                if self.tools.contains_key(&item_id) {
+                    return Err(BridgeResponseError::InvalidResponse);
+                }
+                let call_id = required_response_object_string(item, "call_id")?;
+                let name = required_response_object_string(item, "name")?;
+                let index = self.allocate_index();
+                self.tools.insert(
+                    item_id,
+                    ToolBlock {
+                        index,
+                        arguments: String::new(),
+                        had_delta: false,
+                    },
+                );
+                self.has_tool_use = true;
+                self.output.push_back(anthropic_event(
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "tool_use", "id": call_id, "name": name}
+                    }),
+                ));
+                Ok(())
+            }
+            Some("reasoning") => {
+                let item_id = required_response_object_string(item, "id")?.to_owned();
+                if self.reasoning.contains_key(&item_id) {
+                    return Err(BridgeResponseError::InvalidResponse);
+                }
+                let index = self.allocate_index();
+                self.reasoning
+                    .insert(item_id, ReasoningBlock { index, open: false });
+                Ok(())
+            }
+            Some("message") => Ok(()),
+            _ => Err(BridgeResponseError::InvalidResponse),
+        }
+    }
+
+    fn tool_arguments_delta(&mut self, payload: &Value) -> Result<(), BridgeResponseError> {
+        self.require_started()?;
+        let item_id = required_response_string(payload, "item_id")?;
+        let delta = required_response_string(payload, "delta")?;
+        let tool = self
+            .tools
+            .get_mut(item_id)
+            .ok_or(BridgeResponseError::InvalidResponse)?;
+        tool.arguments.push_str(delta);
+        tool.had_delta = true;
+        self.output.push_back(anthropic_event(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": tool.index,
+                "delta": {"type": "input_json_delta", "partial_json": delta}
+            }),
+        ));
+        Ok(())
+    }
+
+    fn stop_tool(&mut self, payload: &Value) -> Result<(), BridgeResponseError> {
+        let item_id = required_response_string(payload, "item_id")?;
+        let mut tool = self
+            .tools
+            .remove(item_id)
+            .ok_or(BridgeResponseError::InvalidResponse)?;
+        let complete = payload
+            .get("arguments")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| tool.arguments.clone());
+        serde_json::from_str::<Value>(&complete)
+            .map_err(|_| BridgeResponseError::InvalidResponse)?;
+        if tool.had_delta && complete != tool.arguments {
+            return Err(BridgeResponseError::InvalidResponse);
+        }
+        if !tool.had_delta {
+            tool.arguments.push_str(&complete);
+            self.output.push_back(anthropic_event(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": tool.index,
+                    "delta": {"type": "input_json_delta", "partial_json": complete}
+                }),
+            ));
+        }
+        self.push_block_stop(tool.index);
+        Ok(())
+    }
+
+    fn reasoning_delta(&mut self, payload: &Value) -> Result<(), BridgeResponseError> {
+        self.require_started()?;
+        if let Some(index) = self.text_index.take() {
+            self.push_block_stop(index);
+        }
+        let item_id = required_response_string(payload, "item_id")?;
+        let reasoning = self
+            .reasoning
+            .get_mut(item_id)
+            .ok_or(BridgeResponseError::InvalidResponse)?;
+        let delta = required_response_string(payload, "delta")?;
+        if !reasoning.open {
+            self.output.push_back(anthropic_event(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": reasoning.index,
+                    "content_block": {"type": "thinking", "thinking": ""}
+                }),
+            ));
+            reasoning.open = true;
+        }
+        self.output.push_back(anthropic_event(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": reasoning.index,
+                "delta": {"type": "thinking_delta", "thinking": delta}
+            }),
+        ));
+        Ok(())
+    }
+
+    fn stop_output_item(&mut self, payload: &Value) -> Result<(), BridgeResponseError> {
+        let item = payload
+            .get("item")
+            .and_then(Value::as_object)
+            .ok_or(BridgeResponseError::InvalidResponse)?;
+        match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => {
+                let item_id = required_response_object_string(item, "id")?;
+                let reasoning = self
+                    .reasoning
+                    .remove(item_id)
+                    .ok_or(BridgeResponseError::InvalidResponse)?;
+                if reasoning.open {
+                    self.push_block_stop(reasoning.index);
+                }
+                Ok(())
+            }
+            Some("function_call") => {
+                let item_id = required_response_object_string(item, "id")?;
+                if !self.tools.contains_key(item_id) {
+                    return Ok(());
+                }
+                let mut done = payload.clone();
+                done["item_id"] = Value::String(item_id.to_owned());
+                if done.get("arguments").is_none() {
+                    done["arguments"] = item
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(String::new()));
+                }
+                self.stop_tool(&done)
+            }
+            Some("message") => Ok(()),
+            _ => Err(BridgeResponseError::InvalidResponse),
+        }
+    }
+
+    fn complete_message(
+        &mut self,
+        event_name: &str,
+        payload: &Value,
+    ) -> Result<(), BridgeResponseError> {
+        self.require_started()?;
+        let response = response_object(payload);
+        if response.get("error").is_some_and(|error| !error.is_null())
+            || matches!(
+                response.get("status").and_then(Value::as_str),
+                Some("failed" | "cancelled")
+            )
+        {
+            self.output
+                .push_back(bridge_error_event("subscription-bridge-upstream-error"));
+            self.terminated = true;
+            return Ok(());
+        }
+        if let Some(index) = self.text_index.take() {
+            self.push_block_stop(index);
+        }
+        if !self.tools.is_empty() || !self.reasoning.is_empty() {
+            return Err(BridgeResponseError::InvalidResponse);
+        }
+        let status = response.get("status").and_then(Value::as_str).unwrap_or(
+            if event_name == "response.incomplete" {
+                "incomplete"
+            } else {
+                "completed"
+            },
+        );
+        if !matches!(status, "completed" | "incomplete") {
+            return Err(BridgeResponseError::InvalidResponse);
+        }
+        let stop_reason = if status == "incomplete" {
+            match response
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+            {
+                None | Some("max_output_tokens" | "max_tokens") => "max_tokens",
+                Some(_) => "end_turn",
+            }
+        } else if self.has_tool_use {
+            "tool_use"
+        } else {
+            "end_turn"
+        };
+        let usage = response_usage(response.get("usage"))?;
+        self.output.push_back(anthropic_event(
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                "usage": usage
+            }),
+        ));
+        self.output.push_back(anthropic_event(
+            "message_stop",
+            json!({"type": "message_stop"}),
+        ));
+        self.terminated = true;
+        Ok(())
+    }
+
+    fn allocate_index(&mut self) -> u64 {
+        let index = self.next_index;
+        self.next_index += 1;
+        index
+    }
+
+    fn require_started(&self) -> Result<(), BridgeResponseError> {
+        if self.message_started {
+            Ok(())
+        } else {
+            Err(BridgeResponseError::InvalidResponse)
+        }
+    }
+
+    fn push_block_stop(&mut self, index: u64) {
+        self.output.push_back(anthropic_event(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": index}),
+        ));
+    }
+
+    fn fail_invalid(&mut self) {
+        if !self.terminated {
+            self.output
+                .push_back(bridge_error_event("subscription-bridge-invalid-response"));
+            self.terminated = true;
+        }
+    }
+}
+
+fn take_sse_block(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    let (end, delimiter) = match (lf, crlf) {
+        (Some(lf), Some(crlf)) if lf <= crlf => (lf, 2),
+        (Some(_), Some(crlf)) => (crlf, 4),
+        (Some(lf), None) => (lf, 2),
+        (None, Some(crlf)) => (crlf, 4),
+        (None, None) => return None,
+    };
+    let block = buffer[..end].to_vec();
+    buffer.drain(..end + delimiter);
+    Some(block)
+}
+
+fn response_object(payload: &Value) -> &Value {
+    payload.get("response").unwrap_or(payload)
+}
+
+fn required_response_string<'a>(
+    value: &'a Value,
+    field: &str,
+) -> Result<&'a str, BridgeResponseError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(BridgeResponseError::InvalidResponse)
+}
+
+fn required_response_object_string<'a>(
+    value: &'a Map<String, Value>,
+    field: &str,
+) -> Result<&'a str, BridgeResponseError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(BridgeResponseError::InvalidResponse)
+}
+
+fn response_usage(usage: Option<&Value>) -> Result<Value, BridgeResponseError> {
+    let usage = match usage {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(usage)) => Some(usage),
+        Some(_) => return Err(BridgeResponseError::InvalidResponse),
+    };
+    let read = usage
+        .and_then(|usage| usage.get("cache_read_input_tokens"))
+        .or_else(|| {
+            usage
+                .and_then(|usage| usage.get("input_tokens_details"))
+                .and_then(|details| details.get("cached_tokens"))
+        })
+        .map(valid_usage_number)
+        .transpose()?
+        .unwrap_or(0);
+    let creation = usage
+        .and_then(|usage| usage.get("cache_creation_input_tokens"))
+        .or_else(|| {
+            usage
+                .and_then(|usage| usage.get("input_tokens_details"))
+                .and_then(|details| details.get("cache_write_tokens"))
+        })
+        .map(valid_usage_number)
+        .transpose()?
+        .unwrap_or(0);
+    let total_input = usage
+        .and_then(|usage| usage.get("input_tokens"))
+        .map(valid_usage_number)
+        .transpose()?
+        .unwrap_or(0);
+    let output = usage
+        .and_then(|usage| usage.get("output_tokens"))
+        .map(valid_usage_number)
+        .transpose()?
+        .unwrap_or(0);
+    let mut result = json!({
+        "input_tokens": total_input.saturating_sub(read).saturating_sub(creation),
+        "output_tokens": output
+    });
+    if read > 0 {
+        result["cache_read_input_tokens"] = Value::Number(read.into());
+    }
+    if creation > 0 {
+        result["cache_creation_input_tokens"] = Value::Number(creation.into());
+    }
+    Ok(result)
+}
+
+fn valid_usage_number(value: &Value) -> Result<u64, BridgeResponseError> {
+    value.as_u64().ok_or(BridgeResponseError::InvalidResponse)
+}
+
+fn anthropic_event(name: &str, payload: Value) -> Bytes {
+    Bytes::from(format!(
+        "event: {name}\ndata: {}\n\n",
+        serde_json::to_string(&payload).unwrap_or_default()
+    ))
+}
+
+fn bridge_error_event(message: &str) -> Bytes {
+    anthropic_event(
+        "error",
+        json!({
+            "type": "error",
+            "error": {"type": "api_error", "message": message}
+        }),
+    )
 }
 
 fn transform_request(
@@ -474,7 +1135,14 @@ fn insert_header(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::body::Bytes;
     use axum::http::{HeaderMap, HeaderValue};
+    use futures_util::{StreamExt, stream};
     use secrecy::SecretString;
     use serde_json::Value;
 
@@ -505,6 +1173,14 @@ mod tests {
             "messages-tools.expected.json" => {
                 include_str!(
                     "../../tests/fixtures/subscription-bridge/messages-tools.expected.json"
+                )
+            }
+            "responses-stream.input.sse" => {
+                include_str!("../../tests/fixtures/subscription-bridge/responses-stream.input.sse")
+            }
+            "anthropic-stream.expected.sse" => {
+                include_str!(
+                    "../../tests/fixtures/subscription-bridge/anthropic-stream.expected.sse"
                 )
             }
             _ => panic!("unknown subscription bridge fixture source"),
@@ -555,6 +1231,30 @@ mod tests {
         );
     }
 
+    fn parse_sse(contents: &str) -> Vec<(String, Value)> {
+        contents
+            .replace("\r\n", "\n")
+            .split("\n\n")
+            .filter_map(|block| {
+                let mut event = None;
+                let mut data = Vec::new();
+                for line in block.lines() {
+                    if let Some(value) = line.strip_prefix("event:") {
+                        event = Some(value.trim().to_owned());
+                    } else if let Some(value) = line.strip_prefix("data:") {
+                        data.push(value.trim_start());
+                    }
+                }
+                if data.is_empty() {
+                    return None;
+                }
+                let data = serde_json::from_str(&data.join("\n"))
+                    .expect("fixture SSE data must be valid JSON");
+                Some((event.expect("fixture SSE event must be named"), data))
+            })
+            .collect()
+    }
+
     #[test]
     fn fixture_manifest_pins_oracle_provenance_and_content_hashes() {
         let manifest: Value = serde_json::from_str(include_str!(
@@ -572,7 +1272,7 @@ mod tests {
             .and_then(Value::as_array)
             .expect("fixture manifest must contain fixtures");
         assert!(
-            entries.len() == 4,
+            entries.len() == 6,
             "subscription bridge fixture count mismatch"
         );
         for entry in entries {
@@ -744,6 +1444,200 @@ mod tests {
         assert!(
             !diagnostic.contains(REQUEST_CONTENT),
             "redacted fixture comparison exposed controlled request content"
+        );
+    }
+
+    #[tokio::test]
+    async fn converts_chunk_split_text_tools_usage_and_completion_fixture() {
+        let input = fixture_source("responses-stream.input.sse").as_bytes();
+        let multibyte = input
+            .windows("世".len())
+            .position(|window| window == "世".as_bytes())
+            .expect("stream fixture must contain multibyte text");
+        let mut split_points = vec![1, 7, 31, 103, 211, multibyte + 1, 557, input.len()];
+        split_points.sort_unstable();
+        split_points.dedup();
+        let mut start = 0;
+        let chunks = split_points.into_iter().map(move |end| {
+            let end = end.min(input.len());
+            let chunk = Bytes::copy_from_slice(&input[start..end]);
+            start = end;
+            Ok::<_, std::io::Error>(chunk)
+        });
+        let converted = SubscriptionBridgeAdapter::convert_stream(stream::iter(chunks));
+        let actual = converted
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|chunk| String::from_utf8(chunk.to_vec()).expect("bridge SSE must be UTF-8"))
+            .collect::<String>();
+        assert!(
+            parse_sse(&actual) == parse_sse(fixture_source("anthropic-stream.expected.sse")),
+            "subscription bridge streaming fixture mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn converts_reasoning_and_incomplete_stop_reason() {
+        let upstream = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_reason\",\"model\":\"gpt-5.6-luna\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"reason_1\",\"type\":\"reasoning\"}}\n\n",
+            "event: response.reasoning_summary_text.delta\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"reason_1\",\"delta\":\"Checking.\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"reason_1\",\"type\":\"reasoning\"}}\n\n",
+            "event: response.incomplete\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":2,\"output_tokens\":3}}}\n\n"
+        );
+        let actual =
+            SubscriptionBridgeAdapter::convert_stream(stream::iter([Ok::<_, std::io::Error>(
+                Bytes::from_static(upstream.as_bytes()),
+            )]))
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|chunk| String::from_utf8(chunk.to_vec()).expect("bridge SSE must be UTF-8"))
+            .collect::<String>();
+        let events = parse_sse(&actual);
+        assert!(
+            events.iter().any(
+                |(_, event)| event.pointer("/delta/type").and_then(Value::as_str)
+                    == Some("thinking_delta")
+            ) && events.iter().any(|(_, event)| event
+                .pointer("/delta/stop_reason")
+                .and_then(Value::as_str)
+                == Some("max_tokens")),
+            "subscription bridge reasoning/incomplete mapping mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_failed_malformed_contradictory_oversized_and_incomplete_streams() {
+        let response_secret = "FIXTURE_RESPONSE_SECRET_7319";
+        let cases = [
+            format!(
+                "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{\"message\":\"{response_secret}\"}}}}}}\n\n"
+            )
+            .into_bytes(),
+            format!(
+                "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"message\":\"{response_secret}\"}}}}\n\n"
+            )
+            .into_bytes(),
+            b"event: response.created\ndata: {not-json}\n\n".to_vec(),
+            b"event: response.created\ndata: {\"type\":\"response.completed\"}\n\n".to_vec(),
+            vec![b'a'; super::MAX_BRIDGE_SSE_EVENT_BYTES + 1],
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"unfinished\",\"model\":\"gpt-5.6\"}}\n\n".to_vec(),
+        ];
+        for bytes in cases {
+            let actual =
+                SubscriptionBridgeAdapter::convert_stream(stream::iter([Ok::<_, std::io::Error>(
+                    Bytes::from(bytes),
+                )]))
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .map(|chunk| String::from_utf8(chunk.to_vec()).expect("bridge SSE must be UTF-8"))
+                .collect::<String>();
+            assert!(
+                !actual.contains(response_secret)
+                    && parse_sse(&actual).last().is_some_and(|(name, event)| {
+                        name == "error"
+                            && event
+                                .pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .is_some_and(|message| {
+                                    matches!(
+                                        message,
+                                        "subscription-bridge-upstream-error"
+                                            | "subscription-bridge-invalid-response"
+                                    )
+                                })
+                    }),
+                "subscription bridge invalid stream diagnostic mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn maps_non_success_status_with_a_bounded_fixed_error() {
+        let response_secret = "FIXTURE_HTTP_RESPONSE_SECRET_2184";
+        let mapped = SubscriptionBridgeAdapter::map_non_success(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            format!("{{\"error\":\"{response_secret}\"}}").as_bytes(),
+        )
+        .expect("bounded non-success body must map");
+        assert_no_secret_surface(&mapped);
+        let debug = format!("{mapped:?}");
+        let event = String::from_utf8(mapped.event().to_vec()).expect("error SSE must be UTF-8");
+        assert!(
+            mapped.status() == axum::http::StatusCode::TOO_MANY_REQUESTS
+                && !debug.contains(response_secret)
+                && !event.contains(response_secret)
+                && event.contains("subscription-bridge-upstream-error"),
+            "subscription bridge non-success mapping mismatch"
+        );
+        let oversized = vec![b'x'; super::MAX_BRIDGE_ERROR_BODY_BYTES + 1];
+        assert!(matches!(
+            SubscriptionBridgeAdapter::map_non_success(
+                axum::http::StatusCode::BAD_GATEWAY,
+                &oversized
+            ),
+            Err(super::BridgeResponseError::InvalidResponse)
+        ));
+    }
+
+    struct DropObservedStream {
+        yielded: bool,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl futures_util::Stream for DropObservedStream {
+        type Item = Result<Bytes, std::io::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if self.yielded {
+                std::task::Poll::Pending
+            } else {
+                self.yielded = true;
+                std::task::Poll::Ready(Some(Ok(Bytes::from_static(
+                    b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"cancel\",\"model\":\"gpt-5.6\"}}\n\n",
+                ))))
+            }
+        }
+    }
+
+    impl Drop for DropObservedStream {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_downstream_stream_drops_upstream_without_a_detached_task() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let upstream = DropObservedStream {
+            yielded: false,
+            drops: Arc::clone(&drops),
+        };
+        let mut converted = Box::pin(SubscriptionBridgeAdapter::convert_stream(upstream));
+        let first = converted
+            .as_mut()
+            .next()
+            .await
+            .expect("created must produce a frame");
+        assert!(
+            String::from_utf8_lossy(&first).contains("message_start"),
+            "subscription bridge cancellation fixture did not start"
+        );
+        drop(converted);
+        assert!(
+            drops.load(Ordering::SeqCst) == 1,
+            "dropping downstream did not synchronously drop upstream ownership"
         );
     }
 

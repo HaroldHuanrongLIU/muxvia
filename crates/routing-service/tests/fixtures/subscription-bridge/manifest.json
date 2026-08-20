@@ -31,6 +31,16 @@
       "file": "messages-tools.expected.json",
       "behavior": "gpt-5.6-luna Responses tool request",
       "sha256": "9e467d6b14b99eee3bdf84d8804e2cc6b3d02822abd1d3fd603ae4b996320a2e"
+    },
+    {
+      "file": "responses-stream.input.sse",
+      "behavior": "gpt-5.6 Responses text, tool, usage, and completion stream",
+      "sha256": "fd3093df980ae92b3fc36f3d6f7cd094baee98d35db5ddd33a1f88be816af6ff"
+    },
+    {
+      "file": "anthropic-stream.expected.sse",
+      "behavior": "Anthropic text, tool, usage, and completion stream",
+      "sha256": "ca380b42f6ff8b26adc07d4e497a0c4c64fb92a882d52684a4f1d767e9e90b41"
     }
   ]
 }

@@ -67,7 +67,7 @@ export const commandCatalog = [
   command("universal-provider.cancel", "command.universal-provider.cancel", null, ["escape"], ["universal-provider-editor"], false),
   command("universal-provider.confirm", "command.universal-provider.confirm", null, ["return", "y"], ["universal-provider-confirm"], false),
   command("universal-provider.confirm.cancel", "command.universal-provider.confirm.cancel", null, ["escape", "n"], ["universal-provider-confirm"], false),
-  command("subscription-account.list", "command.subscription-account.list", "accounts", ["<leader>i"], ["codex", "claude"], true),
+  command("subscription-account.list", "command.subscription-account.list", "accounts", ["<leader>i"], ["codex", "claude", "provider-picker-claude"], true),
   command("subscription-account.authorize", "command.subscription-account.authorize", null, ["a"], ["subscription-account-picker"], false),
   command("subscription-account.reauthorize", "command.subscription-account.reauthorize", null, ["r"], ["subscription-account-picker"], false),
   command("subscription-account.default", "command.subscription-account.default", null, ["s"], ["subscription-account-picker"], false),

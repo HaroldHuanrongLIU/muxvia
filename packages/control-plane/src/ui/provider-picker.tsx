@@ -2,7 +2,7 @@ import type { InputRenderable, KeyEvent } from "@opentui/core"
 import { createEffect, createSignal, For, onMount, Show, type Accessor } from "solid-js"
 
 import { useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
-import type { ReachabilityResult, Target, TargetView } from "../control/types"
+import type { ReachabilityResult, SubscriptionAccountCatalogView, Target, TargetView } from "../control/types"
 import { inspectionErrorKey, type Translator } from "../i18n"
 import { theme } from "../theme"
 import { useOverlay } from "./overlay-stack"
@@ -17,6 +17,7 @@ export interface ProviderPickerProps {
   pending: Accessor<boolean>
   activationMode: Accessor<"direct" | "takeover" | undefined>
   allowDirect: Accessor<boolean>
+  subscriptionBindings: Accessor<Readonly<SubscriptionAccountCatalogView["bindings"]>>
   onSelectedIdChange: (id: string | undefined) => void
   onEdit: () => void
   onActivateDirect: () => void
@@ -30,6 +31,7 @@ export interface ProviderPickerProps {
   onCheckReachability: () => void
   onMove: (delta: -1 | 1) => void
   onDelete: () => void
+  onManageSubscriptionAccounts: () => void
 }
 
 export function ProviderPicker(props: ProviderPickerProps) {
@@ -60,13 +62,16 @@ export function ProviderPicker(props: ProviderPickerProps) {
     enabled: () => overlay.depth === 1 && !props.pending(),
     handlers: {
       "provider.edit": props.onEdit,
-      ...(props.allowDirect() ? { "provider.activate.direct": props.onActivateDirect } : {}),
+      ...(props.allowDirect() ? { "provider.activate.direct": () => {
+        if (selected()?.authentication !== "codex-subscription") props.onActivateDirect()
+      } } : {}),
       ...(props.target === "claude" ? { "provider.activate.takeover": props.onActivateTakeover } : {}),
       "provider.duplicate": props.onDuplicate,
       "provider.reachability.check": props.onCheckReachability,
       "provider.move-up": () => props.onMove(-1),
       "provider.move-down": () => props.onMove(1),
       "provider.delete": props.onDelete,
+      "subscription-account.list": props.onManageSubscriptionAccounts,
     },
   })
   useCommandLayer({
@@ -134,6 +139,18 @@ export function ProviderPicker(props: ProviderPickerProps) {
       default: return props.t("provider.provenance.other")
     }
   }
+  const subscriptionBindingState = (provider: Provider) => {
+    if (provider.authentication !== "codex-subscription") return undefined
+    if (provider.missingFields.includes("subscription-account-binding")) {
+      return props.t("subscription-bridge.binding.not-bound")
+    }
+    const binding = props.subscriptionBindings().find((candidate) => (
+      candidate.target === props.target && candidate.providerId === provider.id
+    ))
+    return binding
+      ? props.t(`subscription-account.resolution.${binding.resolution.state}`)
+      : props.t("subscription-bridge.binding.not-bound")
+  }
 
   return <box flexDirection="column" padding={1} rowGap={1} backgroundColor={theme.panel}>
     <text fg={theme.text}>{props.t("provider.list.title")}</text>
@@ -176,7 +193,15 @@ export function ProviderPicker(props: ProviderPickerProps) {
       <text fg={theme.text}>{provider.name}</text>
       <text fg={theme.muted}>{provider.baseUrl}</text>
       <text fg={theme.muted}>{provider.model}</text>
-      <text fg={theme.muted}>{props.t(provider.credential === "present" ? "provider.credential-reference.present" : "provider.credential-reference.missing")}</text>
+      <Show when={provider.authentication === "codex-subscription"}>
+        <text fg={theme.warning}>{props.t("subscription-bridge.picker-requirement")}</text>
+        <text fg={theme.warning}>{props.t("subscription-bridge.binding", { state: subscriptionBindingState(provider) ?? "" })}</text>
+      </Show>
+      <Show when={provider.authentication === "codex-subscription"} fallback={
+        <text fg={theme.muted}>{props.t(provider.credential === "present" ? "provider.credential-reference.present" : "provider.credential-reference.missing")}</text>
+      }>
+        <text fg={theme.muted}>{props.t("subscription-bridge.authentication")}</text>
+      </Show>
       <text fg={theme.muted}>{provider.generated ? props.t("provider.generated") : props.t("provider.not-generated")}</text>
       <Show when={provider.generated}><text fg={theme.warning}>{props.t("generated-provider.lifecycle")}</text></Show>
       <text fg={theme.muted}>{provider.activeReferences.length
@@ -203,6 +228,8 @@ export function ProviderPicker(props: ProviderPickerProps) {
               : ""
       }</text>}</For>
     </box>}</For>
-    <text fg={theme.muted}>{props.t(props.target === "claude" ? "provider.list.help.claude" : "provider.list.help")}</text>
+    <text fg={theme.muted}>{props.t(selected()?.authentication === "codex-subscription"
+      ? "subscription-bridge.picker-help"
+      : props.target === "claude" ? "provider.list.help.claude" : "provider.list.help")}</text>
   </box>
 }

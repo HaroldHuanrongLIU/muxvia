@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test"
+import { readFileSync } from "node:fs"
 
 import { commandCatalog } from "../src/commands/catalog"
 import { en } from "../src/i18n/en"
@@ -229,6 +230,78 @@ test("Failover route commands, health, and editor copy have exact locale parity"
     "降级",
     "路由 Provider 已更改，请检查草稿后重新保存。",
   ])
+})
+
+test("Subscription Bridge risk and Compatibility Deviation copy is exact in both locales and public docs", () => {
+  const english = createTranslator("en")
+  const chinese = createTranslator("zh-CN")
+  expect([
+    english("provider.preset.codex-subscription-bridge"),
+    english("subscription-bridge.authentication"),
+    english("subscription-bridge.requirements"),
+    english("subscription-bridge.risk.interface"),
+    english("subscription-bridge.risk.quota"),
+    english("subscription-bridge.risk.continuity"),
+    english("subscription-bridge.risk.terms"),
+    english("subscription-bridge.risk.support"),
+    english("subscription-bridge.tested-models"),
+    english("subscription-bridge.deviations"),
+  ]).toEqual([
+    "Codex Subscription Bridge",
+    "Subscription Account authentication · no Provider credential",
+    "Takeover required · Subscription Account binding required",
+    "Undocumented ChatGPT Codex interface",
+    "Uses the selected account's shared subscription quota.",
+    "May stop working without notice.",
+    "Use may be subject to applicable account and subscription terms.",
+    "Not officially supported or endorsed by OpenAI or Anthropic.",
+    "Tested models · gpt-5.6 and gpt-5.4 · text and tools",
+    "Compatibility Deviations · no count_tokens, multimodal/PDF, WebSearch, FAST tier, quota/model catalog/cache-key/price projection, model aliases, or arbitrary-model claim · stricter bounded parsing and fixed diagnostics",
+  ])
+  expect([
+    chinese("provider.preset.codex-subscription-bridge"),
+    chinese("subscription-bridge.authentication"),
+    chinese("subscription-bridge.requirements"),
+    chinese("subscription-bridge.risk.interface"),
+    chinese("subscription-bridge.risk.quota"),
+    chinese("subscription-bridge.risk.continuity"),
+    chinese("subscription-bridge.risk.terms"),
+    chinese("subscription-bridge.risk.support"),
+    chinese("subscription-bridge.tested-models"),
+    chinese("subscription-bridge.deviations"),
+  ]).toEqual([
+    "Codex 订阅桥接",
+    "订阅账户认证 · 不使用 Provider 凭据",
+    "需要 Takeover · 必须绑定订阅账户",
+    "使用未公开文档的 ChatGPT Codex 接口",
+    "使用所选账户共享的订阅配额。",
+    "接口可能随时停止工作，恕不另行通知。",
+    "使用行为可能受适用的账户及订阅条款约束。",
+    "不受 OpenAI 或 Anthropic 官方支持或认可。",
+    "已测试模型 · gpt-5.6 和 gpt-5.4 · 文本与工具",
+    "兼容性差异 · 不支持 count_tokens、多模态/PDF、WebSearch、FAST 服务层、配额/模型目录/缓存键/价格投影、模型别名或任意模型声明 · 使用更严格的有界解析和固定诊断",
+  ])
+
+  const documentation = readFileSync(new URL("../../../docs/subscription-bridge.md", import.meta.url), "utf8")
+  for (const phrase of [
+    "https://chatgpt.com/backend-api/codex",
+    "undocumented ChatGPT Codex interface",
+    "shared subscription quota",
+    "may stop working without notice",
+    "applicable account and subscription terms",
+    "not officially supported or endorsed",
+    "gpt-5.6",
+    "gpt-5.4",
+    "## Compatibility Deviations",
+    "`/v1/messages/count_tokens`",
+    "multimodal",
+    "WebSearch",
+    "FAST",
+    "prompt-cache-key",
+    "model alias",
+    "arbitrary model",
+    "bounded JSON and SSE parsing",
+  ]) expect(documentation).toContain(phrase)
 })
 
 test("Reconciliation closed compatibility, shadow, field, and state labels have full locale parity", () => {

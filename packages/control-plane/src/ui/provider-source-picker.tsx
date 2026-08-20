@@ -56,11 +56,14 @@ export function ProviderSourcePicker(props: {
     }
     setKeyCapture(value)
   }
-  const label = (source: ProviderSource) => source.kind === "blank"
-    ? props.t("provider.source.blank")
-    : props.t(source.preset.key === "anthropic-api-messages"
-      ? "provider.preset.anthropic-api-messages"
-      : "provider.preset.openai-api-responses")
+  const label = (source: ProviderSource) => {
+    if (source.kind === "blank") return props.t("provider.source.blank")
+    switch (source.preset.key) {
+      case "anthropic-api-messages": return props.t("provider.preset.anthropic-api-messages")
+      case "codex-subscription-bridge": return props.t("provider.preset.codex-subscription-bridge")
+      default: return props.t("provider.preset.openai-api-responses")
+    }
+  }
 
   return <box flexDirection="column" padding={1} rowGap={1} backgroundColor={theme.panel}>
     <text fg={theme.text}>{props.t("provider.source.title")}</text>

@@ -89,9 +89,13 @@ function accountCatalog(revision = 1): SubscriptionAccountCatalogView {
 }
 
 class MemoryTargetSession implements TargetSession {
+  readonly actions: OrdinaryTargetAction[] = []
   constructor(readonly view = targetView()) {}
   get(): Readonly<TargetView> { return this.view }
-  async act(_action: OrdinaryTargetAction): Promise<ActionOutcome> { throw new Error("unused") }
+  async act(action: OrdinaryTargetAction): Promise<ActionOutcome> {
+    this.actions.push(structuredClone(action))
+    return { status: "applied", view: this.view }
+  }
   async discoverModels(): Promise<never> { throw new Error("unused") }
   async checkReachability(): Promise<never> { throw new Error("unused") }
   async previewReconciliation(): Promise<never> { throw new Error("unused") }
@@ -101,6 +105,26 @@ class MemoryTargetSession implements TargetSession {
   subscribe(): () => void { return () => {} }
   async whenClosed(): Promise<void> { return await new Promise(() => {}) }
   async close(): Promise<void> {}
+}
+
+function bridgeTargetView(missingBinding = false): TargetView {
+  const initial = targetView("claude")
+  return {
+    ...initial,
+    providers: [{
+      ...initial.providers[0]!,
+      name: "Codex Subscription Bridge",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      model: "gpt-5.6",
+      protocol: "anthropic-messages",
+      authentication: "codex-subscription",
+      routingRequirement: "takeover-required",
+      credential: "missing",
+      completeness: missingBinding ? "incomplete" : "complete",
+      missingFields: missingBinding ? ["subscription-account-binding"] : [],
+      provenance: { kind: "preset", key: "codex-subscription-bridge" },
+    }],
+  }
 }
 
 class MemorySubscriptionSession implements SubscriptionAccountSession {
@@ -201,6 +225,79 @@ test("either Target opens one account workflow and browser failure does not stop
     })
   } finally {
     setup.renderer.destroy()
+  }
+})
+
+test("Bridge picker blocks Direct, presents every binding failure, and hands off to Subscription Accounts", async () => {
+  const cases = [
+    { label: "Not bound", target: bridgeTargetView(true), bindings: [] },
+    {
+      label: "Missing Account",
+      target: bridgeTargetView(),
+      bindings: [{
+        target: "claude" as const,
+        providerId,
+        providerRevision: 1,
+        providerName: "Codex Subscription Bridge",
+        binding: { kind: "fixed" as const, accountId: "missing-account" },
+        resolution: { state: "missing" as const, accountId: "missing-account" },
+      }],
+    },
+    {
+      label: "Needs Reauthorization",
+      target: bridgeTargetView(),
+      bindings: [{
+        target: "claude" as const,
+        providerId,
+        providerRevision: 1,
+        providerName: "Codex Subscription Bridge",
+        binding: { kind: "fixed" as const, accountId: "account-primary" },
+        resolution: { state: "needs-reauthorization" as const, accountId: "account-primary" },
+      }],
+    },
+  ]
+
+  for (const [index, fixture] of cases.entries()) {
+    const target = new MemoryTargetSession(fixture.target)
+    const accounts = new MemorySubscriptionSession({ ...accountCatalog(), bindings: fixture.bindings })
+    const setup = await testRender(() => <App
+      session={target}
+      subscriptionAccountSession={accounts}
+    />, { width: 120, height: 30, useThread: false, kittyKeyboard: true })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("2")
+      await setup.mockInput.typeText("/providers")
+      setup.mockInput.pressEnter()
+      const picker = await setup.waitForFrame((frame) => frame.includes(`Subscription Account · ${fixture.label}`))
+      expect(picker).toContain("Takeover required")
+      expect(picker.replace(/\s+/g, " ")).toContain("Subscription Account authentication · no Provider credential")
+      expect(picker).not.toContain("Credential Reference missing")
+      expect(picker.replace(/\s+/g, " ")).toContain("ctrl+x i Subscription Accounts")
+
+      setup.mockInput.pressKey("x", { ctrl: true })
+      setup.mockInput.pressKey("a")
+      await Promise.resolve()
+      expect(target.actions).toHaveLength(0)
+
+      if (index === 0) {
+        setup.mockInput.pressKey("x", { ctrl: true })
+        setup.mockInput.pressKey("i")
+        const overlay = await setup.waitForFrame((frame) => frame.includes("Subscription Accounts"))
+        expect(overlay.replace(/\s+/g, " ")).toContain("Active binding target · Claude Code")
+        setup.mockInput.pressKey("f")
+        await setup.waitFor(() => accounts.actions.length === 1)
+        expect(accounts.actions[0]).toEqual({
+          kind: "bind-provider-fixed",
+          target: "claude",
+          providerId,
+          providerRevision: 1,
+          accountId: "account-primary",
+        })
+      }
+    } finally {
+      setup.renderer.destroy()
+    }
   }
 })
 

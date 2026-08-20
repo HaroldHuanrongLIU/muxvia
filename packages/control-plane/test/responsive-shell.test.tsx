@@ -1,9 +1,13 @@
 import { expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
 
+import { MuxviaKeymapProvider } from "../src/commands/keymap"
 import type { TargetSession } from "../src/control/target-session"
 import type { ActionOutcome, CompatibilityProbe, ReconciliationPreview, ReconciliationStrategy, TargetAction, TargetView } from "../src/control/types"
+import { createTranslator } from "../src/i18n"
 import { App } from "../src/ui/app"
+import { OverlayProvider } from "../src/ui/overlay-stack"
+import { ProviderForm } from "../src/ui/provider-form"
 
 const sizes = [[1, 1], [2, 2], [20, 5], [40, 10], [80, 24], [120, 30], [121, 30]] as const
 
@@ -175,6 +179,47 @@ test("Home renders the exact extreme-size matrix without excluded application ch
   try {
     await setup.renderOnce()
     await expectSizeMatrix(setup)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Subscription Bridge risk disclosure renders across the exact extreme-size matrix", async () => {
+  const setup = await testRender(() => <MuxviaKeymapProvider><OverlayProvider><ProviderForm
+    target="claude"
+    mode="create"
+    initialDraft={{
+      name: "Subscription Route",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      model: "gpt-5.6",
+      presetKey: "codex-subscription-bridge",
+      authentication: "codex-subscription",
+    }}
+    credentialPresence="missing"
+    pending={false}
+    t={createTranslator("en")}
+    onDirtyChange={() => {}}
+    onCancel={() => {}}
+    onSave={async () => true}
+  /></OverlayProvider></MuxviaKeymapProvider>, {
+    width: 100,
+    height: 38,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    for (const [width, height] of sizes) {
+      setup.resize(width, height)
+      await setup.renderOnce()
+      expect(() => setup.captureCharFrame()).not.toThrow()
+    }
+    setup.resize(100, 38)
+    await setup.renderOnce()
+    const wide = setup.captureCharFrame()
+    expect(wide).toContain("Undocumented ChatGPT Codex interface")
+    expect(wide).toContain("Compatibility Deviations")
+    expect(wide).not.toContain("API credential")
   } finally {
     setup.renderer.destroy()
   }

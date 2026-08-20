@@ -42,6 +42,8 @@ const backendSecret = "backend-claude-direct-secret-must-not-render"
 const settingsSecret = "settings-claude-direct-secret-must-not-render"
 const claudeDirectSecrets = [credentialSecret, backendSecret, settingsSecret] as const
 const compatibilitySecrets = [credentialSecret, configSecret, backendSecret, settingsSecret] as const
+const bridgeAccountSecret = "subscription-bridge-account-secret-must-not-render"
+const bridgeSecrets = [credentialSecret, bridgeAccountSecret, configSecret, backendSecret, settingsSecret] as const
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -1537,6 +1539,115 @@ test("Claude Provider editor selects Bearer authentication and dispatches only i
     expect(JSON.stringify(claude.actions)).not.toContain(credentialSecret)
   } finally {
     setup.renderer.destroy()
+  }
+})
+
+test("Claude Subscription Bridge preset is fixed credentialless and discloses its exact risk boundary", async () => {
+  const controlledSources = {
+    credential: credentialSecret,
+    account: bridgeAccountSecret,
+    config: configSecret,
+    backend: new Error(backendSecret),
+    settings: { raw: settingsSecret },
+  }
+  assertControlledSecretSource(controlledSources, bridgeSecrets, "subscription-bridge-workflow-source")
+  const claude = new MemoryTargetSession(view({
+    target: "claude",
+    providerPresets: [{
+      key: "codex-subscription-bridge",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      model: "",
+      protocol: "anthropic-messages",
+      authentication: "codex-subscription",
+      controlledSources,
+    } as TargetView["providerPresets"][number]],
+  }))
+  const setup = await testRender(() => <App session={claude} />, {
+    width: 100,
+    height: 38,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.mockInput.typeText("/provider")
+    setup.mockInput.pressEnter()
+    const sources = await waitForSecretFreeFrame(
+      setup,
+      (frame) => frame.includes("Codex Subscription Bridge"),
+      bridgeSecrets,
+      "subscription-bridge-source-picker",
+    )
+
+    setup.mockInput.pressKey("down")
+    setup.mockInput.pressEnter()
+    const editor = await waitForSecretFreeFrame(
+      setup,
+      (frame) => frame.includes("Undocumented ChatGPT Codex interface"),
+      bridgeSecrets,
+      "subscription-bridge-editor",
+    )
+    expect(editor).toContain("https://chatgpt.com/backend-api/codex")
+    expect(editor).toContain("Subscription Account authentication · no Provider credential")
+    expect(editor).toContain("Takeover required · Subscription Account binding required")
+    expect(editor).toContain("shared subscription quota")
+    expect(editor).toContain("May stop working without notice")
+    expect(editor).toContain("applicable account and subscription terms")
+    expect(editor).toContain("Not officially supported or endorsed")
+    expect(editor).toContain("Tested models · gpt-5.6 and gpt-5.4 · text and tools")
+    expect(editor).toContain("Compatibility Deviations")
+    expect(editor).toContain("count_tokens")
+    expect(editor).not.toContain("API credential")
+
+    await setup.mockInput.typeText("Subscription Route")
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText("gpt-5.6")
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("h")
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("r")
+    setup.mockInput.pressEnter()
+    await waitForSecretFreeCondition(
+      setup,
+      () => claude.actions.length === 1,
+      () => auditSecretFreeActions(claude.actions, bridgeSecrets, "subscription-bridge-save"),
+      "secret-scan-failed:subscription-bridge-save-action",
+      "subscription-bridge-save",
+    )
+    expect(claude.actions).toEqual([{
+      kind: "create-provider",
+      name: "Subscription Route",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      model: "gpt-5.6",
+      authentication: "codex-subscription",
+      credential: { kind: "remove" },
+      presetKey: "codex-subscription-bridge",
+    }])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Subscription Bridge workflow scanner fails with one fixed diagnostic for every controlled source", () => {
+  const controlledSources = {
+    credential: credentialSecret,
+    account: bridgeAccountSecret,
+    config: configSecret,
+    backend: new Error(backendSecret),
+    settings: { raw: settingsSecret },
+  }
+  assertControlledSecretSource(controlledSources, bridgeSecrets, "subscription-bridge-scanner-source")
+  auditSecretFreeFrame("safe subscription bridge frame", bridgeSecrets, "subscription-bridge-controlled")
+  for (const secret of bridgeSecrets) {
+    let diagnostic = ""
+    try {
+      auditSecretFreeFrame(`safe prefix ${secret} safe suffix`, bridgeSecrets, "subscription-bridge-controlled")
+    } catch (error) {
+      diagnostic = error instanceof Error ? error.message : ""
+    }
+    expect(diagnostic).toBe("secret-scan-failed:subscription-bridge-controlled-frame")
+    for (const forbidden of bridgeSecrets) expect(diagnostic).not.toContain(forbidden)
   }
 })
 

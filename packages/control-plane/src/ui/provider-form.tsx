@@ -48,17 +48,22 @@ export interface ProviderFormRef {
 }
 
 type CredentialIntent = "keep" | "remove" | "replace"
+const SUBSCRIPTION_BRIDGE_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 export function ProviderForm(props: ProviderFormProps) {
   const overlay = useOverlay()
   const onDraftChange = props.onDraftChange
+  const subscriptionBridge = props.initialDraft.presetKey === "codex-subscription-bridge"
+    || props.initialDraft.authentication === "codex-subscription"
   const [focus, setFocus] = createSignal(0)
   const [name, setName] = createSignal(props.initialDraft.name)
-  const [baseUrl, setBaseUrl] = createSignal(props.initialDraft.baseUrl)
+  const [baseUrl, setBaseUrl] = createSignal(subscriptionBridge ? SUBSCRIPTION_BRIDGE_BASE_URL : props.initialDraft.baseUrl)
   const [model, setModel] = createSignal(props.initialDraft.model)
   const [credential, setCredential] = createSignal("")
   const [authentication, setAuthentication] = createSignal(
-    props.initialDraft.authentication ?? (props.target === "claude" ? "anthropic-api-key" : "openai-bearer"),
+    subscriptionBridge
+      ? "codex-subscription"
+      : props.initialDraft.authentication ?? (props.target === "claude" ? "anthropic-api-key" : "openai-bearer"),
   )
   const [credentialIntent, setCredentialIntent] = createSignal<CredentialIntent>(
     props.mode === "create" || props.duplicateCredentialChoice === "without" ? "remove" : "keep",
@@ -111,7 +116,7 @@ export function ProviderForm(props: ProviderFormProps) {
   })
 
   const runDiscovery = async (source: DiscoverySource) => {
-    if (!props.discoverModels) return
+    if (!props.discoverModels || subscriptionBridge) return
     discoveryAbort?.abort()
     const controller = new AbortController()
     discoveryAbort = controller
@@ -162,13 +167,19 @@ export function ProviderForm(props: ProviderFormProps) {
   })
 
   const credentialEdit = (): Extract<TargetAction, { kind: "create-provider" }> ["credential"] => {
+    if (subscriptionBridge) return { kind: "remove" }
     if (credentialIntent() === "replace") return { kind: "replace", value: credential() }
     if (credentialIntent() === "keep") return { kind: "keep" }
     return { kind: "remove" }
   }
   const submit = async () => {
     if (props.pending) return
-    const fields = { name: name(), baseUrl: baseUrl(), model: model(), authentication: authentication() }
+    const fields = {
+      name: name(),
+      baseUrl: subscriptionBridge ? SUBSCRIPTION_BRIDGE_BASE_URL : baseUrl(),
+      model: model(),
+      authentication: subscriptionBridge ? "codex-subscription" as const : authentication(),
+    }
     const result: ProviderFormResult = props.mode === "create"
       ? { kind: "create-provider", ...fields, credential: credentialEdit(), presetKey: props.initialDraft.presetKey ?? null }
       : props.mode === "edit"
@@ -199,11 +210,13 @@ export function ProviderForm(props: ProviderFormProps) {
   }
 
   const removeCredential = () => {
+    if (subscriptionBridge) return
     clearSensitive()
     setCredentialIntent("remove")
     setDirty(true)
   }
   const refreshModels = () => {
+    if (subscriptionBridge) return
     const credentialSource: Extract<DiscoverySource, { kind: "draft" }>["credentialSource"] = credentialIntent() === "replace"
       ? { kind: "ephemeral", value: credential() }
       : credentialIntent() === "keep" && props.credentialPresence === "present" && props.initialDraft.providerId && props.initialDraft.providerRevision
@@ -221,6 +234,7 @@ export function ProviderForm(props: ProviderFormProps) {
     })
   }
   const openModelPicker = () => {
+    if (subscriptionBridge) return
     const current = discovery()
     if (current.status !== "success" || current.models.length === 0) return
     overlay.push({
@@ -258,7 +272,7 @@ export function ProviderForm(props: ProviderFormProps) {
       "provider.models.refresh": refreshModels,
       "provider.models.select": openModelPicker,
       "provider.authentication.toggle": () => {
-        if (props.target !== "claude") return
+        if (props.target !== "claude" || subscriptionBridge) return
         setAuthentication((current) => current === "anthropic-api-key" ? "anthropic-bearer" : "anthropic-api-key")
         setDirty(true)
       },
@@ -270,11 +284,11 @@ export function ProviderForm(props: ProviderFormProps) {
     if (key.name === "tab") {
       key.preventDefault()
       key.stopPropagation()
-      const count = props.target === "claude" ? 5 : 4
+      const count = subscriptionBridge ? 2 : props.target === "claude" ? 5 : 4
       setFocus((current) => (current + (key.shift ? count - 1 : 1)) % count)
       return
     }
-    const credentialFocus = props.target === "claude" ? 4 : 3
+    const credentialFocus = subscriptionBridge ? -1 : props.target === "claude" ? 4 : 3
     if (focus() !== credentialFocus || key.ctrl || key.meta || key.super || key.hyper) return
     if (key.name === "backspace") {
       key.preventDefault()
@@ -296,7 +310,7 @@ export function ProviderForm(props: ProviderFormProps) {
   })
 
   usePaste((event) => {
-    const credentialFocus = props.target === "claude" ? 4 : 3
+    const credentialFocus = subscriptionBridge ? -1 : props.target === "claude" ? 4 : 3
     if (event.defaultPrevented || overlay.depth > 0 || focus() !== credentialFocus) return
     event.preventDefault()
     event.stopPropagation()
@@ -327,25 +341,40 @@ export function ProviderForm(props: ProviderFormProps) {
         <input ref={(input: InputRenderable) => { inputs[0] = input }} {...inputStyle} focused={focus() === 0} value={name()} onInput={update(name, setName)} placeholder={props.t("provider.placeholder.name")} />
       </box>
       <box flexDirection="column">
-        <text fg={focus() === 1 ? theme.primary : theme.muted}>{props.t("provider.field.base-url")}</text>
-        <input ref={(input: InputRenderable) => { inputs[1] = input }} {...inputStyle} focused={focus() === 1} value={baseUrl()} onInput={update(baseUrl, setBaseUrl)} placeholder={props.t("provider.placeholder.base-url")} />
+        <text fg={!subscriptionBridge && focus() === 1 ? theme.primary : theme.muted}>{props.t("provider.field.base-url")}</text>
+        <Show when={subscriptionBridge} fallback={<input ref={(input: InputRenderable) => { inputs[1] = input }} {...inputStyle} focused={focus() === 1} value={baseUrl()} onInput={update(baseUrl, setBaseUrl)} placeholder={props.t("provider.placeholder.base-url")} />}>
+          <text fg={theme.text} bg={theme.element}>{SUBSCRIPTION_BRIDGE_BASE_URL}</text>
+        </Show>
       </box>
       <box flexDirection="column">
-        <text fg={focus() === 2 ? theme.primary : theme.muted}>{props.t("provider.field.model")}</text>
-        <input ref={(input: InputRenderable) => { inputs[2] = input }} {...inputStyle} focused={focus() === 2} value={model()} onInput={update(model, setModel)} placeholder={props.t("provider.placeholder.model")} />
+        <text fg={focus() === (subscriptionBridge ? 1 : 2) ? theme.primary : theme.muted}>{props.t("provider.field.model")}</text>
+        <input ref={(input: InputRenderable) => { inputs[subscriptionBridge ? 1 : 2] = input }} {...inputStyle} focused={focus() === (subscriptionBridge ? 1 : 2)} value={model()} onInput={update(model, setModel)} placeholder={props.t("provider.placeholder.model")} />
       </box>
       <box flexDirection="column">
         <Show when={props.target === "claude"}>
           <box flexDirection="column">
-            <text fg={focus() === 3 ? theme.primary : theme.muted}>{props.t("provider.field.authentication")}</text>
-            <text fg={theme.text} bg={theme.element}>{props.t(authentication() === "anthropic-api-key" ? "provider.authentication.api-key" : "provider.authentication.bearer")}</text>
+            <text fg={!subscriptionBridge && focus() === 3 ? theme.primary : theme.muted}>{props.t("provider.field.authentication")}</text>
+            <text fg={theme.text} bg={theme.element}>{props.t(subscriptionBridge
+              ? "subscription-bridge.authentication"
+              : authentication() === "anthropic-api-key" ? "provider.authentication.api-key" : "provider.authentication.bearer")}</text>
           </box>
         </Show>
       </box>
-      <box flexDirection="column">
+      <Show when={!subscriptionBridge}><box flexDirection="column">
         <text fg={focus() === (props.target === "claude" ? 4 : 3) ? theme.primary : theme.muted}>{props.t("provider.field.credential")}</text>
         <text fg={theme.text} bg={theme.element}>{credential() ? "•".repeat(credential().length) : credentialPlaceholder()}</text>
-      </box>
+      </box></Show>
+      <Show when={subscriptionBridge}><box flexDirection="column" rowGap={1}>
+        <text fg={theme.warning}>{props.t("subscription-bridge.requirements")}</text>
+        <text fg={theme.warning}>{props.t("subscription-bridge.risk.interface")}</text>
+        <text fg={theme.muted}>{props.t("subscription-bridge.risk.quota")}</text>
+        <text fg={theme.muted}>{props.t("subscription-bridge.risk.continuity")}</text>
+        <text fg={theme.muted}>{props.t("subscription-bridge.risk.terms")}</text>
+        <text fg={theme.muted}>{props.t("subscription-bridge.risk.support")}</text>
+        <text fg={theme.muted}>{props.t("subscription-bridge.tested-models")}</text>
+        <text fg={theme.warning}>{props.t("subscription-bridge.deviations")}</text>
+        <text fg={theme.muted}>{props.t("subscription-bridge.accounts-help")}</text>
+      </box></Show>
       <Show when={discovery().status !== "idle"}>
         <text fg={discovery().status === "failure" ? theme.error : theme.muted}>{(() => {
           const current = discovery()

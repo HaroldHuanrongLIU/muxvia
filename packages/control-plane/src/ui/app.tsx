@@ -277,6 +277,7 @@ function Shell(props: {
   const renderer = useRenderer()
   const dimensions = useTerminalDimensions()
   const overlay = useOverlay()
+  const keymap = useMuxviaKeymap()
   const [route, setRoute] = createSignal<ShellRoute>({ kind: "home" })
   const initialViews = Object.fromEntries(
     Object.entries(props.sessions()).map(([target, session]) => [target, session!.get()]),
@@ -322,6 +323,7 @@ function Shell(props: {
     },
   )
   const [selectedSubscriptionAccountId, setSelectedSubscriptionAccountId] = createSignal<string>()
+  const [subscriptionAccountProviderId, setSubscriptionAccountProviderId] = createSignal<string>()
   const [subscriptionAccountPending, setSubscriptionAccountPending] = createSignal(false)
   const [subscriptionAccountNotice, setSubscriptionAccountNotice] = createSignal<string>()
   const [subscriptionAuthorization, setSubscriptionAuthorization] = createSignal<SubscriptionAuthorizationState>()
@@ -1052,6 +1054,7 @@ function Shell(props: {
           pending={() => providerMutationPending() || applying() !== undefined}
           activationMode={applying}
           allowDirect={() => managedWriteProblem(views()[target]) === undefined}
+          subscriptionBindings={() => subscriptionAccountView().bindings}
           onSelectedIdChange={setSelectedProviderId}
           onEdit={() => {
             const provider = selectedProvider()
@@ -1081,6 +1084,13 @@ function Shell(props: {
           onCheckReachability={() => { void checkSelectedReachability() }}
           onMove={(delta) => moveSelected(delta)}
           onDelete={() => requestDelete()}
+          onManageSubscriptionAccounts={() => {
+            const provider = selectedProvider()
+            if (!provider || provider.authentication !== "codex-subscription") return
+            setSubscriptionAccountProviderId(provider.id)
+            overlay.close(pickerToken)
+            queueMicrotask(() => keymap.dispatchCommand("subscription-account.list"))
+          }}
         />,
         onClose: () => {
           reachabilityGenerations[target]++
@@ -1618,6 +1628,8 @@ function Shell(props: {
   }
 
   const openSubscriptionAccounts = () => {
+    const requestedProviderId = subscriptionAccountProviderId()
+    setSubscriptionAccountProviderId()
     const originSession = props.subscriptionAccountSession()
     if (!originSession || overlay.depth > 0 || subscriptionAccountPending()) return
     setSubscriptionAccountView(originSession.get() as SubscriptionAccountCatalogView)
@@ -1630,7 +1642,8 @@ function Shell(props: {
       const target = activeTarget()
       const current = view()
       if (!target || !current) return undefined
-      const provider = current.providers.find((candidate) => candidate.id === current.currentProviderId)
+      const provider = current.providers.find((candidate) => candidate.id === requestedProviderId)
+        ?? current.providers.find((candidate) => candidate.id === current.currentProviderId)
         ?? current.providers[0]
       return provider ? {
         target,

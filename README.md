@@ -41,6 +41,7 @@ T01 deliberately excludes the complete OpenCode-style shell, Claude Code, Direct
 
 - [Domain language](./CONTEXT.md)
 - [Architecture decision records](./docs/adr/)
+- [Codex Subscription Bridge compatibility and risk notice](./docs/subscription-bridge.md)
 - [Accepted OpenCode-style Control Plane](./docs/adr/0011-build-a-focused-opentui-control-plane.md)
 
 ## License

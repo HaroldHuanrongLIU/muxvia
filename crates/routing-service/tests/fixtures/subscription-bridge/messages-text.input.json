@@ -1,0 +1,22 @@
+{
+  "model": "claude-opus-placeholder",
+  "system": [
+    { "type": "text", "text": "You are concise." },
+    { "type": "text", "text": "Answer exactly." }
+  ],
+  "metadata": {
+    "user_id": "raw-user",
+    "session_id": "metadata-session"
+  },
+  "messages": [
+    { "role": "user", "content": "FIXTURE_REQUEST_CONTENT_6521" },
+    {
+      "role": "assistant",
+      "content": [{ "type": "text", "text": "Hi there" }]
+    }
+  ],
+  "max_tokens": 1024,
+  "temperature": 0.3,
+  "top_p": 0.8,
+  "stream": false
+}

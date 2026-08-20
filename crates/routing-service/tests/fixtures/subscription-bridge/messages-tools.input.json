@@ -1,0 +1,43 @@
+{
+  "model": "claude-sonnet-placeholder",
+  "metadata": { "user_id": "tenant_session_session-from-user" },
+  "messages": [
+    { "role": "user", "content": "Find weather." },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "text", "text": "Checking." },
+        {
+          "type": "tool_use",
+          "id": "toolu_1",
+          "name": "weather",
+          "input": { "z": 1, "a": { "y": 2, "x": 1 } }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_1",
+          "content": "72 F"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "weather",
+      "description": "Read the weather",
+      "input_schema": {
+        "properties": {
+          "city": { "type": "string" },
+          "source": { "type": "string", "format": "uri" }
+        },
+        "required": ["city"]
+      }
+    }
+  ],
+  "tool_choice": { "type": "tool", "name": "weather" }
+}

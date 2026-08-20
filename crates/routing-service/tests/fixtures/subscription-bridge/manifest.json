@@ -1,0 +1,36 @@
+{
+  "oracle": {
+    "project": "farion1231/cc-switch",
+    "tag": "v3.19.2",
+    "commit": "43eaf07355af145aebfee301801779e824d4c221",
+    "retrieved": "2026-08-21",
+    "sourcePaths": [
+      "src-tauri/src/proxy/providers/transform_responses.rs",
+      "src-tauri/src/proxy/providers/claude.rs",
+      "src-tauri/src/proxy/forwarder.rs",
+      "src-tauri/src/proxy/session.rs"
+    ]
+  },
+  "fixtures": [
+    {
+      "file": "messages-text.input.json",
+      "behavior": "Anthropic text and system input",
+      "sha256": "91b0ff3b10ac973ffaf30035eb3861b2d26785eddfb56473ed7ca78fcb062a6c"
+    },
+    {
+      "file": "messages-text.expected.json",
+      "behavior": "gpt-5.6 Responses text request",
+      "sha256": "6fd0f0f3daee7454a41893d1346752de38ef7e3344e4f5212c057332571f30c0"
+    },
+    {
+      "file": "messages-tools.input.json",
+      "behavior": "Anthropic tools and session input",
+      "sha256": "e63a214699a27c3dc6761a0533892ff6a2463504c0c94bdbe8d8d1f8eab9c0ea"
+    },
+    {
+      "file": "messages-tools.expected.json",
+      "behavior": "gpt-5.6-luna Responses tool request",
+      "sha256": "9e467d6b14b99eee3bdf84d8804e2cc6b3d02822abd1d3fd603ae4b996320a2e"
+    }
+  ]
+}

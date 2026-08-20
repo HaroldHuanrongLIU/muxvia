@@ -1,0 +1,19 @@
+{
+  "model": "gpt-5.6",
+  "instructions": "You are concise.\n\nAnswer exactly.",
+  "input": [
+    {
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "FIXTURE_REQUEST_CONTENT_6521" }]
+    },
+    {
+      "role": "assistant",
+      "content": [{ "type": "output_text", "text": "Hi there" }]
+    }
+  ],
+  "store": false,
+  "include": ["reasoning.encrypted_content"],
+  "tools": [],
+  "parallel_tool_calls": false,
+  "stream": true
+}

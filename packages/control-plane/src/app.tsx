@@ -6,6 +6,7 @@ import { createSignal } from "solid-js"
 
 import { RpcClient, ControlError } from "./control/rpc-client"
 import type { TargetSession } from "./control/target-session"
+import type { UniversalProviderSession } from "./control/universal-provider-session"
 import type { ClaudePreflightContext, Target } from "./control/types"
 import { resolveLocale } from "./i18n"
 import { App } from "./ui/app"
@@ -40,6 +41,12 @@ export interface RunPorts {
     target: Target,
     claudeContext?: ClaudePreflightContext,
   ): Promise<TargetSession>
+  connectUniversalProviders?(
+    socketPath: string,
+    release: string,
+    signal: AbortSignal,
+    claudeContext: ClaudePreflightContext,
+  ): Promise<UniversalProviderSession>
   spawn(path: string, args: string[], options: SpawnOptions): void
   createRenderer(): Promise<CliRenderer>
   render(node: () => JSX.Element, renderer: CliRenderer): Promise<void>
@@ -124,6 +131,16 @@ export function createProductionRenderer(): Promise<CliRenderer> {
 const productionPorts: RunPorts = {
   connect: (socketPath, release, signal, target, claudeContext) =>
     connectTargetSession(socketPath, release, signal, target, undefined, claudeContext),
+  connectUniversalProviders: async (socketPath, release, signal, claudeContext) => {
+    const control = await RpcClient.connect(socketPath, release, signal)
+    try {
+      if (signal.aborted) throw new ConnectionDeadlineError()
+      return await control.openUniversalProviders(claudeContext)
+    } catch (error) {
+      await control.close().catch(() => {})
+      throw error
+    }
+  },
   spawn: (path, args) => {
     const child = spawn(path, args, { shell: false, detached: true, stdio: "ignore" })
     child.unref()
@@ -270,6 +287,44 @@ async function connectOrStart(
   throw new ControlError("service-unavailable", "Routing Service did not become ready")
 }
 
+async function connectUniversalCatalog(
+  options: RunOptions,
+  ports: RunPorts,
+  cancellation: AbortSignal,
+  claudeContext: ClaudePreflightContext,
+): Promise<UniversalProviderSession | undefined> {
+  const connect = ports.connectUniversalProviders
+  if (!connect || cancellation.aborted) return undefined
+  const controller = new AbortController()
+  let expired = false
+  let cancelTimeout = () => {}
+  let rejectTimeout!: (error: ConnectionDeadlineError) => void
+  const timeout = new Promise<never>((_, reject) => { rejectTimeout = reject })
+  cancelTimeout = ports.clock.timeout(readinessTimeoutMs, () => {
+    expired = true
+    controller.abort()
+    rejectTimeout(new ConnectionDeadlineError())
+  })
+  let rejectCancelled!: (error: ConnectionCancelledError) => void
+  const cancelled = new Promise<never>((_, reject) => { rejectCancelled = reject })
+  const onCancel = () => {
+    controller.abort()
+    rejectCancelled(new ConnectionCancelledError())
+  }
+  cancellation.addEventListener("abort", onCancel, { once: true })
+  const connection = connect(options.socketPath, options.release, controller.signal, claudeContext).then(async (session) => {
+    if (!expired && !cancellation.aborted) return session
+    await session.close().catch(() => {})
+    throw new ConnectionDeadlineError()
+  })
+  try {
+    return await Promise.race([connection, timeout, cancelled])
+  } finally {
+    cancelTimeout()
+    cancellation.removeEventListener("abort", onCancel)
+  }
+}
+
 export async function run(options: RunOptions, ports: RunPorts = productionPorts): Promise<void> {
   const locale = resolveLocale(process.env)
   const renderer = await ports.createRenderer()
@@ -285,6 +340,7 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
   )
   const [sessions, setSessions] = createSignal<Partial<Record<Target, TargetSession>>>({})
   const [unavailable, setUnavailable] = createSignal<Partial<Record<Target, string>>>({})
+  const [universalSession, setUniversalSession] = createSignal<UniversalProviderSession>()
   const closedSessions = new Set<TargetSession>()
   const closeSessionOnce = async (session: TargetSession): Promise<void> => {
     if (closedSessions.has(session)) return
@@ -320,7 +376,18 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
     }))
     if (renderer.isDestroyed) return
     if (Object.keys(sessions()).length === 0) throw firstConnectionFailure ?? new ConnectionDeadlineError()
-    await ports.render(() => <App sessions={sessions} unavailable={unavailable} locale={locale} />, renderer)
+    if (ports.connectUniversalProviders && !startup.signal.aborted) {
+      try {
+        const catalog = await connectUniversalCatalog(options, ports, startup.signal, claudeContext)
+        if (!catalog) throw new ConnectionDeadlineError()
+        if (!startup.signal.aborted) setUniversalSession(catalog)
+        else await catalog.close().catch(() => {})
+      } catch {
+        // Target management remains available if the independent catalog session is unavailable.
+      }
+    }
+    if (renderer.isDestroyed) return
+    await ports.render(() => <App sessions={sessions} unavailable={unavailable} universalSession={universalSession} locale={locale} />, renderer)
     const opened = sessions()
     const uniqueSessions = [...new Set(Object.values(opened))]
     for (const target of ["codex", "claude"] as const) {
@@ -338,7 +405,10 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
     for (const stop of stopListening) stop()
     try {
       renderer.setTerminalTitle("")
-      await Promise.all([...new Set(Object.values(sessions()))].map((session) => closeSessionOnce(session).catch(() => {})))
+      await Promise.all([
+        ...[...new Set(Object.values(sessions()))].map((session) => closeSessionOnce(session).catch(() => {})),
+        universalSession()?.close().catch(() => {}),
+      ])
     } finally {
       if (!renderer.isDestroyed) renderer.destroy()
       await destroyed

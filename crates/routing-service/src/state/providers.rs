@@ -8,7 +8,7 @@ use crate::domain::provider::has_valid_provider_declaration;
 use crate::{
     control::protocol::{
         CredentialEdit, DuplicateCredential, ProviderAuthentication, ProviderPresetView,
-        ProviderProtocol, Target,
+        ProviderProtocol, ProviderRoutingRequirement, Target,
     },
     domain::provider::normalize_provider_base_url,
 };
@@ -29,6 +29,20 @@ struct SourceDeclaration {
     provenance_kind: Option<String>,
     provenance_key: Option<String>,
     generated_owner_id: Option<String>,
+}
+
+struct ExistingProvider {
+    name: String,
+    base_url: String,
+    model: String,
+    credential_id: Option<String>,
+    provider_revision: u64,
+    authentication: String,
+    protocol: String,
+    routing_requirement: String,
+    generated_owner_id: Option<String>,
+    generated_source_revision: Option<u64>,
+    generated_overlay_revision: Option<u64>,
 }
 
 pub(crate) struct ProviderInspectionSnapshot {
@@ -116,6 +130,7 @@ pub(super) enum ProviderAction {
         model: String,
         credential: CredentialEdit,
         authentication: Option<ProviderAuthentication>,
+        routing_requirement: Option<ProviderRoutingRequirement>,
     },
     Reorder {
         provider_ids: Vec<Uuid>,
@@ -140,6 +155,8 @@ pub(super) enum ProviderMutationError {
     ProviderReferenced,
     StaleProviderRevision,
     NoProviderChange,
+    GeneratedProviderReadOnly,
+    GeneratedProviderDeleteForbidden,
 }
 
 pub(super) fn mutate_provider(
@@ -173,6 +190,7 @@ pub(super) fn mutate_provider(
             model,
             credential,
             authentication,
+            routing_requirement,
         } => update_provider(
             transaction,
             target,
@@ -183,6 +201,7 @@ pub(super) fn mutate_provider(
             model,
             credential,
             authentication,
+            routing_requirement,
         ),
         ProviderAction::Reorder { provider_ids } => {
             reorder_providers_for(transaction, target, &provider_ids)
@@ -292,7 +311,7 @@ pub(super) fn delete_provider_for(
         return Err(ProviderMutationError::StaleProviderRevision);
     }
     if generated_owner_id.is_some() {
-        return Err(ProviderMutationError::Invalid);
+        return Err(ProviderMutationError::GeneratedProviderDeleteForbidden);
     }
     let referenced: bool = transaction
         .query_row(
@@ -507,48 +526,155 @@ fn update_provider(
     model: String,
     credential: CredentialEdit,
     authentication: Option<ProviderAuthentication>,
+    routing_requirement: Option<ProviderRoutingRequirement>,
 ) -> Result<(), ProviderMutationError> {
     let provider_id = Uuid::parse_str(&provider_id).map_err(|_| ProviderMutationError::Invalid)?;
     let name = normalized_name(name)?;
     let base_url = normalized_base_url(base_url)?;
     let existing = transaction
         .query_row(
-            "SELECT name, base_url, model, credential_id, provider_revision, authentication, protocol
+            "SELECT name, base_url, model, credential_id, provider_revision, authentication,
+                    protocol, routing_requirement, generated_owner_id,
+                    generated_source_revision, generated_overlay_revision
              FROM providers WHERE id = ?1 AND target = ?2",
             params![provider_id.to_string(), target.as_str()],
             |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, u64>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?,
-                ))
+                Ok(ExistingProvider {
+                    name: row.get(0)?,
+                    base_url: row.get(1)?,
+                    model: row.get(2)?,
+                    credential_id: row.get(3)?,
+                    provider_revision: row.get(4)?,
+                    authentication: row.get(5)?,
+                    protocol: row.get(6)?,
+                    routing_requirement: row.get(7)?,
+                    generated_owner_id: row.get(8)?,
+                    generated_source_revision: row.get(9)?,
+                    generated_overlay_revision: row.get(10)?,
+                })
             },
         )
         .optional()
         .map_err(|_| ProviderMutationError::Invalid)?
         .ok_or(ProviderMutationError::Invalid)?;
-    if existing.4 != provider_revision {
+    if existing.provider_revision != provider_revision {
         return Err(ProviderMutationError::StaleProviderRevision);
     }
 
-    let credential_id = match credential {
-        CredentialEdit::Keep => existing.3.clone(),
-        CredentialEdit::Remove => None,
-        CredentialEdit::Replace { value } => Some(insert_credential(transaction, target, value)?),
-    };
-    let authentication = authentication.unwrap_or_else(|| parse_authentication(&existing.5));
-    if existing.6 != protocol_for(target).to_string()
+    let authentication =
+        authentication.unwrap_or_else(|| parse_authentication(&existing.authentication));
+    let routing_requirement = routing_requirement
+        .unwrap_or_else(|| parse_routing_requirement(&existing.routing_requirement));
+    if existing.protocol != protocol_for(target).to_string()
         || !has_valid_provider_declaration(target, protocol_for(target), authentication)
     {
         return Err(ProviderMutationError::Invalid);
     }
-    if existing.0 == name
-        && existing.1 == base_url
-        && existing.2 == model
-        && existing.3 == credential_id
-        && existing.5 == authentication.to_string()
+
+    if let Some(generated_owner_id) = existing.generated_owner_id.as_deref() {
+        if !matches!(&credential, CredentialEdit::Keep) {
+            return Err(ProviderMutationError::GeneratedProviderReadOnly);
+        }
+        let (source_name, source_base_url, source_revision, enabled, overlay_revision): (
+            String,
+            String,
+            u64,
+            bool,
+            u64,
+        ) = transaction
+            .query_row(
+                "SELECT u.name, u.base_url, u.provider_revision, t.enabled, t.overlay_revision
+                 FROM universal_providers u
+                 JOIN universal_provider_targets t ON t.universal_provider_id = u.id
+                 WHERE u.id = ?1 AND t.target = ?2",
+                params![generated_owner_id, target.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| ProviderMutationError::Invalid)?
+            .ok_or(ProviderMutationError::Invalid)?;
+        if !enabled
+            || existing.generated_source_revision != Some(source_revision)
+            || existing.generated_overlay_revision != Some(overlay_revision)
+            || name != source_name
+            || base_url != source_base_url
+            || existing.name != source_name
+            || existing.base_url != source_base_url
+        {
+            return Err(ProviderMutationError::GeneratedProviderReadOnly);
+        }
+        if existing.model == model
+            && existing.authentication == authentication.to_string()
+            && existing.routing_requirement == routing_requirement.to_string()
+        {
+            return Err(ProviderMutationError::NoProviderChange);
+        }
+        let next_overlay_revision = overlay_revision
+            .checked_add(1)
+            .ok_or(ProviderMutationError::Invalid)?;
+        transaction
+            .execute(
+                "UPDATE universal_provider_targets
+                 SET model = ?1, authentication = ?2, routing_requirement = ?3,
+                     overlay_revision = ?4, synchronized_overlay_revision = ?4
+                 WHERE universal_provider_id = ?5 AND target = ?6",
+                params![
+                    model,
+                    authentication.to_string(),
+                    routing_requirement.to_string(),
+                    next_overlay_revision,
+                    generated_owner_id,
+                    target.as_str(),
+                ],
+            )
+            .map_err(|_| ProviderMutationError::Invalid)?;
+        transaction
+            .execute(
+                "UPDATE providers
+                 SET model = ?1, authentication = ?2, routing_requirement = ?3,
+                     provider_revision = provider_revision + 1,
+                     generated_overlay_revision = ?4
+                 WHERE id = ?5 AND target = ?6",
+                params![
+                    model,
+                    authentication.to_string(),
+                    routing_requirement.to_string(),
+                    next_overlay_revision,
+                    provider_id.to_string(),
+                    target.as_str(),
+                ],
+            )
+            .map_err(|_| ProviderMutationError::Invalid)?;
+        transaction
+            .execute(
+                "UPDATE universal_provider_catalog_state
+                 SET revision = revision + 1, view_sequence = view_sequence + 1
+                 WHERE singleton = 1",
+                [],
+            )
+            .map_err(|_| ProviderMutationError::Invalid)?;
+        return Ok(());
+    }
+
+    let credential_id = match credential {
+        CredentialEdit::Keep => existing.credential_id.clone(),
+        CredentialEdit::Remove => None,
+        CredentialEdit::Replace { value } => Some(insert_credential(transaction, target, value)?),
+    };
+    if existing.name == name
+        && existing.base_url == base_url
+        && existing.model == model
+        && existing.credential_id == credential_id
+        && existing.authentication == authentication.to_string()
+        && existing.routing_requirement == routing_requirement.to_string()
     {
         return Err(ProviderMutationError::NoProviderChange);
     }
@@ -556,20 +682,23 @@ fn update_provider(
         .execute(
             "UPDATE providers
              SET name = ?1, base_url = ?2, model = ?3, credential_id = ?4, authentication = ?5,
-                 provider_revision = provider_revision + 1
-             WHERE id = ?6 AND target = ?7",
+                 routing_requirement = ?6, provider_revision = provider_revision + 1
+             WHERE id = ?7 AND target = ?8",
             params![
                 name,
                 base_url,
                 model,
                 credential_id,
                 authentication.to_string(),
+                routing_requirement.to_string(),
                 provider_id.to_string(),
                 target.as_str()
             ],
         )
         .map_err(|_| ProviderMutationError::Invalid)?;
-    if let Some(previous_credential_id) = existing.3.filter(|id| Some(id) != credential_id.as_ref())
+    if let Some(previous_credential_id) = existing
+        .credential_id
+        .filter(|id| Some(id) != credential_id.as_ref())
     {
         transaction
             .execute(
@@ -639,5 +768,12 @@ fn parse_authentication(value: &str) -> ProviderAuthentication {
         "anthropic-api-key" => ProviderAuthentication::AnthropicApiKey,
         "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
         _ => ProviderAuthentication::OpenaiBearer,
+    }
+}
+
+fn parse_routing_requirement(value: &str) -> ProviderRoutingRequirement {
+    match value {
+        "takeover-required" => ProviderRoutingRequirement::TakeoverRequired,
+        _ => ProviderRoutingRequirement::DirectCompatible,
     }
 }

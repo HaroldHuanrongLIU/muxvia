@@ -166,6 +166,7 @@ CREATE TABLE activation_recovery (
 "#;
 
 const V5_SCHEMA: &str = include_str!("fixtures/state-schema-v5.sql");
+const V8_SCHEMA: &str = include_str!("fixtures/state-schema-v8.sql");
 // Immutable schema-v7 fixture. Do not replace this with the live schema: the
 // migration test must continue to exercise the real historical boundary.
 const V7_SCHEMA: &str = r#"
@@ -297,7 +298,7 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
         .await
         .unwrap();
 
-    assert_eq!(version, "8");
+    assert_eq!(version, "9");
     assert_eq!(not_null, 1);
     assert_eq!(default_value.as_deref(), Some("1"));
     assert!(table_sql.contains("CHECK (managed_config_version IN (1,2))"));
@@ -352,7 +353,7 @@ async fn schema_v8_failed_migration_rolls_back_then_reruns() {
         connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'target_compatibility'", [], |row| row.get::<_, i64>(0)).unwrap(),
         connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'reconciliation_intents'", [], |row| row.get::<_, i64>(0)).unwrap(),
     );
-    assert_eq!(rerun, ("8".into(), 1, 1));
+    assert_eq!(rerun, ("9".into(), 1, 1));
 }
 
 fn v7_projection_fingerprint(connection: &Connection) -> Vec<u64> {
@@ -391,6 +392,158 @@ fn fingerprint_bytes(mut fingerprint: u64, bytes: &[u8]) -> u64 {
         fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
     }
     fingerprint
+}
+
+#[tokio::test]
+async fn schema_v9_migrates_real_v8_state_and_adds_universal_provider_tables() {
+    let fixture = StoreFixture::new();
+    fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    connection.execute_batch(V8_SCHEMA).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO credentials VALUES ('00000000-0000-4000-8000-000000000801', 'codex', 'V8_PROVIDER_SECRET');
+             INSERT INTO providers (id, target, position, provider_revision, name, base_url, model, protocol, authentication, credential_id, routing_requirement)
+             VALUES ('00000000-0000-4000-8000-000000000802', 'codex', 0, 5, 'Existing', 'https://existing.example/v1', 'existing-model', 'openai-responses', 'openai-bearer', '00000000-0000-4000-8000-000000000801', 'direct-compatible');
+             INSERT INTO target_compatibility VALUES ('codex', '0.42.0', 'unknown-compatible', '0.42.0');
+             INSERT INTO reconciliation_intents VALUES ('00000000-0000-4000-8000-000000000803', 'codex', 'reapply', 'rolled-back', 0, '{\"before\":true}', '{\"desired\":true}');",
+        )
+        .unwrap();
+    let before = v8_projection_fingerprint(&connection);
+    drop(connection);
+
+    let store = StateStore::open(&fixture.home).await.unwrap();
+    drop(store);
+
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    let version: String = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'schema-version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let tables = [
+        "universal_provider_catalog_state",
+        "universal_credentials",
+        "universal_providers",
+        "universal_provider_targets",
+        "universal_action_receipts",
+        "universal_provider_seeds",
+    ];
+    let present = tables.map(|table| {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    });
+    let catalog_state: (u64, u64) = connection
+        .query_row(
+            "SELECT revision, view_sequence FROM universal_provider_catalog_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let foreign_key_failures: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    assert_eq!(version, "9");
+    assert_eq!(present, [1, 1, 1, 1, 1, 1]);
+    assert_eq!(catalog_state, (0, 0));
+    assert_eq!(foreign_key_failures, 0);
+    assert_eq!(
+        v8_projection_fingerprint(&connection),
+        before,
+        "schema-v9 migration changed preserved v8 state"
+    );
+}
+
+#[tokio::test]
+async fn schema_v9_failed_migration_rolls_back_all_catalog_changes_then_reruns() {
+    let fixture = StoreFixture::new();
+    fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    connection.execute_batch(V8_SCHEMA).unwrap();
+    connection
+        .execute_batch("CREATE TABLE universal_provider_targets (collision TEXT NOT NULL);")
+        .unwrap();
+    drop(connection);
+
+    assert!(StateStore::open(&fixture.home).await.is_err());
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    let failed: (String, i64, i64) = connection
+        .query_row(
+            "SELECT
+               (SELECT value FROM metadata WHERE key = 'schema-version'),
+               (SELECT COUNT(*) FROM pragma_table_info('providers')
+                 WHERE name IN ('generated_source_revision', 'generated_overlay_revision')),
+               (SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'universal_provider_catalog_state')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(failed, ("8".to_owned(), 0, 0));
+    connection
+        .execute_batch("DROP TABLE universal_provider_targets;")
+        .unwrap();
+    drop(connection);
+
+    let store = StateStore::open(&fixture.home).await.unwrap();
+    drop(store);
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    let rerun: (String, i64, i64) = connection
+        .query_row(
+            "SELECT
+               (SELECT value FROM metadata WHERE key = 'schema-version'),
+               (SELECT COUNT(*) FROM pragma_table_info('providers')
+                 WHERE name IN ('generated_source_revision', 'generated_overlay_revision')),
+               (SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'universal_provider_catalog_state')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(rerun, ("9".to_owned(), 2, 1));
+}
+
+fn v8_projection_fingerprint(connection: &Connection) -> Vec<u64> {
+    let projections = [
+        "SELECT json_array(id, target, bearer_token) FROM credentials ORDER BY target, id",
+        "SELECT json_array(id, target, position, provider_revision, name, base_url, model, protocol, authentication, credential_id, provenance_kind, provenance_key, generated_owner_id, routing_requirement) FROM providers ORDER BY target, position, id",
+        "SELECT json_array(target, management_revision, view_sequence, current_provider_id, serving_provider_id, takeover_state, route_port, routing_credential, activated_snapshot_id, managed_config_path, managed_config_version, recovery_intent_id, recovery_state) FROM target_route_state ORDER BY target",
+        "SELECT json_array(target, code, message, source, selector) FROM target_problems ORDER BY target, code",
+        "SELECT json_array(id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch) FROM activated_snapshots ORDER BY target, id",
+        "SELECT json_array(target, action_id, action_kind, committed_revision, outcome_json) FROM action_receipts ORDER BY target, action_id",
+        "SELECT json_array(id, target, action_id, config_path, file_identity_json, payload_json, state, created_revision) FROM activation_recovery ORDER BY target, id",
+        "SELECT json_array(target, observed_version, classification, acknowledged_version) FROM target_compatibility ORDER BY target",
+        "SELECT json_array(action_id, target, strategy, state, created_revision, before_json, desired_json) FROM reconciliation_intents ORDER BY target, action_id",
+    ];
+    projections
+        .into_iter()
+        .map(|projection| {
+            let mut fingerprint =
+                fingerprint_bytes(0xcbf2_9ce4_8422_2325_u64, projection.as_bytes());
+            let rows = connection
+                .prepare(projection)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for row in rows {
+                fingerprint = fingerprint_bytes(fingerprint, row.as_bytes());
+                fingerprint = fingerprint_bytes(fingerprint, &[0]);
+            }
+            fingerprint
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -477,7 +630,7 @@ async fn schema_v7_migrates_real_v5_claude_states_and_binds_the_unique_committed
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "8"
+            "9"
         );
         let route: (
             i64,
@@ -855,7 +1008,7 @@ async fn schema_v7_does_not_guess_between_multiple_legacy_committed_intents() {
         .unwrap();
     assert_eq!(
         migrated,
-        ("8".to_owned(), None, "recovery-required".to_owned())
+        ("9".to_owned(), None, "recovery-required".to_owned())
     );
 }
 
@@ -1390,7 +1543,7 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "8");
+    assert_eq!(schema_version, "9");
     assert_eq!(
         view.providers[0].id,
         Uuid::parse_str(existing_provider_id).unwrap()
@@ -1620,7 +1773,7 @@ async fn schema_v4_migrates_v2_routing_requirement_and_historical_receipts() {
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "8");
+    assert_eq!(schema_version, "9");
     assert_eq!(
         store.target_view().await.unwrap().providers[0].routing_requirement,
         ProviderRoutingRequirement::DirectCompatible

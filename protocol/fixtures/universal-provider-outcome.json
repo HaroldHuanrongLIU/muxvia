@@ -1,0 +1,50 @@
+{
+  "type": "response",
+  "requestId": "universal-act-1",
+  "result": {
+    "kind": "universal-provider-outcome",
+    "outcome": {
+      "status": "applied",
+      "view": {
+        "revision": 1,
+        "viewSequence": 1,
+        "providers": [
+          {
+            "id": "00000000-0000-4000-8000-000000000901",
+            "position": 0,
+            "providerRevision": 1,
+            "name": "Shared Gateway",
+            "baseUrl": "https://gateway.example/v1",
+            "credential": "present",
+            "provenance": null,
+            "targets": [
+              {
+                "target": "codex",
+                "enabled": true,
+                "model": "gateway-model",
+                "authentication": "openai-bearer",
+                "routingRequirement": "direct-compatible",
+                "overlayRevision": 1,
+                "generatedProviderId": null,
+                "synchronization": "pending",
+                "activeReferences": []
+              },
+              {
+                "target": "claude",
+                "enabled": true,
+                "model": "gateway-model",
+                "authentication": "anthropic-bearer",
+                "routingRequirement": "takeover-required",
+                "overlayRevision": 1,
+                "generatedProviderId": null,
+                "synchronization": "pending",
+                "activeReferences": []
+              }
+            ]
+          }
+        ],
+        "presets": []
+      }
+    }
+  }
+}

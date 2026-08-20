@@ -4,6 +4,7 @@ import { testRender } from "@opentui/solid"
 
 import { MuxviaKeymapProvider, useMuxviaKeymap } from "../src/commands/keymap"
 import type { CompatibilityResolution, TargetSession } from "../src/control/target-session"
+import type { UniversalProviderSession } from "../src/control/universal-provider-session"
 import type {
   ActionOutcome,
   CompatibilityProbe,
@@ -15,6 +16,9 @@ import type {
   ReconciliationStrategy,
   TargetAction,
   TargetView,
+  UniversalProviderAction,
+  UniversalProviderCatalogView,
+  UniversalProviderOutcome,
 } from "../src/control/types"
 import { createTranslator } from "../src/i18n"
 import { App } from "../src/ui/app"
@@ -65,6 +69,13 @@ function provider(overrides: Partial<TargetView["providers"][number]>): TargetVi
     missingFields: [],
     provenance: null,
     generated: false,
+    universalProviderId: null,
+    synchronization: null,
+    ownership: {
+      name: "target-provider", baseUrl: "target-provider", model: "target-provider",
+      protocol: "target-fixed", authentication: "target-provider",
+      routingRequirement: "target-provider", credential: "target-provider",
+    },
     activeReferences: [],
     ...overrides,
   }
@@ -214,6 +225,71 @@ class MemoryTargetSession implements TargetSession {
   }
   async whenClosed(): Promise<void> { return await new Promise(() => {}) }
   async close(): Promise<void> {}
+}
+
+class MemoryUniversalProviderSession implements UniversalProviderSession {
+  readonly actions: unknown[] = []
+  readonly #listeners = new Set<(next: UniversalProviderCatalogView) => void>()
+  #view: UniversalProviderCatalogView
+  readonly #handler: (action: UniversalProviderAction) => Promise<UniversalProviderOutcome>
+
+  constructor(
+    initial: UniversalProviderCatalogView,
+    handler: (action: UniversalProviderAction) => Promise<UniversalProviderOutcome> = async () => ({ status: "applied", view: initial }),
+  ) {
+    this.#view = initial
+    this.#handler = handler
+  }
+  get(): Readonly<UniversalProviderCatalogView> { return this.#view }
+  async act(action: UniversalProviderAction): Promise<UniversalProviderOutcome> {
+    this.actions.push("credential" in action && action.credential.kind === "replace"
+      ? { ...structuredClone(action), credential: { kind: "replace", valuePresent: action.credential.value.length > 0 } }
+      : structuredClone(action))
+    const outcome = await this.#handler(action)
+    this.#view = outcome.view
+    return outcome
+  }
+  subscribe(listener: (next: UniversalProviderCatalogView) => void): () => void {
+    this.#listeners.add(listener)
+    return () => this.#listeners.delete(listener)
+  }
+  push(next: UniversalProviderCatalogView): void {
+    this.#view = next
+    for (const listener of this.#listeners) listener(next)
+  }
+  async whenClosed(): Promise<void> { return await new Promise(() => {}) }
+  async close(): Promise<void> {}
+}
+
+function universalCatalog(): UniversalProviderCatalogView {
+  return {
+    revision: 1,
+    viewSequence: 1,
+    providers: [{
+      id: "00000000-0000-4000-8000-000000000070",
+      position: 0,
+      providerRevision: 1,
+      name: "Shared Frontier",
+      baseUrl: "https://shared.example/v1",
+      credential: "present",
+      provenance: { kind: "preset", key: "openai-api-responses" },
+      targets: [
+        {
+          target: "codex", enabled: true, model: "gpt-shared", authentication: "openai-bearer",
+          routingRequirement: "direct-compatible", overlayRevision: 1,
+          generatedProviderId: "00000000-0000-4000-8000-000000000071",
+          synchronization: "current", activeReferences: [],
+        },
+        {
+          target: "claude", enabled: true, model: "claude-shared", authentication: "anthropic-api-key",
+          routingRequirement: "takeover-required", overlayRevision: 1,
+          generatedProviderId: "00000000-0000-4000-8000-000000000072",
+          synchronization: "pending", activeReferences: [],
+        },
+      ],
+    }],
+    presets: [],
+  }
 }
 
 function reconciliationPreview(
@@ -434,6 +510,85 @@ test("/providers renders provenance kinds and generated state with secret-free s
     await setup.renderOnce()
     expect(setup.captureCharFrame()).toContain("Edit Provider")
     expect(setup.captureCharFrame()).toContain("Preset Provider")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Generated Provider editor locks Universal fields and saves only the Target Overlay", async () => {
+  const generated = provider({
+    id: "00000000-0000-4000-8000-000000000071",
+    name: "Shared Claude",
+    baseUrl: "https://shared.example/v1",
+    model: "claude-old",
+    protocol: "anthropic-messages",
+    authentication: "anthropic-api-key",
+    routingRequirement: "direct-compatible",
+    credential: "missing",
+    generated: true,
+    universalProviderId: "00000000-0000-4000-8000-000000000070",
+    synchronization: "current",
+    provenance: { kind: "universal-provider", key: "00000000-0000-4000-8000-000000000070" },
+    ownership: {
+      name: "universal-provider", baseUrl: "universal-provider", model: "target-overlay",
+      protocol: "target-fixed", authentication: "target-overlay",
+      routingRequirement: "target-overlay", credential: "universal-provider",
+    },
+  })
+  const initial = view({ target: "claude", providers: [generated] })
+  const session = new MemoryTargetSession(initial, async () => ({ status: "applied", view: initial }))
+  const setup = await testRender(() => <App session={session} />, { width: 80, height: 30, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("2")
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Managed by its Universal Provider"))
+    setup.mockInput.pressEnter()
+    const editor = await setup.waitForFrame((frame) => frame.includes("Generated Provider Target Overlay"))
+    expect(editor).toContain("Universal-owned fields are read-only")
+    expect(editor).toContain("Shared Claude")
+    expect(editor).toContain("https://shared.example/v1")
+    expect(editor).toContain("Target fixed")
+
+    await setup.mockInput.typeText("-overlay")
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(" ")
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(" ")
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 1)
+    expect(session.actions[0]).toEqual({
+      kind: "update-provider",
+      providerId: generated.id,
+      providerRevision: generated.providerRevision,
+      name: "Shared Claude",
+      baseUrl: "https://shared.example/v1",
+      model: "claude-old-overlay",
+      authentication: "anthropic-bearer",
+      routingRequirement: "takeover-required",
+      credential: { kind: "keep" },
+    })
+
+    await setup.mockInput.typeText("/providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Managed by its Universal Provider"))
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("d")
+    await setup.renderOnce()
+    expect(session.actions).toHaveLength(1)
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("c")
+    await setup.waitForFrame((frame) => frame.includes("Shared Claude Copy"))
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.actions.length === 2)
+    expect(session.actions[1]).toMatchObject({
+      kind: "duplicate-provider",
+      sourceProviderId: generated.id,
+      sourceProviderRevision: generated.providerRevision,
+      credential: { kind: "without" },
+    })
   } finally {
     setup.renderer.destroy()
   }
@@ -803,6 +958,374 @@ test("Preset source selection copies an ordinary draft without discovery and sav
       credential: { kind: "remove" },
       presetKey: "openai-api-responses",
     }])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("either Target opens one shared Universal Provider catalog with dual synchronization rails", async () => {
+  const catalog = new MemoryUniversalProviderSession(universalCatalog())
+  const codex = new MemoryTargetSession(view())
+  const claude = new MemoryTargetSession(view({ target: "claude" }))
+  const setup = await testRender(() => <App
+    sessions={{ codex, claude }}
+    universalSession={catalog}
+  />, { width: 80, height: 30, useThread: false, kittyKeyboard: true })
+  try {
+    await setup.renderOnce()
+    for (const key of ["1", "2"] as const) {
+      setup.mockInput.pressKey(key)
+      await setup.mockInput.typeText("/universal-providers")
+      setup.mockInput.pressEnter()
+      const frame = await setup.waitForFrame((next) => next.includes("Shared Frontier"))
+      expect(frame).toContain("Universal Providers")
+      expect(frame).toContain("Codex CLI · Current")
+      expect(frame).toContain("Claude Code · Pending")
+      setup.mockInput.pressEscape()
+      await setup.renderOnce()
+      setup.mockInput.pressEscape()
+      await setup.renderOnce()
+    }
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("Preset draft edits both Target overlays and synchronizes only after confirmation", async () => {
+  const presetCatalog: UniversalProviderCatalogView = {
+    revision: 1,
+    viewSequence: 1,
+    providers: [],
+    presets: [{
+      key: "openai-api-responses",
+      name: "OpenAI API",
+      baseUrl: "https://api.openai.com/v1",
+      targets: [
+        { target: "codex", enabled: true, model: "", authentication: "openai-bearer", routingRequirement: "direct-compatible" },
+        { target: "claude", enabled: false, model: "", authentication: "anthropic-api-key", routingRequirement: "direct-compatible" },
+      ],
+    }],
+  }
+  const createdId = "00000000-0000-4000-8000-000000000070"
+  let current = presetCatalog
+  const catalog = new MemoryUniversalProviderSession(presetCatalog, async (action) => {
+    if (action.kind === "create-universal-provider") {
+      current = {
+        revision: 2,
+        viewSequence: 2,
+        presets: presetCatalog.presets,
+        providers: [{
+          id: createdId,
+          position: 0,
+          providerRevision: 1,
+          name: action.name,
+          baseUrl: action.baseUrl,
+          credential: action.credential.kind === "replace" ? "present" : "missing",
+          provenance: { kind: "preset", key: action.presetKey! },
+          targets: action.targets.map((target, index) => ({
+            ...target,
+            overlayRevision: 1,
+            generatedProviderId: `00000000-0000-4000-8000-00000000007${index + 1}`,
+            synchronization: "pending" as const,
+            activeReferences: [],
+          })),
+        }],
+      }
+    } else if (action.kind === "synchronize-universal-provider") {
+      current = {
+        ...current,
+        revision: 3,
+        viewSequence: 3,
+        providers: current.providers.map((provider) => ({
+          ...provider,
+          providerRevision: 2,
+          targets: provider.targets.map((target) => ({ ...target, synchronization: "current" as const })),
+        })),
+      }
+    }
+    return { status: "applied", view: current }
+  })
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} universalSession={catalog} />, {
+    width: 80, height: 30, useThread: false, kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/universal-providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("No Universal Providers"))
+    setup.mockInput.pressKey("c")
+    await setup.waitForFrame((frame) => frame.includes("Create Universal Provider from"))
+    setup.mockInput.pressKey("down")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Create Universal Provider") && frame.includes("Target projection"))
+
+    await setup.mockInput.typeText(" Shared")
+    setup.mockInput.pressTab()
+    setup.mockInput.pressTab()
+    setup.mockInput.pressTab()
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText("gpt-shared")
+    setup.mockInput.pressTab()
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(" ")
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText("claude-shared")
+    setup.mockInput.pressTab()
+    setup.mockInput.pressTab()
+    await setup.mockInput.typeText(" ")
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => catalog.actions.length === 1)
+    expect(catalog.actions[0]).toMatchObject({
+      kind: "create-universal-provider",
+      name: "OpenAI API Shared",
+      baseUrl: "https://api.openai.com/v1",
+      credential: { kind: "remove" },
+      presetKey: "openai-api-responses",
+      targets: [
+        { target: "codex", enabled: true, model: "gpt-shared", authentication: "openai-bearer", routingRequirement: "direct-compatible" },
+        { target: "claude", enabled: true, model: "claude-shared", authentication: "anthropic-api-key", routingRequirement: "takeover-required" },
+      ],
+    })
+    const pending = await setup.waitForFrame((frame) => frame.includes("OpenAI API Shared"))
+    expect(pending).toContain("Codex CLI · Pending")
+    expect(pending).toContain("Claude Code · Pending")
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("s")
+    const confirmation = await setup.waitForFrame((frame) => frame.includes("Synchronize Universal Provider?"))
+    expect(confirmation).toContain("OpenAI API Shared")
+    expect(catalog.actions).toHaveLength(1)
+    setup.mockInput.pressKey("y")
+    await setup.waitFor(() => catalog.actions.length === 2)
+    expect(catalog.actions[1]).toEqual({
+      kind: "synchronize-universal-provider",
+      providerId: createdId,
+      providerRevision: 1,
+    })
+    const synchronized = await setup.waitForFrame((frame) => frame.includes("Codex CLI · Current"))
+    expect(synchronized).toContain("Claude Code · Current")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test.each(["invalid-universal-provider", "compatibility-acknowledgement-required"])(
+  "Universal Provider workflow scans %s failures before rendering",
+  async (problemCode) => {
+    const universalSecret = "universal-provider-credential-secret-must-not-render"
+    const secrets = [universalSecret, configSecret, backendSecret, settingsSecret] as const
+    const catalog = new MemoryUniversalProviderSession(universalCatalog(), async () => {
+      throw {
+        code: problemCode,
+        message: backendSecret,
+        configuration: configSecret,
+        settings: { raw: settingsSecret },
+      }
+    })
+    const session = new MemoryTargetSession(view())
+    const setup = await testRender(() => <App session={session} universalSession={catalog} />, {
+      width: 80, height: 30, useThread: false, kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("1")
+      await setup.mockInput.typeText("/universal-providers")
+      setup.mockInput.pressEnter()
+      await waitForSecretFreeFrame(setup, (frame) => frame.includes("Shared Frontier"), secrets, "universal-open")
+      setup.mockInput.pressEnter()
+      await waitForSecretFreeFrame(setup, (frame) => frame.includes("Edit Universal Provider"), secrets, "universal-edit")
+      setup.mockInput.pressTab()
+      setup.mockInput.pressTab()
+      await setup.mockInput.typeText(universalSecret)
+      setup.mockInput.pressEnter()
+      await waitForSecretFreeCondition(
+        setup,
+        () => catalog.actions.length === 1,
+        () => auditSecretFreeActions(catalog.actions, secrets, "universal-action"),
+        "secret-scan-failed:universal-action",
+        "universal-action",
+      )
+      await setup.renderOnce()
+      const failure = setup.captureCharFrame()
+      auditSecretFreeFrame(failure, secrets, "universal-error")
+      const renderedCode = problemCode === "invalid-universal-provider"
+        ? "invalid-universal-"
+        : "compatibility"
+      expect(failure.includes(renderedCode)).toBeTrue()
+      expect(failure.includes("Universal Provider action failed")).toBeTrue()
+      auditSecretFreeActions(catalog.actions, secrets, "universal-action-final")
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)
+
+test("Universal Provider catalog keeps English and Chinese parity at every supported terminal size", async () => {
+  for (const locale of ["en", "zh-CN"] as const) {
+    const catalog = new MemoryUniversalProviderSession(universalCatalog())
+    const session = new MemoryTargetSession(view())
+    const setup = await testRender(() => <App session={session} universalSession={catalog} locale={locale} />, {
+      width: 80, height: 30, useThread: false, kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey("1")
+      await setup.mockInput.typeText("/universal-providers")
+      setup.mockInput.pressEnter()
+      const initial = await setup.waitForFrame((frame) => frame.includes("Shared Frontier"))
+      expect(initial).toContain(locale === "en" ? "Universal Providers" : "通用 Provider")
+      expect(initial).toContain(locale === "en" ? "Pending" : "待同步")
+      for (const [width, height] of [[1, 1], [2, 2], [20, 5], [40, 10], [80, 24], [121, 30]] as const) {
+        setup.resize(width, height)
+        await setup.renderOnce()
+        expect(() => setup.captureCharFrame()).not.toThrow()
+      }
+    } finally {
+      setup.renderer.destroy()
+    }
+  }
+})
+
+test("Universal Provider edit, detached duplicate, reference blocker, and delete stay in one overlay stack", async () => {
+  const original = universalCatalog().providers[0]!
+  let current: UniversalProviderCatalogView = {
+    ...universalCatalog(),
+    providers: [{
+      ...original,
+      targets: original.targets.map((target) => target.target === "codex"
+        ? { ...target, activeReferences: ["current" as const] }
+        : target),
+    }],
+  }
+  let blockDelete = true
+  const detachedId = "00000000-0000-4000-8000-000000000079"
+  const catalog = new MemoryUniversalProviderSession(current, async (action) => {
+    if (action.kind === "update-universal-provider") {
+      current = {
+        ...current,
+        revision: 2,
+        viewSequence: 2,
+        providers: current.providers.map((provider) => provider.id === action.providerId
+          ? { ...provider, providerRevision: 2, name: action.name, baseUrl: action.baseUrl, targets: provider.targets.map((target) => ({
+            ...target,
+            ...action.targets.find((candidate) => candidate.target === target.target),
+          })) }
+          : provider),
+      }
+    } else if (action.kind === "duplicate-universal-provider") {
+      current = {
+        ...current,
+        revision: 3,
+        viewSequence: 3,
+        providers: [...current.providers, {
+          ...current.providers[0]!,
+          id: detachedId,
+          position: 1,
+          providerRevision: 1,
+          name: action.name,
+          baseUrl: action.baseUrl,
+          credential: "missing",
+          provenance: null,
+          targets: current.providers[0]!.targets.map((target) => ({
+            ...target,
+            ...action.targets.find((candidate) => candidate.target === target.target),
+            generatedProviderId: null,
+            synchronization: "pending" as const,
+            activeReferences: [],
+          })),
+        }],
+      }
+    } else if (action.kind === "delete-universal-provider") {
+      if (blockDelete) throw { code: "generated-provider-referenced", message: backendSecret }
+      current = {
+        ...current,
+        revision: current.revision + 1,
+        viewSequence: current.viewSequence + 1,
+        providers: current.providers.filter((provider) => provider.id !== action.providerId),
+      }
+    }
+    return { status: "applied", view: current }
+  })
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} universalSession={catalog} />, {
+    width: 80, height: 30, useThread: false, kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/universal-providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Codex CLI references"))
+
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Edit Universal Provider"))
+    await setup.mockInput.typeText(" Updated")
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => catalog.actions.length === 1)
+    expect(catalog.actions[0]).toMatchObject({ kind: "update-universal-provider", name: "Shared Frontier Updated" })
+    await setup.waitForFrame((frame) => frame.includes("Shared Frontier Updated"))
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("c")
+    await setup.waitForFrame((frame) => frame.includes("Duplicate as detached Universal Provider"))
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => catalog.actions.length === 2)
+    expect(catalog.actions[1]).toMatchObject({
+      kind: "duplicate-universal-provider",
+      name: "Shared Frontier Updated Copy",
+      credential: { kind: "without" },
+    })
+    await setup.waitForFrame((frame) => frame.includes("Shared Frontier Updated Copy"))
+
+    setup.mockInput.pressKey("x", { ctrl: true })
+    setup.mockInput.pressKey("d")
+    await setup.waitForFrame((frame) => frame.includes("Delete Universal Provider?"))
+    setup.mockInput.pressKey("y")
+    await setup.waitFor(() => catalog.actions.length === 3)
+    await setup.renderOnce()
+    const blocked = setup.captureCharFrame()
+    auditSecretFreeFrame(blocked, [backendSecret], "universal-reference-blocker")
+    expect(blocked.includes("generated-provider-")).toBeTrue()
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("pending Universal Provider action is nondismissible and suppresses duplicate dispatch", async () => {
+  const pending = deferred<UniversalProviderOutcome>()
+  const initial = universalCatalog()
+  const catalog = new MemoryUniversalProviderSession(initial, async () => await pending.promise)
+  const session = new MemoryTargetSession(view())
+  const setup = await testRender(() => <App session={session} universalSession={catalog} />, {
+    width: 80, height: 30, useThread: false, kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/universal-providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Shared Frontier"))
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("Edit Universal Provider"))
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => catalog.actions.length === 1)
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Edit Universal Provider")
+
+    setup.mockInput.pressEscape()
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Edit Universal Provider")
+    expect(catalog.actions).toHaveLength(1)
+
+    pending.resolve({
+      status: "applied",
+      view: { ...initial, revision: 2, viewSequence: 2 },
+    })
+    await setup.waitForFrame((frame) => frame.includes("Shared Frontier") && frame.includes("C create"))
+    expect(catalog.actions).toHaveLength(1)
   } finally {
     setup.renderer.destroy()
   }

@@ -2,9 +2,10 @@ use tokio_rusqlite::rusqlite::{Connection, Result};
 
 use crate::control::protocol::{
     ActivatedSnapshotView, ClaudeBlockingSelector, ControlProblem, CredentialPresence,
-    ManagedConfigurationView, ProviderAuthentication, ProviderCompleteness, ProviderProtocol,
-    ProviderProvenanceView, ProviderReferenceView, ProviderRequirement, ProviderRoutingRequirement,
-    ProviderView, RecoveryView, RouteHealthView, ServiceView, TakeoverView, Target, TargetView,
+    ManagedConfigurationView, ProviderAuthentication, ProviderCompleteness,
+    ProviderFieldOwnershipView, ProviderProtocol, ProviderProvenanceView, ProviderReferenceView,
+    ProviderRequirement, ProviderRoutingRequirement, ProviderView, RecoveryView, RouteHealthView,
+    ServiceView, TakeoverView, Target, TargetView, UniversalSynchronizationState,
 };
 use crate::domain::provider::has_valid_provider_declaration;
 use crate::state::providers::provider_presets;
@@ -63,7 +64,9 @@ pub(crate) fn project_target_view_for(
 
     let mut statement = connection.prepare(
         "SELECT p.id, p.position, p.provider_revision, p.name, p.base_url, p.model, p.protocol,
-                p.authentication, p.routing_requirement, p.provenance_kind, p.provenance_key, p.generated_owner_id,
+                p.authentication, p.routing_requirement, p.provenance_kind, p.provenance_key,
+                p.generated_owner_id, p.generated_source_revision, p.generated_overlay_revision,
+                u.provider_revision, t.overlay_revision,
                 p.credential_id IS NOT NULL,
                 EXISTS(
                     SELECT 1 FROM target_route_state r
@@ -74,12 +77,16 @@ pub(crate) fn project_target_view_for(
                     JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
                     WHERE r.target = ?1 AND s.provider_id = p.id
                 )
-         FROM providers p WHERE p.target = ?1 ORDER BY p.position",
+         FROM providers p
+         LEFT JOIN universal_providers u ON u.id = p.generated_owner_id
+         LEFT JOIN universal_provider_targets t
+           ON t.universal_provider_id = p.generated_owner_id AND t.target = p.target
+         WHERE p.target = ?1 ORDER BY p.position",
     )?;
     let providers = statement
         .query_map([target_name], |row| {
             let id = uuid::Uuid::parse_str(&row.get::<_, String>(0)?).map_err(conversion_error)?;
-            let has_credential: bool = row.get(12)?;
+            let has_credential: bool = row.get(16)?;
             let base_url: String = row.get(4)?;
             let model: String = row.get(5)?;
             let mut missing_fields = Vec::new();
@@ -114,12 +121,39 @@ pub(crate) fn project_target_view_for(
                 _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
             };
             let mut active_references = Vec::new();
-            if row.get(13)? {
+            if row.get(17)? {
                 active_references.push(ProviderReferenceView::Current);
             }
-            if row.get(14)? {
+            if row.get(18)? {
                 active_references.push(ProviderReferenceView::ActivatedSnapshot);
             }
+            let generated_state = match (
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<u64>>(12)?,
+                row.get::<_, Option<u64>>(13)?,
+                row.get::<_, Option<u64>>(14)?,
+                row.get::<_, Option<u64>>(15)?,
+            ) {
+                (None, None, None, None, None) => None,
+                (
+                    Some(owner),
+                    Some(source),
+                    Some(overlay),
+                    Some(expected_source),
+                    Some(expected_overlay),
+                ) => {
+                    let owner = uuid::Uuid::parse_str(&owner).map_err(conversion_error)?;
+                    Some((
+                        owner,
+                        if source == expected_source && overlay == expected_overlay {
+                            UniversalSynchronizationState::Current
+                        } else {
+                            UniversalSynchronizationState::Pending
+                        },
+                    ))
+                }
+                _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+            };
             Ok(ProviderView {
                 id,
                 position: row.get(1)?,
@@ -146,7 +180,14 @@ pub(crate) fn project_target_view_for(
                 },
                 missing_fields,
                 provenance,
-                generated: row.get::<_, Option<String>>(11)?.is_some(),
+                generated: generated_state.is_some(),
+                universal_provider_id: generated_state.map(|value| value.0),
+                synchronization: generated_state.map(|value| value.1),
+                ownership: if generated_state.is_some() {
+                    ProviderFieldOwnershipView::generated()
+                } else {
+                    ProviderFieldOwnershipView::target_provider()
+                },
                 active_references,
             })
         })?

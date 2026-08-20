@@ -3,7 +3,7 @@ import { expect, test } from "bun:test"
 import { testRender } from "@opentui/solid"
 import { createSignal, onCleanup, type JSX } from "solid-js"
 
-import { resolveSlash } from "../src/commands/catalog"
+import { commandsForScope, resolveSlash } from "../src/commands/catalog"
 import {
   MuxviaKeymapProvider,
   useCommandLayer,
@@ -259,6 +259,30 @@ test("slash and leader resolve one exact Codex Direct Activation command", async
     expect(executed).toEqual(["target.direct.apply", "target.direct.apply"])
   } finally {
     setup.renderer.destroy()
+  }
+})
+
+test("Universal Provider catalog has one command identity from either Target", async () => {
+  for (const scope of ["codex", "claude"] as const) {
+    const executed: string[] = []
+    const setup = await commandHarness({
+      handlers: {
+        "universal-provider.list": () => executed.push("universal-provider.list"),
+      } as Handlers,
+      onDispatch: () => {},
+      scope,
+    })
+    try {
+      expect(resolveSlash("/universal-providers", scope)).toBe("universal-provider.list")
+      expect(commandsForScope(scope).find((command) => command.id === "universal-provider.list")?.palette).toBeTrue()
+      setup.keymap.dispatchCommand(resolveSlash("/universal-providers", scope)!)
+      setup.mockInput.pressKey("x", { ctrl: true })
+      setup.mockInput.pressKey("g")
+      await setup.renderOnce()
+      expect(executed).toEqual(["universal-provider.list", "universal-provider.list"])
+    } finally {
+      setup.renderer.destroy()
+    }
   }
 })
 

@@ -1052,6 +1052,25 @@ impl ReconciliationService {
         context: Option<ReconciliationContext>,
         probe_unmanaged_provider_write: bool,
     ) -> DeferredPublication<Result<(), ActionFailure>> {
+        self.ensure_write_allowed(target, context, probe_unmanaged_provider_write, false)
+            .await
+    }
+
+    pub(crate) async fn ensure_synchronization_write_allowed(
+        &self,
+        target: Target,
+        context: Option<ReconciliationContext>,
+    ) -> DeferredPublication<Result<(), ActionFailure>> {
+        self.ensure_write_allowed(target, context, true, true).await
+    }
+
+    async fn ensure_write_allowed(
+        &self,
+        target: Target,
+        context: Option<ReconciliationContext>,
+        probe_unmanaged_provider_write: bool,
+        require_unmanaged_acknowledgement: bool,
+    ) -> DeferredPublication<Result<(), ActionFailure>> {
         match self.state.managed_write_status_for(target).await {
             Ok(ManagedWriteStatus::Allowed) => {}
             Ok(ManagedWriteStatus::ConfigurationDrift) => {
@@ -1091,7 +1110,11 @@ impl ReconciliationService {
                 }
             };
             return match self
-                .ensure_compatibility_allowed(target, &compatibility, false)
+                .ensure_compatibility_allowed(
+                    target,
+                    &compatibility,
+                    require_unmanaged_acknowledgement,
+                )
                 .await
             {
                 Ok(()) => DeferredPublication::none(Ok(())),

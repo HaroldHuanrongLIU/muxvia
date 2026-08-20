@@ -6,15 +6,15 @@ use tokio_rusqlite::rusqlite::{
 
 use crate::control::protocol::{
     ActionOutcome, ActionStatus, ActivatedSnapshotView, ControlProblem, CredentialPresence,
-    ManagedConfigurationView, ProviderAuthentication, ProviderCompleteness, ProviderPresetView,
-    ProviderProtocol, ProviderProvenanceView, ProviderReferenceView, ProviderRequirement,
-    ProviderRoutingRequirement, ProviderView, RecoveryView, RouteHealthView, ServiceView,
-    TakeoverView, Target, TargetView,
+    ManagedConfigurationView, ProviderAuthentication, ProviderCompleteness,
+    ProviderFieldOwnershipView, ProviderPresetView, ProviderProtocol, ProviderProvenanceView,
+    ProviderReferenceView, ProviderRequirement, ProviderRoutingRequirement, ProviderView,
+    RecoveryView, RouteHealthView, ServiceView, TakeoverView, Target, TargetView,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -47,6 +47,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v5(connection)?;
             migrate_v6(connection)?;
             migrate_v7(connection)?;
+            migrate_v8(connection)?;
         }
         Some(2) => {
             migrate_v2(connection)?;
@@ -55,6 +56,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v5(connection)?;
             migrate_v6(connection)?;
             migrate_v7(connection)?;
+            migrate_v8(connection)?;
         }
         Some(3) => {
             migrate_v3(connection)?;
@@ -62,27 +64,113 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v5(connection)?;
             migrate_v6(connection)?;
             migrate_v7(connection)?;
+            migrate_v8(connection)?;
         }
         Some(4) => {
             migrate_v4(connection)?;
             migrate_v5(connection)?;
             migrate_v6(connection)?;
             migrate_v7(connection)?;
+            migrate_v8(connection)?;
         }
         Some(5) => {
             migrate_v5(connection)?;
             migrate_v6(connection)?;
             migrate_v7(connection)?;
+            migrate_v8(connection)?;
         }
         Some(6) => {
             migrate_v6(connection)?;
             migrate_v7(connection)?;
+            migrate_v8(connection)?;
         }
-        Some(7) => migrate_v7(connection)?,
+        Some(7) => {
+            migrate_v7(connection)?;
+            migrate_v8(connection)?;
+        }
+        Some(8) => migrate_v8(connection)?,
         Some(_) => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v8(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "ALTER TABLE providers ADD COLUMN generated_source_revision INTEGER
+           CHECK (generated_source_revision IS NULL OR generated_source_revision >= 1);
+         ALTER TABLE providers ADD COLUMN generated_overlay_revision INTEGER
+           CHECK (generated_overlay_revision IS NULL OR generated_overlay_revision >= 1);
+         CREATE UNIQUE INDEX providers_generated_owner_target
+           ON providers(generated_owner_id, target)
+           WHERE generated_owner_id IS NOT NULL;
+         CREATE TABLE universal_provider_catalog_state (
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+           revision INTEGER NOT NULL CHECK (revision >= 0),
+           view_sequence INTEGER NOT NULL CHECK (view_sequence >= 0)
+         );
+         CREATE TABLE universal_credentials (
+           id TEXT PRIMARY KEY,
+           bearer_token TEXT NOT NULL
+         );
+         CREATE TABLE universal_providers (
+           id TEXT PRIMARY KEY,
+           position INTEGER NOT NULL UNIQUE CHECK (position >= 0),
+           provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
+           name TEXT NOT NULL,
+           base_url TEXT NOT NULL,
+           credential_id TEXT REFERENCES universal_credentials(id),
+           provenance_kind TEXT,
+           provenance_key TEXT,
+           CHECK (
+             (provenance_kind IS NULL AND provenance_key IS NULL)
+             OR (provenance_kind IS NOT NULL AND provenance_key IS NOT NULL)
+           )
+         );
+         CREATE TABLE universal_provider_targets (
+           universal_provider_id TEXT NOT NULL REFERENCES universal_providers(id) ON DELETE CASCADE,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+           model TEXT NOT NULL,
+           authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
+           routing_requirement TEXT NOT NULL CHECK (routing_requirement IN ('direct-compatible', 'takeover-required')),
+           overlay_revision INTEGER NOT NULL CHECK (overlay_revision >= 1),
+           synchronized_source_revision INTEGER CHECK (synchronized_source_revision IS NULL OR synchronized_source_revision >= 1),
+           synchronized_overlay_revision INTEGER CHECK (synchronized_overlay_revision IS NULL OR synchronized_overlay_revision >= 1),
+           CHECK (
+             (target = 'codex' AND authentication = 'openai-bearer')
+             OR (target = 'claude' AND authentication IN ('anthropic-api-key', 'anthropic-bearer'))
+           ),
+           CHECK (
+             (synchronized_source_revision IS NULL AND synchronized_overlay_revision IS NULL)
+             OR (synchronized_source_revision IS NOT NULL AND synchronized_overlay_revision IS NOT NULL)
+           ),
+           PRIMARY KEY (universal_provider_id, target)
+         );
+         CREATE TABLE universal_action_receipts (
+           action_id TEXT PRIMARY KEY,
+           action_kind TEXT NOT NULL,
+           committed_revision INTEGER NOT NULL CHECK (committed_revision >= 0),
+           outcome_json TEXT NOT NULL
+         );
+         CREATE TABLE universal_provider_seeds (
+           preset_key TEXT PRIMARY KEY,
+           seeded_provider_id TEXT
+         );
+         INSERT INTO universal_provider_catalog_state
+           (singleton, revision, view_sequence) VALUES (1, 0, 0);",
+    )?;
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.execute(
+        "UPDATE metadata SET value = '9' WHERE key = 'schema-version'",
+        [],
+    )?;
+    transaction.commit()
 }
 
 fn migrate_v7(connection: &mut Connection) -> Result<()> {
@@ -834,6 +922,9 @@ impl LegacyV2ProviderView {
             missing_fields: self.missing_fields,
             provenance: self.provenance,
             generated: self.generated,
+            universal_provider_id: None,
+            synchronization: None,
+            ownership: ProviderFieldOwnershipView::target_provider(),
             active_references: self.active_references,
         }
     }
@@ -969,6 +1060,9 @@ impl LegacyV3ProviderView {
             missing_fields: self.missing_fields,
             provenance: self.provenance,
             generated: self.generated,
+            universal_provider_id: None,
+            synchronization: None,
+            ownership: ProviderFieldOwnershipView::target_provider(),
             active_references: self.active_references,
         }
     }

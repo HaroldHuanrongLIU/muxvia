@@ -8,8 +8,9 @@ import {
   parseServerFrame,
   parseTargetAction,
   parseTargetView,
+  parseUniversalProviderAction,
 } from "../src/control/types"
-import type { TargetView } from "../src/control/types"
+import type { TargetAction, TargetView } from "../src/control/types"
 
 const fixtures = new URL("../../../protocol/fixtures/", import.meta.url)
 
@@ -28,13 +29,50 @@ test.each([
   ["check-reachability.json", parseClientFrame],
   ["cancel-inspection.json", parseClientFrame],
   ["probe-compatibility.json", parseClientFrame],
+  ["open-universal-providers.json", parseClientFrame],
   ["compatibility-probe.json", parseServerFrame],
+  ["universal-provider-catalog.json", parseServerFrame],
+  ["universal-provider-act.json", parseClientFrame],
+  ["universal-provider-outcome.json", parseServerFrame],
+  ["universal-provider-view.json", parseServerFrame],
   ["preview-reconciliation.json", parseServerFrame],
   ["apply-reconciliation.json", parseTargetAction],
   ["resolve-compatibility.json", parseTargetAction],
+  ["create-universal-provider.json", parseUniversalProviderAction],
+  ["update-universal-provider.json", parseUniversalProviderAction],
+  ["duplicate-universal-provider.json", parseUniversalProviderAction],
+  ["delete-universal-provider.json", parseUniversalProviderAction],
+  ["synchronize-universal-provider.json", parseUniversalProviderAction],
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)
+})
+
+test("Universal Provider JSON schema exposes the complete closed catalog contract", async () => {
+  const schema = JSON.parse(await readFile(
+    fileURLToPath(new URL("../../../protocol/control-v1.schema.json", import.meta.url)),
+    "utf8",
+  ))
+  const hasBranch = (definition: string, discriminator: string) =>
+    schema.$defs[definition]?.oneOf?.some((branch: any) =>
+      branch.properties?.kind?.const === discriminator || branch.properties?.type?.const === discriminator)
+
+  expect(hasBranch("controlOperation", "open-universal-providers")).toBeTrue()
+  expect(hasBranch("controlOperation", "universal-provider-act")).toBeTrue()
+  expect(hasBranch("controlResult", "universal-provider-catalog")).toBeTrue()
+  expect(hasBranch("controlResult", "universal-provider-outcome")).toBeTrue()
+  expect(hasBranch("serverFrame", "universal-provider-view")).toBeTrue()
+  expect(schema.$defs.universalProviderAction).toBeDefined()
+  expect(schema.$defs.universalProviderCatalog).toBeDefined()
+  expect(schema.oneOf).toContainEqual({ $ref: "#/$defs/universalProviderAction" })
+
+  const action = await readFixture("create-universal-provider.json") as Record<string, unknown>
+  action.additiveSecret = "UNIVERSAL_ADDITIVE_SECRET_99310"
+  expect(() => parseUniversalProviderAction(action)).toThrow()
+
+  const invalidPreset = await readFixture("create-universal-provider.json") as Record<string, unknown>
+  invalidPreset.presetKey = "unstable-user-defined-preset"
+  expect(() => parseUniversalProviderAction(invalidPreset)).toThrow()
 })
 
 // Catches a parser mutation that accepts arbitrary reconciliation values or lets
@@ -279,6 +317,13 @@ test("round-trips schema-v3 Provider declarations, Presets, and credential inten
     missingFields: [],
     provenance: null,
     generated: false,
+    universalProviderId: null,
+    synchronization: null,
+    ownership: {
+      name: "target-provider", baseUrl: "target-provider", model: "target-provider",
+      protocol: "target-fixed", authentication: "target-provider",
+      routingRequirement: "target-provider", credential: "target-provider",
+    },
     activeReferences: [],
   } satisfies TargetView["providers"][number]
   const view = {
@@ -341,6 +386,77 @@ test("round-trips schema-v3 Provider declarations, Presets, and credential inten
   })
 })
 
+test("round-trips generated Provider ownership and Target Overlay edits as a closed contract", () => {
+  const generated = {
+    id: "00000000-0000-4000-8000-000000000108",
+    position: 0,
+    providerRevision: 3,
+    name: "Universal Generated",
+    baseUrl: "https://universal.example/v1",
+    model: "overlay-model",
+    protocol: "openai-responses",
+    authentication: "openai-bearer",
+    routingRequirement: "takeover-required",
+    credential: "present",
+    completeness: "complete",
+    missingFields: [],
+    provenance: { kind: "universal-provider", key: "00000000-0000-4000-8000-000000000801" },
+    generated: true,
+    universalProviderId: "00000000-0000-4000-8000-000000000801",
+    synchronization: "current",
+    ownership: {
+      name: "universal-provider",
+      baseUrl: "universal-provider",
+      model: "target-overlay",
+      protocol: "target-fixed",
+      authentication: "target-overlay",
+      routingRequirement: "target-overlay",
+      credential: "universal-provider",
+    },
+    activeReferences: ["activated-route-plan"],
+  } satisfies TargetView["providers"][number]
+  const view = {
+    target: "codex",
+    managementRevision: 4,
+    viewSequence: 4,
+    service: { epoch: "00000000-0000-4000-8000-000000000001", state: "running" },
+    mode: "unmanaged",
+    takeover: { state: "inactive", endpoint: null },
+    routeHealth: { state: "unobserved" },
+    providers: [generated],
+    providerPresets: [],
+    currentProviderId: null,
+    servingProviderId: null,
+    managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
+    recovery: { intentId: null, state: "clean" },
+    activatedSnapshot: null,
+    problems: [],
+  }
+  expect(parseTargetView(view).providers[0]).toEqual(generated)
+
+  const overlayEdit = {
+    kind: "update-provider",
+    providerId: generated.id,
+    providerRevision: generated.providerRevision,
+    name: generated.name,
+    baseUrl: generated.baseUrl,
+    model: "overlay-two",
+    credential: { kind: "keep" },
+    authentication: "openai-bearer",
+    routingRequirement: "direct-compatible",
+  } satisfies TargetAction
+  expect(parseTargetAction(overlayEdit)).toEqual(overlayEdit)
+
+  expect(() => parseTargetView({
+    ...view,
+    providers: [{ ...generated, ownership: { ...generated.ownership, model: "universal-provider" } }],
+  })).not.toThrow()
+  expect(() => parseTargetView({
+    ...view,
+    providers: [{ ...generated, ownership: { ...generated.ownership, model: "future-owner" } }],
+  })).toThrow()
+})
+
 test("round-trips Claude Messages declarations with explicit authentication and neutral Route Health", () => {
   const view = {
     target: "claude",
@@ -365,6 +481,13 @@ test("round-trips Claude Messages declarations with explicit authentication and 
       missingFields: [],
       provenance: null,
       generated: false,
+      universalProviderId: null,
+      synchronization: null,
+      ownership: {
+        name: "target-provider", baseUrl: "target-provider", model: "target-provider",
+        protocol: "target-fixed", authentication: "target-provider",
+        routingRequirement: "target-provider", credential: "target-provider",
+      },
       activeReferences: [],
     }],
     providerPresets: [{

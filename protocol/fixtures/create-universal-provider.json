@@ -1,0 +1,26 @@
+{
+  "kind": "create-universal-provider",
+  "name": "Shared Gateway",
+  "baseUrl": "https://gateway.example/v1",
+  "credential": {
+    "kind": "replace",
+    "value": "universal-provider-secret-must-not-escape"
+  },
+  "presetKey": null,
+  "targets": [
+    {
+      "target": "codex",
+      "enabled": true,
+      "model": "gateway-model",
+      "authentication": "openai-bearer",
+      "routingRequirement": "direct-compatible"
+    },
+    {
+      "target": "claude",
+      "enabled": true,
+      "model": "gateway-model",
+      "authentication": "anthropic-bearer",
+      "routingRequirement": "takeover-required"
+    }
+  ]
+}

@@ -3,7 +3,8 @@ import { createSignal, Match, onCleanup, onMount, Show, Switch, type Accessor } 
 
 import { MuxviaKeymapProvider, useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
 import type { TargetSession } from "../control/target-session"
-import type { ReachabilityResult, ReconciliationStrategy, Target, TargetAction, TargetView as TargetViewProjection } from "../control/types"
+import type { UniversalProviderSession } from "../control/universal-provider-session"
+import type { ReachabilityResult, ReconciliationStrategy, Target, TargetAction, TargetView as TargetViewProjection, UniversalProviderAction, UniversalProviderCatalogView } from "../control/types"
 import { createCommandPresenter, createTranslator, messageKeyForProblem, type Locale, type Translator } from "../i18n"
 import { theme } from "../theme"
 import { ActionPrompt } from "./action-prompt"
@@ -11,6 +12,7 @@ import { ClaudeContext } from "./claude-context"
 import { CommandPalette } from "./command-palette"
 import { ExitConfirmation } from "./exit-confirmation"
 import { Home } from "./home"
+import { GeneratedProviderForm } from "./generated-provider-form"
 import { OverlayProvider, useOverlay, type OverlayToken } from "./overlay-stack"
 import { ProviderDeleteConfirmation } from "./provider-delete-confirmation"
 import { ProviderCredentialConfirmation } from "./provider-credential-confirmation"
@@ -21,6 +23,10 @@ import { Reconciliation, type ReconciliationUiState } from "./reconciliation"
 import { TargetSidebar } from "./target-sidebar"
 import { TargetView, type ActivityEntry } from "./target-view"
 import { TakeoverRequiredConfirm } from "./takeover-required-confirm"
+import { UniversalProviderConfirmation } from "./universal-provider-confirmation"
+import { UniversalProviderEditor } from "./universal-provider-editor"
+import { UniversalProviderPicker } from "./universal-provider-picker"
+import { UniversalProviderSourcePicker } from "./universal-provider-source-picker"
 
 export type ShellRoute =
   | { kind: "home" }
@@ -30,6 +36,7 @@ export interface AppProps {
   session?: TargetSession
   sessions?: Partial<Record<Target, TargetSession>> | Accessor<Partial<Record<Target, TargetSession>>>
   unavailable?: Partial<Record<Target, string>> | Accessor<Partial<Record<Target, string>>>
+  universalSession?: UniversalProviderSession | Accessor<UniversalProviderSession | undefined>
   locale?: Locale
 }
 
@@ -110,6 +117,30 @@ function safeInspectionCategory(error: unknown): InspectionCategory {
   }
 }
 
+function safeUniversalProblem(error: unknown): string {
+  const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "internal-failure"
+  switch (code) {
+    case "generated-provider-referenced":
+    case "generated-provider-delete-forbidden":
+    case "generated-provider-read-only":
+    case "invalid-universal-provider":
+    case "no-universal-provider-change":
+    case "provider-synchronization-blocked":
+    case "recovery-required":
+    case "shadowing-configuration":
+    case "stale-universal-catalog-revision":
+    case "stale-universal-provider-revision":
+    case "state-store-error":
+    case "untested-target-cli":
+    case "incompatible-target-cli":
+    case "configuration-drift":
+    case "compatibility-acknowledgement-required":
+      return code
+    default:
+      return "internal-failure"
+  }
+}
+
 function moveIdentity(ids: readonly string[], id: string | undefined, delta: -1 | 1): string[] | undefined {
   if (!id) return undefined
   const index = ids.indexOf(id)
@@ -176,6 +207,7 @@ export function useCommandPaletteOpener(t: Translator, canOpen: () => boolean = 
 function Shell(props: {
   sessions: Accessor<Partial<Record<Target, TargetSession>>>
   unavailable: Accessor<Partial<Record<Target, string>>>
+  universalSession: Accessor<UniversalProviderSession | undefined>
   t: Translator
 }) {
   const renderer = useRenderer()
@@ -204,6 +236,11 @@ function Shell(props: {
   const [notices, setNotices] = createSignal<Partial<Record<Target | "home", Notice>>>({})
   const [activitiesByTarget, setActivitiesByTarget] = createSignal<Record<Target, ActivityEntry[]>>({ codex: [], claude: [] })
   const [sidebarOpenByTarget, setSidebarOpenByTarget] = createSignal<Record<Target, boolean>>({ codex: true, claude: true })
+  const [universalView, setUniversalView] = createSignal<UniversalProviderCatalogView | undefined>(props.universalSession()?.get() as UniversalProviderCatalogView | undefined)
+  const [universalPending, setUniversalPending] = createSignal(false)
+  const [universalNotice, setUniversalNotice] = createSignal<string>()
+  const [universalNoticeKind, setUniversalNoticeKind] = createSignal<"error" | "success">()
+  const [selectedUniversalProviderId, setSelectedUniversalProviderId] = createSignal<string>()
   const providerFormRefs: Partial<Record<Target, ProviderFormRef>> = {}
   const providerFormRefCallbacks = Object.fromEntries(
     (["codex", "claude"] as const).map((target) => [target, (value: ProviderFormRef | undefined) => {
@@ -624,6 +661,8 @@ function Shell(props: {
   onMount(() => {
     const unsubscribes = Object.values(props.sessions()).map((targetSession) =>
       targetSession.subscribe((next) => installView(next, "subscription")))
+    const catalog = props.universalSession()
+    if (catalog) unsubscribes.push(catalog.subscribe((next) => setUniversalView(next)))
     onCleanup(() => { for (const unsubscribe of unsubscribes) unsubscribe() })
   })
 
@@ -962,6 +1001,10 @@ function Shell(props: {
   const requestDelete = () => {
     const provider = selectedProvider()
     if (!provider || providerMutationPending()) return
+    if (provider.generated) {
+      setNotice({ kind: "error", text: props.t("generated-provider.delete.blocked") })
+      return
+    }
     overlay.push({
       id: "provider-delete-confirmation",
       dismissOnEscape: false,
@@ -1094,6 +1137,158 @@ function Shell(props: {
     void activateProvider(provider.id, mode)
   }
 
+  const selectedUniversalProvider = () => universalView()?.providers.find((provider) =>
+    provider.id === selectedUniversalProviderId()) ?? universalView()?.providers[0]
+
+  const runUniversalAction = async (
+    originSession: UniversalProviderSession,
+    action: UniversalProviderAction,
+  ): Promise<boolean> => {
+    if (universalPending()) return false
+    setUniversalPending(true)
+    setUniversalNotice()
+    setUniversalNoticeKind()
+    try {
+      const outcome = await originSession.act(action)
+      if (disposed || exiting || props.universalSession() !== originSession) return false
+      setUniversalView(outcome.view)
+      const selected = selectedUniversalProviderId()
+      if (selected && !outcome.view.providers.some((provider) => provider.id === selected)) {
+        setSelectedUniversalProviderId(outcome.view.providers[0]?.id)
+      }
+      setUniversalNotice(props.t("universal-provider.applied"))
+      setUniversalNoticeKind("success")
+      return true
+    } catch (error) {
+      if (disposed || exiting || props.universalSession() !== originSession) return false
+      setUniversalView(originSession.get() as UniversalProviderCatalogView)
+      setUniversalNotice(props.t("universal-provider.error", { code: safeUniversalProblem(error) }))
+      setUniversalNoticeKind("error")
+      return false
+    } finally {
+      if (!disposed && !exiting) setUniversalPending(false)
+    }
+  }
+
+  const openUniversalEditor = (
+    originSession: UniversalProviderSession,
+    mode: "create" | "edit" | "duplicate",
+    provider = selectedUniversalProvider(),
+    preset?: UniversalProviderCatalogView["presets"][number],
+  ) => {
+    if (universalPending() || (mode !== "create" && !provider)) return
+    setUniversalNotice()
+    setUniversalNoticeKind()
+    overlay.push({
+      id: "universal-provider-editor",
+      dismissOnEscape: false,
+      render: () => <UniversalProviderEditor
+        mode={mode}
+        provider={provider}
+        preset={preset}
+        pending={universalPending()}
+        notice={universalNotice()}
+        t={props.t}
+        onCancel={() => overlay.closeTop()}
+        onSave={(action) => runUniversalAction(originSession, action)}
+      />,
+    })
+  }
+
+  const openUniversalSourcePicker = (originSession: UniversalProviderSession) => {
+    if (universalPending()) return
+    setUniversalNotice()
+    setUniversalNoticeKind()
+    overlay.push({
+      id: "universal-provider-source-picker",
+      render: () => <UniversalProviderSourcePicker
+        presets={universalView()?.presets ?? []}
+        t={props.t}
+        onSelect={(preset) => {
+          overlay.closeTop()
+          queueMicrotask(() => {
+            if (!disposed && !universalPending()) openUniversalEditor(originSession, "create", undefined, preset)
+          })
+        }}
+      />,
+    })
+  }
+
+  const confirmUniversalAction = (
+    originSession: UniversalProviderSession,
+    kind: "delete" | "synchronize",
+  ) => {
+    const provider = selectedUniversalProvider()
+    if (!provider || universalPending()) return
+    setUniversalNotice()
+    setUniversalNoticeKind()
+    const removals = provider.targets.filter((target) => !target.enabled && target.generatedProviderId !== null)
+    const blockers = provider.targets.flatMap((target) => target.activeReferences.map((reference) =>
+      `${props.t(`target.${target.target}`)}: ${reference}`))
+    overlay.push({
+      id: `universal-provider-${kind}-confirmation`,
+      dismissOnEscape: false,
+      render: () => <UniversalProviderConfirmation
+        title={props.t(`universal-provider.${kind}.title`)}
+        message={props.t(`universal-provider.${kind}.message`, {
+          name: provider.name,
+          targets: removals.length
+            ? removals.map((target) => props.t(`target.${target.target}`)).join(", ")
+            : props.t("universal-provider.none"),
+          blockers: blockers.length ? blockers.join(", ") : props.t("universal-provider.none"),
+        })}
+        pending={universalPending()}
+        notice={universalNotice()}
+        t={props.t}
+        onCancel={() => overlay.closeTop()}
+        onConfirm={() => { void (async () => {
+          const applied = await runUniversalAction(originSession, kind === "delete"
+            ? {
+              kind: "delete-universal-provider",
+              providerId: provider.id,
+              providerRevision: provider.providerRevision,
+            }
+            : {
+              kind: "synchronize-universal-provider",
+              providerId: provider.id,
+              providerRevision: provider.providerRevision,
+            })
+          if (applied) overlay.closeTop()
+        })() }}
+      />,
+    })
+  }
+
+  const openUniversalProviders = () => {
+    const originSession = props.universalSession()
+    if (!originSession || overlay.depth > 0 || universalPending()) return
+    setUniversalView(originSession.get() as UniversalProviderCatalogView)
+    setUniversalNotice()
+    setUniversalNoticeKind()
+    const catalog = originSession.get()
+    const preferred = catalog.providers.find((provider) => provider.id === selectedUniversalProviderId())
+      ?? catalog.providers[0]
+    setSelectedUniversalProviderId(preferred?.id)
+    overlay.replace({
+      id: "universal-provider-picker",
+      dismissOnEscape: () => !universalPending(),
+      render: () => <UniversalProviderPicker
+        providers={() => universalView()?.providers ?? []}
+        selectedId={selectedUniversalProviderId}
+        pending={universalPending}
+        notice={universalNotice}
+        noticeKind={universalNoticeKind}
+        t={props.t}
+        onSelectedIdChange={setSelectedUniversalProviderId}
+        onCreate={() => openUniversalSourcePicker(originSession)}
+        onEdit={() => openUniversalEditor(originSession, "edit")}
+        onDuplicate={() => openUniversalEditor(originSession, "duplicate")}
+        onDelete={() => confirmUniversalAction(originSession, "delete")}
+        onSynchronize={() => confirmUniversalAction(originSession, "synchronize")}
+      />,
+    })
+  }
+
   useCommandLayer({
     scope: "global",
     priority: 0,
@@ -1132,6 +1327,7 @@ function Shell(props: {
         openProviderSourcePicker()
       },
       "provider.list": openProviderPicker,
+      "universal-provider.list": openUniversalProviders,
       "target.direct.apply": () => applyDefaultProvider("direct"),
       "target.takeover.apply": () => applyDefaultProvider("takeover"),
       "target.reconciliation.open": openReconciliation,
@@ -1146,6 +1342,7 @@ function Shell(props: {
       "target.sidebar.toggle": () => setSidebarOpen((open) => !open),
       "provider.create": openProviderSourcePicker,
       "provider.list": openProviderPicker,
+      "universal-provider.list": openUniversalProviders,
       "target.direct.apply": () => applyDefaultProvider("direct"),
       "target.takeover.apply": () => applyDefaultProvider("takeover"),
       "target.reconciliation.open": openReconciliation,
@@ -1195,7 +1392,8 @@ function Shell(props: {
                   <Show when={notice()}>
                     <text fg={notice()?.kind === "error" ? theme.error : theme.success}>{notice()?.text}</text>
                   </Show>
-                  <ProviderForm
+                  <Show when={editor()?.mode === "edit" && view()?.providers.find((provider) => provider.id === editor()?.draft.providerId)?.generated}
+                    fallback={<ProviderForm
                     mode={editor()?.mode ?? "create"}
                     initialDraft={editor()?.draft ?? { name: "", baseUrl: "", model: "" }}
                     credentialPresence={editor()?.credentialPresence ?? "missing"}
@@ -1218,7 +1416,21 @@ function Shell(props: {
                       setEditor()
                     }}
                     onSave={saveProvider}
-                  />
+                  />}>
+                    <GeneratedProviderForm
+                      provider={view()!.providers.find((provider) => provider.id === editor()!.draft.providerId)!}
+                      providerRevision={editor()!.draft.providerRevision!}
+                      target={activeTarget()!}
+                      pending={saving()}
+                      t={props.t}
+                      onDirtyChange={(dirty) => setEditor((current) => current ? { ...current, dirty } : current)}
+                      onCancel={() => {
+                        bumpEditorGeneration()
+                        setEditor()
+                      }}
+                      onSave={saveProvider}
+                    />
+                  </Show>
                 </box>
               </scrollbox>
             </Show>
@@ -1247,16 +1459,20 @@ export function App(props: AppProps) {
   const t = createTranslator(props.locale ?? "en")
   const sessionSource = props.sessions
   const unavailableSource = props.unavailable
+  const universalSessionSource = props.universalSession
   const sessions: Accessor<Partial<Record<Target, TargetSession>>> = typeof sessionSource === "function"
     ? sessionSource
     : () => sessionSource ?? (props.session ? { [props.session.get().target]: props.session } : {})
   const unavailable: Accessor<Partial<Record<Target, string>>> = typeof unavailableSource === "function"
     ? unavailableSource
     : () => unavailableSource ?? {}
+  const universalSession: Accessor<UniversalProviderSession | undefined> = typeof universalSessionSource === "function"
+    ? universalSessionSource
+    : () => universalSessionSource
   return (
     <MuxviaKeymapProvider presenter={createCommandPresenter(t)}>
       <OverlayProvider>
-        <Shell sessions={sessions} unavailable={unavailable} t={t} />
+        <Shell sessions={sessions} unavailable={unavailable} universalSession={universalSession} t={t} />
       </OverlayProvider>
     </MuxviaKeymapProvider>
   )

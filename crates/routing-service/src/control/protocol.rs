@@ -133,9 +133,14 @@ pub enum ServerFrame {
         problem: ControlProblem,
         #[serde(skip_serializing_if = "Option::is_none")]
         authoritative_view: Option<TargetView>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        authoritative_universal_provider_view: Option<UniversalProviderCatalogView>,
     },
     TargetView {
         view: TargetView,
+    },
+    UniversalProviderView {
+        view: UniversalProviderCatalogView,
     },
 }
 
@@ -146,6 +151,15 @@ pub enum ServerFrame {
     rename_all_fields = "camelCase"
 )]
 pub enum ControlOperation {
+    OpenUniversalProviders {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claude_context: Option<ClaudePreflightContext>,
+    },
+    UniversalProviderAct {
+        action_id: Uuid,
+        expected_revision: u64,
+        action: Value,
+    },
     OpenTarget {
         target: Target,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -388,6 +402,17 @@ impl fmt::Debug for DraftCredentialSource {
 impl fmt::Debug for ControlOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::OpenUniversalProviders { .. } => formatter.write_str("OpenUniversalProviders"),
+            Self::UniversalProviderAct {
+                action_id,
+                expected_revision,
+                ..
+            } => formatter
+                .debug_struct("UniversalProviderAct")
+                .field("action_id", action_id)
+                .field("expected_revision", expected_revision)
+                .field("action", &Redacted)
+                .finish(),
             Self::OpenTarget { target, .. } => formatter
                 .debug_struct("OpenTarget")
                 .field("target", target)
@@ -460,6 +485,8 @@ pub enum TargetAction {
         credential: CredentialEdit,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authentication: Option<ProviderAuthentication>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        routing_requirement: Option<ProviderRoutingRequirement>,
     },
     ReorderProviders {
         provider_ids: Vec<Uuid>,
@@ -489,6 +516,61 @@ pub enum TargetAction {
         acknowledge_version: Option<String>,
     },
     ResolveCompatibility(ResolveCompatibilityAction),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum UniversalProviderAction {
+    CreateUniversalProvider {
+        name: String,
+        base_url: String,
+        credential: CredentialEdit,
+        preset_key: Option<String>,
+        targets: Vec<UniversalProviderTargetDraft>,
+    },
+    UpdateUniversalProvider {
+        provider_id: Uuid,
+        #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+        provider_revision: u64,
+        name: String,
+        base_url: String,
+        credential: CredentialEdit,
+        targets: Vec<UniversalProviderTargetDraft>,
+    },
+    DuplicateUniversalProvider {
+        source_provider_id: Uuid,
+        #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+        source_provider_revision: u64,
+        name: String,
+        base_url: String,
+        credential: DuplicateCredential,
+        targets: Vec<UniversalProviderTargetDraft>,
+    },
+    DeleteUniversalProvider {
+        provider_id: Uuid,
+        #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+        provider_revision: u64,
+    },
+    SynchronizeUniversalProvider {
+        provider_id: Uuid,
+        #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+        provider_revision: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UniversalProviderTargetDraft {
+    pub target: Target,
+    pub enabled: bool,
+    pub model: String,
+    pub authentication: ProviderAuthentication,
+    pub routing_requirement: ProviderRoutingRequirement,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -535,6 +617,7 @@ impl fmt::Debug for TargetAction {
                 model,
                 credential,
                 authentication,
+                routing_requirement,
             } => formatter
                 .debug_struct("UpdateProvider")
                 .field("provider_id", provider_id)
@@ -544,6 +627,7 @@ impl fmt::Debug for TargetAction {
                 .field("model", model)
                 .field("credential", credential)
                 .field("authentication", authentication)
+                .field("routing_requirement", routing_requirement)
                 .finish(),
             Self::ReorderProviders { provider_ids } => formatter
                 .debug_struct("ReorderProviders")
@@ -669,11 +753,84 @@ pub enum ActivationMode {
 )]
 pub enum ControlResult {
     TargetView { view: TargetView },
+    UniversalProviderCatalog { view: UniversalProviderCatalogView },
+    UniversalProviderOutcome { outcome: UniversalProviderOutcome },
     ActionOutcome { outcome: ActionOutcome },
     ModelDiscovery { result: ModelDiscoveryResult },
     Reachability { result: ReachabilityResult },
     ReconciliationPreview { preview: ReconciliationPreview },
     CompatibilityProbe(CompatibilityProbeResult),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UniversalProviderOutcome {
+    pub status: ActionStatus,
+    pub view: UniversalProviderCatalogView,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UniversalProviderCatalogView {
+    pub revision: u64,
+    pub view_sequence: u64,
+    pub providers: Vec<UniversalProviderView>,
+    pub presets: Vec<UniversalProviderPresetView>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UniversalProviderView {
+    pub id: Uuid,
+    pub position: u32,
+    #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+    pub provider_revision: u64,
+    pub name: String,
+    pub base_url: String,
+    pub credential: CredentialPresence,
+    pub provenance: Option<ProviderProvenanceView>,
+    pub targets: Vec<UniversalProviderTargetView>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UniversalProviderTargetView {
+    pub target: Target,
+    pub enabled: bool,
+    pub model: String,
+    pub authentication: ProviderAuthentication,
+    pub routing_requirement: ProviderRoutingRequirement,
+    #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+    pub overlay_revision: u64,
+    pub generated_provider_id: Option<Uuid>,
+    pub synchronization: UniversalSynchronizationState,
+    pub active_references: Vec<ProviderReferenceView>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UniversalSynchronizationState {
+    Current,
+    Pending,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UniversalProviderPresetView {
+    pub key: String,
+    pub name: String,
+    pub base_url: String,
+    pub targets: Vec<UniversalProviderPresetTargetView>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UniversalProviderPresetTargetView {
+    pub target: Target,
+    pub enabled: bool,
+    pub model: String,
+    pub authentication: ProviderAuthentication,
+    pub routing_requirement: ProviderRoutingRequirement,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -878,7 +1035,66 @@ pub struct ProviderView {
     pub missing_fields: Vec<ProviderRequirement>,
     pub provenance: Option<ProviderProvenanceView>,
     pub generated: bool,
+    #[serde(default)]
+    pub universal_provider_id: Option<Uuid>,
+    #[serde(default)]
+    pub synchronization: Option<UniversalSynchronizationState>,
+    #[serde(default)]
+    pub ownership: ProviderFieldOwnershipView,
     pub active_references: Vec<ProviderReferenceView>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderFieldOwner {
+    TargetProvider,
+    UniversalProvider,
+    TargetOverlay,
+    TargetFixed,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderFieldOwnershipView {
+    pub name: ProviderFieldOwner,
+    pub base_url: ProviderFieldOwner,
+    pub model: ProviderFieldOwner,
+    pub protocol: ProviderFieldOwner,
+    pub authentication: ProviderFieldOwner,
+    pub routing_requirement: ProviderFieldOwner,
+    pub credential: ProviderFieldOwner,
+}
+
+impl ProviderFieldOwnershipView {
+    pub(crate) fn target_provider() -> Self {
+        Self {
+            name: ProviderFieldOwner::TargetProvider,
+            base_url: ProviderFieldOwner::TargetProvider,
+            model: ProviderFieldOwner::TargetProvider,
+            protocol: ProviderFieldOwner::TargetFixed,
+            authentication: ProviderFieldOwner::TargetProvider,
+            routing_requirement: ProviderFieldOwner::TargetProvider,
+            credential: ProviderFieldOwner::TargetProvider,
+        }
+    }
+
+    pub(crate) fn generated() -> Self {
+        Self {
+            name: ProviderFieldOwner::UniversalProvider,
+            base_url: ProviderFieldOwner::UniversalProvider,
+            model: ProviderFieldOwner::TargetOverlay,
+            protocol: ProviderFieldOwner::TargetFixed,
+            authentication: ProviderFieldOwner::TargetOverlay,
+            routing_requirement: ProviderFieldOwner::TargetOverlay,
+            credential: ProviderFieldOwner::UniversalProvider,
+        }
+    }
+}
+
+impl Default for ProviderFieldOwnershipView {
+    fn default() -> Self {
+        Self::target_provider()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -977,6 +1193,7 @@ pub struct ProviderProvenanceView {
 pub enum ProviderReferenceView {
     Current,
     ActivatedSnapshot,
+    ActivatedRoutePlan,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

@@ -2,7 +2,8 @@ use std::{fs, path::PathBuf, sync::Arc};
 
 use muxvia_routing::{
     control::protocol::{
-        ActionStatus, CredentialPresence, ProviderReferenceView, ProviderRoutingRequirement,
+        ActionStatus, CredentialPresence, ProviderFieldOwner, ProviderReferenceView,
+        ProviderRoutingRequirement,
     },
     home::MuxviaHome,
     state::StateStore,
@@ -140,31 +141,59 @@ async fn set_runtime_state(home: &MuxviaHome, provider_id: Uuid, snapshot_id: Uu
 }
 
 async fn mark_generated(home: &MuxviaHome, provider_id: Uuid, owner_id: Uuid) {
-    tokio_rusqlite::Connection::open(home.database_path())
-        .await
-        .unwrap()
-        .call(move |connection| -> Result<()> {
-            connection.execute(
-                "UPDATE providers
-                 SET generated_owner_id = ?1,
-                     provenance_kind = 'universal-provider', provenance_key = ?1
-                 WHERE id = ?2",
-                params![owner_id.to_string(), provider_id.to_string()],
-            )?;
-            Ok(())
-        })
-        .await
-        .unwrap();
+    seed_generated_owner(home, provider_id, owner_id, true).await;
 }
 
 async fn set_generated_owner(home: &MuxviaHome, provider_id: Uuid, owner_id: Uuid) {
+    seed_generated_owner(home, provider_id, owner_id, false).await;
+}
+
+async fn seed_generated_owner(
+    home: &MuxviaHome,
+    provider_id: Uuid,
+    owner_id: Uuid,
+    replace_provenance: bool,
+) {
     tokio_rusqlite::Connection::open(home.database_path())
         .await
         .unwrap()
         .call(move |connection| -> Result<()> {
+            let (name, base_url, model, authentication, routing_requirement): (
+                String,
+                String,
+                String,
+                String,
+                String,
+            ) = connection.query_row(
+                "SELECT name, base_url, model, authentication, routing_requirement
+                 FROM providers WHERE id = ?1",
+                [provider_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )?;
             connection.execute(
-                "UPDATE providers SET generated_owner_id = ?1 WHERE id = ?2",
-                params![owner_id.to_string(), provider_id.to_string()],
+                "INSERT INTO universal_providers
+                 (id, position, provider_revision, name, base_url)
+                 VALUES (?1, 0, 1, ?2, ?3)",
+                params![owner_id.to_string(), name, base_url],
+            )?;
+            connection.execute(
+                "INSERT INTO universal_provider_targets
+                 (universal_provider_id, target, enabled, model, authentication,
+                  routing_requirement, overlay_revision, synchronized_source_revision,
+                  synchronized_overlay_revision)
+                 VALUES (?1, 'codex', 1, ?2, ?3, ?4, 1, 1, 1),
+                        (?1, 'claude', 0, '', 'anthropic-api-key',
+                         'direct-compatible', 1, NULL, NULL)",
+                params![owner_id.to_string(), model, authentication, routing_requirement],
+            )?;
+            connection.execute(
+                "UPDATE providers
+                 SET generated_owner_id = ?1, generated_source_revision = 1,
+                     generated_overlay_revision = 1,
+                     provenance_kind = CASE WHEN ?3 THEN 'universal-provider' ELSE provenance_kind END,
+                     provenance_key = CASE WHEN ?3 THEN ?1 ELSE provenance_key END
+                 WHERE id = ?2",
+                params![owner_id.to_string(), provider_id.to_string(), replace_provenance],
             )?;
             Ok(())
         })
@@ -496,7 +525,7 @@ async fn generated_source_duplicates_as_an_ordinary_detached_provider() {
                 "Detached",
                 "https://detached.example/v1",
                 "detached-model",
-                serde_json::json!({ "kind": "without" }),
+                serde_json::json!({ "kind": "reuse-source" }),
             ),
         )
         .await
@@ -508,6 +537,15 @@ async fn generated_source_duplicates_as_an_ordinary_detached_provider() {
         .find(|provider| provider.name == "Detached")
         .unwrap();
     assert!(!detached.generated);
+    assert_eq!(detached.universal_provider_id, None);
+    assert_eq!(detached.synchronization, None);
+    assert_eq!(detached.ownership.name, ProviderFieldOwner::TargetProvider);
+    assert_eq!(detached.ownership.protocol, ProviderFieldOwner::TargetFixed);
+    assert_eq!(detached.credential, CredentialPresence::Present);
+    assert_eq!(
+        credential_id(&fixture.home, detached.id).await,
+        credential_id(&fixture.home, source.id).await
+    );
     assert_eq!(detached.provenance, None);
     assert_eq!(
         generated_metadata(&fixture.home, detached.id).await,

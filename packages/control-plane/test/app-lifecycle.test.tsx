@@ -10,7 +10,8 @@ import {
   type SignalSource,
 } from "../src/app"
 import type { TargetSession } from "../src/control/target-session"
-import type { ActionOutcome, TargetAction, TargetView } from "../src/control/types"
+import type { UniversalProviderSession } from "../src/control/universal-provider-session"
+import type { ActionOutcome, ClaudePreflightContext, TargetAction, TargetView, UniversalProviderAction, UniversalProviderCatalogView, UniversalProviderOutcome } from "../src/control/types"
 
 const initialView: TargetView = {
   target: "codex",
@@ -114,6 +115,24 @@ class LifecycleSession implements TargetSession {
     return { status: "applied", view: initialView }
   }
   subscribe(_listener: (next: TargetView) => void): () => void { return () => {} }
+  async close(): Promise<void> { this.closeCalls++ }
+  whenClosed(): Promise<void> { return this.closed.promise }
+}
+
+class LifecycleUniversalSession implements UniversalProviderSession {
+  closeCalls = 0
+  readonly closed = deferred<void>()
+  readonly view: UniversalProviderCatalogView = {
+    revision: 0,
+    viewSequence: 0,
+    providers: [],
+    presets: [],
+  }
+  get(): Readonly<UniversalProviderCatalogView> { return this.view }
+  async act(_action: UniversalProviderAction): Promise<UniversalProviderOutcome> {
+    return { status: "applied", view: this.view }
+  }
+  subscribe(_listener: (next: UniversalProviderCatalogView) => void): () => void { return () => {} }
   async close(): Promise<void> { this.closeCalls++ }
   whenClosed(): Promise<void> { return this.closed.promise }
 }
@@ -225,6 +244,41 @@ test("startup opens independent Codex and Claude sessions and closes each exactl
     expect(targets).toEqual(["codex", "claude"])
     expect(codex.closeCalls).toBe(1)
     expect(claude.closeCalls).toBe(1)
+  } finally {
+    if (!setup.renderer.isDestroyed) setup.renderer.destroy()
+  }
+})
+
+test("startup mounts and closes one independent Universal Provider catalog session", async () => {
+  const { setup } = await rendererFixture()
+  const target = new LifecycleSession()
+  const catalog = new LifecycleUniversalSession()
+  let catalogConnections = 0
+  let catalogContext: ClaudePreflightContext | undefined
+  const running = run(options, ports(setup, target, {
+    connectUniversalProviders: async (_socketPath, _release, _signal, claudeContext) => {
+      catalogConnections++
+      catalogContext = claudeContext
+      return catalog
+    },
+  }))
+  try {
+    await setup.waitForFrame((frame) => frame.includes("MUXVIA"))
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/universal-providers")
+    setup.mockInput.pressEnter()
+    await setup.waitForFrame((frame) => frame.includes("No Universal Providers"))
+    setup.mockInput.pressEscape()
+    await setup.waitForFrame((frame) => frame.includes("Codex · Control Plane") && !frame.includes("No Universal Providers"))
+    setup.mockInput.pressCtrlC()
+    await running
+    expect(catalogConnections).toBe(1)
+    expect(catalogContext).toMatchObject({
+      claudeConfigDir: null,
+      selectorState: "unset",
+      hostManagedState: "unmanaged",
+    })
+    expect(catalog.closeCalls).toBe(1)
   } finally {
     if (!setup.renderer.isDestroyed) setup.renderer.destroy()
   }

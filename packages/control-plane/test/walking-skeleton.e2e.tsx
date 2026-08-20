@@ -239,6 +239,112 @@ async function claudePost(
 
 type HeldReconciliationTarget = "codex" | "claude"
 
+type FailoverFixtureBehavior = "success" | "retryable-failure"
+
+async function startFailoverFixtureUpstream(
+  target: HeldReconciliationTarget,
+  credential: string,
+) {
+  const calls: CapturedRequest[] = []
+  const waiters = new Set<() => void>()
+  let behavior: FailoverFixtureBehavior = "success"
+  let held: {
+    behavior: FailoverFixtureBehavior
+    started: () => void
+    release: Promise<void>
+    releaseNow: () => void
+  } | undefined
+  const server = createHttpServer(async (request, response) => {
+    const body: Buffer[] = []
+    for await (const chunk of request) body.push(Buffer.from(chunk))
+    const captured: CapturedRequest = {
+      authorization: typeof request.headers.authorization === "string" ? request.headers.authorization : null,
+      headers: Object.fromEntries(Object.entries(request.headers).map(([name, value]) => [name, value ?? null])),
+      contentType: typeof request.headers["content-type"] === "string" ? request.headers["content-type"] : null,
+      method: request.method ?? "",
+      testHeader: typeof request.headers["x-test-preserved"] === "string" ? request.headers["x-test-preserved"] : null,
+      body: Buffer.concat(body).toString("utf8"),
+      path: request.url ?? "",
+    }
+    if (request.method === "GET") {
+      response.writeHead(401, { "x-fixture-reachability": "reachable" }).end()
+      return
+    }
+    calls.push(captured)
+    for (const notify of waiters) notify()
+    const expectedPath = target === "codex" ? "/v1/responses" : "/v1/messages"
+    if (captured.path.split("?", 1)[0] !== expectedPath || captured.authorization !== `Bearer ${credential}`) {
+      response.writeHead(403, { "content-type": "application/json" }).end('{"error":"fixture-rejected"}')
+      return
+    }
+    let selected = behavior
+    if (held) {
+      const current = held
+      selected = current.behavior
+      current.started()
+      await current.release
+      if (held === current) held = undefined
+    }
+    if (selected === "retryable-failure") {
+      response.writeHead(503, { "content-type": "application/json" })
+      response.end('{"error":"fixture-unavailable"}')
+      return
+    }
+    response.writeHead(target === "codex" ? 201 : 200, { "content-type": "text/event-stream" })
+    for (const part of target === "codex" ? SSE_BYTES : CLAUDE_SSE_BYTES) response.write(part)
+    response.end()
+  })
+  await new Promise<void>((resolveListen, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolveListen)
+  })
+  const address = server.address()
+  if (!address || typeof address === "string") throw new Error("failover-upstream-address-missing")
+  return {
+    target,
+    credential,
+    calls,
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    setBehavior(next: FailoverFixtureBehavior) { behavior = next },
+    holdNext(next: FailoverFixtureBehavior) {
+      if (held) throw new Error("failover-upstream-hold-already-armed")
+      let started!: () => void
+      let release!: () => void
+      const startedPromise = new Promise<void>((resolveStarted) => { started = resolveStarted })
+      const releasePromise = new Promise<void>((resolveRelease) => { release = resolveRelease })
+      held = { behavior: next, started, release: releasePromise, releaseNow: release }
+      return { started: startedPromise, release }
+    },
+    async waitForCallCount(count: number) {
+      if (calls.length >= count) return
+      await new Promise<void>((resolveCount, reject) => {
+        const timeout = setTimeout(() => {
+          waiters.delete(notify)
+          reject(new Error(`failover-upstream-call-timeout:${target}:${count}`))
+        }, deadlineMs)
+        const notify = () => {
+          if (calls.length < count) return
+          clearTimeout(timeout)
+          waiters.delete(notify)
+          resolveCount()
+        }
+        waiters.add(notify)
+      })
+    },
+    releaseHeld() {
+      const current = held
+      held = undefined
+      current?.releaseNow()
+    },
+    async stop() {
+      held?.releaseNow()
+      held = undefined
+      server.closeAllConnections()
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
+    },
+  }
+}
+
 async function startHeldReconciliationUpstream(credentials: Readonly<Record<HeldReconciliationTarget, string>>) {
   const calls: CapturedRequest[] = []
   let hold: {
@@ -6984,6 +7090,432 @@ test("real processes prove the complete Target Provider workflow without leaking
     await upstream.stop()
   }
 })
+
+test("real processes prove failover routes, pinned epochs, stale health, and target isolation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "fh-"))
+  roots.push(root)
+  const userHome = join(root, "home")
+  const muxviaHome = join(userHome, ".muxvia")
+  const socketPath = join(muxviaHome, "run/control.sock")
+  const databasePath = join(muxviaHome, "state/muxvia.db")
+  const codexConfig = join(userHome, ".codex/config.toml")
+  const claudeSettings = join(userHome, ".claude/settings.json")
+  const firstShutdown = join(root, "shutdown-first")
+  const targetNames = ["codex", "claude"] as const
+  type FailoverTarget = typeof targetNames[number]
+  type FailoverFixture = Awaited<ReturnType<typeof startFailoverFixtureUpstream>>
+  type TargetFixtures = { primary: FailoverFixture; fallbackA: FailoverFixture; fallbackB: FailoverFixture }
+
+  const fixtureSecrets = {
+    codex: {
+      primary: "failover-codex-primary-provider-secret",
+      fallbackA: "failover-codex-fallback-a-provider-secret",
+      fallbackB: "failover-codex-fallback-b-provider-secret",
+    },
+    claude: {
+      primary: "failover-claude-primary-provider-secret",
+      fallbackA: "failover-claude-fallback-a-provider-secret",
+      fallbackB: "failover-claude-fallback-b-provider-secret",
+    },
+  } as const
+  const fixtures = {
+    codex: {
+      primary: await startFailoverFixtureUpstream("codex", fixtureSecrets.codex.primary),
+      fallbackA: await startFailoverFixtureUpstream("codex", fixtureSecrets.codex.fallbackA),
+      fallbackB: await startFailoverFixtureUpstream("codex", fixtureSecrets.codex.fallbackB),
+    },
+    claude: {
+      primary: await startFailoverFixtureUpstream("claude", fixtureSecrets.claude.primary),
+      fallbackA: await startFailoverFixtureUpstream("claude", fixtureSecrets.claude.fallbackA),
+      fallbackB: await startFailoverFixtureUpstream("claude", fixtureSecrets.claude.fallbackB),
+    },
+  } satisfies Record<FailoverTarget, TargetFixtures>
+  const allFixtures = targetNames.flatMap((target) => Object.values(fixtures[target]))
+  const providerSecrets = targetNames.flatMap((target) => Object.values(fixtureSecrets[target]))
+  const routingSecrets = new Set<string>()
+  const publicSecrets = () => [...providerSecrets, ...routingSecrets]
+  const services: Array<{ child: ReturnType<typeof spawn>; output: ReturnType<typeof captureProcessOutput> }> = []
+  const readinessSockets: Array<ReturnType<typeof createConnection>> = []
+  const rpcStreams: Buffer[][] = []
+  const decodedFrames: unknown[] = []
+  const observedViews: TargetView[] = []
+  const observedOutcomes: unknown[] = []
+  const nativeFrames: string[] = []
+  let codexClient: RpcClient | undefined
+  let claudeClient: RpcClient | undefined
+  let codexSession: TargetSession | undefined
+  let claudeSession: TargetSession | undefined
+  let subscriptions: Array<() => void> = []
+  let setup: Awaited<ReturnType<typeof testRender>> | undefined
+  let recorder: ReturnType<typeof createRendererAudit> | undefined
+
+  await mkdir(dirname(codexConfig), { recursive: true, mode: 0o700 })
+  await mkdir(dirname(claudeSettings), { recursive: true, mode: 0o700 })
+  await writeFile(codexConfig, '# operator comment survives\nunrelated = "keep-me"\n', { mode: 0o600 })
+  await writeFile(claudeSettings, JSON.stringify({
+    operator: { theme: "dark", hooks: ["keep"] },
+    env: { OPERATOR_UNRELATED: "keep-me" },
+  }, null, 2), { mode: 0o640 })
+  await chmod(fakeCodex, 0o755)
+  await chmod(fakeClaude, 0o755)
+
+  const startService = async (label: string, shutdownFile?: string) => {
+    const args = [
+      "--home", muxviaHome,
+      "--test-codex-executable", fakeCodex,
+      "--test-claude-executable", fakeClaude,
+    ]
+    if (shutdownFile) args.push("--test-shutdown-file", shutdownFile)
+    const child = spawn(serviceBinary, args, {
+      cwd: root,
+      env: { HOME: userHome, PATH: `${dirname(fakeCodex)}:/usr/bin:/bin`, MUXVIA_INTEGRATION_TEST: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    const output = captureProcessOutput(child)
+    const service = { child, output }
+    services.push(service)
+    const exitedBeforeReady = output.completed.then(({ code }) => {
+      scanProcessOutputNoSecrets(output.streams, publicSecrets())
+      throw new Error(`failover-routing-service-exited:${label}:${code}`)
+    }) as Promise<never>
+    await waitForEventTurnReadiness(
+      () => probeUnixSocket(socketPath, readinessSockets),
+      exitedBeforeReady,
+      `failover-${label}-service`,
+    )
+    return service
+  }
+  const connect = async (release: string) => {
+    const chunks: Buffer[] = []
+    const decoder = new FrameDecoder()
+    rpcStreams.push(chunks)
+    const client = await eventBarrier(RpcClient.connect(socketPath, release, undefined, (path) => {
+      const socket = createConnection({ path })
+      socket.on("data", (chunk) => {
+        const bytes = Buffer.from(chunk)
+        chunks.push(bytes)
+        for (const frame of decoder.push(bytes)) {
+          assertSecretSafeStructured(frame, publicSecrets(), "failover-rpc-frame")
+          decodedFrames.push(frame)
+        }
+      })
+      return socket
+    }), `${release}-connect`)
+    readinessSockets.splice(0).forEach((socket) => socket.destroy())
+    return client
+  }
+  const openSessions = async (release: string) => {
+    codexClient = await connect(`${release}-codex`)
+    claudeClient = await connect(`${release}-claude`)
+    codexSession = await eventBarrier(codexClient.openTarget("codex"), `${release}-codex-open`)
+    claudeSession = await eventBarrier(claudeClient.openTarget("claude", {
+      claudeConfigDir: null,
+      selectorState: "unset",
+      hostManagedState: "unmanaged",
+      cwd: root,
+    }), `${release}-claude-open`)
+    const collect = (view: TargetView) => {
+      assertSecretSafeStructured(view, publicSecrets(), "failover-target-view")
+      observedViews.push(view)
+    }
+    collect(codexSession.get() as TargetView)
+    collect(claudeSession.get() as TargetView)
+    subscriptions = [
+      codexSession.subscribe((view) => collect(view as TargetView)),
+      claudeSession.subscribe((view) => collect(view as TargetView)),
+    ]
+  }
+  const closeSessions = async () => {
+    subscriptions.splice(0).forEach((unsubscribe) => unsubscribe())
+    const sessions = [codexSession, claudeSession]
+    const clients = [codexClient, claudeClient]
+    codexSession = undefined
+    claudeSession = undefined
+    codexClient = undefined
+    claudeClient = undefined
+    await Promise.all(sessions.map((session) => session?.close().catch(() => undefined)))
+    await Promise.all(clients.map((client) => client?.close().catch(() => undefined)))
+  }
+  const sessionFor = (target: FailoverTarget): TargetSession => {
+    const session = target === "codex" ? codexSession : claudeSession
+    if (!session) throw new Error(`failover-session-missing:${target}`)
+    return session
+  }
+  const safeAct = async (target: FailoverTarget, action: OrdinaryTargetAction, label: string) => {
+    const outcome = await actSecretSafe(sessionFor(target), action, publicSecrets(), `failover-${target}-${label}`)
+    observedOutcomes.push(outcome)
+    return outcome
+  }
+  const post = async (target: FailoverTarget, route: { endpoint: string; credential: string }) => {
+    return target === "codex"
+      ? await chunkedPost(route.endpoint, route.credential)
+      : await claudePost(route.endpoint, route.credential, "/v1/messages", {
+        model: "failover-claude-primary", messages: [], max_tokens: 16, stream: true,
+      })
+  }
+  const readRoute = async (target: FailoverTarget) => {
+    const route = target === "codex"
+      ? extractManagedConfig(await readFile(codexConfig, "utf8"), "failover-codex-primary")
+      : extractClaudeManagedSettings(
+        await readFile(claudeSettings, "utf8"), "failover-claude-primary", providerSecrets,
+      )
+    routingSecrets.add(route.credential)
+    return route
+  }
+  const providerByName = (target: FailoverTarget, name: string) => {
+    const provider = sessionFor(target).get().providers.find((candidate) => candidate.name === name)
+    if (!provider) throw new Error(`failover-provider-missing:${target}:${name}`)
+    return provider
+  }
+  const applyPlan = async (target: FailoverTarget, providerNames: readonly string[]) => {
+    const members = providerNames.map((name) => {
+      const provider = providerByName(target, name)
+      return { providerId: provider.id, providerRevision: provider.providerRevision }
+    })
+    await safeAct(target, { kind: "save-failover-draft", members }, "save-route")
+    const draftRevision = sessionFor(target).get().failover?.draftRevision
+    if (!draftRevision) throw new Error(`failover-draft-revision-missing:${target}`)
+    await safeAct(target, { kind: "apply-failover-chain", draftRevision }, "apply-route")
+  }
+  const waitForServing = async (
+    target: FailoverTarget,
+    providerId: string,
+    label: string,
+  ) => await waitForSecretSafeSession(
+    sessionFor(target),
+    (view) => view.servingProviderId === providerId,
+    publicSecrets(),
+    `failover-${target}-${label}`,
+  )
+  const assertResponse = (target: FailoverTarget, result: Awaited<ReturnType<typeof chunkedPost>>) => {
+    const valid = target === "codex"
+      ? result.status === 201 && result.body === SSE_BYTES.join("")
+      : result.status === 200 && result.body === CLAUDE_SSE_BYTES.join("")
+    if (!valid) throw new Error(`failover-response-invalid:${target}`)
+  }
+  const auditUpstreamRequests = () => {
+    for (const target of targetNames) {
+      for (const fixture of Object.values(fixtures[target])) {
+        for (const call of fixture.calls) {
+          auditCapturedRequestAndProject(call, {
+            providerCredential: fixture.credential,
+            forbiddenRoutingCredentials: [...routingSecrets],
+            authorization: "expected-provider",
+          })
+          scanNoSecrets([call], [
+            ...publicSecrets().filter((secret) => secret !== fixture.credential),
+          ], `failover-upstream-${target}`)
+          const expectedPath = target === "codex" ? "/v1/responses" : "/v1/messages"
+          if (call.method !== "POST" || call.path.split("?", 1)[0] !== expectedPath) {
+            throw new Error(`failover-upstream-request-mismatch:${target}`)
+          }
+        }
+      }
+    }
+  }
+  const renderRoutes = async () => {
+    setup = await testRender(() => <App sessions={{ codex: codexSession!, claude: claudeSession! }} />, {
+      width: 100,
+      height: 30,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    recorder = createRendererAudit(setup)
+    recorder.start()
+    for (const [index, target] of targetNames.entries()) {
+      setup.mockInput.pressKey(index === 0 ? "1" : "2")
+      await setup.mockInput.typeText("/route")
+      setup.mockInput.pressEnter()
+      const frame = await waitForSecretSafeFrame(
+        setup,
+        (value) => value.includes("Failover Route") && value.includes("Stale"),
+        publicSecrets(),
+        `failover-${target}-route`,
+      )
+      nativeFrames.push(frame)
+      if (!frame.includes("Current:") || !frame.includes("Serving:") || !frame.includes("Fallback")) {
+        throw new Error(`failover-route-frame-incomplete:${target}`)
+      }
+      setup.mockInput.pressEscape()
+      await setup.renderOnce()
+    }
+  }
+  const closeRenderer = () => {
+    recorder?.stop()
+    if (recorder) nativeFrames.push(...recorder.frames())
+    if (setup && !setup.renderer.isDestroyed) setup.renderer.destroy()
+    setup = undefined
+    recorder = undefined
+  }
+
+  try {
+    const first = await startService("first", firstShutdown)
+    await openSessions("failover-first")
+    const routes = {} as Record<FailoverTarget, { endpoint: string; credential: string }>
+    for (const target of targetNames) {
+      const targetFixtures = fixtures[target]
+      for (const [role, fixture] of Object.entries(targetFixtures) as Array<[keyof TargetFixtures, FailoverFixture]>) {
+        const name = `${target === "codex" ? "Codex" : "Claude"} ${role}`
+        await safeAct(target, {
+          kind: "create-provider",
+          name,
+          baseUrl: fixture.baseUrl,
+          model: `failover-${target}-${role === "primary" ? "primary" : role === "fallbackA" ? "fallback-a" : "fallback-b"}`,
+          credential: { kind: "replace", value: fixture.credential },
+          authentication: target === "codex" ? "openai-bearer" : "anthropic-bearer",
+          presetKey: null,
+        }, `create-${role}`)
+      }
+      const primaryName = `${target === "codex" ? "Codex" : "Claude"} primary`
+      await safeAct(target, {
+        kind: "activate-provider",
+        providerId: providerByName(target, primaryName).id,
+        mode: "takeover",
+      }, "activate-primary")
+      routes[target] = await readRoute(target)
+      await applyPlan(target, [primaryName, `${target === "codex" ? "Codex" : "Claude"} fallbackA`])
+    }
+
+    for (const target of targetNames) {
+      const session = sessionFor(target)
+      const targetFixtures = fixtures[target]
+      const primary = providerByName(target, `${target === "codex" ? "Codex" : "Claude"} primary`)
+      const fallbackA = providerByName(target, `${target === "codex" ? "Codex" : "Claude"} fallbackA`)
+      const fallbackB = providerByName(target, `${target === "codex" ? "Codex" : "Claude"} fallbackB`)
+      const peer = target === "codex" ? "claude" : "codex"
+      const peerBefore = stableTargetViewFingerprint(sessionFor(peer).get())
+      const current = session.get().currentProviderId
+      const firstPlanEpoch = session.get().failover?.activePlan?.epoch
+      if (!firstPlanEpoch || current !== primary.id) throw new Error(`failover-initial-plan-invalid:${target}`)
+
+      targetFixtures.primary.setBehavior("retryable-failure")
+      targetFixtures.fallbackA.setBehavior("success")
+      assertResponse(target, await post(target, routes[target]))
+      await waitForServing(target, fallbackA.id, "fallback-serving")
+      if (session.get().currentProviderId !== primary.id || session.get().routeHealth.state !== "degraded") {
+        throw new Error(`failover-current-serving-projection-invalid:${target}`)
+      }
+
+      targetFixtures.primary.setBehavior("success")
+      assertResponse(target, await post(target, routes[target]))
+      await waitForServing(target, primary.id, "primary-failback")
+      if (session.get().currentProviderId !== primary.id) throw new Error(`failover-current-changed:${target}`)
+
+      const held = targetFixtures.primary.holdNext("retryable-failure")
+      const fallbackACalls = targetFixtures.fallbackA.calls.length
+      const fallbackBCalls = targetFixtures.fallbackB.calls.length
+      const pinnedRequest = post(target, routes[target])
+      await eventBarrier(held.started, `failover-${target}-held-primary`)
+      await applyPlan(target, [
+        `${target === "codex" ? "Codex" : "Claude"} primary`,
+        `${target === "codex" ? "Codex" : "Claude"} fallbackB`,
+      ])
+      const nextPlanEpoch = session.get().failover?.activePlan?.epoch
+      if (!nextPlanEpoch || nextPlanEpoch === firstPlanEpoch) throw new Error(`failover-plan-epoch-not-replaced:${target}`)
+      held.release()
+      assertResponse(target, await eventBarrier(pinnedRequest, `failover-${target}-pinned-request`))
+      await targetFixtures.fallbackA.waitForCallCount(fallbackACalls + 1)
+      if (targetFixtures.fallbackB.calls.length !== fallbackBCalls) {
+        throw new Error(`failover-pinned-request-used-new-plan:${target}`)
+      }
+      if (session.get().failover?.activePlan?.epoch !== nextPlanEpoch) {
+        throw new Error(`failover-active-plan-overwritten:${target}`)
+      }
+
+      targetFixtures.primary.setBehavior("retryable-failure")
+      targetFixtures.fallbackB.setBehavior("success")
+      assertResponse(target, await post(target, routes[target]))
+      await waitForServing(target, fallbackB.id, "new-plan-fallback")
+      const beforeReachability = stableTargetViewFingerprint(session.get())
+      const reachability = await eventBarrier(
+        session.checkReachability(primary.id, primary.providerRevision),
+        `failover-${target}-reachability`,
+      )
+      assertSecretSafeStructured(reachability, publicSecrets(), `failover-${target}-reachability`)
+      if (stableTargetViewFingerprint(session.get()) !== beforeReachability) {
+        throw new Error(`failover-reachability-mutated-health:${target}`)
+      }
+      if (stableTargetViewFingerprint(sessionFor(peer).get()) !== peerBefore) {
+        throw new Error(`failover-peer-target-mutated:${target}`)
+      }
+    }
+
+    closeRenderer()
+    await closeSessions()
+    await writeFile(firstShutdown, "shutdown\n")
+    const firstExit = await eventBarrier(first.output.completed, "failover-first-exit")
+    if (firstExit.code !== 0 || firstExit.signal !== null) throw new Error("failover-first-exit-invalid")
+    await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" })
+
+    const firstEpochs = Object.fromEntries(targetNames.map((target) => [target, observedViews
+      .filter((view) => view.target === target).at(-1)!.service.epoch])) as Record<FailoverTarget, string>
+    const second = await startService("restart")
+    await openSessions("failover-restart")
+    for (const target of targetNames) {
+      const view = sessionFor(target).get()
+      const activeMembers = new Set(view.failover?.activePlan?.members.map(({ providerId }) => providerId))
+      const memberHealth = view.providers
+        .filter(({ id }) => activeMembers.has(id))
+        .map(({ routeHealth }) => routeHealth?.state)
+      if (view.service.epoch === firstEpochs[target]
+        || view.routeHealth.state !== "stale"
+        || memberHealth.length !== 2
+        || memberHealth.some((state) => state !== "stale")) {
+        throw new Error(`failover-restart-stale-projection-invalid:${target}`)
+      }
+    }
+
+    await renderRoutes()
+    closeRenderer()
+    for (const target of targetNames) {
+      const session = sessionFor(target)
+      const primary = providerByName(target, `${target === "codex" ? "Codex" : "Claude"} primary`)
+      const primaryCalls = fixtures[target].primary.calls.length
+      fixtures[target].primary.setBehavior("success")
+      assertResponse(target, await post(target, routes[target]))
+      await fixtures[target].primary.waitForCallCount(primaryCalls + 1)
+      await waitForServing(target, primary.id, "restart-primary")
+      if (session.get().routeHealth.state !== "healthy" || session.get().currentProviderId !== primary.id) {
+        throw new Error(`failover-restart-eligibility-not-reset:${target}`)
+      }
+      await safeAct(target, { kind: "activate-provider", providerId: primary.id, mode: "direct" }, "activate-direct")
+      if (session.get().failover?.activePlan?.members.length !== 1) {
+        throw new Error(`failover-direct-plan-not-reset:${target}`)
+      }
+    }
+
+    await closeSessions()
+    const naturalExit = await Promise.race([
+      second.output.completed,
+      Bun.sleep(deadlineMs).then(() => undefined),
+    ])
+    if (!naturalExit || naturalExit.code !== 0 || naturalExit.signal !== null) {
+      throw new Error("failover-natural-exit-failed")
+    }
+    await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" })
+
+    const database = new Database(databasePath, { readonly: true })
+    const receipts = database.query("SELECT outcome_json AS outcome FROM action_receipts ORDER BY committed_revision, action_id").all()
+    database.close()
+    scanNoSecrets([receipts], publicSecrets(), "failover-action-receipts")
+    scanRawRpcFramesNoSecrets(rpcStreams, publicSecrets())
+    scanNoSecrets([decodedFrames, observedViews, observedOutcomes, nativeFrames], publicSecrets(), "failover-public-surfaces")
+    scanProcessOutputNoSecrets(services.flatMap(({ output }) => output.streams), publicSecrets())
+    auditUpstreamRequests()
+  } finally {
+    closeRenderer()
+    readinessSockets.splice(0).forEach((socket) => socket.destroy())
+    for (const fixture of allFixtures) fixture.releaseHeld()
+    await closeSessions()
+    await writeFile(firstShutdown, "shutdown\n").catch(() => {})
+    for (const { child } of services) if (child.exitCode === null) child.kill("SIGKILL")
+    await Promise.all(services.map(({ output }) => Promise.race([
+      output.completed.catch(() => undefined),
+      Bun.sleep(deadlineMs),
+    ])))
+    await Promise.all(allFixtures.map((fixture) => fixture.stop()))
+  }
+}, 120_000)
 
 test("real processes prove Universal Provider synchronization across both Targets", async () => {
   const root = await mkdtemp(join(tmpdir(), "mu-"))

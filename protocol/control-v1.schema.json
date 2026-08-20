@@ -191,7 +191,9 @@
         { "type": "object", "properties": { "kind": { "const": "duplicate-provider" }, "sourceProviderId": { "type": "string", "format": "uuid" }, "sourceProviderRevision": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/duplicateCredential" } }, "required": ["kind", "sourceProviderId", "sourceProviderRevision", "name", "baseUrl", "model", "credential"] },
         { "type": "object", "properties": { "kind": { "const": "activate-provider" }, "providerId": { "type": "string" }, "mode": { "enum": ["direct", "takeover"] } }, "required": ["kind", "providerId", "mode"] },
         { "type": "object", "properties": { "kind": { "const": "reconcile" }, "strategy": { "$ref": "#/$defs/reconciliationStrategy" }, "observationToken": { "type": "string", "format": "uuid" }, "acknowledgeVersion": { "type": "string" } }, "required": ["kind", "strategy", "observationToken"] },
-        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "resolve-compatibility" }, "version": { "type": "string" } }, "required": ["kind", "version"] }
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "resolve-compatibility" }, "version": { "type": "string" } }, "required": ["kind", "version"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "save-failover-draft" }, "members": { "type": "array", "items": { "type": "object", "additionalProperties": false, "properties": { "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["providerId", "providerRevision"] } } }, "required": ["kind", "members"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "apply-failover-chain" }, "draftRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "draftRevision"] }
       ]
     },
     "universalProviderPresetTarget": {
@@ -268,6 +270,57 @@
         { "type": "object", "properties": { "kind": { "const": "synchronize-universal-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"], "additionalProperties": false }
       ]
     },
+    "routeHealth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": { "enum": ["unobserved", "healthy", "degraded", "unavailable", "stale"] }
+      },
+      "required": ["state"]
+    },
+    "failoverDraftMember": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "providerId": { "type": "string", "format": "uuid" },
+        "providerRevision": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["providerId", "providerRevision"]
+    },
+    "activatedRoutePlanMember": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "position": { "type": "integer", "minimum": 0 },
+        "providerId": { "type": "string", "format": "uuid" },
+        "providerRevision": { "type": "integer", "minimum": 1 },
+        "name": { "type": "string" },
+        "model": { "type": "string" },
+        "protocol": { "enum": ["openai-responses", "anthropic-messages"] },
+        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer"] }
+      },
+      "required": ["position", "providerId", "providerRevision", "name", "model", "protocol", "authentication"]
+    },
+    "activatedRoutePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "epoch": { "type": "string", "format": "uuid" },
+        "members": { "type": "array", "items": { "$ref": "#/$defs/activatedRoutePlanMember" } }
+      },
+      "required": ["id", "epoch", "members"]
+    },
+    "failoverView": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "draftRevision": { "type": "integer", "minimum": 0 },
+        "draftMembers": { "type": "array", "items": { "$ref": "#/$defs/failoverDraftMember" } },
+        "activePlan": { "oneOf": [{ "$ref": "#/$defs/activatedRoutePlan" }, { "type": "null" }] }
+      },
+      "required": ["draftRevision", "draftMembers", "activePlan"]
+    },
     "targetView": {
       "type": "object",
       "properties": {
@@ -277,7 +330,7 @@
         "service": { "type": "object", "properties": { "epoch": { "type": "string", "format": "uuid" }, "state": { "type": "string" } }, "required": ["epoch", "state"] },
         "mode": { "type": "string" },
         "takeover": { "type": "object" },
-        "routeHealth": { "type": "object", "properties": { "state": { "const": "unobserved" } }, "required": ["state"], "additionalProperties": false },
+        "routeHealth": { "$ref": "#/$defs/routeHealth" },
         "providers": { "type": "array", "items": { "$ref": "#/$defs/provider" } },
         "providerPresets": { "type": "array", "items": { "$ref": "#/$defs/providerPreset" } },
         "currentProviderId": { "type": ["string", "null"] },
@@ -285,9 +338,10 @@
         "managedConfiguration": { "type": "object" },
         "recovery": { "type": "object", "properties": { "intentId": { "type": ["string", "null"], "format": "uuid" }, "state": { "type": "string" } }, "required": ["intentId", "state"], "additionalProperties": false },
         "activatedSnapshot": { "oneOf": [{ "$ref": "#/$defs/activatedSnapshot" }, { "type": "null" }] },
+        "failover": { "$ref": "#/$defs/failoverView" },
         "problems": { "type": "array", "items": { "$ref": "#/$defs/controlProblem" } }
       },
-      "required": ["target", "managementRevision", "viewSequence", "service", "mode", "takeover", "routeHealth", "providers", "providerPresets", "currentProviderId", "servingProviderId", "managedConfiguration", "recovery", "activatedSnapshot", "problems"]
+      "required": ["target", "managementRevision", "viewSequence", "service", "mode", "takeover", "routeHealth", "providers", "providerPresets", "currentProviderId", "servingProviderId", "managedConfiguration", "recovery", "activatedSnapshot", "failover", "problems"]
     },
     "credentialEdit": {
       "oneOf": [
@@ -336,9 +390,10 @@
           },
           "required": ["name", "baseUrl", "model", "protocol", "authentication", "routingRequirement", "credential"]
         },
+        "routeHealth": { "$ref": "#/$defs/routeHealth" },
         "activeReferences": { "type": "array", "items": { "enum": ["current", "activated-snapshot", "activated-route-plan"] } }
       },
-      "required": ["id", "position", "providerRevision", "name", "baseUrl", "model", "protocol", "authentication", "routingRequirement", "credential", "completeness", "missingFields", "provenance", "generated", "universalProviderId", "synchronization", "ownership", "activeReferences"]
+      "required": ["id", "position", "providerRevision", "name", "baseUrl", "model", "protocol", "authentication", "routingRequirement", "credential", "completeness", "missingFields", "provenance", "generated", "universalProviderId", "synchronization", "ownership", "routeHealth", "activeReferences"]
     },
     "providerFieldOwner": {
       "enum": ["target-provider", "universal-provider", "target-overlay", "target-fixed"]

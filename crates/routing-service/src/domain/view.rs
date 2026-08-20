@@ -1,11 +1,12 @@
-use tokio_rusqlite::rusqlite::{Connection, Result};
+use tokio_rusqlite::rusqlite::{Connection, OptionalExtension, Result};
 
 use crate::control::protocol::{
-    ActivatedSnapshotView, ClaudeBlockingSelector, ControlProblem, CredentialPresence,
+    ActivatedRoutePlanMemberView, ActivatedRoutePlanView, ActivatedSnapshotView,
+    ClaudeBlockingSelector, ControlProblem, CredentialPresence, FailoverDraftMember, FailoverView,
     ManagedConfigurationView, ProviderAuthentication, ProviderCompleteness,
     ProviderFieldOwnershipView, ProviderProtocol, ProviderProvenanceView, ProviderReferenceView,
-    ProviderRequirement, ProviderRoutingRequirement, ProviderView, RecoveryView, RouteHealthView,
-    ServiceView, TakeoverView, Target, TargetView, UniversalSynchronizationState,
+    ProviderRequirement, ProviderRoutingRequirement, ProviderView, RecoveryView, RouteHealthState,
+    RouteHealthView, ServiceView, TakeoverView, Target, TargetView, UniversalSynchronizationState,
 };
 use crate::domain::provider::has_valid_provider_declaration;
 use crate::state::providers::provider_presets;
@@ -76,11 +77,20 @@ pub(crate) fn project_target_view_for(
                     SELECT 1 FROM target_route_state r
                     JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
                     WHERE r.target = ?1 AND s.provider_id = p.id
-                )
+                ),
+                EXISTS(
+                    SELECT 1 FROM target_route_state r
+                    JOIN activated_route_plan_members member
+                      ON member.plan_id = r.active_route_plan_id
+                    WHERE r.target = ?1 AND member.provider_id = p.id
+                ),
+                health.state, health.service_epoch
          FROM providers p
          LEFT JOIN universal_providers u ON u.id = p.generated_owner_id
          LEFT JOIN universal_provider_targets t
            ON t.universal_provider_id = p.generated_owner_id AND t.target = p.target
+         LEFT JOIN provider_route_health health
+           ON health.target = p.target AND health.provider_id = p.id
          WHERE p.target = ?1 ORDER BY p.position",
     )?;
     let providers = statement
@@ -127,6 +137,23 @@ pub(crate) fn project_target_view_for(
             if row.get(18)? {
                 active_references.push(ProviderReferenceView::ActivatedSnapshot);
             }
+            if row.get(19)? {
+                active_references.push(ProviderReferenceView::ActivatedRoutePlan);
+            }
+            let route_health = match (
+                row.get::<_, Option<String>>(20)?,
+                row.get::<_, Option<String>>(21)?,
+            ) {
+                (None, None) => RouteHealthState::Unobserved,
+                (Some(_), Some(epoch)) if epoch != service_epoch => RouteHealthState::Stale,
+                (Some(state), Some(_)) => match state.as_str() {
+                    "healthy" => RouteHealthState::Healthy,
+                    "degraded" => RouteHealthState::Degraded,
+                    "unavailable" => RouteHealthState::Unavailable,
+                    _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+                },
+                _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+            };
             let generated_state = match (
                 row.get::<_, Option<String>>(11)?,
                 row.get::<_, Option<u64>>(12)?,
@@ -187,6 +214,9 @@ pub(crate) fn project_target_view_for(
                     ProviderFieldOwnershipView::generated()
                 } else {
                     ProviderFieldOwnershipView::target_provider()
+                },
+                route_health: RouteHealthView {
+                    state: route_health,
                 },
                 active_references,
             })
@@ -277,6 +307,9 @@ pub(crate) fn project_target_view_for(
         )
     });
 
+    let failover = project_failover_view(connection, target)?;
+    let route_health = project_target_route_health(&providers, &failover);
+
     Ok(TargetView {
         target,
         management_revision,
@@ -295,7 +328,7 @@ pub(crate) fn project_target_view_for(
             endpoint: (!startup_unavailable).then_some(endpoint).flatten(),
         },
         route_health: RouteHealthView {
-            state: "unobserved".to_owned(),
+            state: route_health,
         },
         providers,
         provider_presets: provider_presets(target),
@@ -323,8 +356,139 @@ pub(crate) fn project_target_view_for(
             },
         },
         activated_snapshot,
+        failover,
         problems,
     })
+}
+
+fn project_failover_view(connection: &Connection, target: Target) -> Result<FailoverView> {
+    let target_name = target.as_str();
+    let draft_revision = connection.query_row(
+        "SELECT draft_revision FROM failover_drafts WHERE target = ?1",
+        [target_name],
+        |row| row.get(0),
+    )?;
+    let mut draft_statement = connection.prepare(
+        "SELECT provider_id, provider_revision
+         FROM failover_draft_members WHERE target = ?1 ORDER BY position",
+    )?;
+    let draft_members = draft_statement
+        .query_map([target_name], |row| {
+            Ok(FailoverDraftMember {
+                provider_id: uuid::Uuid::parse_str(&row.get::<_, String>(0)?)
+                    .map_err(conversion_error)?,
+                provider_revision: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>>>()?;
+
+    let plan = connection
+        .query_row(
+            "SELECT plan.id, plan.epoch
+             FROM target_route_state route
+             JOIN activated_route_plans plan ON plan.id = route.active_route_plan_id
+             WHERE route.target = ?1 AND plan.target = route.target",
+            [target_name],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let active_plan = match plan {
+        None => None,
+        Some((id, epoch)) => {
+            let mut member_statement = connection.prepare(
+                "SELECT position, provider_id, provider_revision, name, model, protocol,
+                        authentication
+                 FROM activated_route_plan_members WHERE plan_id = ?1 ORDER BY position",
+            )?;
+            let members = member_statement
+                .query_map([&id], |row| {
+                    Ok(ActivatedRoutePlanMemberView {
+                        position: row.get(0)?,
+                        provider_id: uuid::Uuid::parse_str(&row.get::<_, String>(1)?)
+                            .map_err(conversion_error)?,
+                        provider_revision: row.get(2)?,
+                        name: row.get(3)?,
+                        model: row.get(4)?,
+                        protocol: parse_protocol(&row.get::<_, String>(5)?)?,
+                        authentication: parse_authentication(&row.get::<_, String>(6)?)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>>>()?;
+            if members.is_empty() {
+                return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+            }
+            Some(ActivatedRoutePlanView {
+                id: uuid::Uuid::parse_str(&id).map_err(conversion_error)?,
+                epoch: uuid::Uuid::parse_str(&epoch).map_err(conversion_error)?,
+                members,
+            })
+        }
+    };
+
+    Ok(FailoverView {
+        draft_revision,
+        draft_members,
+        active_plan,
+    })
+}
+
+fn project_target_route_health(
+    providers: &[ProviderView],
+    failover: &FailoverView,
+) -> RouteHealthState {
+    let Some(plan) = failover.active_plan.as_ref() else {
+        return RouteHealthState::Unobserved;
+    };
+    let states = plan
+        .members
+        .iter()
+        .map(|member| {
+            providers
+                .iter()
+                .find(|provider| provider.id == member.provider_id)
+                .map(|provider| provider.route_health.state)
+                .unwrap_or(RouteHealthState::Unobserved)
+        })
+        .collect::<Vec<_>>();
+    if states
+        .iter()
+        .all(|state| *state == RouteHealthState::Unobserved)
+    {
+        RouteHealthState::Unobserved
+    } else if states.iter().all(|state| {
+        matches!(
+            state,
+            RouteHealthState::Unobserved | RouteHealthState::Stale
+        )
+    }) {
+        RouteHealthState::Stale
+    } else if states.first() == Some(&RouteHealthState::Healthy) {
+        RouteHealthState::Healthy
+    } else if states
+        .iter()
+        .all(|state| *state == RouteHealthState::Unavailable)
+    {
+        RouteHealthState::Unavailable
+    } else {
+        RouteHealthState::Degraded
+    }
+}
+
+fn parse_protocol(value: &str) -> Result<ProviderProtocol> {
+    match value {
+        "openai-responses" => Ok(ProviderProtocol::OpenaiResponses),
+        "anthropic-messages" => Ok(ProviderProtocol::AnthropicMessages),
+        _ => Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn parse_authentication(value: &str) -> Result<ProviderAuthentication> {
+    match value {
+        "openai-bearer" => Ok(ProviderAuthentication::OpenaiBearer),
+        "anthropic-api-key" => Ok(ProviderAuthentication::AnthropicApiKey),
+        "anthropic-bearer" => Ok(ProviderAuthentication::AnthropicBearer),
+        _ => Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+    }
 }
 
 fn conversion_error(
@@ -352,7 +516,7 @@ pub(crate) fn empty_target_view_for(service_epoch: &str, target: Target) -> Targ
             endpoint: None,
         },
         route_health: RouteHealthView {
-            state: "unobserved".to_owned(),
+            state: RouteHealthState::Unobserved,
         },
         providers: Vec::new(),
         provider_presets: provider_presets(target),
@@ -368,6 +532,7 @@ pub(crate) fn empty_target_view_for(service_epoch: &str, target: Target) -> Targ
             state: "clean".to_owned(),
         },
         activated_snapshot: None,
+        failover: FailoverView::default(),
         problems: Vec::new(),
     }
 }

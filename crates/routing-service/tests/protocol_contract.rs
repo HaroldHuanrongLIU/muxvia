@@ -34,6 +34,10 @@ fn fixtures_round_trip_as_their_protocol_types() {
     let view: TargetView = serde_json::from_value(target_view.clone()).unwrap();
     assert_eq!(serde_json::to_value(view).unwrap(), target_view);
 
+    let failover_view = fixture("failover-target-view.json");
+    let view: TargetView = serde_json::from_value(failover_view.clone()).unwrap();
+    assert_eq!(serde_json::to_value(view).unwrap(), failover_view);
+
     let save_provider = fixture("save-provider.json");
     let action: TargetAction = serde_json::from_value(save_provider.clone()).unwrap();
     assert_eq!(serde_json::to_value(action).unwrap(), save_provider);
@@ -42,6 +46,8 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "reorder-providers.json",
         "delete-provider.json",
         "duplicate-provider.json",
+        "save-failover-draft.json",
+        "apply-failover-chain.json",
     ] {
         let action = fixture(name);
         let parsed: TargetAction = serde_json::from_value(action.clone()).unwrap();
@@ -100,6 +106,87 @@ fn fixtures_round_trip_as_their_protocol_types() {
     let resolve_compatibility = fixture("resolve-compatibility.json");
     let parsed: TargetAction = serde_json::from_value(resolve_compatibility.clone()).unwrap();
     assert_eq!(serde_json::to_value(parsed).unwrap(), resolve_compatibility);
+}
+
+#[test]
+fn failover_actions_are_closed_and_revision_bound() {
+    let save = fixture("save-failover-draft.json");
+    let apply = fixture("apply-failover-chain.json");
+
+    let saved: TargetAction = serde_json::from_value(save.clone()).unwrap();
+    let applied: TargetAction = serde_json::from_value(apply.clone()).unwrap();
+    assert_eq!(serde_json::to_value(saved).unwrap(), save);
+    assert_eq!(serde_json::to_value(applied).unwrap(), apply);
+
+    for (fixture_name, field) in [
+        ("save-failover-draft.json", "additiveSecret"),
+        ("apply-failover-chain.json", "additiveSecret"),
+    ] {
+        let mut invalid = fixture(fixture_name);
+        invalid[field] = serde_json::json!("FAILOVER_PROTOCOL_SECRET_86421");
+        assert!(
+            serde_json::from_value::<TargetAction>(invalid).is_err(),
+            "accepted additive failover action field"
+        );
+    }
+
+    let mut invalid_member_revision = fixture("save-failover-draft.json");
+    invalid_member_revision["members"][0]["providerRevision"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<TargetAction>(invalid_member_revision).is_err());
+
+    let mut invalid_draft_revision = fixture("apply-failover-chain.json");
+    invalid_draft_revision["draftRevision"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<TargetAction>(invalid_draft_revision).is_err());
+
+    let schema = fixture("../control-v1.schema.json");
+    let branches = schema["$defs"]["targetAction"]["oneOf"]
+        .as_array()
+        .expect("targetAction branches");
+    for discriminator in ["save-failover-draft", "apply-failover-chain"] {
+        let branch = branches
+            .iter()
+            .find(|branch| branch["properties"]["kind"]["const"] == discriminator)
+            .expect("missing failover action schema branch");
+        assert_eq!(branch["additionalProperties"], false);
+    }
+}
+
+#[test]
+fn failover_view_schema_is_closed_and_complete() {
+    let schema = fixture("../control-v1.schema.json");
+    let target = &schema["$defs"]["targetView"];
+    assert_eq!(
+        target["properties"]["failover"]["$ref"],
+        "#/$defs/failoverView"
+    );
+    assert!(
+        target["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("failover"))
+    );
+    assert_eq!(
+        schema["$defs"]["provider"]["properties"]["routeHealth"]["$ref"],
+        "#/$defs/routeHealth"
+    );
+    assert!(
+        schema["$defs"]["provider"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("routeHealth"))
+    );
+    assert_eq!(
+        schema["$defs"]["routeHealth"]["properties"]["state"]["enum"],
+        serde_json::json!(["unobserved", "healthy", "degraded", "unavailable", "stale"])
+    );
+    assert_eq!(
+        schema["$defs"]["failoverView"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schema["$defs"]["activatedRoutePlan"]["additionalProperties"],
+        false
+    );
 }
 
 #[test]
@@ -539,6 +626,7 @@ fn provider_declaration_contract_round_trips_the_secret_free_projection_and_acti
             "routingRequirement": "target-provider",
             "credential": "target-provider"
         },
+        "routeHealth": { "state": "unobserved" },
         "activeReferences": []
     });
     let view = serde_json::json!({
@@ -562,6 +650,7 @@ fn provider_declaration_contract_round_trips_the_secret_free_projection_and_acti
         "managedConfiguration": { "state": "unmanaged", "path": null, "restartRequired": false },
         "recovery": { "intentId": null, "state": "clean" },
         "activatedSnapshot": null,
+        "failover": { "draftRevision": 1, "draftMembers": [], "activePlan": null },
         "problems": []
     });
     let parsed: TargetView = serde_json::from_value(view.clone()).unwrap();
@@ -663,6 +752,18 @@ fn claude_declarations_use_the_exact_messages_authentication_and_neutral_health_
     assert_eq!(
         serialized["routeHealth"],
         serde_json::json!({ "state": "unobserved" })
+    );
+    assert_eq!(
+        serialized["providers"][0]["routeHealth"],
+        serde_json::json!({ "state": "unobserved" })
+    );
+    assert_eq!(
+        serialized["failover"],
+        serde_json::json!({
+            "draftRevision": 0,
+            "draftMembers": [],
+            "activePlan": null
+        })
     );
     assert!(serialized.get("futureField").is_none());
 

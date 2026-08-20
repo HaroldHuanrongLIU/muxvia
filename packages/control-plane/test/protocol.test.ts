@@ -21,10 +21,13 @@ async function readFixture(name: string): Promise<unknown> {
 test.each([
   ["hello.json", parseClientFrame],
   ["initial-target-view.json", parseTargetView],
+  ["failover-target-view.json", parseTargetView],
   ["save-provider.json", parseTargetAction],
   ["reorder-providers.json", parseTargetAction],
   ["delete-provider.json", parseTargetAction],
   ["duplicate-provider.json", parseTargetAction],
+  ["save-failover-draft.json", parseTargetAction],
+  ["apply-failover-chain.json", parseTargetAction],
   ["discover-models.json", parseClientFrame],
   ["check-reachability.json", parseClientFrame],
   ["cancel-inspection.json", parseClientFrame],
@@ -46,6 +49,61 @@ test.each([
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)
+})
+
+test("Failover Chain actions are closed and revision bound", async () => {
+  const save = await readFixture("save-failover-draft.json") as any
+  const apply = await readFixture("apply-failover-chain.json") as any
+  expect(parseTargetAction(save)).toEqual(save)
+  expect(parseTargetAction(apply)).toEqual(apply)
+
+  for (const value of [save, apply]) {
+    const invalid = structuredClone(value)
+    invalid.additiveSecret = "FAILOVER_PROTOCOL_SECRET_86421"
+    expect(() => parseTargetAction(invalid)).toThrow()
+  }
+  const invalidMember = structuredClone(save)
+  invalidMember.members[0].providerRevision = 0
+  expect(() => parseTargetAction(invalidMember)).toThrow()
+  const invalidDraft = structuredClone(apply)
+  invalidDraft.draftRevision = 0
+  expect(() => parseTargetAction(invalidDraft)).toThrow()
+
+  const schema = JSON.parse(await readFile(
+    fileURLToPath(new URL("../../../protocol/control-v1.schema.json", import.meta.url)),
+    "utf8",
+  ))
+  for (const discriminator of ["save-failover-draft", "apply-failover-chain"]) {
+    const branch = schema.$defs.targetAction.oneOf.find(
+      (candidate: any) => candidate.properties?.kind?.const === discriminator,
+    )
+    expect(branch).toBeDefined()
+    expect(branch.additionalProperties).toBeFalse()
+  }
+})
+
+test("Failover Chain view schema is closed and complete", async () => {
+  const schema = JSON.parse(await readFile(
+    fileURLToPath(new URL("../../../protocol/control-v1.schema.json", import.meta.url)),
+    "utf8",
+  ))
+  expect(schema.$defs.targetView.properties.failover.$ref).toBe("#/$defs/failoverView")
+  expect(schema.$defs.targetView.required).toContain("failover")
+  expect(schema.$defs.provider.properties.routeHealth.$ref).toBe("#/$defs/routeHealth")
+  expect(schema.$defs.provider.required).toContain("routeHealth")
+  expect(schema.$defs.routeHealth.properties.state.enum).toEqual([
+    "unobserved", "healthy", "degraded", "unavailable", "stale",
+  ])
+  expect(schema.$defs.failoverView.additionalProperties).toBeFalse()
+  expect(schema.$defs.activatedRoutePlan.additionalProperties).toBeFalse()
+
+  const missingFailover = await readFixture("failover-target-view.json") as any
+  delete missingFailover.failover
+  expect(() => parseTargetView(missingFailover)).toThrow()
+
+  const missingProviderHealth = await readFixture("failover-target-view.json") as any
+  delete missingProviderHealth.providers[0].routeHealth
+  expect(() => parseTargetView(missingProviderHealth)).toThrow()
 })
 
 test("Universal Provider JSON schema exposes the complete closed catalog contract", async () => {
@@ -324,6 +382,7 @@ test("round-trips schema-v3 Provider declarations, Presets, and credential inten
       protocol: "target-fixed", authentication: "target-provider",
       routingRequirement: "target-provider", credential: "target-provider",
     },
+    routeHealth: { state: "unobserved" },
     activeReferences: [],
   } satisfies TargetView["providers"][number]
   const view = {
@@ -347,6 +406,7 @@ test("round-trips schema-v3 Provider declarations, Presets, and credential inten
     managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
     recovery: { intentId: null, state: "clean" },
     activatedSnapshot: null,
+    failover: { draftRevision: 1, draftMembers: [], activePlan: null },
     problems: [],
   } satisfies TargetView
   expect(parseTargetView(view)).toEqual(view)
@@ -413,6 +473,7 @@ test("round-trips generated Provider ownership and Target Overlay edits as a clo
       routingRequirement: "target-overlay",
       credential: "universal-provider",
     },
+    routeHealth: { state: "unobserved" },
     activeReferences: ["activated-route-plan"],
   } satisfies TargetView["providers"][number]
   const view = {
@@ -430,6 +491,7 @@ test("round-trips generated Provider ownership and Target Overlay edits as a clo
     managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
     recovery: { intentId: null, state: "clean" },
     activatedSnapshot: null,
+    failover: { draftRevision: 1, draftMembers: [], activePlan: null },
     problems: [],
   }
   expect(parseTargetView(view).providers[0]).toEqual(generated)
@@ -488,6 +550,7 @@ test("round-trips Claude Messages declarations with explicit authentication and 
         protocol: "target-fixed", authentication: "target-provider",
         routingRequirement: "target-provider", credential: "target-provider",
       },
+      routeHealth: { state: "unobserved" },
       activeReferences: [],
     }],
     providerPresets: [{
@@ -502,6 +565,7 @@ test("round-trips Claude Messages declarations with explicit authentication and 
     managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
     recovery: { intentId: null, state: "clean" },
     activatedSnapshot: null,
+    failover: { draftRevision: 1, draftMembers: [], activePlan: null },
     problems: [],
     futureField: "ignored",
   }

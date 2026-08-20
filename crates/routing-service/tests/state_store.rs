@@ -104,7 +104,7 @@ async fn fresh_schema_v7_reopens_with_codex_and_claude_route_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, "9");
+    assert_eq!(version, "10");
     assert_eq!(targets, ["claude", "codex"]);
     let _ = fs::remove_dir_all(root);
 }
@@ -830,7 +830,10 @@ async fn claude_target_view_projects_only_the_messages_preset() {
     let fixture = StoreFixture::new().await;
     let view = fixture.store.target_view_for(Target::Claude).await.unwrap();
     assert_eq!(view.target, Target::Claude);
-    assert_eq!(view.route_health.state, "unobserved");
+    assert_eq!(
+        view.route_health.state,
+        muxvia_routing::control::protocol::RouteHealthState::Unobserved
+    );
     assert_eq!(view.provider_presets.len(), 1);
     assert_eq!(view.provider_presets[0].key, "anthropic-api-messages");
     assert_eq!(

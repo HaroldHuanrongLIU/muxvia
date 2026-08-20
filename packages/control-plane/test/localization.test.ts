@@ -192,6 +192,45 @@ test("Reconciliation stable problems map to fixed localized diagnostics", () => 
   expect(messageKeyForProblem("target-busy")).toBe("error.target-busy")
 })
 
+test("Failover route commands, health, and editor copy have exact locale parity", () => {
+  const english = createTranslator("en")
+  const chinese = createTranslator("zh-CN")
+  expect([
+    english("command.route.open"),
+    english("route.title"),
+    english("route.current-serving", { current: "A", serving: "B" }),
+    english("route.diverged"),
+    english("route.synchronized"),
+    labelTargetState(english, "degraded"),
+    english(messageKeyForProblem("stale-provider-revision")),
+  ]).toEqual([
+    "Edit failover route",
+    "Failover Route",
+    "Current: A · Serving: B",
+    "Draft differs from the active route",
+    "Synchronized",
+    "Degraded",
+    "A route Provider changed. Review the draft and save it again.",
+  ])
+  expect([
+    chinese("command.route.open"),
+    chinese("route.title"),
+    chinese("route.current-serving", { current: "A", serving: "B" }),
+    chinese("route.diverged"),
+    chinese("route.synchronized"),
+    labelTargetState(chinese, "degraded"),
+    chinese(messageKeyForProblem("stale-provider-revision")),
+  ]).toEqual([
+    "编辑故障转移路由",
+    "故障转移路由",
+    "Current：A · Serving：B",
+    "草稿与生效路由不同",
+    "已同步",
+    "降级",
+    "路由 Provider 已更改，请检查草稿后重新保存。",
+  ])
+})
+
 test("Reconciliation closed compatibility, shadow, field, and state labels have full locale parity", () => {
   const english = createTranslator("en")
   const chinese = createTranslator("zh-CN")

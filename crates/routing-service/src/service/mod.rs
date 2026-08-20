@@ -6,3 +6,4 @@ pub(crate) mod reconcile;
 // Task 4 consumes the prepared target-native values exposed by this seam.
 #[allow(dead_code)]
 pub(crate) mod reconciliation_adapter;
+pub(crate) mod route_plan;

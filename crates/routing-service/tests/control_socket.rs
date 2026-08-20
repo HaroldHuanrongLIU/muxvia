@@ -4057,6 +4057,222 @@ async fn open_target_subscribes_and_action_responds_before_complete_push() {
 }
 
 #[tokio::test]
+async fn failover_draft_save_responds_before_one_push_and_changes_no_live_route() {
+    let mut fixture = ControlFixture::start().await;
+    let home = MuxviaHome::from_user_home(&fixture.root.join("home"));
+    seed_codex_direct(&home, Arc::clone(&fixture.store)).await;
+    let activated = fixture.store.target_view_for(Target::Codex).await.unwrap();
+    let fallback = fixture
+        .store
+        .apply_provider_action_for(
+            Target::Codex,
+            Uuid::new_v4(),
+            activated.management_revision,
+            json!({
+                "kind": "create-provider",
+                "name": "Fallback",
+                "baseUrl": "https://fallback.test/v1",
+                "model": "fallback-model",
+                "credential": { "kind": "replace", "value": "FAILOVER_DRAFT_SECRET" },
+                "authentication": "openai-bearer",
+                "presetKey": null
+            }),
+        )
+        .await
+        .unwrap();
+    let before = fallback.view;
+    let current = before.current_provider_id.clone().unwrap();
+    let current_revision = before
+        .providers
+        .iter()
+        .find(|provider| provider.id.to_string() == current)
+        .unwrap()
+        .provider_revision;
+    let fallback_provider = before
+        .providers
+        .iter()
+        .find(|provider| provider.name == "Fallback")
+        .unwrap();
+
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    request(
+        &mut stream,
+        "failover-open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    let action_id = Uuid::new_v4();
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request",
+            "requestId": "failover-save",
+            "operation": {
+                "kind": "act",
+                "target": "codex",
+                "actionId": action_id,
+                "expectedRevision": before.management_revision,
+                "action": {
+                    "kind": "save-failover-draft",
+                    "members": [
+                        { "providerId": current, "providerRevision": current_revision },
+                        { "providerId": fallback_provider.id, "providerRevision": fallback_provider.provider_revision }
+                    ]
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let response = read_frame(&mut stream).await.unwrap();
+    assert!(
+        response["type"] == "response",
+        "draft save did not return a response"
+    );
+    let push = read_frame(&mut stream).await.unwrap();
+    let view = &response["result"]["outcome"]["view"];
+    assert!(
+        push["view"] == *view,
+        "draft save push did not match its response"
+    );
+    assert!(
+        view["failover"]["draftRevision"] == 2
+            && view["failover"]["draftMembers"]
+                .as_array()
+                .is_some_and(|members| members.len() == 2),
+        "saved draft was not projected"
+    );
+    assert!(
+        view["currentProviderId"] == serde_json::to_value(&before.current_provider_id).unwrap()
+            && view["servingProviderId"]
+                == serde_json::to_value(&before.serving_provider_id).unwrap()
+            && view["activatedSnapshot"]
+                == serde_json::to_value(&before.activated_snapshot).unwrap()
+            && view["mode"] == before.mode,
+        "draft save changed the live route"
+    );
+    assert!(
+        !format!("{response:?}{push:?}").contains("FAILOVER_DRAFT_SECRET"),
+        "draft response exposed a Provider credential"
+    );
+
+    let replay = request(
+        &mut stream,
+        "failover-replay",
+        json!({
+            "kind": "act", "target": "codex", "actionId": action_id,
+            "expectedRevision": 0,
+            "action": { "kind": "save-failover-draft", "members": [] }
+        }),
+    )
+    .await;
+    assert!(
+        replay["result"]["outcome"]["status"] == "replayed",
+        "draft replay was not receipt-first"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut stream))
+            .await
+            .is_err(),
+        "draft replay published a duplicate view"
+    );
+
+    let apply_action_id = Uuid::new_v4();
+    let config_path = fixture.root.join("home/.codex/config.toml");
+    let exact_config = fs::read(&config_path).unwrap();
+    let config_text = String::from_utf8(exact_config.clone()).unwrap();
+    let model_line = config_text
+        .lines()
+        .find(|line| line.starts_with("model = "))
+        .expect("managed configuration must contain the selected model");
+    let drifted_config = config_text.replacen(model_line, "model = \"stale-external-drift\"", 1);
+    fs::write(&config_path, drifted_config).unwrap();
+    let stale_apply = request(
+        &mut stream,
+        "failover-stale-apply",
+        json!({
+            "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
+            "expectedRevision": 0,
+            "action": { "kind": "apply-failover-chain", "draftRevision": 2 }
+        }),
+    )
+    .await;
+    assert!(
+        stale_apply["type"] == "error" && stale_apply["problem"]["code"] == "stale-revision",
+        "stale Apply did not reject before live managed-state observation"
+    );
+    let after_stale = fixture.store.target_view_for(Target::Codex).await.unwrap();
+    assert!(
+        after_stale.management_revision == view["managementRevision"].as_u64().unwrap()
+            && after_stale.managed_configuration.state == "applied"
+            && after_stale.problems.is_empty(),
+        "stale Apply persisted a managed-write blocker"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut stream))
+            .await
+            .is_err(),
+        "stale Apply published a Target View"
+    );
+    fs::write(&config_path, exact_config).unwrap();
+    write_frame(
+        &mut stream,
+        &json!({
+            "type": "request", "requestId": "failover-apply",
+            "operation": {
+                "kind": "act", "target": "codex", "actionId": apply_action_id,
+                "expectedRevision": view["managementRevision"],
+                "action": { "kind": "apply-failover-chain", "draftRevision": 2 }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let applied = read_frame(&mut stream).await.unwrap();
+    assert!(
+        applied["type"] == "response",
+        "Failover Apply did not return a response"
+    );
+    let applied_push = read_frame(&mut stream).await.unwrap();
+    let applied_view = &applied["result"]["outcome"]["view"];
+    assert!(
+        applied_push["view"] == *applied_view
+            && applied_view["failover"]["activePlan"]["members"]
+                .as_array()
+                .is_some_and(|members| members.len() == 2),
+        "Failover Apply did not publish its immutable plan"
+    );
+    assert!(
+        applied_view["currentProviderId"] == view["currentProviderId"]
+            && applied_view["servingProviderId"] == view["servingProviderId"]
+            && applied_view["activatedSnapshot"] == view["activatedSnapshot"],
+        "Failover Apply changed the live route"
+    );
+    let apply_replay = request(
+        &mut stream,
+        "failover-apply-replay",
+        json!({
+            "kind": "act", "target": "codex", "actionId": apply_action_id,
+            "expectedRevision": 0,
+            "action": { "kind": "apply-failover-chain", "draftRevision": 999 }
+        }),
+    )
+    .await;
+    assert!(
+        apply_replay["result"]["outcome"]["status"] == "replayed",
+        "Failover Apply did not replay receipt-first"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut stream))
+            .await
+            .is_err(),
+        "Failover Apply replay published a duplicate view"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn reconciliation_publication_waits_for_the_initiating_action_response_writer_ack() {
     let mut fixture = ControlFixture::start().await;
     let home = MuxviaHome::from_user_home(&fixture.root.join("home"));

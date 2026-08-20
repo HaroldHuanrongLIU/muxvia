@@ -45,6 +45,7 @@ function provider(overrides: Partial<TargetView["providers"][number]> = {}): Tar
       protocol: "target-fixed", authentication: "target-provider",
       routingRequirement: "target-provider", credential: "target-provider",
     },
+    routeHealth: { state: "unobserved" },
     activeReferences: [],
     ...overrides,
   }
@@ -72,6 +73,7 @@ function view(overrides: Partial<TargetView> = {}): TargetView {
     managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
     recovery: { intentId: null, state: "clean" },
     activatedSnapshot: null,
+    failover: { draftRevision: 1, draftMembers: [], activePlan: null },
     problems: [],
     ...overrides,
   }

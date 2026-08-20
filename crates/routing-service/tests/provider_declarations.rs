@@ -298,7 +298,7 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
         .await
         .unwrap();
 
-    assert_eq!(version, "9");
+    assert_eq!(version, "10");
     assert_eq!(not_null, 1);
     assert_eq!(default_value.as_deref(), Some("1"));
     assert!(table_sql.contains("CHECK (managed_config_version IN (1,2))"));
@@ -353,12 +353,13 @@ async fn schema_v8_failed_migration_rolls_back_then_reruns() {
         connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'target_compatibility'", [], |row| row.get::<_, i64>(0)).unwrap(),
         connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'reconciliation_intents'", [], |row| row.get::<_, i64>(0)).unwrap(),
     );
-    assert_eq!(rerun, ("9".into(), 1, 1));
+    assert_eq!(rerun, ("10".into(), 1, 1));
 }
 
 fn v7_projection_fingerprint(connection: &Connection) -> Vec<u64> {
     let projections = [
-        "SELECT json_array(id, target, bearer_token) FROM credentials ORDER BY target, id",
+        "SELECT json_array(id, target, bearer_token) FROM credentials
+         WHERE id NOT LIKE 'route-plan-%' ORDER BY target, id",
         "SELECT json_array(id, target, position, provider_revision, name, base_url, model, protocol, authentication, credential_id, provenance_kind, provenance_key, generated_owner_id, routing_requirement) FROM providers ORDER BY target, position, id",
         "SELECT json_array(target, management_revision, view_sequence, current_provider_id, serving_provider_id, takeover_state, route_port, routing_credential, activated_snapshot_id, managed_config_path, managed_config_version, recovery_intent_id, recovery_state) FROM target_route_state ORDER BY target",
         "SELECT json_array(target, code, message) FROM target_problems ORDER BY target, code",
@@ -412,8 +413,7 @@ async fn schema_v9_migrates_real_v8_state_and_adds_universal_provider_tables() {
     let before = v8_projection_fingerprint(&connection);
     drop(connection);
 
-    let store = StateStore::open(&fixture.home).await.unwrap();
-    drop(store);
+    drop(StateStore::open(&fixture.home).await.unwrap());
 
     let connection = Connection::open(fixture.home.database_path()).unwrap();
     let version: String = connection
@@ -453,7 +453,7 @@ async fn schema_v9_migrates_real_v8_state_and_adds_universal_provider_tables() {
         })
         .unwrap();
 
-    assert_eq!(version, "9");
+    assert_eq!(version, "10");
     assert_eq!(present, [1, 1, 1, 1, 1, 1]);
     assert_eq!(catalog_state, (0, 0));
     assert_eq!(foreign_key_failures, 0);
@@ -495,8 +495,7 @@ async fn schema_v9_failed_migration_rolls_back_all_catalog_changes_then_reruns()
         .unwrap();
     drop(connection);
 
-    let store = StateStore::open(&fixture.home).await.unwrap();
-    drop(store);
+    drop(StateStore::open(&fixture.home).await.unwrap());
     let connection = Connection::open(fixture.home.database_path()).unwrap();
     let rerun: (String, i64, i64) = connection
         .query_row(
@@ -510,7 +509,479 @@ async fn schema_v9_failed_migration_rolls_back_all_catalog_changes_then_reruns()
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(rerun, ("9".to_owned(), 2, 1));
+    assert_eq!(rerun, ("10".to_owned(), 2, 1));
+}
+
+fn upgrade_v8_fixture_to_v9(connection: &Connection) {
+    connection
+        .execute_batch(
+            "ALTER TABLE providers ADD COLUMN generated_source_revision INTEGER
+               CHECK (generated_source_revision IS NULL OR generated_source_revision >= 1);
+             ALTER TABLE providers ADD COLUMN generated_overlay_revision INTEGER
+               CHECK (generated_overlay_revision IS NULL OR generated_overlay_revision >= 1);
+             CREATE UNIQUE INDEX providers_generated_owner_target
+               ON providers(generated_owner_id, target)
+               WHERE generated_owner_id IS NOT NULL;
+             CREATE TABLE universal_provider_catalog_state (
+               singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+               revision INTEGER NOT NULL CHECK (revision >= 0),
+               view_sequence INTEGER NOT NULL CHECK (view_sequence >= 0)
+             );
+             CREATE TABLE universal_credentials (
+               id TEXT PRIMARY KEY,
+               bearer_token TEXT NOT NULL
+             );
+             CREATE TABLE universal_providers (
+               id TEXT PRIMARY KEY,
+               position INTEGER NOT NULL UNIQUE CHECK (position >= 0),
+               provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
+               name TEXT NOT NULL,
+               base_url TEXT NOT NULL,
+               credential_id TEXT REFERENCES universal_credentials(id),
+               provenance_kind TEXT,
+               provenance_key TEXT,
+               CHECK ((provenance_kind IS NULL AND provenance_key IS NULL)
+                 OR (provenance_kind IS NOT NULL AND provenance_key IS NOT NULL))
+             );
+             CREATE TABLE universal_provider_targets (
+               universal_provider_id TEXT NOT NULL REFERENCES universal_providers(id) ON DELETE CASCADE,
+               target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+               enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+               model TEXT NOT NULL,
+               authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
+               routing_requirement TEXT NOT NULL CHECK (routing_requirement IN ('direct-compatible', 'takeover-required')),
+               overlay_revision INTEGER NOT NULL CHECK (overlay_revision >= 1),
+               synchronized_source_revision INTEGER CHECK (synchronized_source_revision IS NULL OR synchronized_source_revision >= 1),
+               synchronized_overlay_revision INTEGER CHECK (synchronized_overlay_revision IS NULL OR synchronized_overlay_revision >= 1),
+               CHECK ((target = 'codex' AND authentication = 'openai-bearer')
+                 OR (target = 'claude' AND authentication IN ('anthropic-api-key', 'anthropic-bearer'))),
+               CHECK ((synchronized_source_revision IS NULL AND synchronized_overlay_revision IS NULL)
+                 OR (synchronized_source_revision IS NOT NULL AND synchronized_overlay_revision IS NOT NULL)),
+               PRIMARY KEY (universal_provider_id, target)
+             );
+             CREATE TABLE universal_action_receipts (
+               action_id TEXT PRIMARY KEY,
+               action_kind TEXT NOT NULL,
+               committed_revision INTEGER NOT NULL CHECK (committed_revision >= 0),
+               outcome_json TEXT NOT NULL
+             );
+             CREATE TABLE universal_provider_seeds (
+               preset_key TEXT PRIMARY KEY,
+               seeded_provider_id TEXT
+             );
+             INSERT INTO universal_provider_catalog_state VALUES (1, 0, 0);
+             UPDATE metadata SET value = '9' WHERE key = 'schema-version';",
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn schema_v10_migrates_v9_current_snapshot_into_one_member_plan() {
+    let fixture = StoreFixture::new();
+    fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    connection.execute_batch(V8_SCHEMA).unwrap();
+    upgrade_v8_fixture_to_v9(&connection);
+    connection
+        .execute_batch(
+            "INSERT INTO credentials VALUES
+               ('00000000-0000-4000-8000-000000000901', 'codex', 'V9_PROVIDER_SECRET');
+             INSERT INTO providers
+               (id, target, position, provider_revision, name, base_url, model, protocol,
+                authentication, credential_id, routing_requirement)
+             VALUES
+               ('00000000-0000-4000-8000-000000000902', 'codex', 0, 5, 'Existing',
+                'https://existing.example/v1', 'existing-model', 'openai-responses',
+                'openai-bearer', '00000000-0000-4000-8000-000000000901', 'direct-compatible');
+             INSERT INTO activated_snapshots
+               (id, target, provider_id, base_url, model, protocol, authentication,
+                provider_bearer_token, epoch)
+             VALUES
+               ('00000000-0000-4000-8000-000000000903', 'codex',
+                '00000000-0000-4000-8000-000000000902', 'https://existing.example/v1',
+                'existing-model', 'openai-responses', 'openai-bearer',
+                'V9_PROVIDER_SECRET', '00000000-0000-4000-8000-000000000904');
+             UPDATE target_route_state SET
+               management_revision = 5, view_sequence = 8,
+               current_provider_id = '00000000-0000-4000-8000-000000000902',
+               serving_provider_id = '00000000-0000-4000-8000-000000000902',
+               activated_snapshot_id = '00000000-0000-4000-8000-000000000903',
+               takeover_state = 'active', route_port = 43129,
+               routing_credential = 'V9_ROUTING_SECRET'
+             WHERE target = 'codex';",
+        )
+        .unwrap();
+    let before = v8_projection_fingerprint(&connection);
+    drop(connection);
+
+    let store = StateStore::open(&fixture.home).await.unwrap();
+    let migrated_view = store.target_view_for(Target::Codex).await.unwrap();
+    let migrated_provider = migrated_view
+        .providers
+        .iter()
+        .find(|provider| provider.id.to_string() == "00000000-0000-4000-8000-000000000902")
+        .unwrap();
+    assert!(
+        migrated_provider.active_references
+            == [
+                ProviderReferenceView::Current,
+                ProviderReferenceView::ActivatedSnapshot,
+                ProviderReferenceView::ActivatedRoutePlan,
+            ],
+        "migrated Provider references omitted the active route plan"
+    );
+    assert!(
+        migrated_view.failover.draft_revision == 1
+            && migrated_view.failover.draft_members.len() == 1
+            && migrated_view
+                .failover
+                .active_plan
+                .as_ref()
+                .is_some_and(|plan| plan.members.len() == 1),
+        "migrated Target View omitted the one-member route plan"
+    );
+    let service_epoch = migrated_view.service.epoch;
+    let health_connection = Connection::open(fixture.home.database_path()).unwrap();
+    health_connection
+        .execute(
+            "INSERT INTO provider_route_health
+             (target, provider_id, state, service_epoch, consecutive_successes,
+              consecutive_failures, total_attempts, failed_attempts,
+              observation_sequence, last_outcome)
+             VALUES ('codex', '00000000-0000-4000-8000-000000000902', 'healthy', ?1,
+                     1, 0, 1, 0, 1, 'success')",
+            [service_epoch],
+        )
+        .unwrap();
+    drop(health_connection);
+    let current_health = store.target_view_for(Target::Codex).await.unwrap();
+    assert!(
+        current_health.route_health.state
+            == muxvia_routing::control::protocol::RouteHealthState::Healthy
+            && current_health.providers[0].route_health.state
+                == muxvia_routing::control::protocol::RouteHealthState::Healthy,
+        "current-epoch health was not projected"
+    );
+    drop(store);
+    let restarted = StateStore::open(&fixture.home).await.unwrap();
+    let stale_health = restarted.target_view_for(Target::Codex).await.unwrap();
+    assert!(
+        stale_health.route_health.state
+            == muxvia_routing::control::protocol::RouteHealthState::Stale
+            && stale_health.providers[0].route_health.state
+                == muxvia_routing::control::protocol::RouteHealthState::Stale,
+        "prior-epoch health was not projected as stale"
+    );
+    drop(restarted);
+
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    let version: String = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'schema-version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let present = [
+        "failover_drafts",
+        "failover_draft_members",
+        "activated_route_plans",
+        "activated_route_plan_members",
+        "provider_route_health",
+    ]
+    .map(|table| {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    });
+    let drafts: Vec<(String, u64, i64)> = {
+        let mut statement = connection
+            .prepare(
+                "SELECT d.target, d.draft_revision, COUNT(m.position)
+                 FROM failover_drafts d LEFT JOIN failover_draft_members m ON m.target = d.target
+                 GROUP BY d.target, d.draft_revision ORDER BY d.target",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let codex_plan: (String, String, String, u64, u32) = connection
+        .query_row(
+            "SELECT r.active_route_plan_id, p.epoch, m.provider_id, m.provider_revision, m.position
+             FROM target_route_state r
+             JOIN activated_route_plans p ON p.id = r.active_route_plan_id
+             JOIN activated_route_plan_members m ON m.plan_id = p.id
+             WHERE r.target = 'codex'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    let plan_secret_boundary: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM pragma_table_info('activated_route_plan_members')
+                 WHERE name = 'provider_bearer_token'),
+               (SELECT COUNT(*) FROM activated_route_plan_members member
+                 JOIN providers provider ON provider.id = member.provider_id
+                 WHERE member.credential_id = provider.credential_id),
+               (SELECT COUNT(*) FROM credentials WHERE bearer_token = 'V9_PROVIDER_SECRET')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    assert_eq!(version, "10");
+    assert_eq!(present, [1, 1, 1, 1, 1]);
+    assert_eq!(
+        drafts,
+        vec![("claude".into(), 1, 0), ("codex".into(), 1, 1)]
+    );
+    assert_eq!(
+        codex_plan,
+        (
+            "00000000-0000-4000-8000-000000000903".into(),
+            "00000000-0000-4000-8000-000000000904".into(),
+            "00000000-0000-4000-8000-000000000902".into(),
+            5,
+            0,
+        )
+    );
+    assert_eq!(
+        plan_secret_boundary,
+        (0, 1, 1),
+        "migration copied a secret into the plan or lost its Credential Reference"
+    );
+    assert_eq!(
+        v8_projection_fingerprint(&connection),
+        before,
+        "migration changed v9 state"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn schema_v10_preserves_snapshot_credential_when_current_provider_changed() {
+    let fixture = StoreFixture::new();
+    fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    connection.execute_batch(V8_SCHEMA).unwrap();
+    upgrade_v8_fixture_to_v9(&connection);
+    connection
+        .execute_batch(
+            "INSERT INTO credentials VALUES
+               ('00000000-0000-4000-8000-000000000921', 'codex', 'V9_EDITED_PROVIDER_SECRET');
+             INSERT INTO providers
+               (id, target, position, provider_revision, name, base_url, model, protocol,
+                authentication, credential_id, routing_requirement)
+             VALUES
+               ('00000000-0000-4000-8000-000000000922', 'codex', 0, 6, 'Edited',
+                'https://edited.example/v1', 'edited-model', 'openai-responses',
+                'openai-bearer', '00000000-0000-4000-8000-000000000921', 'direct-compatible');
+             INSERT INTO activated_snapshots
+               (id, target, provider_id, base_url, model, protocol, authentication,
+                provider_bearer_token, epoch)
+             VALUES
+               ('00000000-0000-4000-8000-000000000923', 'codex',
+                '00000000-0000-4000-8000-000000000922', 'https://snapshot.example/v1',
+                'snapshot-model', 'openai-responses', 'openai-bearer',
+                'V9_SNAPSHOT_SECRET', '00000000-0000-4000-8000-000000000924');
+             UPDATE target_route_state SET
+               management_revision = 6, view_sequence = 9,
+               current_provider_id = '00000000-0000-4000-8000-000000000922',
+               serving_provider_id = '00000000-0000-4000-8000-000000000922',
+               activated_snapshot_id = '00000000-0000-4000-8000-000000000923',
+               takeover_state = 'active', route_port = 43130,
+               routing_credential = 'V9_ROUTING_SECRET'
+             WHERE target = 'codex';",
+        )
+        .unwrap();
+    drop(connection);
+
+    drop(StateStore::open(&fixture.home).await.unwrap());
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    let credential_boundary: (bool, bool, bool, bool, bool) = connection
+        .query_row(
+            "SELECT
+               NOT EXISTS (
+                 SELECT 1 FROM pragma_table_info('activated_route_plan_members')
+                 WHERE name = 'provider_bearer_token'
+               ),
+               plan_credential.bearer_token = 'V9_SNAPSHOT_SECRET',
+               provider_credential.bearer_token = 'V9_EDITED_PROVIDER_SECRET',
+               member.credential_id != provider.credential_id,
+               (SELECT COUNT(*) FROM credentials WHERE target = 'codex') = 2
+             FROM target_route_state route
+             JOIN activated_route_plan_members member
+               ON member.plan_id = route.active_route_plan_id
+             JOIN credentials plan_credential ON plan_credential.id = member.credential_id
+             JOIN providers provider ON provider.id = route.current_provider_id
+             JOIN credentials provider_credential ON provider_credential.id = provider.credential_id
+             WHERE route.target = 'codex'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert!(
+        credential_boundary == (true, true, true, true, true),
+        "migration did not preserve the immutable snapshot credential boundary"
+    );
+}
+
+#[tokio::test]
+async fn schema_v10_failed_migration_rolls_back_then_reruns() {
+    let fixture = StoreFixture::new();
+    fs::create_dir_all(fixture.home.database_path().parent().unwrap()).unwrap();
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    connection.execute_batch(V8_SCHEMA).unwrap();
+    upgrade_v8_fixture_to_v9(&connection);
+    connection
+        .execute_batch(
+            "INSERT INTO credentials VALUES
+               ('00000000-0000-4000-8000-000000000911', 'codex', 'ROLLBACK_PROVIDER_SECRET');
+             INSERT INTO providers
+               (id, target, position, provider_revision, name, base_url, model, protocol,
+                authentication, credential_id, routing_requirement)
+             VALUES
+               ('00000000-0000-4000-8000-000000000912', 'codex', 0, 2, 'Existing',
+                'https://existing.example/v1', 'existing-model', 'openai-responses',
+                'openai-bearer', '00000000-0000-4000-8000-000000000911', 'direct-compatible');
+             UPDATE target_route_state
+             SET current_provider_id = '00000000-0000-4000-8000-000000000912'
+             WHERE target = 'codex';",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(StateStore::open(&fixture.home).await.is_err());
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    let failed_version: String = connection
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'schema-version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let failed_tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'table' AND name IN
+               ('failover_drafts', 'failover_draft_members', 'activated_route_plans',
+                'activated_route_plan_members', 'provider_route_health')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        failed_version == "9",
+        "failed migration changed schema version"
+    );
+    assert!(
+        failed_tables == 0,
+        "failed migration left route-plan tables"
+    );
+    connection
+        .execute_batch(
+            "INSERT INTO activated_snapshots
+               (id, target, provider_id, base_url, model, protocol, authentication,
+                provider_bearer_token, epoch)
+             VALUES
+               ('00000000-0000-4000-8000-000000000913', 'codex',
+                '00000000-0000-4000-8000-000000000912', 'https://existing.example/v1',
+                'existing-model', 'openai-responses', 'openai-bearer',
+                'ROLLBACK_PROVIDER_SECRET', '00000000-0000-4000-8000-000000000914');
+             UPDATE target_route_state
+             SET activated_snapshot_id = '00000000-0000-4000-8000-000000000913'
+             WHERE target = 'codex';",
+        )
+        .unwrap();
+    drop(connection);
+
+    drop(StateStore::open(&fixture.home).await.unwrap());
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    let rerun: (String, i64, i64) = connection
+        .query_row(
+            "SELECT
+               (SELECT value FROM metadata WHERE key = 'schema-version'),
+               (SELECT COUNT(*) FROM activated_route_plans),
+               (SELECT COUNT(*) FROM activated_route_plan_members)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(
+        rerun == ("10".into(), 1, 1),
+        "migration rerun was incomplete"
+    );
+}
+
+#[tokio::test]
+async fn schema_v10_fresh_store_has_two_empty_drafts_and_no_active_plan() {
+    let fixture = StoreFixture::new();
+    drop(StateStore::open(&fixture.home).await.unwrap());
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    let state: (String, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+               (SELECT value FROM metadata WHERE key = 'schema-version'),
+               (SELECT COUNT(*) FROM failover_drafts WHERE draft_revision = 1),
+               (SELECT COUNT(*) FROM failover_draft_members),
+               (SELECT COUNT(*) FROM activated_route_plans),
+               (SELECT COUNT(*) FROM target_route_state WHERE active_route_plan_id IS NOT NULL)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert!(
+        state == ("10".into(), 2, 0, 0, 0),
+        "fresh route-plan state was not empty"
+    );
+    let foreign_key_failures: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(
+        foreign_key_failures == 0,
+        "fresh route-plan schema has invalid foreign keys"
+    );
 }
 
 fn v8_projection_fingerprint(connection: &Connection) -> Vec<u64> {
@@ -630,7 +1101,7 @@ async fn schema_v7_migrates_real_v5_claude_states_and_binds_the_unique_committed
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "9"
+            "10"
         );
         let route: (
             i64,
@@ -762,6 +1233,22 @@ async fn schema_v7_selects_current_bindings_from_v6_receipts_after_retry_history
         let prior_recovery = format!("20000000-0000-4000-8000-000000000{}", base + 5);
         let rolled_back_recovery = format!("20000000-0000-4000-8000-000000000{}", base + 6);
         let retried_recovery = format!("20000000-0000-4000-8000-000000000{}", base + 7);
+        connection
+            .execute(
+                "INSERT INTO credentials (id, target, bearer_token) VALUES (?1, ?2, 'provider-secret')",
+                params![provider_id, target],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO providers
+                 (id, target, position, provider_revision, name, base_url, model, protocol,
+                  authentication, credential_id, routing_requirement)
+                 VALUES (?1, ?2, 0, 1, 'Provider', 'https://provider.test',
+                         'current-model', ?3, ?4, ?1, 'direct-compatible')",
+                params![provider_id, target, protocol, authentication],
+            )
+            .unwrap();
         for (snapshot_id, model, epoch) in [
             (&prior_snapshot, "prior-model", base + 8),
             (&current_snapshot, "current-model", base + 9),
@@ -1008,7 +1495,7 @@ async fn schema_v7_does_not_guess_between_multiple_legacy_committed_intents() {
         .unwrap();
     assert_eq!(
         migrated,
-        ("9".to_owned(), None, "recovery-required".to_owned())
+        ("10".to_owned(), None, "recovery-required".to_owned())
     );
 }
 
@@ -1543,7 +2030,7 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "9");
+    assert_eq!(schema_version, "10");
     assert_eq!(
         view.providers[0].id,
         Uuid::parse_str(existing_provider_id).unwrap()
@@ -1773,7 +2260,7 @@ async fn schema_v4_migrates_v2_routing_requirement_and_historical_receipts() {
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "9");
+    assert_eq!(schema_version, "10");
     assert_eq!(
         store.target_view().await.unwrap().providers[0].routing_requirement,
         ProviderRoutingRequirement::DirectCompatible

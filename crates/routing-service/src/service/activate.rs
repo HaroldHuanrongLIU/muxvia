@@ -24,7 +24,8 @@ use crate::{
     domain::activation::ActivatedSnapshot,
     home::MuxviaHome,
     model::{
-        ModelServer, ModelServerError, ModelServerHandle, ReservedListener, UpstreamTransport,
+        ModelServer, ModelServerError, ModelServerHandle, ReservedListener, RouteHealthRuntime,
+        UpstreamTransport,
     },
     state::{
         ActionFailure, ActivationCommit, ActivationPreparation, ActivationRuntime,
@@ -344,6 +345,8 @@ pub struct ActivationService {
     claude_gate: Arc<Mutex<()>>,
     codex_model: Arc<Mutex<Option<ModelServerHandle>>>,
     claude_model: Arc<Mutex<Option<ModelServerHandle>>>,
+    codex_route_health: Arc<RouteHealthRuntime>,
+    claude_route_health: Arc<RouteHealthRuntime>,
     hooks: ActivationHooks,
     configuration_home_override: Option<PathBuf>,
 }
@@ -368,6 +371,8 @@ impl ActivationService {
             claude_gate: Arc::new(Mutex::new(())),
             codex_model: Arc::new(Mutex::new(None)),
             claude_model: Arc::new(Mutex::new(None)),
+            codex_route_health: Arc::new(RouteHealthRuntime::default()),
+            claude_route_health: Arc::new(RouteHealthRuntime::default()),
             hooks: ActivationHooks::default(),
             configuration_home_override: None,
         }
@@ -509,7 +514,12 @@ impl ActivationService {
                 )
                 .await
             }
-            Ok(TargetAction::Reconcile { .. } | TargetAction::ResolveCompatibility(_)) => Err(self
+            Ok(
+                TargetAction::Reconcile { .. }
+                | TargetAction::ResolveCompatibility(_)
+                | TargetAction::SaveFailoverDraft(_)
+                | TargetAction::ApplyFailoverChain(_),
+            ) => Err(self
                 .store
                 .failure_for(target, "invalid-provider", "Provider action is malformed")
                 .await),
@@ -1086,11 +1096,12 @@ impl ActivationService {
         }
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, takeover.route_port)).await?;
         let reserved = ReservedListener::new(listener)?;
-        let handle = ModelServer::bind_reserved_for(
+        let handle = ModelServer::bind_reserved_for_with_health(
             reserved,
             target,
             Arc::clone(&self.store),
             Arc::clone(&self.upstream),
+            Arc::clone(self.route_health_for(target)),
         )
         .await?;
         if handle.endpoint().port() != takeover.route_port || !handle.is_running() {
@@ -1601,15 +1612,23 @@ impl ActivationService {
             .map_err(|_| ())?;
         let reserved = ReservedListener::new(listener).map_err(|_| ())?;
         let endpoint = reserved.endpoint().port();
-        let handle = ModelServer::bind_reserved_staged_for(
+        let handle = ModelServer::bind_reserved_staged_for_with_health(
             reserved,
             target,
             Arc::clone(&self.store),
             Arc::clone(&self.upstream),
+            Arc::clone(self.route_health_for(target)),
         )
         .await
         .map_err(|_| ())?;
         Ok((endpoint, Some(handle)))
+    }
+
+    fn route_health_for(&self, target: Target) -> &Arc<RouteHealthRuntime> {
+        match target {
+            Target::Codex => &self.codex_route_health,
+            Target::Claude => &self.claude_route_health,
+        }
     }
 
     async fn rollback(

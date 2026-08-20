@@ -25,6 +25,7 @@ const initialView: TargetView = {
   managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
   recovery: { intentId: null, state: "clean" },
   activatedSnapshot: null,
+  failover: { draftRevision: 1, draftMembers: [], activePlan: null },
   problems: [],
 }
 

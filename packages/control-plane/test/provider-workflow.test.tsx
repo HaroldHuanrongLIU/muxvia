@@ -76,6 +76,7 @@ function provider(overrides: Partial<TargetView["providers"][number]>): TargetVi
       protocol: "target-fixed", authentication: "target-provider",
       routingRequirement: "target-provider", credential: "target-provider",
     },
+    routeHealth: { state: "unobserved" },
     activeReferences: [],
     ...overrides,
   }
@@ -97,6 +98,7 @@ function view(overrides: Partial<TargetView> = {}): TargetView {
     managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
     recovery: { intentId: null, state: "clean" },
     activatedSnapshot: null,
+    failover: { draftRevision: 1, draftMembers: [], activePlan: null },
     problems: [],
     ...overrides,
   }
@@ -375,6 +377,148 @@ function expectInOrder(frame: string, names: readonly string[]): void {
     cursor = (next ?? 0) + name.length
   }
 }
+
+test.each(["codex", "claude"] as const)(
+  "Failover route overlay saves a Target-bound draft and applies one immutable plan for %s",
+  async (target) => {
+    const primary = provider({
+      id: "00000000-0000-4000-8000-000000000041",
+      name: "Primary Rail",
+      routeHealth: { state: "degraded" },
+    })
+    const fallback = provider({
+      id: "00000000-0000-4000-8000-000000000042",
+      position: 1,
+      name: "Fallback Rail",
+      routeHealth: { state: "healthy" },
+    })
+    const initial = view({
+      target,
+      managementRevision: 4,
+      viewSequence: 7,
+      providers: [primary, fallback],
+      currentProviderId: primary.id,
+      servingProviderId: fallback.id,
+      failover: {
+        draftRevision: 2,
+        draftMembers: [{ providerId: primary.id, providerRevision: primary.providerRevision }],
+        activePlan: {
+          id: "00000000-0000-4000-8000-000000000043",
+          epoch: "00000000-0000-4000-8000-000000000044",
+          members: [{
+            position: 0,
+            providerId: primary.id,
+            providerRevision: primary.providerRevision,
+            name: primary.name,
+            model: primary.model,
+            protocol: primary.protocol,
+            authentication: primary.authentication,
+          }],
+        },
+      },
+    })
+    const apply = deferred<ActionOutcome>()
+    let authoritative = initial
+    const session = new MemoryTargetSession(initial, async (action) => {
+      if (action.kind === "save-failover-draft") {
+        authoritative = {
+          ...authoritative,
+          managementRevision: authoritative.managementRevision + 1,
+          viewSequence: authoritative.viewSequence + 1,
+          failover: {
+            ...authoritative.failover!,
+            draftRevision: authoritative.failover!.draftRevision + 1,
+            draftMembers: structuredClone(action.members),
+          },
+        }
+        return { status: "applied", view: authoritative }
+      }
+      if (action.kind === "apply-failover-chain") return await apply.promise
+      return { status: "applied", view: authoritative }
+    })
+    const setup = await testRender(() => <App sessions={{ [target]: session }} />, {
+      width: 100,
+      height: 30,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey(target === "codex" ? "1" : "2")
+      await setup.mockInput.typeText("/route")
+      setup.mockInput.pressEnter()
+      const opened = await setup.waitForFrame((frame) => frame.includes("Failover Route"))
+      expect(opened).toContain("Current: Primary Rail · Serving: Fallback Rail")
+      expect(opened).toContain("01 · Current · Primary Rail · Complete · Synchronized")
+      expect(opened).toContain("Degraded")
+      expect(opened).toContain("Draft matches the active route")
+
+      await setup.mockInput.typeText("a")
+      await waitForSecretFreeCondition(
+        setup,
+        () => session.actions.length === 1,
+        () => auditSecretFreeActions(session.actions, compatibilitySecrets, `route-save-${target}`),
+        `secret-scan-failed:route-save-${target}`,
+        `route-save-${target}`,
+      )
+      const saved = await setup.waitForFrame((frame) => frame.includes("02 · Fallback · Fallback Rail"))
+      expect(saved).toContain("Draft differs from the active route")
+      assertSecretFreeStructured("action", session.actions, compatibilitySecrets, `route-save-${target}`, (actions) => {
+        expect(actions).toEqual([{
+          kind: "save-failover-draft",
+          members: [
+            { providerId: primary.id, providerRevision: 1 },
+            { providerId: fallback.id, providerRevision: 1 },
+          ],
+        }])
+      })
+
+      setup.mockInput.pressEnter()
+      await waitForSecretFreeCondition(
+        setup,
+        () => session.actions.length === 2,
+        () => auditSecretFreeActions(session.actions, compatibilitySecrets, `route-apply-${target}`),
+        `secret-scan-failed:route-apply-${target}`,
+        `route-apply-${target}`,
+      )
+      setup.mockInput.pressEscape()
+      const pending = await setup.waitForFrame((frame) => frame.includes("Applying immutable route plan"))
+      expect(pending).toContain("Failover Route")
+
+      const draft = authoritative.failover!.draftMembers
+      authoritative = {
+        ...authoritative,
+        managementRevision: authoritative.managementRevision + 1,
+        viewSequence: authoritative.viewSequence + 1,
+        failover: {
+          ...authoritative.failover!,
+          activePlan: {
+            id: "00000000-0000-4000-8000-000000000045",
+            epoch: "00000000-0000-4000-8000-000000000046",
+            members: draft.map((member, position) => {
+              const declaration = authoritative.providers.find((candidate) => candidate.id === member.providerId)!
+              return {
+                position,
+                providerId: member.providerId,
+                providerRevision: member.providerRevision,
+                name: declaration.name,
+                model: declaration.model,
+                protocol: declaration.protocol,
+                authentication: declaration.authentication,
+              }
+            }),
+          },
+        },
+      }
+      apply.resolve({ status: "applied", view: authoritative })
+      const applied = await setup.waitForFrame((frame) => frame.includes("Draft matches the active route") && frame.includes("000000000046"))
+      expect(applied).toContain("Fallback Rail")
+      expect(session.actions[1]).toEqual({ kind: "apply-failover-chain", draftRevision: 3 })
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)
 
 async function fillProviderDraft(
   mockInput: Awaited<ReturnType<typeof testRender>>["mockInput"],

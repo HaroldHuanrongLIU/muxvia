@@ -992,6 +992,8 @@ async fn reapply_reconciliation_over_real_uds_restores_owned_and_preserves_unrel
         },
     )
     .await;
+    let failover_before =
+        serde_json::to_value(store.target_view_for(Target::Codex).await.unwrap().failover).unwrap();
     let committed = fs::read_to_string(user_home.join(".codex/config.toml")).unwrap();
     let drifted = committed.replace("committed-model", "external-model")
         + "\nunrelated_after_preview = \"preserve-me\"\n";
@@ -1043,6 +1045,10 @@ async fn reapply_reconciliation_over_real_uds_restores_owned_and_preserves_unrel
     assert_eq!(
         outcome["result"]["outcome"]["view"]["managementRevision"],
         revision + 1
+    );
+    assert_eq!(
+        outcome["result"]["outcome"]["view"]["failover"], failover_before,
+        "Reapply changed the Failover Chain draft or active plan"
     );
     let rendered = fs::read_to_string(user_home.join(".codex/config.toml")).unwrap();
     assert!(rendered.contains("committed-model"));
@@ -1355,6 +1361,29 @@ operator_note = "preserve-this-unrelated-field"
     );
     assert_eq!(view["mode"], "direct");
     assert_eq!(view["takeover"]["state"], "inactive");
+    assert_eq!(
+        view["failover"]["activePlan"]["id"],
+        view["activatedSnapshot"]["id"]
+    );
+    assert_eq!(
+        view["failover"]["activePlan"]["members"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        view["failover"]["activePlan"]["members"][0]["providerId"],
+        view["currentProviderId"]
+    );
+    assert_eq!(
+        view["failover"]["draftMembers"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        view["failover"]["draftMembers"][0]["providerId"],
+        view["currentProviderId"]
+    );
     let _push = read_frame(&mut stream).await.unwrap();
     assert_eq!(activation.model_endpoint_for(Target::Codex).await, None);
     assert_eq!(
@@ -1679,6 +1708,13 @@ async fn restore_reconciliation_exits_only_the_idle_target_and_retains_provider_
     assert_eq!(view["takeover"]["state"], "inactive");
     assert!(view["currentProviderId"].is_null());
     assert!(view["activatedSnapshot"].is_null());
+    assert!(view["failover"]["activePlan"].is_null());
+    assert!(
+        view["failover"]["draftMembers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(view["providers"].as_array().unwrap().len(), provider_count);
     let rendered = fs::read_to_string(user_home.join(".codex/config.toml")).unwrap();
     assert!(rendered.contains("restore_unrelated = \"keep-this\""));

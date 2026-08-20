@@ -20,6 +20,7 @@ import { ProviderForm, type ProviderDraft, type ProviderFormRef, type ProviderFo
 import { ProviderPicker } from "./provider-picker"
 import { ProviderSourcePicker, type ProviderSource } from "./provider-source-picker"
 import { Reconciliation, type ReconciliationUiState } from "./reconciliation"
+import { RouteEditor } from "./route-editor"
 import { TargetSidebar } from "./target-sidebar"
 import { TargetView, type ActivityEntry } from "./target-view"
 import { TakeoverRequiredConfirm } from "./takeover-required-confirm"
@@ -55,6 +56,13 @@ type ReconciliationWorkflowState = ReconciliationUiState & {
   originSession: TargetSession
   generation: number
 }
+type RouteWorkflowState = {
+  overlayToken: OverlayToken
+  originSession: TargetSession
+  generation: number
+  pending?: "save" | "apply"
+  errorCode?: string
+}
 
 const reconciliationProblemCodes = new Set([
   "compatibility-acknowledgement-required",
@@ -86,6 +94,30 @@ function safeReconciliationProblem(error: unknown): string {
     case "stale-revision":
     case "target-busy":
     case "untested-target-cli":
+      return code
+    default:
+      return "internal-failure"
+  }
+}
+
+function safeRouteProblem(error: unknown): string {
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String(error.code)
+    : "internal-failure"
+  switch (code) {
+    case "invalid-failover-chain":
+    case "stale-failover-draft-revision":
+    case "duplicate-failover-provider":
+    case "current-provider-must-be-first":
+    case "incomplete-route-plan-provider":
+    case "unsynchronized-route-plan-provider":
+    case "stale-provider-revision":
+    case "stale-revision":
+    case "recovery-required":
+    case "configuration-drift":
+    case "shadowing-configuration":
+    case "compatibility-acknowledgement-required":
+    case "incompatible-target-cli":
       return code
     default:
       return "internal-failure"
@@ -232,6 +264,7 @@ function Shell(props: {
   const [reachabilityByTarget, setReachabilityByTarget] = createSignal<Partial<Record<Target, ReachabilityState>>>({})
   const [applyingByTarget, setApplyingByTarget] = createSignal<Record<Target, "direct" | "takeover" | undefined>>({ codex: undefined, claude: undefined })
   const [reconciliationByTarget, setReconciliationByTarget] = createSignal<Partial<Record<Target, ReconciliationWorkflowState>>>({})
+  const [routeWorkflowByTarget, setRouteWorkflowByTarget] = createSignal<Partial<Record<Target, RouteWorkflowState>>>({})
   const showCommandPalette = useCommandPaletteOpener(props.t, () => applying() === undefined)
   const [notices, setNotices] = createSignal<Partial<Record<Target | "home", Notice>>>({})
   const [activitiesByTarget, setActivitiesByTarget] = createSignal<Record<Target, ActivityEntry[]>>({ codex: [], claude: [] })
@@ -258,6 +291,8 @@ function Shell(props: {
   const providerSourcePickerScheduled: Record<Target, boolean> = { codex: false, claude: false }
   const reconciliationScheduled: Record<Target, boolean> = { codex: false, claude: false }
   const reconciliationGenerations: Record<Target, number> = { codex: 0, claude: 0 }
+  const routeWorkflowScheduled: Record<Target, boolean> = { codex: false, claude: false }
+  const routeWorkflowGenerations: Record<Target, number> = { codex: 0, claude: 0 }
   const reconciliationAborts: Partial<Record<Target, AbortController>> = {}
   const reachabilityAborts: Partial<Record<Target, AbortController>> = {}
   const reachabilityGenerations: Record<Target, number> = { codex: 0, claude: 0 }
@@ -655,6 +690,103 @@ function Shell(props: {
         },
       })
       if (compatibilityOnly) void probeCompatibility(target, token)
+    })
+  }
+
+  const updateRouteWorkflow = (
+    target: Target,
+    token: OverlayToken,
+    update: (current: RouteWorkflowState) => RouteWorkflowState,
+  ) => {
+    setRouteWorkflowByTarget((states) => {
+      const current = states[target]
+      if (!current || current.overlayToken !== token) return states
+      return { ...states, [target]: update(current) }
+    })
+  }
+
+  const saveRouteDraft = async (
+    target: Target,
+    token: OverlayToken,
+    members: NonNullable<TargetViewProjection["failover"]>["draftMembers"],
+  ) => {
+    const current = routeWorkflowByTarget()[target]
+    if (!current || current.overlayToken !== token || current.pending) return
+    const { originSession, generation } = current
+    updateRouteWorkflow(target, token, (state) => ({ ...state, pending: "save", errorCode: undefined }))
+    try {
+      const outcome = await originSession.act({ kind: "save-failover-draft", members: [...members] })
+      const latest = routeWorkflowByTarget()[target]
+      if (disposed || exiting || !latest || latest.overlayToken !== token || latest.originSession !== originSession || latest.generation !== generation) return
+      installView(outcome.view, "action")
+      updateRouteWorkflow(target, token, (state) => ({ ...state, pending: undefined }))
+    } catch (error) {
+      if (disposed || exiting) return
+      installView(originSession.get() as TargetViewProjection, "action")
+      const latest = routeWorkflowByTarget()[target]
+      if (!latest || latest.overlayToken !== token || latest.generation !== generation) return
+      updateRouteWorkflow(target, token, (state) => ({ ...state, pending: undefined, errorCode: safeRouteProblem(error) }))
+    }
+  }
+
+  const applyRouteDraft = async (target: Target, token: OverlayToken) => {
+    const current = routeWorkflowByTarget()[target]
+    const failover = current?.originSession.get().failover
+    if (!current || current.overlayToken !== token || current.pending || !failover) return
+    const { originSession, generation } = current
+    updateRouteWorkflow(target, token, (state) => ({ ...state, pending: "apply", errorCode: undefined }))
+    try {
+      const outcome = await originSession.act({
+        kind: "apply-failover-chain",
+        draftRevision: failover.draftRevision,
+      })
+      const latest = routeWorkflowByTarget()[target]
+      if (disposed || exiting || !latest || latest.overlayToken !== token || latest.originSession !== originSession || latest.generation !== generation) return
+      installView(outcome.view, "action")
+      updateRouteWorkflow(target, token, (state) => ({ ...state, pending: undefined }))
+      const activity: ActivityDraft = { kind: "success", messageKey: "activity.route.applied" }
+      appendActivity(activity, target)
+      if (activeTarget() === target) setNotice({ kind: "success", text: props.t(activity.messageKey) }, target)
+    } catch (error) {
+      if (disposed || exiting) return
+      installView(originSession.get() as TargetViewProjection, "action")
+      const latest = routeWorkflowByTarget()[target]
+      if (!latest || latest.overlayToken !== token || latest.generation !== generation) return
+      updateRouteWorkflow(target, token, (state) => ({ ...state, pending: undefined, errorCode: safeRouteProblem(error) }))
+    }
+  }
+
+  const openRouteEditor = () => {
+    const target = activeTarget()
+    const originSession = session(target)
+    if (!target || !originSession || !originSession.get().failover || routeWorkflowScheduled[target] || overlay.depth > 0) return
+    routeWorkflowScheduled[target] = true
+    queueMicrotask(() => {
+      routeWorkflowScheduled[target] = false
+      if (disposed || exiting || activeTarget() !== target || overlay.depth > 0) return
+      const token = Symbol(`route-editor-${target}`)
+      const generation = ++routeWorkflowGenerations[target]
+      const initial: RouteWorkflowState = { overlayToken: token, originSession, generation }
+      setRouteWorkflowByTarget((states) => ({ ...states, [target]: initial }))
+      overlay.replace({
+        id: "route-editor",
+        token,
+        dismissOnEscape: () => routeWorkflowByTarget()[target]?.pending !== "apply",
+        render: () => <RouteEditor
+          view={() => views()[target] ?? originSession.get() as TargetViewProjection}
+          t={props.t}
+          pending={() => routeWorkflowByTarget()[target]?.pending}
+          errorCode={() => routeWorkflowByTarget()[target]?.errorCode}
+          onSave={(members) => { void saveRouteDraft(target, token, [...members]) }}
+          onApply={() => { void applyRouteDraft(target, token) }}
+        />,
+        onClose: () => {
+          routeWorkflowGenerations[target]++
+          setRouteWorkflowByTarget((states) => states[target]?.overlayToken === token
+            ? { ...states, [target]: undefined }
+            : states)
+        },
+      })
     })
   }
 
@@ -1331,6 +1463,7 @@ function Shell(props: {
       "target.direct.apply": () => applyDefaultProvider("direct"),
       "target.takeover.apply": () => applyDefaultProvider("takeover"),
       "target.reconciliation.open": openReconciliation,
+      "route.open": openRouteEditor,
     },
   })
   useCommandLayer({
@@ -1346,6 +1479,7 @@ function Shell(props: {
       "target.direct.apply": () => applyDefaultProvider("direct"),
       "target.takeover.apply": () => applyDefaultProvider("takeover"),
       "target.reconciliation.open": openReconciliation,
+      "route.open": openRouteEditor,
     },
   })
   const horizontalPadding = () => dimensions().width >= 5 ? 2 : 0

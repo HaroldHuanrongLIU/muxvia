@@ -507,6 +507,10 @@ impl StateStore {
                                  WHERE id = ?1
                                    AND NOT EXISTS (
                                      SELECT 1 FROM providers WHERE credential_id = ?1
+                                   )
+                                   AND NOT EXISTS (
+                                     SELECT 1 FROM activated_route_plan_members
+                                     WHERE credential_id = ?1
                                    )",
                                 [credential_id],
                             )?;
@@ -643,6 +647,10 @@ impl StateStore {
                              WHERE id = ?1
                                AND NOT EXISTS (
                                  SELECT 1 FROM providers WHERE credential_id = ?1
+                               )
+                               AND NOT EXISTS (
+                                 SELECT 1 FROM activated_route_plan_members
+                                 WHERE credential_id = ?1
                                )",
                             [previous_credential_id],
                         )?;
@@ -1311,7 +1319,10 @@ fn delete_universal_provider(
                 .execute(
                     "DELETE FROM credentials
                      WHERE id = ?1
-                       AND NOT EXISTS (SELECT 1 FROM providers WHERE credential_id = ?1)",
+                       AND NOT EXISTS (SELECT 1 FROM providers WHERE credential_id = ?1)
+                       AND NOT EXISTS (
+                         SELECT 1 FROM activated_route_plan_members WHERE credential_id = ?1
+                       )",
                     [credential_id],
                 )
                 .map_err(|_| CatalogMutationError::State)?;
@@ -1615,15 +1626,19 @@ fn project_active_references(
     target: Target,
     provider_id: Uuid,
 ) -> Result<Vec<ProviderReferenceView>, tokio_rusqlite::rusqlite::Error> {
-    let (is_current, is_snapshot): (bool, bool) = connection.query_row(
+    let (is_current, is_snapshot, is_route_plan): (bool, bool, bool) = connection.query_row(
         "SELECT COALESCE(current_provider_id = ?2, 0),
                 EXISTS(
                   SELECT 1 FROM activated_snapshots s
                   WHERE s.id = r.activated_snapshot_id AND s.provider_id = ?2
+                ),
+                EXISTS(
+                  SELECT 1 FROM activated_route_plan_members member
+                  WHERE member.plan_id = r.active_route_plan_id AND member.provider_id = ?2
                 )
          FROM target_route_state r WHERE r.target = ?1",
         params![target.as_str(), provider_id.to_string()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let mut references = Vec::new();
     if is_current {
@@ -1631,6 +1646,9 @@ fn project_active_references(
     }
     if is_snapshot {
         references.push(ProviderReferenceView::ActivatedSnapshot);
+    }
+    if is_route_plan {
+        references.push(ProviderReferenceView::ActivatedRoutePlan);
     }
     Ok(references)
 }

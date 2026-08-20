@@ -23,6 +23,7 @@ function view(): TargetView {
     managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
     recovery: { intentId: null, state: "clean" },
     activatedSnapshot: null,
+    failover: { draftRevision: 1, draftMembers: [], activePlan: null },
     problems: [],
   }
 }
@@ -33,10 +34,58 @@ class StaticTargetSession implements TargetSession {
   constructor(
     target: "codex" | "claude" = "codex",
     problem?: "configuration-drift" | "compatibility-acknowledgement-required",
+    withFailover = false,
   ) {
+    const routeProvider: TargetView["providers"][number] = {
+      id: "00000000-0000-4000-8000-000000000011",
+      position: 0,
+      providerRevision: 1,
+      name: "Responsive Primary",
+      baseUrl: "https://responsive.example/v1",
+      model: "responsive-model",
+      protocol: target === "codex" ? "openai-responses" : "anthropic-messages",
+      authentication: target === "codex" ? "openai-bearer" : "anthropic-api-key",
+      routingRequirement: "direct-compatible",
+      credential: "present",
+      completeness: "complete",
+      missingFields: [],
+      provenance: null,
+      generated: false,
+      universalProviderId: null,
+      synchronization: null,
+      ownership: {
+        name: "target-provider", baseUrl: "target-provider", model: "target-provider",
+        protocol: "target-fixed", authentication: "target-provider",
+        routingRequirement: "target-provider", credential: "target-provider",
+      },
+      routeHealth: { state: "healthy" },
+      activeReferences: ["current", "activated-route-plan"],
+    }
     this.#view = {
       ...view(),
       target,
+      ...(withFailover ? {
+        providers: [routeProvider],
+        currentProviderId: routeProvider.id,
+        servingProviderId: routeProvider.id,
+        failover: {
+          draftRevision: 1,
+          draftMembers: [{ providerId: routeProvider.id, providerRevision: 1 }],
+          activePlan: {
+            id: "00000000-0000-4000-8000-000000000012",
+            epoch: "00000000-0000-4000-8000-000000000013",
+            members: [{
+              position: 0,
+              providerId: routeProvider.id,
+              providerRevision: 1,
+              name: routeProvider.name,
+              model: routeProvider.model,
+              protocol: routeProvider.protocol,
+              authentication: routeProvider.authentication,
+            }],
+          },
+        },
+      } : {}),
       problems: problem ? [{ code: problem, message: "must-not-render" }] : [],
     }
   }
@@ -188,6 +237,29 @@ test("Claude renders the exact extreme-size matrix without excluded application 
     setup.renderer.destroy()
   }
 })
+
+test.each(["codex", "claude"] as const)(
+  "Failover route overlay renders the exact extreme-size matrix for %s",
+  async (target) => {
+    const session = new StaticTargetSession(target, undefined, true)
+    const setup = await testRender(() => <App sessions={{ [target]: session }} />, {
+      width: 80,
+      height: 24,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey(target === "codex" ? "1" : "2")
+      await setup.mockInput.typeText("/route")
+      setup.mockInput.pressEnter()
+      await setup.waitForFrame((frame) => frame.includes("Failover Route"))
+      await expectSizeMatrix(setup)
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)
 
 test.each(["codex", "claude"] as const)(
   "Reconciliation modal renders the exact extreme-size matrix for %s",

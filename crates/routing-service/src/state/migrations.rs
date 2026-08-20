@@ -6,15 +6,15 @@ use tokio_rusqlite::rusqlite::{
 
 use crate::control::protocol::{
     ActionOutcome, ActionStatus, ActivatedSnapshotView, ControlProblem, CredentialPresence,
-    ManagedConfigurationView, ProviderAuthentication, ProviderCompleteness,
+    FailoverView, ManagedConfigurationView, ProviderAuthentication, ProviderCompleteness,
     ProviderFieldOwnershipView, ProviderPresetView, ProviderProtocol, ProviderProvenanceView,
     ProviderReferenceView, ProviderRequirement, ProviderRoutingRequirement, ProviderView,
-    RecoveryView, RouteHealthView, ServiceView, TakeoverView, Target, TargetView,
+    RecoveryView, RouteHealthState, RouteHealthView, ServiceView, TakeoverView, Target, TargetView,
 };
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -48,6 +48,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v6(connection)?;
             migrate_v7(connection)?;
             migrate_v8(connection)?;
+            migrate_v9(connection)?;
         }
         Some(2) => {
             migrate_v2(connection)?;
@@ -57,6 +58,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v6(connection)?;
             migrate_v7(connection)?;
             migrate_v8(connection)?;
+            migrate_v9(connection)?;
         }
         Some(3) => {
             migrate_v3(connection)?;
@@ -65,6 +67,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v6(connection)?;
             migrate_v7(connection)?;
             migrate_v8(connection)?;
+            migrate_v9(connection)?;
         }
         Some(4) => {
             migrate_v4(connection)?;
@@ -72,27 +75,173 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v6(connection)?;
             migrate_v7(connection)?;
             migrate_v8(connection)?;
+            migrate_v9(connection)?;
         }
         Some(5) => {
             migrate_v5(connection)?;
             migrate_v6(connection)?;
             migrate_v7(connection)?;
             migrate_v8(connection)?;
+            migrate_v9(connection)?;
         }
         Some(6) => {
             migrate_v6(connection)?;
             migrate_v7(connection)?;
             migrate_v8(connection)?;
+            migrate_v9(connection)?;
         }
         Some(7) => {
             migrate_v7(connection)?;
             migrate_v8(connection)?;
+            migrate_v9(connection)?;
         }
-        Some(8) => migrate_v8(connection)?,
+        Some(8) => {
+            migrate_v8(connection)?;
+            migrate_v9(connection)?;
+        }
+        Some(9) => migrate_v9(connection)?,
         Some(_) => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v9(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE failover_drafts (
+           target TEXT PRIMARY KEY CHECK (target IN ('codex', 'claude')),
+           draft_revision INTEGER NOT NULL CHECK (draft_revision >= 1)
+         );
+         CREATE TABLE failover_draft_members (
+           target TEXT NOT NULL REFERENCES failover_drafts(target) ON DELETE CASCADE,
+           position INTEGER NOT NULL CHECK (position >= 0),
+           provider_id TEXT NOT NULL,
+           provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
+           PRIMARY KEY (target, position),
+           UNIQUE (target, provider_id)
+         );
+         CREATE TABLE activated_route_plans (
+           id TEXT PRIMARY KEY,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           epoch TEXT NOT NULL,
+           created_revision INTEGER NOT NULL CHECK (created_revision >= 0)
+         );
+         CREATE TABLE activated_route_plan_members (
+           plan_id TEXT NOT NULL REFERENCES activated_route_plans(id) ON DELETE CASCADE,
+           position INTEGER NOT NULL CHECK (position >= 0),
+           provider_id TEXT NOT NULL,
+           provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
+           name TEXT NOT NULL,
+           base_url TEXT NOT NULL,
+           model TEXT NOT NULL,
+           protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
+           authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
+           credential_id TEXT NOT NULL REFERENCES credentials(id),
+           routing_requirement TEXT NOT NULL CHECK (routing_requirement IN ('direct-compatible', 'takeover-required')),
+           PRIMARY KEY (plan_id, position),
+           UNIQUE (plan_id, provider_id)
+         );
+         CREATE TABLE provider_route_health (
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           provider_id TEXT NOT NULL,
+           state TEXT NOT NULL CHECK (state IN ('healthy', 'degraded', 'unavailable')),
+           service_epoch TEXT NOT NULL,
+           consecutive_successes INTEGER NOT NULL CHECK (consecutive_successes >= 0),
+           consecutive_failures INTEGER NOT NULL CHECK (consecutive_failures >= 0),
+           total_attempts INTEGER NOT NULL CHECK (total_attempts >= 0),
+           failed_attempts INTEGER NOT NULL CHECK (failed_attempts >= 0 AND failed_attempts <= total_attempts),
+           observation_sequence INTEGER NOT NULL CHECK (observation_sequence >= 0),
+           last_outcome TEXT NOT NULL,
+           PRIMARY KEY (target, provider_id)
+         );
+         ALTER TABLE target_route_state ADD COLUMN active_route_plan_id TEXT
+           REFERENCES activated_route_plans(id);
+         INSERT INTO failover_drafts (target, draft_revision)
+           VALUES ('codex', 1), ('claude', 1);",
+    )?;
+
+    let invalid_routes: u64 = transaction.query_row(
+        "SELECT COUNT(*)
+         FROM target_route_state route
+         LEFT JOIN activated_snapshots snapshot
+           ON snapshot.id = route.activated_snapshot_id
+          AND snapshot.target = route.target
+          AND snapshot.provider_id = route.current_provider_id
+         LEFT JOIN providers provider
+           ON provider.id = route.current_provider_id
+          AND provider.target = route.target
+         WHERE route.current_provider_id IS NOT NULL
+           AND (snapshot.id IS NULL OR provider.id IS NULL)",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_routes != 0 {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+
+    transaction.execute_batch(
+        "INSERT INTO failover_draft_members
+           (target, position, provider_id, provider_revision)
+         SELECT route.target, 0, provider.id, provider.provider_revision
+         FROM target_route_state route
+         JOIN providers provider
+           ON provider.id = route.current_provider_id AND provider.target = route.target;
+
+         INSERT INTO activated_route_plans (id, target, epoch, created_revision)
+         SELECT snapshot.id, route.target, snapshot.epoch, route.management_revision
+         FROM target_route_state route
+         JOIN activated_snapshots snapshot
+           ON snapshot.id = route.activated_snapshot_id
+          AND snapshot.target = route.target
+          AND snapshot.provider_id = route.current_provider_id;
+
+         INSERT INTO credentials (id, target, bearer_token)
+         SELECT 'route-plan-' || snapshot.id, route.target, snapshot.provider_bearer_token
+         FROM target_route_state route
+         JOIN activated_snapshots snapshot
+           ON snapshot.id = route.activated_snapshot_id
+          AND snapshot.target = route.target
+          AND snapshot.provider_id = route.current_provider_id
+         JOIN providers provider
+           ON provider.id = route.current_provider_id AND provider.target = route.target
+         LEFT JOIN credentials credential
+           ON credential.id = provider.credential_id AND credential.target = provider.target
+         WHERE credential.bearer_token IS NOT snapshot.provider_bearer_token;
+
+         INSERT INTO activated_route_plan_members
+           (plan_id, position, provider_id, provider_revision, name, base_url, model,
+            protocol, authentication, credential_id, routing_requirement)
+         SELECT snapshot.id, 0, provider.id, provider.provider_revision, provider.name,
+                snapshot.base_url, snapshot.model, snapshot.protocol, snapshot.authentication,
+                CASE WHEN credential.bearer_token = snapshot.provider_bearer_token
+                     THEN provider.credential_id ELSE 'route-plan-' || snapshot.id END,
+                provider.routing_requirement
+         FROM target_route_state route
+         JOIN activated_snapshots snapshot
+           ON snapshot.id = route.activated_snapshot_id
+          AND snapshot.target = route.target
+          AND snapshot.provider_id = route.current_provider_id
+         JOIN providers provider
+           ON provider.id = route.current_provider_id AND provider.target = route.target
+         LEFT JOIN credentials credential
+           ON credential.id = provider.credential_id AND credential.target = provider.target;
+
+         UPDATE target_route_state
+         SET active_route_plan_id = activated_snapshot_id
+         WHERE current_provider_id IS NOT NULL;",
+    )?;
+
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.execute(
+        "UPDATE metadata SET value = '10' WHERE key = 'schema-version'",
+        [],
+    )?;
+    transaction.commit()
 }
 
 fn migrate_v8(connection: &mut Connection) -> Result<()> {
@@ -758,7 +907,7 @@ impl LegacyV2ActionOutcome {
                 mode: self.view.mode,
                 takeover: self.view.takeover,
                 route_health: RouteHealthView {
-                    state: "unobserved".to_owned(),
+                    state: RouteHealthState::Unobserved,
                 },
                 providers: self
                     .view
@@ -786,6 +935,7 @@ impl LegacyV2ActionOutcome {
                     .view
                     .activated_snapshot
                     .map(LegacySnapshotView::into_v4),
+                failover: FailoverView::default(),
                 problems: self.view.problems,
             },
         }
@@ -925,6 +1075,7 @@ impl LegacyV2ProviderView {
             universal_provider_id: None,
             synchronization: None,
             ownership: ProviderFieldOwnershipView::target_provider(),
+            route_health: RouteHealthView::default(),
             active_references: self.active_references,
         }
     }
@@ -971,7 +1122,7 @@ impl LegacyV3ActionOutcome {
                 mode: self.view.mode,
                 takeover: self.view.takeover,
                 route_health: RouteHealthView {
-                    state: "unobserved".to_owned(),
+                    state: RouteHealthState::Unobserved,
                 },
                 providers: self
                     .view
@@ -999,6 +1150,7 @@ impl LegacyV3ActionOutcome {
                     .view
                     .activated_snapshot
                     .map(LegacySnapshotView::into_v4),
+                failover: FailoverView::default(),
                 problems: self.view.problems,
             },
         }
@@ -1063,6 +1215,7 @@ impl LegacyV3ProviderView {
             universal_provider_id: None,
             synchronization: None,
             ownership: ProviderFieldOwnershipView::target_provider(),
+            route_health: RouteHealthView::default(),
             active_references: self.active_references,
         }
     }

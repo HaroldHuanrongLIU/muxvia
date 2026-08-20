@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::broadcast;
@@ -7,8 +10,9 @@ use uuid::Uuid;
 
 use crate::{
     control::protocol::{
-        ActionOutcome, ActionStatus, ControlProblem, ProviderAuthentication, ProviderProtocol,
-        ProviderRoutingRequirement, Target, TargetAction, TargetView, UniversalProviderCatalogView,
+        ActionOutcome, ActionStatus, ControlProblem, FailoverDraftMember, ProviderAuthentication,
+        ProviderProtocol, ProviderRoutingRequirement, Target, TargetAction, TargetView,
+        UniversalProviderCatalogView,
     },
     domain::{
         activation::ActivatedSnapshot, provider::has_valid_provider_declaration,
@@ -145,6 +149,33 @@ pub struct RoutingSnapshot {
     protocol: ProviderProtocol,
     authentication: ProviderAuthentication,
     epoch: Uuid,
+}
+
+#[derive(Clone)]
+pub(crate) struct ActivatedRoutePlanSnapshot {
+    pub(crate) id: Uuid,
+    pub(crate) epoch: Uuid,
+    pub(crate) members: Vec<RoutePlanMemberSnapshot>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RoutePlanMemberSnapshot {
+    pub(crate) provider_id: Uuid,
+    pub(crate) base_url: String,
+    pub(crate) model: String,
+    pub(crate) provider_credential: SecretString,
+    pub(crate) protocol: ProviderProtocol,
+    pub(crate) authentication: ProviderAuthentication,
+}
+
+pub(crate) struct RouteObservation {
+    pub(crate) provider_id: Uuid,
+    pub(crate) state: String,
+    pub(crate) consecutive_successes: u64,
+    pub(crate) consecutive_failures: u64,
+    pub(crate) total_attempts: u64,
+    pub(crate) failed_attempts: u64,
+    pub(crate) outcome: String,
 }
 
 impl RoutingSnapshot {
@@ -796,6 +827,54 @@ impl StateStore {
                     snapshot.model, snapshot.protocol.to_string(), snapshot.authentication.to_string(),
                     provider_credential, snapshot.epoch.to_string()],
             )?;
+            transaction.execute(
+                "INSERT INTO activated_route_plans (id, target, epoch, created_revision)
+                 SELECT ?1, ?2, ?3, management_revision + 1
+                 FROM target_route_state WHERE target = ?2",
+                params![
+                    snapshot.id.to_string(),
+                    target.as_str(),
+                    snapshot.epoch.to_string()
+                ],
+            )?;
+            let inserted_plan_member = transaction.execute(
+                "INSERT INTO activated_route_plan_members
+                 (plan_id, position, provider_id, provider_revision, name, base_url, model,
+                  protocol, authentication, credential_id, routing_requirement)
+                 SELECT ?1, 0, provider.id, provider.provider_revision, provider.name,
+                        ?2, ?3, ?4, ?5, provider.credential_id, provider.routing_requirement
+                 FROM providers provider
+                 WHERE provider.id = ?6 AND provider.target = ?7
+                   AND provider.credential_id IS NOT NULL",
+                params![
+                    snapshot.id.to_string(),
+                    snapshot.base_url,
+                    snapshot.model,
+                    snapshot.protocol.to_string(),
+                    snapshot.authentication.to_string(),
+                    snapshot.provider_id.to_string(),
+                    target.as_str(),
+                ],
+            )?;
+            if inserted_plan_member != 1 {
+                return Err(StateError::InvalidActivatedSnapshot);
+            }
+            transaction.execute(
+                "DELETE FROM failover_draft_members WHERE target = ?1",
+                [target.as_str()],
+            )?;
+            transaction.execute(
+                "UPDATE failover_drafts SET draft_revision = draft_revision + 1
+                 WHERE target = ?1",
+                [target.as_str()],
+            )?;
+            transaction.execute(
+                "INSERT INTO failover_draft_members
+                 (target, position, provider_id, provider_revision)
+                 SELECT ?1, 0, provider.id, provider.provider_revision
+                 FROM providers provider WHERE provider.id = ?2 AND provider.target = ?1",
+                params![target.as_str(), snapshot.provider_id.to_string()],
+            )?;
             let changed = transaction.execute(
                 "UPDATE activation_recovery SET state = 'committed', payload_json = ?4
                  WHERE id = ?1 AND target = ?2 AND action_id = ?3 AND state = 'pending'",
@@ -819,6 +898,7 @@ impl StateStore {
                     routing_credential = ?4, activated_snapshot_id = ?5,
                     managed_config_path = ?6, managed_config_version = ?7,
                     recovery_intent_id = ?8,
+                    active_route_plan_id = ?5,
                     recovery_state = 'clean'
                  WHERE target = ?9",
                 params![snapshot.provider_id.to_string(), takeover_state, route_port,
@@ -1238,6 +1318,106 @@ impl StateStore {
             .map_err(map_state_call_error)
     }
 
+    pub(crate) async fn activated_route_plan_for(
+        &self,
+        target: Target,
+    ) -> Result<Option<ActivatedRoutePlanSnapshot>, StateError> {
+        self.connection
+            .call(
+                move |connection| -> Result<Option<ActivatedRoutePlanSnapshot>, StateError> {
+                    let plan = connection.query_row(
+                        "SELECT plan.id, plan.epoch
+                     FROM target_route_state route
+                     JOIN activated_route_plans plan ON plan.id = route.active_route_plan_id
+                     WHERE route.target = ?1 AND plan.target = route.target",
+                        [target.as_str()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    );
+                    let (id, epoch) = match plan {
+                        Ok(plan) => plan,
+                        Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => {
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(StateError::Sqlite(error)),
+                    };
+                    let expected_member_count: usize = connection.query_row(
+                        "SELECT COUNT(*) FROM activated_route_plan_members WHERE plan_id = ?1",
+                        [&id],
+                        |row| row.get(0),
+                    )?;
+                    let members = connection
+                        .prepare(
+                            "SELECT member.provider_id, member.base_url, member.model,
+                                credential.bearer_token, member.protocol, member.authentication
+                         FROM activated_route_plan_members member
+                         JOIN activated_route_plans plan ON plan.id = member.plan_id
+                         JOIN credentials credential
+                           ON credential.id = member.credential_id
+                          AND credential.target = plan.target
+                         WHERE member.plan_id = ?1 ORDER BY member.position",
+                        )?
+                        .query_map([&id], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                            ))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .map(
+                            |(
+                                provider_id,
+                                base_url,
+                                model,
+                                credential,
+                                protocol,
+                                authentication,
+                            )| {
+                                Ok(RoutePlanMemberSnapshot {
+                                    provider_id: Uuid::parse_str(&provider_id)
+                                        .map_err(|_| StateError::InvalidActivatedSnapshot)?,
+                                    base_url,
+                                    model,
+                                    provider_credential: SecretString::from(credential),
+                                    protocol: match protocol.as_str() {
+                                        "openai-responses" => ProviderProtocol::OpenaiResponses,
+                                        "anthropic-messages" => ProviderProtocol::AnthropicMessages,
+                                        _ => return Err(StateError::InvalidActivatedSnapshot),
+                                    },
+                                    authentication: match authentication.as_str() {
+                                        "openai-bearer" => ProviderAuthentication::OpenaiBearer,
+                                        "anthropic-api-key" => {
+                                            ProviderAuthentication::AnthropicApiKey
+                                        }
+                                        "anthropic-bearer" => {
+                                            ProviderAuthentication::AnthropicBearer
+                                        }
+                                        _ => return Err(StateError::InvalidActivatedSnapshot),
+                                    },
+                                })
+                            },
+                        )
+                        .collect::<Result<Vec<_>, StateError>>()?;
+                    if members.is_empty() || members.len() != expected_member_count {
+                        return Err(StateError::InvalidActivatedSnapshot);
+                    }
+                    Ok(Some(ActivatedRoutePlanSnapshot {
+                        id: Uuid::parse_str(&id)
+                            .map_err(|_| StateError::InvalidActivatedSnapshot)?,
+                        epoch: Uuid::parse_str(&epoch)
+                            .map_err(|_| StateError::InvalidActivatedSnapshot)?,
+                        members,
+                    }))
+                },
+            )
+            .await
+            .map_err(map_state_call_error)
+    }
+
     pub async fn record_serving(&self, snapshot_id: Uuid) -> Result<TargetView, StateError> {
         self.record_serving_for(Target::Codex, snapshot_id).await
     }
@@ -1284,6 +1464,113 @@ impl StateStore {
         Ok(view)
     }
 
+    pub(crate) async fn record_route_observations_for(
+        &self,
+        target: Target,
+        plan_id: Uuid,
+        plan_epoch: Uuid,
+        observations: Vec<RouteObservation>,
+        serving_provider_id: Option<Uuid>,
+    ) -> Result<TargetView, StateError> {
+        let service_epoch = self.service_epoch.clone();
+        let view = self
+            .connection
+            .call(move |connection| -> Result<TargetView, StateError> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let plan_id = plan_id.to_string();
+                let belongs_to_target: bool = transaction.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM activated_route_plans
+                       WHERE id = ?1 AND target = ?2 AND epoch = ?3
+                     )",
+                    params![plan_id, target.as_str(), plan_epoch.to_string()],
+                    |row| row.get(0),
+                )?;
+                if !belongs_to_target {
+                    return Err(StateError::InvalidActivatedSnapshot);
+                }
+                let mut health_changed = false;
+                for observation in observations {
+                    let belongs_to_pinned_plan: bool = transaction.query_row(
+                        "SELECT EXISTS(
+                           SELECT 1 FROM activated_route_plan_members
+                           WHERE plan_id = ?1 AND provider_id = ?2
+                         )",
+                        params![plan_id, observation.provider_id.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    if !belongs_to_pinned_plan {
+                        return Err(StateError::InvalidActivatedSnapshot);
+                    }
+                    health_changed |= transaction.execute(
+                        "INSERT INTO provider_route_health
+                         (target, provider_id, state, service_epoch, consecutive_successes,
+                          consecutive_failures, total_attempts, failed_attempts,
+                          observation_sequence, last_outcome)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)
+                         ON CONFLICT(target, provider_id) DO UPDATE SET
+                           state = excluded.state,
+                           service_epoch = excluded.service_epoch,
+                           consecutive_successes = excluded.consecutive_successes,
+                           consecutive_failures = excluded.consecutive_failures,
+                           total_attempts = excluded.total_attempts,
+                           failed_attempts = excluded.failed_attempts,
+                           observation_sequence = provider_route_health.observation_sequence + 1,
+                           last_outcome = excluded.last_outcome
+                         WHERE provider_route_health.service_epoch <> excluded.service_epoch
+                            OR excluded.total_attempts > provider_route_health.total_attempts",
+                        params![
+                            target.as_str(),
+                            observation.provider_id.to_string(),
+                            observation.state,
+                            service_epoch,
+                            observation.consecutive_successes,
+                            observation.consecutive_failures,
+                            observation.total_attempts,
+                            observation.failed_attempts,
+                            observation.outcome,
+                        ],
+                    )? != 0;
+                }
+                let serving_changed = if let Some(provider_id) = serving_provider_id {
+                    let belongs_to_pinned_plan: bool = transaction.query_row(
+                        "SELECT EXISTS(
+                           SELECT 1 FROM activated_route_plan_members
+                           WHERE plan_id = ?1 AND provider_id = ?2
+                         )",
+                        params![plan_id, provider_id.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    if !belongs_to_pinned_plan {
+                        return Err(StateError::InvalidActivatedSnapshot);
+                    }
+                    transaction.execute(
+                        "UPDATE target_route_state SET serving_provider_id = ?1
+                         WHERE target = ?2 AND serving_provider_id IS NOT ?1",
+                        params![provider_id.to_string(), target.as_str()],
+                    )? != 0
+                } else {
+                    false
+                };
+                if health_changed || serving_changed {
+                    transaction.execute(
+                        "UPDATE target_route_state SET view_sequence = view_sequence + 1
+                         WHERE target = ?1",
+                        [target.as_str()],
+                    )?;
+                }
+                let view = project_target_view_for(&transaction, &service_epoch, target)?;
+                transaction.commit()?;
+                Ok(view)
+            })
+            .await
+            .map_err(map_state_call_error)?;
+        self.publish_target_view(view.clone()).await?;
+        Ok(view)
+    }
+
     pub async fn receipt(&self, action_id: Uuid) -> Result<Option<ActionOutcome>, StateError> {
         self.receipt_for(Target::Codex, action_id).await
     }
@@ -1312,6 +1599,513 @@ impl StateStore {
             })
             .await
             .map_err(map_state_call_error)
+    }
+
+    pub(crate) async fn save_failover_draft_for(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        expected_revision: u64,
+        members: Vec<FailoverDraftMember>,
+    ) -> Result<ActionOutcome, ActionFailure> {
+        let service_epoch = self.service_epoch.clone();
+        let action_id = action_id.to_string();
+        let result = self
+            .connection
+            .call(move |connection| -> Result<FailoverAttempt, StateError> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                if let Ok(json) = transaction.query_row(
+                    "SELECT outcome_json FROM action_receipts
+                     WHERE target = ?1 AND action_id = ?2",
+                    params![target.as_str(), action_id],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    let mut outcome: ActionOutcome = serde_json::from_str(&json)?;
+                    outcome.status = ActionStatus::Replayed;
+                    return Ok(FailoverAttempt::Applied(outcome));
+                }
+
+                let (management_revision, current_provider_id): (u64, Option<String>) = transaction
+                    .query_row(
+                        "SELECT management_revision, current_provider_id
+                         FROM target_route_state WHERE target = ?1",
+                        [target.as_str()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                let failure = |code: &str, message: &str| -> Result<FailoverAttempt, StateError> {
+                    Ok(FailoverAttempt::Failure(ActionFailure {
+                        problem: ControlProblem {
+                            code: code.to_owned(),
+                            message: message.to_owned(),
+                            source: None,
+                            selector: None,
+                        },
+                        authoritative_view: project_target_view_for(
+                            &transaction,
+                            &service_epoch,
+                            target,
+                        )?,
+                    }))
+                };
+                if management_revision != expected_revision {
+                    return failure("stale-revision", "Target revision is stale");
+                }
+                let Some(current_provider_id) = current_provider_id else {
+                    return failure(
+                        "invalid-failover-chain",
+                        "A Current Provider is required before saving a Failover Chain",
+                    );
+                };
+                if members.is_empty() {
+                    return failure(
+                        "invalid-failover-chain",
+                        "Failover Chain must contain at least one Provider",
+                    );
+                }
+                if members[0].provider_id.to_string() != current_provider_id {
+                    return failure(
+                        "current-provider-must-be-first",
+                        "Current Provider must be the first Failover Chain member",
+                    );
+                }
+                let mut unique = HashSet::with_capacity(members.len());
+                if members
+                    .iter()
+                    .any(|member| !unique.insert(member.provider_id))
+                {
+                    return failure(
+                        "duplicate-failover-provider",
+                        "Failover Chain cannot contain duplicate Providers",
+                    );
+                }
+
+                for member in &members {
+                    let declaration = transaction.query_row(
+                        "SELECT p.provider_revision, p.name, p.base_url, p.model, p.protocol,
+                                p.authentication, p.credential_id IS NOT NULL,
+                                p.generated_owner_id, p.generated_source_revision,
+                                p.generated_overlay_revision, u.provider_revision,
+                                overlay.overlay_revision, overlay.enabled
+                         FROM providers p
+                         LEFT JOIN universal_providers u ON u.id = p.generated_owner_id
+                         LEFT JOIN universal_provider_targets overlay
+                           ON overlay.universal_provider_id = p.generated_owner_id
+                          AND overlay.target = p.target
+                         WHERE p.target = ?1 AND p.id = ?2",
+                        params![target.as_str(), member.provider_id.to_string()],
+                        |row| {
+                            Ok((
+                                row.get::<_, u64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, bool>(6)?,
+                                row.get::<_, Option<String>>(7)?,
+                                row.get::<_, Option<u64>>(8)?,
+                                row.get::<_, Option<u64>>(9)?,
+                                row.get::<_, Option<u64>>(10)?,
+                                row.get::<_, Option<u64>>(11)?,
+                                row.get::<_, Option<bool>>(12)?,
+                            ))
+                        },
+                    );
+                    let Ok((
+                        provider_revision,
+                        name,
+                        base_url,
+                        model,
+                        protocol,
+                        authentication,
+                        has_credential,
+                        generated_owner_id,
+                        generated_source_revision,
+                        generated_overlay_revision,
+                        source_revision,
+                        overlay_revision,
+                        enabled,
+                    )) = declaration
+                    else {
+                        return failure(
+                            "incomplete-route-plan-provider",
+                            "Failover Chain Provider is missing or incomplete",
+                        );
+                    };
+                    if provider_revision != member.provider_revision {
+                        return failure(
+                            "stale-provider-revision",
+                            "Failover Chain Provider revision is stale",
+                        );
+                    }
+                    let protocol = match protocol.as_str() {
+                        "openai-responses" => ProviderProtocol::OpenaiResponses,
+                        "anthropic-messages" => ProviderProtocol::AnthropicMessages,
+                        _ => {
+                            return failure(
+                                "incomplete-route-plan-provider",
+                                "Failover Chain Provider is missing or incomplete",
+                            );
+                        }
+                    };
+                    let authentication = match authentication.as_str() {
+                        "openai-bearer" => ProviderAuthentication::OpenaiBearer,
+                        "anthropic-api-key" => ProviderAuthentication::AnthropicApiKey,
+                        "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
+                        _ => {
+                            return failure(
+                                "incomplete-route-plan-provider",
+                                "Failover Chain Provider is missing or incomplete",
+                            );
+                        }
+                    };
+                    if name.trim().is_empty()
+                        || base_url.trim().is_empty()
+                        || model.trim().is_empty()
+                        || !has_credential
+                        || !has_valid_provider_declaration(target, protocol, authentication)
+                    {
+                        return failure(
+                            "incomplete-route-plan-provider",
+                            "Failover Chain Provider is missing or incomplete",
+                        );
+                    }
+                    match generated_owner_id {
+                        None => {}
+                        Some(_)
+                            if enabled == Some(true)
+                                && generated_source_revision == source_revision
+                                && generated_overlay_revision == overlay_revision => {}
+                        Some(_) => {
+                            return failure(
+                                "unsynchronized-route-plan-provider",
+                                "Generated Failover Chain Provider must be synchronized",
+                            );
+                        }
+                    }
+                }
+
+                transaction.execute(
+                    "DELETE FROM failover_draft_members WHERE target = ?1",
+                    [target.as_str()],
+                )?;
+                for (position, member) in members.iter().enumerate() {
+                    transaction.execute(
+                        "INSERT INTO failover_draft_members
+                         (target, position, provider_id, provider_revision)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            target.as_str(),
+                            u32::try_from(position)
+                                .map_err(|_| tokio_rusqlite::rusqlite::Error::InvalidQuery)?,
+                            member.provider_id.to_string(),
+                            member.provider_revision,
+                        ],
+                    )?;
+                }
+                transaction.execute(
+                    "UPDATE failover_drafts SET draft_revision = draft_revision + 1
+                     WHERE target = ?1",
+                    [target.as_str()],
+                )?;
+                transaction.execute(
+                    "UPDATE target_route_state
+                     SET management_revision = management_revision + 1,
+                         view_sequence = view_sequence + 1
+                     WHERE target = ?1",
+                    [target.as_str()],
+                )?;
+                let view = project_target_view_for(&transaction, &service_epoch, target)?;
+                let outcome = ActionOutcome {
+                    status: ActionStatus::Applied,
+                    view,
+                };
+                transaction.execute(
+                    "INSERT INTO action_receipts
+                     (target, action_id, action_kind, committed_revision, outcome_json)
+                     VALUES (?1, ?2, 'save-failover-draft', ?3, ?4)",
+                    params![
+                        target.as_str(),
+                        action_id,
+                        outcome.view.management_revision,
+                        serde_json::to_string(&outcome)?,
+                    ],
+                )?;
+                transaction.commit()?;
+                Ok(FailoverAttempt::Applied(outcome))
+            })
+            .await
+            .map_err(map_state_call_error);
+        match result {
+            Ok(FailoverAttempt::Applied(outcome)) => Ok(outcome),
+            Ok(FailoverAttempt::Failure(failure)) => Err(failure),
+            Err(_) => Err(self
+                .failure_for(target, "state-store-error", "State store operation failed")
+                .await),
+        }
+    }
+
+    pub(crate) async fn apply_failover_chain_for(
+        &self,
+        target: Target,
+        action_id: Uuid,
+        expected_revision: u64,
+        expected_draft_revision: u64,
+    ) -> Result<ActionOutcome, ActionFailure> {
+        let service_epoch = self.service_epoch.clone();
+        let action_id = action_id.to_string();
+        let plan_id = Uuid::new_v4().to_string();
+        let plan_epoch = Uuid::new_v4().to_string();
+        let result = self
+            .connection
+            .call(move |connection| -> Result<FailoverAttempt, StateError> {
+                let transaction = connection.transaction_with_behavior(
+                    tokio_rusqlite::rusqlite::TransactionBehavior::Immediate,
+                )?;
+                if let Ok(json) = transaction.query_row(
+                    "SELECT outcome_json FROM action_receipts
+                         WHERE target = ?1 AND action_id = ?2",
+                    params![target.as_str(), action_id],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    let mut outcome: ActionOutcome = serde_json::from_str(&json)?;
+                    outcome.status = ActionStatus::Replayed;
+                    return Ok(FailoverAttempt::Applied(outcome));
+                }
+                let (management_revision, current_provider_id, draft_revision): (
+                    u64,
+                    Option<String>,
+                    u64,
+                ) = transaction.query_row(
+                    "SELECT route.management_revision, route.current_provider_id,
+                                draft.draft_revision
+                         FROM target_route_state route
+                         JOIN failover_drafts draft ON draft.target = route.target
+                         WHERE route.target = ?1",
+                    [target.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                let failure = |code: &str, message: &str| -> Result<FailoverAttempt, StateError> {
+                    Ok(FailoverAttempt::Failure(ActionFailure {
+                        problem: ControlProblem {
+                            code: code.to_owned(),
+                            message: message.to_owned(),
+                            source: None,
+                            selector: None,
+                        },
+                        authoritative_view: project_target_view_for(
+                            &transaction,
+                            &service_epoch,
+                            target,
+                        )?,
+                    }))
+                };
+                if management_revision != expected_revision {
+                    return failure("stale-revision", "Target revision is stale");
+                }
+                if draft_revision != expected_draft_revision {
+                    return failure(
+                        "stale-failover-draft-revision",
+                        "Failover Chain draft revision is stale",
+                    );
+                }
+                let Some(current_provider_id) = current_provider_id else {
+                    return failure(
+                        "invalid-failover-chain",
+                        "A Current Provider is required before applying a Failover Chain",
+                    );
+                };
+                let members = transaction
+                    .prepare(
+                        "SELECT draft.position, draft.provider_id, draft.provider_revision,
+                                    provider.provider_revision, provider.name, provider.base_url,
+                                    provider.model, provider.protocol, provider.authentication,
+                                    credential.id, credential.bearer_token,
+                                    provider.routing_requirement,
+                                    provider.generated_owner_id,
+                                    provider.generated_source_revision,
+                                    provider.generated_overlay_revision,
+                                    universal.provider_revision, overlay.overlay_revision,
+                                    overlay.enabled
+                             FROM failover_draft_members draft
+                             JOIN providers provider
+                               ON provider.id = draft.provider_id
+                              AND provider.target = draft.target
+                             JOIN credentials credential
+                               ON credential.id = provider.credential_id
+                              AND credential.target = provider.target
+                             LEFT JOIN universal_providers universal
+                               ON universal.id = provider.generated_owner_id
+                             LEFT JOIN universal_provider_targets overlay
+                               ON overlay.universal_provider_id = provider.generated_owner_id
+                              AND overlay.target = provider.target
+                             WHERE draft.target = ?1 ORDER BY draft.position",
+                    )?
+                    .query_map([target.as_str()], |row| {
+                        Ok(RoutePlanSnapshotMember {
+                            position: row.get(0)?,
+                            provider_id: row.get(1)?,
+                            draft_provider_revision: row.get(2)?,
+                            provider_revision: row.get(3)?,
+                            name: row.get(4)?,
+                            base_url: row.get(5)?,
+                            model: row.get(6)?,
+                            protocol: row.get(7)?,
+                            authentication: row.get(8)?,
+                            credential_id: row.get(9)?,
+                            provider_bearer_token: row.get(10)?,
+                            routing_requirement: row.get(11)?,
+                            generated_owner_id: row.get(12)?,
+                            generated_source_revision: row.get(13)?,
+                            generated_overlay_revision: row.get(14)?,
+                            source_revision: row.get(15)?,
+                            overlay_revision: row.get(16)?,
+                            enabled: row.get(17)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let draft_count: u64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM failover_draft_members WHERE target = ?1",
+                    [target.as_str()],
+                    |row| row.get(0),
+                )?;
+                if members.is_empty() || members.len() as u64 != draft_count {
+                    return failure(
+                        "incomplete-route-plan-provider",
+                        "Failover Chain Provider is missing or incomplete",
+                    );
+                }
+                if members[0].provider_id != current_provider_id {
+                    return failure(
+                        "current-provider-must-be-first",
+                        "Current Provider must be the first Failover Chain member",
+                    );
+                }
+                for (expected_position, member) in members.iter().enumerate() {
+                    if member.position as usize != expected_position
+                        || member.draft_provider_revision != member.provider_revision
+                    {
+                        return failure(
+                            "stale-provider-revision",
+                            "Failover Chain Provider revision is stale",
+                        );
+                    }
+                    let protocol = match member.protocol.as_str() {
+                        "openai-responses" => ProviderProtocol::OpenaiResponses,
+                        "anthropic-messages" => ProviderProtocol::AnthropicMessages,
+                        _ => {
+                            return failure(
+                                "incomplete-route-plan-provider",
+                                "Failover Chain Provider is missing or incomplete",
+                            );
+                        }
+                    };
+                    let authentication = match member.authentication.as_str() {
+                        "openai-bearer" => ProviderAuthentication::OpenaiBearer,
+                        "anthropic-api-key" => ProviderAuthentication::AnthropicApiKey,
+                        "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
+                        _ => {
+                            return failure(
+                                "incomplete-route-plan-provider",
+                                "Failover Chain Provider is missing or incomplete",
+                            );
+                        }
+                    };
+                    if member.name.trim().is_empty()
+                        || member.base_url.trim().is_empty()
+                        || member.model.trim().is_empty()
+                        || member.provider_bearer_token.is_empty()
+                        || !has_valid_provider_declaration(target, protocol, authentication)
+                    {
+                        return failure(
+                            "incomplete-route-plan-provider",
+                            "Failover Chain Provider is missing or incomplete",
+                        );
+                    }
+                    match &member.generated_owner_id {
+                        None => {}
+                        Some(_)
+                            if member.enabled == Some(true)
+                                && member.generated_source_revision == member.source_revision
+                                && member.generated_overlay_revision == member.overlay_revision => {
+                        }
+                        Some(_) => {
+                            return failure(
+                                "unsynchronized-route-plan-provider",
+                                "Generated Failover Chain Provider must be synchronized",
+                            );
+                        }
+                    }
+                }
+
+                let committed_revision = management_revision
+                    .checked_add(1)
+                    .ok_or(tokio_rusqlite::rusqlite::Error::InvalidQuery)?;
+                transaction.execute(
+                    "INSERT INTO activated_route_plans (id, target, epoch, created_revision)
+                         VALUES (?1, ?2, ?3, ?4)",
+                    params![plan_id, target.as_str(), plan_epoch, committed_revision],
+                )?;
+                for member in &members {
+                    transaction.execute(
+                        "INSERT INTO activated_route_plan_members
+                             (plan_id, position, provider_id, provider_revision, name, base_url,
+                              model, protocol, authentication, credential_id,
+                              routing_requirement)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                        params![
+                            plan_id,
+                            member.position,
+                            member.provider_id,
+                            member.provider_revision,
+                            member.name,
+                            member.base_url,
+                            member.model,
+                            member.protocol,
+                            member.authentication,
+                            member.credential_id,
+                            member.routing_requirement,
+                        ],
+                    )?;
+                }
+                transaction.execute(
+                    "UPDATE target_route_state
+                         SET active_route_plan_id = ?1,
+                             management_revision = management_revision + 1,
+                             view_sequence = view_sequence + 1
+                         WHERE target = ?2",
+                    params![plan_id, target.as_str()],
+                )?;
+                let view = project_target_view_for(&transaction, &service_epoch, target)?;
+                let outcome = ActionOutcome {
+                    status: ActionStatus::Applied,
+                    view,
+                };
+                transaction.execute(
+                    "INSERT INTO action_receipts
+                         (target, action_id, action_kind, committed_revision, outcome_json)
+                         VALUES (?1, ?2, 'apply-failover-chain', ?3, ?4)",
+                    params![
+                        target.as_str(),
+                        action_id,
+                        outcome.view.management_revision,
+                        serde_json::to_string(&outcome)?,
+                    ],
+                )?;
+                transaction.commit()?;
+                Ok(FailoverAttempt::Applied(outcome))
+            })
+            .await
+            .map_err(map_state_call_error);
+        match result {
+            Ok(FailoverAttempt::Applied(outcome)) => Ok(outcome),
+            Ok(FailoverAttempt::Failure(failure)) => Err(failure),
+            Err(_) => Err(self
+                .failure_for(target, "state-store-error", "State store operation failed")
+                .await),
+        }
     }
 
     pub async fn apply_provider_action(
@@ -1921,6 +2715,32 @@ enum ProviderAttempt {
     Failure(ActionFailure),
 }
 
+enum FailoverAttempt {
+    Applied(ActionOutcome),
+    Failure(ActionFailure),
+}
+
+struct RoutePlanSnapshotMember {
+    position: u32,
+    provider_id: String,
+    draft_provider_revision: u64,
+    provider_revision: u64,
+    name: String,
+    base_url: String,
+    model: String,
+    protocol: String,
+    authentication: String,
+    credential_id: String,
+    provider_bearer_token: String,
+    routing_requirement: String,
+    generated_owner_id: Option<String>,
+    generated_source_revision: Option<u64>,
+    generated_overlay_revision: Option<u64>,
+    source_revision: Option<u64>,
+    overlay_revision: Option<u64>,
+    enabled: Option<bool>,
+}
+
 fn map_call_error(error: tokio_rusqlite::Error<tokio_rusqlite::rusqlite::Error>) -> StateError {
     match error {
         tokio_rusqlite::Error::ConnectionClosed => StateError::Unavailable,
@@ -1934,5 +2754,514 @@ pub(super) fn map_state_call_error(error: tokio_rusqlite::Error<StateError>) -> 
         tokio_rusqlite::Error::ConnectionClosed => StateError::Unavailable,
         tokio_rusqlite::Error::Error(error) => error,
         _ => StateError::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod failover_tests {
+    use super::*;
+    use crate::control::protocol::RouteHealthState;
+
+    #[tokio::test]
+    async fn draft_save_is_revision_guarded_receipt_first_and_route_neutral() {
+        let root = tempfile::tempdir().unwrap();
+        let home = MuxviaHome::from_user_home(root.path());
+        let store = StateStore::open(&home).await.unwrap();
+        let first = store
+            .apply_provider_action_for(
+                Target::Codex,
+                Uuid::new_v4(),
+                0,
+                serde_json::json!({
+                    "kind": "create-provider", "name": "Current",
+                    "baseUrl": "https://current.test/v1", "model": "current-model",
+                    "credential": { "kind": "replace", "value": "CURRENT_SECRET" },
+                    "authentication": "openai-bearer", "presetKey": null
+                }),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .apply_provider_action_for(
+                Target::Codex,
+                Uuid::new_v4(),
+                first.view.management_revision,
+                serde_json::json!({
+                    "kind": "create-provider", "name": "Fallback",
+                    "baseUrl": "https://fallback.test/v1", "model": "fallback-model",
+                    "credential": { "kind": "replace", "value": "FALLBACK_SECRET" },
+                    "authentication": "openai-bearer", "presetKey": null
+                }),
+            )
+            .await
+            .unwrap();
+        let current = second.view.providers[0].clone();
+        let fallback = second.view.providers[1].clone();
+        let snapshot_id = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        store
+            .connection
+            .call({
+                let current_id = current.id.to_string();
+                move |connection| {
+                    connection.execute(
+                        "INSERT INTO activated_snapshots
+                         (id, target, provider_id, base_url, model, protocol, authentication,
+                          provider_bearer_token, epoch)
+                         VALUES (?1, 'codex', ?2, 'https://current.test/v1', 'current-model',
+                                 'openai-responses', 'openai-bearer', 'CURRENT_SECRET', ?3)",
+                        params![snapshot_id.to_string(), current_id, epoch.to_string()],
+                    )?;
+                    connection.execute(
+                        "UPDATE target_route_state SET current_provider_id = ?1,
+                           serving_provider_id = ?1, activated_snapshot_id = ?2
+                         WHERE target = 'codex'",
+                        params![current_id, snapshot_id.to_string()],
+                    )?;
+                    Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+                }
+            })
+            .await
+            .unwrap();
+
+        let action_id = Uuid::new_v4();
+        let members = vec![
+            FailoverDraftMember {
+                provider_id: current.id,
+                provider_revision: current.provider_revision,
+            },
+            FailoverDraftMember {
+                provider_id: fallback.id,
+                provider_revision: fallback.provider_revision,
+            },
+        ];
+        let applied = store
+            .save_failover_draft_for(
+                Target::Codex,
+                action_id,
+                second.view.management_revision,
+                members,
+            )
+            .await
+            .unwrap();
+        assert!(
+            applied.status == ActionStatus::Applied
+                && applied.view.management_revision == second.view.management_revision + 1
+                && applied.view.failover.draft_revision == 2
+                && applied.view.failover.draft_members.len() == 2,
+            "draft save did not commit exactly once"
+        );
+        assert!(
+            applied.view.current_provider_id == second.view.providers[0].id.to_string().into()
+                && applied.view.serving_provider_id
+                    == second.view.providers[0].id.to_string().into()
+                && applied
+                    .view
+                    .activated_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.id)
+                    == Some(snapshot_id)
+                && applied.view.failover.active_plan.is_none(),
+            "draft save changed the live route"
+        );
+        let replayed = store
+            .save_failover_draft_for(Target::Codex, action_id, 0, Vec::new())
+            .await
+            .unwrap();
+        assert!(
+            replayed.status == ActionStatus::Replayed && replayed.view == applied.view,
+            "draft save did not replay before examining the second payload"
+        );
+        let before_failure = store.target_view_for(Target::Codex).await.unwrap();
+        let failure = store
+            .save_failover_draft_for(
+                Target::Codex,
+                Uuid::new_v4(),
+                before_failure.management_revision,
+                vec![
+                    FailoverDraftMember {
+                        provider_id: current.id,
+                        provider_revision: current.provider_revision,
+                    },
+                    FailoverDraftMember {
+                        provider_id: current.id,
+                        provider_revision: current.provider_revision,
+                    },
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            failure.problem.code == "duplicate-failover-provider"
+                && failure.authoritative_view == before_failure,
+            "invalid draft changed authoritative state"
+        );
+
+        let apply_action_id = Uuid::new_v4();
+        let applied_plan = store
+            .apply_failover_chain_for(
+                Target::Codex,
+                apply_action_id,
+                before_failure.management_revision,
+                before_failure.failover.draft_revision,
+            )
+            .await
+            .unwrap();
+        let plan = applied_plan.view.failover.active_plan.as_ref().unwrap();
+        assert!(
+            applied_plan.status == ActionStatus::Applied
+                && plan.members.len() == 2
+                && plan.members[0].provider_id == current.id
+                && plan.members[1].provider_id == fallback.id
+                && applied_plan.view.current_provider_id == before_failure.current_provider_id
+                && applied_plan.view.serving_provider_id == before_failure.serving_provider_id,
+            "Apply did not atomically activate the draft snapshot"
+        );
+        let replayed_plan = store
+            .apply_failover_chain_for(Target::Codex, apply_action_id, 0, 999)
+            .await
+            .unwrap();
+        assert!(
+            replayed_plan.status == ActionStatus::Replayed
+                && replayed_plan.view == applied_plan.view,
+            "Apply did not replay before checking stale revisions"
+        );
+        let mut latest_plan = applied_plan;
+        for (name, trigger) in [
+            (
+                "plan",
+                "CREATE TEMP TRIGGER fail_failover_apply BEFORE INSERT ON activated_route_plans
+                 BEGIN SELECT RAISE(ABORT, 'failover-plan'); END;",
+            ),
+            (
+                "member",
+                "CREATE TEMP TRIGGER fail_failover_apply BEFORE INSERT ON activated_route_plan_members
+                 BEGIN SELECT RAISE(ABORT, 'failover-member'); END;",
+            ),
+            (
+                "route",
+                "CREATE TEMP TRIGGER fail_failover_apply BEFORE UPDATE ON target_route_state
+                 BEGIN SELECT RAISE(ABORT, 'failover-route'); END;",
+            ),
+            (
+                "receipt",
+                "CREATE TEMP TRIGGER fail_failover_apply BEFORE INSERT ON action_receipts
+                 BEGIN SELECT RAISE(ABORT, 'failover-receipt'); END;",
+            ),
+        ] {
+            let before = store.target_view_for(Target::Codex).await.unwrap();
+            let counts_before = store
+                .connection
+                .call(|connection| {
+                    Ok::<_, tokio_rusqlite::rusqlite::Error>((
+                        connection.query_row("SELECT COUNT(*) FROM activated_route_plans", [], |row| row.get::<_, u64>(0))?,
+                        connection.query_row("SELECT COUNT(*) FROM activated_route_plan_members", [], |row| row.get::<_, u64>(0))?,
+                        connection.query_row("SELECT COUNT(*) FROM action_receipts", [], |row| row.get::<_, u64>(0))?,
+                    ))
+                })
+                .await
+                .unwrap();
+            store
+                .connection
+                .call(move |connection| connection.execute_batch(trigger))
+                .await
+                .unwrap();
+            let failed_action = Uuid::new_v4();
+            let failure = store
+                .apply_failover_chain_for(
+                    Target::Codex,
+                    failed_action,
+                    before.management_revision,
+                    before.failover.draft_revision,
+                )
+                .await
+                .unwrap_err();
+            store
+                .connection
+                .call(|connection| connection.execute_batch("DROP TRIGGER fail_failover_apply;"))
+                .await
+                .unwrap();
+            let after = store.target_view_for(Target::Codex).await.unwrap();
+            let counts_after = store
+                .connection
+                .call(|connection| {
+                    Ok::<_, tokio_rusqlite::rusqlite::Error>((
+                        connection.query_row("SELECT COUNT(*) FROM activated_route_plans", [], |row| row.get::<_, u64>(0))?,
+                        connection.query_row("SELECT COUNT(*) FROM activated_route_plan_members", [], |row| row.get::<_, u64>(0))?,
+                        connection.query_row("SELECT COUNT(*) FROM action_receipts", [], |row| row.get::<_, u64>(0))?,
+                    ))
+                })
+                .await
+                .unwrap();
+            assert!(
+                failure.problem.code == "state-store-error"
+                    && after == before
+                    && counts_after == counts_before,
+                "Apply boundary failure changed route state at {name}"
+            );
+            latest_plan = store
+                .apply_failover_chain_for(
+                    Target::Codex,
+                    failed_action,
+                    before.management_revision,
+                    before.failover.draft_revision,
+                )
+                .await
+                .unwrap();
+        }
+        let latest_plan_identity = latest_plan
+            .view
+            .failover
+            .active_plan
+            .as_ref()
+            .map(|plan| (plan.id, plan.epoch))
+            .expect("Apply must project the activated plan identity");
+        let primary_unavailable = store
+            .record_route_observations_for(
+                Target::Codex,
+                latest_plan_identity.0,
+                latest_plan_identity.1,
+                vec![RouteObservation {
+                    provider_id: current.id,
+                    state: "unavailable".to_owned(),
+                    consecutive_successes: 0,
+                    consecutive_failures: 4,
+                    total_attempts: 4,
+                    failed_attempts: 4,
+                    outcome: "transport-failure".to_owned(),
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            primary_unavailable.route_health.state == RouteHealthState::Degraded
+                && primary_unavailable.providers[0].route_health.state
+                    == RouteHealthState::Unavailable
+                && primary_unavailable.providers[1].route_health.state
+                    == RouteHealthState::Unobserved,
+            "an eligible unobserved fallback did not keep the route degraded"
+        );
+        let before_observation_sequence = primary_unavailable.view_sequence;
+        let fallback_view = store
+            .record_route_observations_for(
+                Target::Codex,
+                latest_plan_identity.0,
+                latest_plan_identity.1,
+                vec![RouteObservation {
+                    provider_id: fallback.id,
+                    state: "healthy".to_owned(),
+                    consecutive_successes: 1,
+                    consecutive_failures: 0,
+                    total_attempts: 1,
+                    failed_attempts: 0,
+                    outcome: "success".to_owned(),
+                }],
+                Some(fallback.id),
+            )
+            .await
+            .unwrap();
+        assert!(
+            fallback_view.current_provider_id == latest_plan.view.current_provider_id
+                && fallback_view.serving_provider_id == Some(fallback.id.to_string())
+                && fallback_view.route_health.state == RouteHealthState::Degraded
+                && fallback_view.providers[0].route_health.state == RouteHealthState::Unavailable
+                && fallback_view.providers[1].route_health.state == RouteHealthState::Healthy
+                && fallback_view.view_sequence == before_observation_sequence + 1,
+            "fallback health changed Current or failed to project Serving"
+        );
+        let pinned_plan = latest_plan
+            .view
+            .failover
+            .active_plan
+            .as_ref()
+            .expect("the request must have pinned an active plan")
+            .clone();
+        let current_only_draft = store
+            .save_failover_draft_for(
+                Target::Codex,
+                Uuid::new_v4(),
+                fallback_view.management_revision,
+                vec![FailoverDraftMember {
+                    provider_id: current.id,
+                    provider_revision: current.provider_revision,
+                }],
+            )
+            .await
+            .unwrap();
+        let current_only_plan = store
+            .apply_failover_chain_for(
+                Target::Codex,
+                Uuid::new_v4(),
+                current_only_draft.view.management_revision,
+                current_only_draft.view.failover.draft_revision,
+            )
+            .await
+            .unwrap();
+        let newest_health = store
+            .record_route_observations_for(
+                Target::Codex,
+                current_only_plan
+                    .view
+                    .failover
+                    .active_plan
+                    .as_ref()
+                    .unwrap()
+                    .id,
+                current_only_plan
+                    .view
+                    .failover
+                    .active_plan
+                    .as_ref()
+                    .unwrap()
+                    .epoch,
+                vec![RouteObservation {
+                    provider_id: current.id,
+                    state: "healthy".to_owned(),
+                    consecutive_successes: 7,
+                    consecutive_failures: 0,
+                    total_attempts: 7,
+                    failed_attempts: 0,
+                    outcome: "success".to_owned(),
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        let stale_health = store
+            .record_route_observations_for(
+                Target::Codex,
+                current_only_plan
+                    .view
+                    .failover
+                    .active_plan
+                    .as_ref()
+                    .unwrap()
+                    .id,
+                current_only_plan
+                    .view
+                    .failover
+                    .active_plan
+                    .as_ref()
+                    .unwrap()
+                    .epoch,
+                vec![RouteObservation {
+                    provider_id: current.id,
+                    state: "unavailable".to_owned(),
+                    consecutive_successes: 0,
+                    consecutive_failures: 6,
+                    total_attempts: 6,
+                    failed_attempts: 6,
+                    outcome: "transport-failure".to_owned(),
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            stale_health == newest_health,
+            "an out-of-order health observation changed authoritative state"
+        );
+        let completed_pinned_request = store
+            .record_route_observations_for(
+                Target::Codex,
+                pinned_plan.id,
+                pinned_plan.epoch,
+                vec![RouteObservation {
+                    provider_id: fallback.id,
+                    state: "healthy".to_owned(),
+                    consecutive_successes: 2,
+                    consecutive_failures: 0,
+                    total_attempts: 2,
+                    failed_attempts: 0,
+                    outcome: "success".to_owned(),
+                }],
+                Some(fallback.id),
+            )
+            .await
+            .unwrap();
+        assert!(
+            current_only_plan
+                .view
+                .failover
+                .active_plan
+                .as_ref()
+                .map(|plan| plan.members.len())
+                == Some(1)
+                && completed_pinned_request.failover.active_plan
+                    == current_only_plan.view.failover.active_plan
+                && completed_pinned_request.serving_provider_id == Some(fallback.id.to_string())
+                && pinned_plan.members.len() == 2,
+            "a request completing on its pinned historical plan changed or lost the active route"
+        );
+        let edited = store
+            .apply_provider_action_for(
+                Target::Codex,
+                Uuid::new_v4(),
+                completed_pinned_request.management_revision,
+                serde_json::json!({
+                    "kind": "update-provider",
+                    "providerId": current.id,
+                    "providerRevision": current.provider_revision,
+                    "name": current.name,
+                    "baseUrl": current.base_url,
+                    "model": current.model,
+                    "credential": { "kind": "replace", "value": "ROTATED_SECRET" },
+                    "authentication": "openai-bearer",
+                    "routingRequirement": "direct-compatible"
+                }),
+            )
+            .await
+            .unwrap();
+        let immutable_credential_reference = store
+            .connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1
+                       FROM target_route_state route
+                       JOIN activated_route_plan_members member
+                         ON member.plan_id = route.active_route_plan_id
+                       JOIN credentials planned ON planned.id = member.credential_id
+                       JOIN providers provider ON provider.id = member.provider_id
+                       JOIN credentials current ON current.id = provider.credential_id
+                       WHERE route.target = 'codex'
+                         AND planned.bearer_token = 'CURRENT_SECRET'
+                         AND current.bearer_token = 'ROTATED_SECRET'
+                         AND member.credential_id <> provider.credential_id
+                     )",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            immutable_credential_reference
+                && edited
+                    .view
+                    .failover
+                    .active_plan
+                    .as_ref()
+                    .map(|plan| plan.id)
+                    == current_only_plan
+                        .view
+                        .failover
+                        .active_plan
+                        .as_ref()
+                        .map(|plan| plan.id),
+            "Provider credential replacement changed or exposed the immutable plan credential"
+        );
+        drop(store);
+        let restarted = StateStore::open(&home).await.unwrap();
+        let restarted_view = restarted.target_view_for(Target::Codex).await.unwrap();
+        assert!(
+            restarted_view.route_health.state == RouteHealthState::Stale
+                && restarted_view
+                    .providers
+                    .iter()
+                    .all(|provider| provider.route_health.state == RouteHealthState::Stale),
+            "restart did not project historical route health as stale"
+        );
     }
 }

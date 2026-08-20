@@ -90,6 +90,8 @@ impl StoreFixture {
     ) -> (Uuid, Uuid) {
         let snapshot_id = Uuid::new_v4();
         let provider_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+        let plan_epoch = Uuid::new_v4();
         let database = tokio_rusqlite::Connection::open(self.muxvia_home.database_path())
             .await
             .unwrap();
@@ -127,18 +129,49 @@ impl StoreFixture {
                     (
                         snapshot_id.to_string(),
                         provider_id.to_string(),
-                        base_url,
-                        model,
-                        authentication,
+                        base_url.clone(),
+                        model.clone(),
+                        authentication.clone(),
                         PROVIDER_SECRET,
                         Uuid::new_v4().to_string(),
                     ),
                 )?;
+                transaction.execute("DELETE FROM failover_draft_members WHERE target = 'claude'", [])?;
+                transaction.execute(
+                    "INSERT INTO failover_draft_members (target, position, provider_id, provider_revision)
+                     VALUES ('claude', 0, ?1, 1)",
+                    [provider_id.to_string()],
+                )?;
+                transaction.execute(
+                    "INSERT INTO activated_route_plans (id, target, epoch, created_revision)
+                     VALUES (?1, 'claude', ?2, 0)",
+                    (plan_id.to_string(), plan_epoch.to_string()),
+                )?;
+                transaction.execute(
+                    "INSERT INTO activated_route_plan_members
+                     (plan_id, position, provider_id, provider_revision, name, base_url, model,
+                      protocol, authentication, credential_id, routing_requirement)
+                     VALUES (?1, 0, ?2, 1, 'Claude upstream', ?3, ?4,
+                             'anthropic-messages', ?5, ?6, 'direct-compatible')",
+                    (
+                        plan_id.to_string(),
+                        provider_id.to_string(),
+                        base_url,
+                        model,
+                        authentication,
+                        provider_id.to_string(),
+                    ),
+                )?;
                 transaction.execute(
                     "UPDATE target_route_state
-                     SET activated_snapshot_id = ?1, current_provider_id = ?2
+                     SET activated_snapshot_id = ?1, current_provider_id = ?2,
+                         active_route_plan_id = ?3
                      WHERE target = 'claude'",
-                    (snapshot_id.to_string(), provider_id.to_string()),
+                    (
+                        snapshot_id.to_string(),
+                        provider_id.to_string(),
+                        plan_id.to_string(),
+                    ),
                 )?;
                 transaction.commit()?;
                 Ok(())
@@ -190,11 +223,16 @@ impl UpstreamTransport for BlockingCaptureUpstream {
         if let Some(gate) = self.response_gate.lock().await.take() {
             let _ = gate.await;
         }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
         Ok(UpstreamResponse {
             status: StatusCode::OK,
-            headers: HeaderMap::new(),
+            headers,
             body: Box::pin(stream::once(async {
-                Ok(Bytes::from_static(b"upstream-ok"))
+                Ok(Bytes::from_static(b"{\"content\":\"upstream-ok\"}"))
             })),
         })
     }
@@ -279,7 +317,12 @@ impl UpstreamTransport for InvalidatingObservationUpstream {
         database
             .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
                 connection.execute(
-                    "DELETE FROM activated_snapshots WHERE target = 'claude'",
+                    "UPDATE target_route_state SET active_route_plan_id = NULL
+                     WHERE target = 'claude'",
+                    [],
+                )?;
+                connection.execute(
+                    "DELETE FROM activated_route_plans WHERE target = 'claude'",
                     [],
                 )?;
                 Ok(())
@@ -295,7 +338,7 @@ impl UpstreamTransport for InvalidatingObservationUpstream {
             status: StatusCode::OK,
             headers,
             body: Box::pin(stream::once(async {
-                Ok(Bytes::from_static(b"data: observation survived\n\n"))
+                Ok(Bytes::from_static(b"data: {\"type\":\"message_stop\"}\n\n"))
             })),
         })
     }
@@ -326,10 +369,17 @@ impl UpstreamTransport for CapturingUpstream {
             headers: request.headers,
             body,
         });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
         Ok(UpstreamResponse {
             status: StatusCode::OK,
-            headers: HeaderMap::new(),
-            body: Box::pin(stream::empty()),
+            headers,
+            body: Box::pin(stream::once(async {
+                Ok(Bytes::from_static(b"{\"type\":\"message\",\"content\":[]}"))
+            })),
         })
     }
 }
@@ -1192,7 +1242,10 @@ async fn request_pins_one_claude_snapshot_across_a_concurrent_switch() {
 
     let response = request.await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.bytes().await.unwrap(), "upstream-ok");
+    assert_eq!(
+        response.bytes().await.unwrap(),
+        "{\"content\":\"upstream-ok\"}"
+    );
     assert_eq!(captured.url, "https://first.example/v1/messages");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&captured.body).unwrap()["model"],
@@ -1243,7 +1296,7 @@ async fn serving_observation_failure_cannot_replace_an_upstream_response() {
     assert_eq!(response.headers()["content-type"], "text/event-stream");
     assert_eq!(
         response.text().await.unwrap(),
-        "data: observation survived\n\n"
+        "data: {\"type\":\"message_stop\"}\n\n"
     );
     let after = fixture.store.target_view_for(Target::Claude).await.unwrap();
     assert_eq!(after.serving_provider_id, None);

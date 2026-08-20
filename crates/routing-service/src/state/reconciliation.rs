@@ -384,6 +384,49 @@ impl StateStore {
                                 adopt.snapshot.protocol.to_string(), adopt.snapshot.authentication.to_string(),
                                 observed, adopt.snapshot.epoch.to_string()],
                         )?;
+                        transaction.execute(
+                            "INSERT INTO activated_route_plans
+                             (id, target, epoch, created_revision)
+                             SELECT ?1, ?2, ?3, management_revision + 1
+                             FROM target_route_state WHERE target = ?2",
+                            params![
+                                adopt.snapshot.id.to_string(),
+                                input.target.as_str(),
+                                adopt.snapshot.epoch.to_string()
+                            ],
+                        )?;
+                        transaction.execute(
+                            "INSERT INTO activated_route_plan_members
+                             (plan_id, position, provider_id, provider_revision, name, base_url,
+                              model, protocol, authentication, credential_id, routing_requirement)
+                             VALUES (?1, 0, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8,
+                                     'direct-compatible')",
+                            params![
+                                adopt.snapshot.id.to_string(),
+                                adopt.provider_id.to_string(),
+                                adopt.name,
+                                normalized,
+                                adopt.snapshot.model,
+                                adopt.snapshot.protocol.to_string(),
+                                adopt.snapshot.authentication.to_string(),
+                                credential_id,
+                            ],
+                        )?;
+                        transaction.execute(
+                            "DELETE FROM failover_draft_members WHERE target = ?1",
+                            [input.target.as_str()],
+                        )?;
+                        transaction.execute(
+                            "UPDATE failover_drafts SET draft_revision = draft_revision + 1
+                             WHERE target = ?1",
+                            [input.target.as_str()],
+                        )?;
+                        transaction.execute(
+                            "INSERT INTO failover_draft_members
+                             (target, position, provider_id, provider_revision)
+                             VALUES (?1, 0, ?2, 1)",
+                            params![input.target.as_str(), adopt.provider_id.to_string()],
+                        )?;
                         fail_reconciliation_commit(
                             input.failpoint,
                             ReconciliationCommitFailpoint::SnapshotInsert,
@@ -400,7 +443,8 @@ impl StateStore {
                         transaction.execute(
                             "UPDATE target_route_state SET current_provider_id = ?1,
                                activated_snapshot_id = ?2, recovery_intent_id = ?3,
-                               managed_config_version = ?4, recovery_state = 'clean'
+                               managed_config_version = ?4, active_route_plan_id = ?2,
+                               recovery_state = 'clean'
                              WHERE target = ?5",
                             params![adopt.provider_id.to_string(), adopt.snapshot.id.to_string(),
                                 adopt.recovery_id.to_string(), adopt.managed_config_version,
@@ -428,12 +472,21 @@ impl StateStore {
                     }
                     ReconciliationStrategy::Restore => {
                         transaction.execute(
+                            "DELETE FROM failover_draft_members WHERE target = ?1",
+                            [input.target.as_str()],
+                        )?;
+                        transaction.execute(
+                            "UPDATE failover_drafts SET draft_revision = draft_revision + 1
+                             WHERE target = ?1",
+                            [input.target.as_str()],
+                        )?;
+                        transaction.execute(
                             "UPDATE target_route_state SET current_provider_id = NULL,
                                serving_provider_id = NULL, takeover_state = 'inactive',
                                route_port = NULL, routing_credential = NULL,
                                activated_snapshot_id = NULL, managed_config_path = NULL,
                                managed_config_version = 1, recovery_intent_id = NULL,
-                               recovery_state = 'clean'
+                               active_route_plan_id = NULL, recovery_state = 'clean'
                              WHERE target = ?1",
                             [input.target.as_str()],
                         )?;
@@ -900,14 +953,271 @@ fn shadow_selector_code(source: &ShadowSource) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use secrecy::SecretString;
     use tempfile::TempDir;
+    use tokio_rusqlite::rusqlite::params;
     use uuid::Uuid;
 
+    use super::{
+        AdoptReconciliation, ReconciliationCommit, ReconciliationCommitFailpoint,
+        ReconciliationCommitInput,
+    };
     use crate::{
-        control::protocol::{ActionStatus, ReconciliationStrategy, Target},
+        control::protocol::{
+            ActionStatus, CompatibilityClassification, CompatibilityView, ProviderAuthentication,
+            ProviderProtocol, ReconciliationStrategy, Target,
+        },
+        domain::activation::ActivatedSnapshot,
         home::MuxviaHome,
         state::{ManagedWriteStatus, StateStore},
     };
+
+    async fn seed_managed_route(store: &StateStore, target: Target) -> (Uuid, Uuid, Uuid) {
+        let provider_id = Uuid::new_v4();
+        let credential_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        store
+            .connection
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO credentials (id, target, bearer_token) VALUES (?1, ?2, 'OLD_SECRET')",
+                    params![credential_id.to_string(), target.as_str()],
+                )?;
+                connection.execute(
+                    "INSERT INTO providers
+                     (id, target, position, provider_revision, name, base_url, model, protocol,
+                      authentication, credential_id, provenance_kind, provenance_key,
+                      generated_owner_id, routing_requirement)
+                     VALUES (?1, ?2, 0, 1, 'Old', 'https://old.test/v1', 'old-model',
+                             'openai-responses', 'openai-bearer', ?3, NULL, NULL, NULL,
+                             'direct-compatible')",
+                    params![
+                        provider_id.to_string(),
+                        target.as_str(),
+                        credential_id.to_string()
+                    ],
+                )?;
+                connection.execute(
+                    "INSERT INTO activated_snapshots
+                     (id, target, provider_id, base_url, model, protocol, authentication,
+                      provider_bearer_token, epoch)
+                     VALUES (?1, ?2, ?3, 'https://old.test/v1', 'old-model',
+                             'openai-responses', 'openai-bearer', 'OLD_SECRET', ?4)",
+                    params![
+                        snapshot_id.to_string(),
+                        target.as_str(),
+                        provider_id.to_string(),
+                        epoch.to_string()
+                    ],
+                )?;
+                connection.execute(
+                    "INSERT INTO activated_route_plans (id, target, epoch, created_revision)
+                     VALUES (?1, ?2, ?3, 0)",
+                    params![snapshot_id.to_string(), target.as_str(), epoch.to_string()],
+                )?;
+                connection.execute(
+                    "INSERT INTO activated_route_plan_members
+                     (plan_id, position, provider_id, provider_revision, name, base_url, model,
+                      protocol, authentication, credential_id, routing_requirement)
+                     VALUES (?1, 0, ?2, 1, 'Old', 'https://old.test/v1', 'old-model',
+                             'openai-responses', 'openai-bearer', ?3, 'direct-compatible')",
+                    params![
+                        snapshot_id.to_string(),
+                        provider_id.to_string(),
+                        credential_id.to_string()
+                    ],
+                )?;
+                connection.execute(
+                    "INSERT INTO failover_draft_members
+                     (target, position, provider_id, provider_revision) VALUES (?1, 0, ?2, 1)",
+                    params![target.as_str(), provider_id.to_string()],
+                )?;
+                connection.execute(
+                    "UPDATE target_route_state SET current_provider_id = ?1,
+                       activated_snapshot_id = ?2, active_route_plan_id = ?2
+                     WHERE target = ?3",
+                    params![
+                        provider_id.to_string(),
+                        snapshot_id.to_string(),
+                        target.as_str()
+                    ],
+                )?;
+                Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .unwrap();
+        (provider_id, credential_id, snapshot_id)
+    }
+
+    #[tokio::test]
+    async fn adopt_replaces_the_active_plan_and_draft_without_mutating_history() {
+        let temp = TempDir::new().unwrap();
+        let home = MuxviaHome::from_user_home(temp.path());
+        let store = StateStore::open(&home).await.unwrap();
+        let (old_provider_id, _old_credential_id, old_plan_id) =
+            seed_managed_route(&store, Target::Codex).await;
+        let action_id = Uuid::new_v4();
+        store
+            .insert_reconciliation_intent(
+                Target::Codex,
+                action_id,
+                ReconciliationStrategy::Adopt,
+                0,
+                "before".to_owned(),
+                "desired".to_owned(),
+            )
+            .await
+            .unwrap();
+        let provider_id = Uuid::new_v4();
+        let credential_id = Uuid::new_v4();
+        let snapshot_id = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+
+        let committed = store
+            .commit_reconciliation(ReconciliationCommitInput {
+                target: Target::Codex,
+                action_id,
+                expected_revision: 0,
+                strategy: ReconciliationStrategy::Adopt,
+                compatibility: CompatibilityView {
+                    version: "tested".to_owned(),
+                    classification: CompatibilityClassification::Tested,
+                    acknowledgement_required: false,
+                },
+                adopt: Some(AdoptReconciliation {
+                    provider_id,
+                    credential_id,
+                    snapshot: ActivatedSnapshot {
+                        id: snapshot_id,
+                        target: Target::Codex,
+                        provider_id,
+                        base_url: "https://adopted.test/v1".to_owned(),
+                        model: "adopted-model".to_owned(),
+                        protocol: ProviderProtocol::OpenaiResponses,
+                        authentication: ProviderAuthentication::OpenaiBearer,
+                        provider_credential: SecretString::from("ADOPTED_SECRET"),
+                        epoch,
+                    },
+                    name: "Adopted".to_owned(),
+                    recovery_id: Uuid::new_v4(),
+                    recovery_payload_json: "{}".to_owned(),
+                    file_identity_json: "{}".to_owned(),
+                    config_path: "/tmp/adopted".to_owned(),
+                    managed_config_version: 1,
+                    exit_takeover: false,
+                }),
+                refreshed_recovery_payload_json: None,
+                refreshed_file_identity_json: None,
+                failpoint: ReconciliationCommitFailpoint::None,
+            })
+            .await
+            .unwrap();
+        let ReconciliationCommit::Applied(outcome) = committed else {
+            panic!("Adopt did not commit");
+        };
+
+        let active = outcome.view.failover.active_plan.unwrap();
+        assert!(
+            active.id == snapshot_id
+                && active.epoch == epoch
+                && active.members.len() == 1
+                && active.members[0].provider_id == provider_id
+                && outcome.view.failover.draft_revision == 2
+                && outcome.view.failover.draft_members.len() == 1
+                && outcome.view.failover.draft_members[0].provider_id == provider_id,
+            "Adopt did not replace the active plan and draft with its new Current Provider"
+        );
+        let immutable_history = store
+            .connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM activated_route_plans plan
+                       JOIN activated_route_plan_members member ON member.plan_id = plan.id
+                       WHERE plan.id = ?1 AND plan.target = 'codex' AND member.provider_id = ?2
+                     )",
+                    params![old_plan_id.to_string(), old_provider_id.to_string()],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            immutable_history,
+            "Adopt mutated historical route-plan material"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_clears_the_active_plan_and_draft_without_mutating_history() {
+        let temp = TempDir::new().unwrap();
+        let home = MuxviaHome::from_user_home(temp.path());
+        let store = StateStore::open(&home).await.unwrap();
+        let (old_provider_id, _old_credential_id, old_plan_id) =
+            seed_managed_route(&store, Target::Codex).await;
+        let action_id = Uuid::new_v4();
+        store
+            .insert_reconciliation_intent(
+                Target::Codex,
+                action_id,
+                ReconciliationStrategy::Restore,
+                0,
+                "before".to_owned(),
+                "desired".to_owned(),
+            )
+            .await
+            .unwrap();
+
+        let committed = store
+            .commit_reconciliation(ReconciliationCommitInput {
+                target: Target::Codex,
+                action_id,
+                expected_revision: 0,
+                strategy: ReconciliationStrategy::Restore,
+                compatibility: CompatibilityView {
+                    version: "tested".to_owned(),
+                    classification: CompatibilityClassification::Tested,
+                    acknowledgement_required: false,
+                },
+                adopt: None,
+                refreshed_recovery_payload_json: None,
+                refreshed_file_identity_json: None,
+                failpoint: ReconciliationCommitFailpoint::None,
+            })
+            .await
+            .unwrap();
+        let ReconciliationCommit::Applied(outcome) = committed else {
+            panic!("Restore did not commit");
+        };
+
+        assert!(
+            outcome.view.current_provider_id.is_none()
+                && outcome.view.failover.active_plan.is_none()
+                && outcome.view.failover.draft_revision == 2
+                && outcome.view.failover.draft_members.is_empty(),
+            "Restore left an active plan or draft after clearing the Current Provider"
+        );
+        let immutable_history = store
+            .connection
+            .call(move |connection| {
+                connection.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM activated_route_plans plan
+                       JOIN activated_route_plan_members member ON member.plan_id = plan.id
+                       WHERE plan.id = ?1 AND plan.target = 'codex' AND member.provider_id = ?2
+                     )",
+                    params![old_plan_id.to_string(), old_provider_id.to_string()],
+                    |row| row.get::<_, bool>(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert!(
+            immutable_history,
+            "Restore mutated historical route-plan material"
+        );
+    }
 
     #[tokio::test]
     async fn ambiguous_startup_intent_marks_only_its_target_and_leaves_a_replay_receipt() {

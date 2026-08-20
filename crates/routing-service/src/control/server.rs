@@ -36,7 +36,7 @@ use crate::{
     service::{
         activate::ActivationService, provider_inspector::ProviderInspector,
         provider_synchronization::ProviderSynchronizationService, reconcile::ReconciliationService,
-        reconciliation_adapter::ReconciliationContext,
+        reconciliation_adapter::ReconciliationContext, route_plan::RoutePlanCoordinator,
     },
     state::{ManagedWriteStatus, StateStore},
 };
@@ -153,6 +153,7 @@ struct SessionServices {
     activation: Arc<ActivationService>,
     inspector: Arc<ProviderInspector>,
     reconciliation: Arc<ReconciliationService>,
+    route_plans: Arc<RoutePlanCoordinator>,
     provider_synchronization: Arc<ProviderSynchronizationService>,
 }
 
@@ -222,6 +223,10 @@ impl ControlServer {
         let reconciliation = Arc::new(ReconciliationService::from_runtime(
             Arc::clone(&store),
             reconciliation_runtime,
+        ));
+        let route_plans = Arc::new(RoutePlanCoordinator::new(
+            Arc::clone(&store),
+            Arc::clone(&reconciliation),
         ));
         reconciliation
             .recover_pending_intents()
@@ -321,6 +326,7 @@ impl ControlServer {
                         let activation = Arc::clone(&activation);
                         let inspector = Arc::clone(&inspector);
                         let reconciliation = Arc::clone(&reconciliation);
+                        let route_plans = Arc::clone(&route_plans);
                         let provider_synchronization = Arc::clone(&provider_synchronization);
                         let release = release.clone();
                         let lifecycle = Arc::clone(&lifecycle);
@@ -330,6 +336,7 @@ impl ControlServer {
                             activation,
                             inspector,
                             reconciliation,
+                            route_plans,
                             provider_synchronization,
                         };
                         sessions.spawn(async move {
@@ -511,6 +518,7 @@ async fn serve_session(
         activation,
         inspector,
         reconciliation,
+        route_plans,
         provider_synchronization,
     } = services;
     let first = match read_frame(&mut stream).await {
@@ -924,6 +932,20 @@ async fn serve_session(
                                 }
                                 _ => None,
                             });
+                        let failover_draft =
+                            parsed_action.as_ref().and_then(|action| match action {
+                                TargetAction::SaveFailoverDraft(action) => {
+                                    Some(action.members.clone())
+                                }
+                                _ => None,
+                            });
+                        let failover_apply =
+                            parsed_action.as_ref().and_then(|action| match action {
+                                TargetAction::ApplyFailoverChain(action) => {
+                                    Some(action.draft_revision)
+                                }
+                                _ => None,
+                            });
                         let probe_unmanaged_provider_write = matches!(
                             parsed_action.as_ref(),
                             Some(
@@ -978,6 +1000,28 @@ async fn serve_session(
                                     action_id,
                                     expected_revision,
                                     version,
+                                )
+                                .await;
+                            (deferred.result, deferred.publication)
+                        } else if let Some(members) = failover_draft {
+                            let deferred = route_plans
+                                .save_draft(target, action_id, expected_revision, members)
+                                .await;
+                            (deferred.result, deferred.publication)
+                        } else if let Some(draft_revision) = failover_apply {
+                            let context = match target {
+                                Target::Codex => Some(ReconciliationContext::Codex),
+                                Target::Claude => opened_claude_context
+                                    .clone()
+                                    .map(ReconciliationContext::Claude),
+                            };
+                            let deferred = route_plans
+                                .apply(
+                                    target,
+                                    action_id,
+                                    expected_revision,
+                                    draft_revision,
+                                    context,
                                 )
                                 .await;
                             (deferred.result, deferred.publication)

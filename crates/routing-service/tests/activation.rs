@@ -3984,6 +3984,22 @@ async fn direct_activation_commits_config_snapshot_and_receipt_without_model_rou
     assert_eq!(snapshot.provider_id, provider_id);
     assert_eq!(snapshot.model, "gpt-direct");
     assert_eq!(snapshot.epoch, fixture.store.service_epoch());
+    assert!(
+        outcome.view.failover.draft_members.len() == 1
+            && outcome.view.failover.draft_members[0].provider_id == provider_id
+            && outcome
+                .view
+                .failover
+                .active_plan
+                .as_ref()
+                .is_some_and(|plan| {
+                    plan.id == snapshot.id
+                        && plan.epoch == snapshot.epoch
+                        && plan.members.len() == 1
+                        && plan.members[0].provider_id == provider_id
+                }),
+        "activation did not reset the Failover Chain to one immutable member"
+    );
     assert_eq!(
         observer.0.lock().unwrap().as_slice(),
         &[

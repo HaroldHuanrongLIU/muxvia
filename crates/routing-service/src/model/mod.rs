@@ -1,9 +1,12 @@
 pub mod auth;
+mod commitment;
 pub mod headers;
 mod messages;
+mod router;
 mod server;
 mod upstream;
 
+pub(crate) use router::RouteHealthRuntime;
 pub use server::{
     ModelServer, ModelServerError, ModelServerHandle, ModelServerStatus, ReservedListener,
 };

@@ -17,6 +17,7 @@ pub use store::{
     CommittedActivationSnapshot, CommittedRouteRuntime, CommittedTakeover, RoutingSnapshot,
     StateError, StateStore,
 };
+pub(crate) use store::{ActivatedRoutePlanSnapshot, RouteObservation, RoutePlanMemberSnapshot};
 pub use universal_providers::{
     UniversalProviderActionFailure, UniversalProviderSynchronizationCommit,
     UniversalSynchronizationFailpoint,

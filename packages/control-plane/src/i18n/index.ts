@@ -54,6 +54,15 @@ const problemMessageKeys = new Map<string, MessageKey>([
   ["takeover-required", "error.takeover-required"],
   ["takeover-active", "error.takeover-active"],
   ["internal-failure", "error.internal-failure"],
+  ["invalid-failover-chain", "error.invalid-failover-chain"],
+  ["stale-failover-draft-revision", "error.stale-failover-draft-revision"],
+  ["duplicate-failover-provider", "error.duplicate-failover-provider"],
+  ["current-provider-must-be-first", "error.current-provider-must-be-first"],
+  ["incomplete-route-plan-provider", "error.incomplete-route-plan-provider"],
+  ["unsynchronized-route-plan-provider", "error.unsynchronized-route-plan-provider"],
+  ["stale-provider-revision", "error.stale-provider-revision"],
+  ["no-activated-route-plan", "error.no-activated-route-plan"],
+  ["all-route-providers-unavailable", "error.all-route-providers-unavailable"],
 ])
 
 export function messageKeyForProblem(code: string): MessageKey {
@@ -80,6 +89,9 @@ export function labelTargetState(t: Translator, value: string): string {
     case "required":
     case "recovery-required": return t("state.recovery-required")
     case "unobserved": return t("state.unobserved")
+    case "healthy": return t("state.healthy")
+    case "degraded": return t("state.degraded")
+    case "stale": return t("state.stale")
     default: return t("state.unknown", { value })
   }
 }

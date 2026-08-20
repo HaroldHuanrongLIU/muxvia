@@ -54,6 +54,10 @@ const controlProblemSchema = z.object({
   selector: claudeBlockingSelectorSchema.optional(),
 })
 
+const routeHealthSchema = z.object({
+  state: z.enum(["unobserved", "healthy", "degraded", "unavailable", "stale"]),
+}).strict()
+
 const providerViewSchema = z.object({
   id: z.string(),
   position: z.number().int().nonnegative(),
@@ -83,6 +87,7 @@ const providerViewSchema = z.object({
     routingRequirement: z.enum(["target-provider", "universal-provider", "target-overlay", "target-fixed"]),
     credential: z.enum(["target-provider", "universal-provider", "target-overlay", "target-fixed"]),
   }).strict(),
+  routeHealth: routeHealthSchema,
   activeReferences: z.array(z.enum(["current", "activated-snapshot", "activated-route-plan"])),
 })
 
@@ -112,6 +117,31 @@ const activatedSnapshotSchema = z.object({
   epoch: z.string().uuid(),
 })
 
+const failoverDraftMemberSchema = z.object({
+  providerId: z.string().uuid(),
+  providerRevision: z.number().int().positive(),
+}).strict()
+
+const activatedRoutePlanMemberSchema = z.object({
+  position: z.number().int().nonnegative(),
+  providerId: z.string().uuid(),
+  providerRevision: z.number().int().positive(),
+  name: z.string(),
+  model: z.string(),
+  protocol: z.enum(["openai-responses", "anthropic-messages"]),
+  authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]),
+}).strict()
+
+const failoverViewSchema = z.object({
+  draftRevision: z.number().int().nonnegative(),
+  draftMembers: z.array(failoverDraftMemberSchema),
+  activePlan: z.object({
+    id: z.string().uuid(),
+    epoch: z.string().uuid(),
+    members: z.array(activatedRoutePlanMemberSchema),
+  }).strict().nullable(),
+}).strict()
+
 const targetViewSchema = z.object({
   target: targetSchema,
   managementRevision: z.number().int().nonnegative(),
@@ -125,7 +155,7 @@ const targetViewSchema = z.object({
     state: z.string(),
     endpoint: z.string().nullable(),
   }),
-  routeHealth: z.object({ state: z.literal("unobserved") }),
+  routeHealth: routeHealthSchema,
   providers: z.array(providerViewSchema),
   providerPresets: z.array(providerPresetSchema),
   currentProviderId: z.string().nullable(),
@@ -140,6 +170,7 @@ const targetViewSchema = z.object({
     state: z.string(),
   }),
   activatedSnapshot: activatedSnapshotSchema.nullable(),
+  failover: failoverViewSchema,
   problems: z.array(controlProblemSchema),
 })
 
@@ -274,6 +305,17 @@ const targetActionSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("resolve-compatibility"),
     version: z.string(),
+  }).strict(),
+  z.object({
+    kind: z.literal("save-failover-draft"),
+    members: z.array(z.object({
+      providerId: z.string().uuid(),
+      providerRevision: z.number().int().positive(),
+    }).strict()),
+  }).strict(),
+  z.object({
+    kind: z.literal("apply-failover-chain"),
+    draftRevision: z.number().int().positive(),
   }).strict(),
 ])
 

@@ -322,6 +322,11 @@ pub(super) fn delete_provider_for(
                 SELECT 1 FROM target_route_state r
                  JOIN activated_snapshots s ON s.id = r.activated_snapshot_id
                  WHERE r.target = ?2 AND s.provider_id = ?1
+                UNION ALL
+                SELECT 1 FROM target_route_state r
+                 JOIN activated_route_plan_members member
+                   ON member.plan_id = r.active_route_plan_id
+                 WHERE r.target = ?2 AND member.provider_id = ?1
              )",
             params![provider_id.to_string(), target.as_str()],
             |row| row.get(0),
@@ -348,7 +353,10 @@ pub(super) fn delete_provider_for(
             .execute(
                 "DELETE FROM credentials
                  WHERE id = ?1
-                   AND NOT EXISTS (SELECT 1 FROM providers WHERE credential_id = ?1)",
+                   AND NOT EXISTS (SELECT 1 FROM providers WHERE credential_id = ?1)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM activated_route_plan_members WHERE credential_id = ?1
+                   )",
                 [credential_id],
             )
             .map_err(|_| ProviderMutationError::Invalid)?;
@@ -704,7 +712,10 @@ fn update_provider(
             .execute(
                 "DELETE FROM credentials
                  WHERE id = ?1
-                   AND NOT EXISTS (SELECT 1 FROM providers WHERE credential_id = ?1)",
+                   AND NOT EXISTS (SELECT 1 FROM providers WHERE credential_id = ?1)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM activated_route_plan_members WHERE credential_id = ?1
+                   )",
                 [previous_credential_id],
             )
             .map_err(|_| ProviderMutationError::Invalid)?;

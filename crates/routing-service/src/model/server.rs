@@ -25,6 +25,7 @@ use super::messages::route_messages;
 use super::{
     auth::routing_credential_matches,
     headers::{forward_request_headers, forward_response_headers},
+    router::{RouteHealthRuntime, pin_route_plan, route_pinned_plan},
     upstream::{UpstreamRequest, UpstreamTransport, responses_url},
 };
 
@@ -67,6 +68,7 @@ pub struct ModelServer;
 
 const RESERVED_BIT: usize = 1;
 const ACTIVE_REQUEST_INCREMENT: usize = 2;
+const MAX_REPLAYABLE_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 pub struct ModelServerHandle {
     endpoint: SocketAddr,
@@ -114,6 +116,7 @@ pub(crate) struct RouteState {
     pub(crate) store: Arc<StateStore>,
     pub(crate) upstream: Arc<dyn UpstreamTransport>,
     pub(crate) admission: Arc<AtomicUsize>,
+    pub(crate) route_health: Arc<RouteHealthRuntime>,
 }
 
 impl Clone for RouteState {
@@ -123,6 +126,7 @@ impl Clone for RouteState {
             store: Arc::clone(&self.store),
             upstream: Arc::clone(&self.upstream),
             admission: Arc::clone(&self.admission),
+            route_health: Arc::clone(&self.route_health),
         }
     }
 }
@@ -142,7 +146,32 @@ impl ModelServer {
         store: Arc<StateStore>,
         upstream: Arc<dyn UpstreamTransport>,
     ) -> Result<ModelServerHandle, ModelServerError> {
-        let mut handle = Self::bind_reserved_staged_for(reserved, target, store, upstream).await?;
+        let handle = Self::bind_reserved_for_with_health(
+            reserved,
+            target,
+            store,
+            upstream,
+            Arc::new(RouteHealthRuntime::default()),
+        )
+        .await?;
+        Ok(handle)
+    }
+
+    pub(crate) async fn bind_reserved_for_with_health(
+        reserved: ReservedListener,
+        target: Target,
+        store: Arc<StateStore>,
+        upstream: Arc<dyn UpstreamTransport>,
+        route_health: Arc<RouteHealthRuntime>,
+    ) -> Result<ModelServerHandle, ModelServerError> {
+        let mut handle = Self::bind_reserved_staged_for_with_health(
+            reserved,
+            target,
+            store,
+            upstream,
+            route_health,
+        )
+        .await?;
         handle.activate().await?;
         Ok(handle)
     }
@@ -153,12 +182,30 @@ impl ModelServer {
         store: Arc<StateStore>,
         upstream: Arc<dyn UpstreamTransport>,
     ) -> Result<ModelServerHandle, ModelServerError> {
+        Self::bind_reserved_staged_for_with_health(
+            reserved,
+            target,
+            store,
+            upstream,
+            Arc::new(RouteHealthRuntime::default()),
+        )
+        .await
+    }
+
+    pub(crate) async fn bind_reserved_staged_for_with_health(
+        reserved: ReservedListener,
+        target: Target,
+        store: Arc<StateStore>,
+        upstream: Arc<dyn UpstreamTransport>,
+        route_health: Arc<RouteHealthRuntime>,
+    ) -> Result<ModelServerHandle, ModelServerError> {
         let endpoint = reserved.endpoint;
         let state = RouteState {
             target,
             store,
             upstream,
             admission: Arc::new(AtomicUsize::new(0)),
+            route_health,
         };
         let admission = Arc::clone(&state.admission);
         let router = match target {
@@ -354,39 +401,78 @@ async fn route_responses(
         return local_response(StatusCode::UNAUTHORIZED);
     }
 
-    let snapshot = match state.store.activated_snapshot().await {
-        Ok(Some(snapshot)) => snapshot,
-        Ok(None) | Err(_) => return local_response(StatusCode::SERVICE_UNAVAILABLE),
+    let plan = match pin_route_plan(&state.store, state.target).await {
+        Some(plan) => plan,
+        None => return local_response(StatusCode::SERVICE_UNAVAILABLE),
     };
     let Some(active_request) = ActiveRequestGuard::try_begin(Arc::clone(&state.admission)) else {
         return local_response(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let url = match responses_url(snapshot.base_url()) {
-        Ok(url) => url,
-        Err(_) => return local_response(StatusCode::BAD_GATEWAY),
-    };
-    let headers = match forward_request_headers(request.headers(), snapshot.provider_credential()) {
-        Ok(headers) => headers,
-        Err(_) => return local_response(StatusCode::BAD_GATEWAY),
-    };
-    let body = ReqwestBody::wrap_stream(request.into_body().into_data_stream());
-    let upstream = match state
-        .upstream
-        .send(UpstreamRequest {
-            method: Method::POST,
-            url,
-            headers,
-            body,
-        })
-        .await
-    {
-        Ok(response) => response,
-        Err(_) => return local_response(StatusCode::BAD_GATEWAY),
-    };
-
-    if upstream.status.is_success() {
-        let _ = state.store.record_serving(snapshot.id()).await;
+    let request_headers = request.headers().clone();
+    let mut incoming = request.into_body().into_data_stream();
+    let mut request_body = Vec::new();
+    while let Some(chunk) = incoming.next().await {
+        let Ok(chunk) = chunk else {
+            return local_response(StatusCode::BAD_REQUEST);
+        };
+        if request_body.len().saturating_add(chunk.len()) > MAX_REPLAYABLE_BODY_BYTES {
+            return local_response(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        request_body.extend_from_slice(&chunk);
     }
+    let route = route_pinned_plan(
+        plan,
+        state.target,
+        &state.route_health,
+        &state.upstream,
+        |member| {
+            if member.protocol != crate::control::protocol::ProviderProtocol::OpenaiResponses {
+                return None;
+            }
+            Some(UpstreamRequest {
+                method: Method::POST,
+                url: responses_url(&member.base_url).ok()?,
+                headers: forward_request_headers(&request_headers, &member.provider_credential)
+                    .ok()?,
+                body: ReqwestBody::from(request_body.clone()),
+            })
+        },
+    )
+    .await;
+    let serving_provider = route
+        .routed
+        .as_ref()
+        .filter(|routed| routed.response.status.is_success())
+        .map(|routed| routed.provider_id);
+    if !route.observations.is_empty() {
+        let observations = route
+            .observations
+            .into_iter()
+            .map(|observation| crate::state::RouteObservation {
+                provider_id: observation.provider_id,
+                state: observation.state.to_owned(),
+                consecutive_successes: observation.consecutive_successes,
+                consecutive_failures: observation.consecutive_failures,
+                total_attempts: observation.total_attempts,
+                failed_attempts: observation.failed_attempts,
+                outcome: observation.outcome.to_owned(),
+            })
+            .collect();
+        let _ = state
+            .store
+            .record_route_observations_for(
+                state.target,
+                route.plan_id,
+                route.plan_epoch,
+                observations,
+                serving_provider,
+            )
+            .await;
+    }
+    let Some(routed) = route.routed else {
+        return local_response(StatusCode::BAD_GATEWAY);
+    };
+    let upstream = routed.response;
 
     let mut response = Response::builder()
         .status(upstream.status)

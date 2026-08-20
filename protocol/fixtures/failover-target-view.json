@@ -1,0 +1,122 @@
+{
+  "target": "codex",
+  "managementRevision": 9,
+  "viewSequence": 12,
+  "service": { "epoch": "00000000-0000-4000-8000-000000000001", "state": "running" },
+  "mode": "takeover",
+  "takeover": { "state": "active", "endpoint": "http://127.0.0.1:43121" },
+  "routeHealth": { "state": "degraded" },
+  "providers": [
+    {
+      "id": "00000000-0000-4000-8000-000000000101",
+      "position": 0,
+      "providerRevision": 7,
+      "name": "Primary",
+      "baseUrl": "https://primary.example/v1",
+      "model": "gpt-primary",
+      "protocol": "openai-responses",
+      "authentication": "openai-bearer",
+      "routingRequirement": "direct-compatible",
+      "credential": "present",
+      "completeness": "complete",
+      "missingFields": [],
+      "provenance": null,
+      "generated": false,
+      "universalProviderId": null,
+      "synchronization": null,
+      "ownership": {
+        "name": "target-provider",
+        "baseUrl": "target-provider",
+        "model": "target-provider",
+        "protocol": "target-provider",
+        "authentication": "target-provider",
+        "routingRequirement": "target-provider",
+        "credential": "target-provider"
+      },
+      "routeHealth": { "state": "unavailable" },
+      "activeReferences": ["current", "activated-snapshot", "activated-route-plan"]
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000102",
+      "position": 1,
+      "providerRevision": 3,
+      "name": "Fallback",
+      "baseUrl": "https://fallback.example/v1",
+      "model": "gpt-fallback",
+      "protocol": "openai-responses",
+      "authentication": "openai-bearer",
+      "routingRequirement": "direct-compatible",
+      "credential": "present",
+      "completeness": "complete",
+      "missingFields": [],
+      "provenance": null,
+      "generated": false,
+      "universalProviderId": null,
+      "synchronization": null,
+      "ownership": {
+        "name": "target-provider",
+        "baseUrl": "target-provider",
+        "model": "target-provider",
+        "protocol": "target-provider",
+        "authentication": "target-provider",
+        "routingRequirement": "target-provider",
+        "credential": "target-provider"
+      },
+      "routeHealth": { "state": "healthy" },
+      "activeReferences": ["activated-route-plan"]
+    }
+  ],
+  "providerPresets": [
+    {
+      "key": "openai-api-responses",
+      "baseUrl": "https://api.openai.com/v1",
+      "model": "",
+      "protocol": "openai-responses",
+      "authentication": "openai-bearer"
+    }
+  ],
+  "currentProviderId": "00000000-0000-4000-8000-000000000101",
+  "servingProviderId": "00000000-0000-4000-8000-000000000102",
+  "managedConfiguration": { "state": "managed", "path": "/tmp/config.toml", "restartRequired": false },
+  "recovery": { "intentId": null, "state": "clean" },
+  "activatedSnapshot": {
+    "id": "00000000-0000-4000-8000-000000000201",
+    "providerId": "00000000-0000-4000-8000-000000000101",
+    "model": "gpt-primary",
+    "protocol": "openai-responses",
+    "authentication": "openai-bearer",
+    "epoch": "00000000-0000-4000-8000-000000000301"
+  },
+  "failover": {
+    "draftRevision": 4,
+    "draftMembers": [
+      { "providerId": "00000000-0000-4000-8000-000000000101", "providerRevision": 7 },
+      { "providerId": "00000000-0000-4000-8000-000000000102", "providerRevision": 3 }
+    ],
+    "activePlan": {
+      "id": "00000000-0000-4000-8000-000000000401",
+      "epoch": "00000000-0000-4000-8000-000000000402",
+      "members": [
+        {
+          "position": 0,
+          "providerId": "00000000-0000-4000-8000-000000000101",
+          "providerRevision": 7,
+          "name": "Primary",
+          "model": "gpt-primary",
+          "protocol": "openai-responses",
+          "authentication": "openai-bearer"
+        },
+        {
+          "position": 1,
+          "providerId": "00000000-0000-4000-8000-000000000102",
+          "providerRevision": 3,
+          "name": "Fallback",
+          "model": "gpt-fallback",
+          "protocol": "openai-responses",
+          "authentication": "openai-bearer"
+        }
+      ]
+    }
+  },
+  "problems": []
+}

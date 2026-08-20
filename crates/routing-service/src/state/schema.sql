@@ -98,6 +98,57 @@ CREATE TABLE IF NOT EXISTS universal_provider_seeds (
   seeded_provider_id TEXT
 );
 
+CREATE TABLE IF NOT EXISTS failover_drafts (
+  target TEXT PRIMARY KEY CHECK (target IN ('codex', 'claude')),
+  draft_revision INTEGER NOT NULL CHECK (draft_revision >= 1)
+);
+
+CREATE TABLE IF NOT EXISTS failover_draft_members (
+  target TEXT NOT NULL REFERENCES failover_drafts(target) ON DELETE CASCADE,
+  position INTEGER NOT NULL CHECK (position >= 0),
+  provider_id TEXT NOT NULL,
+  provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
+  PRIMARY KEY (target, position),
+  UNIQUE (target, provider_id)
+);
+
+CREATE TABLE IF NOT EXISTS activated_route_plans (
+  id TEXT PRIMARY KEY,
+  target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+  epoch TEXT NOT NULL,
+  created_revision INTEGER NOT NULL CHECK (created_revision >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS activated_route_plan_members (
+  plan_id TEXT NOT NULL REFERENCES activated_route_plans(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL CHECK (position >= 0),
+  provider_id TEXT NOT NULL,
+  provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
+  name TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  model TEXT NOT NULL,
+  protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
+  authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
+  credential_id TEXT NOT NULL REFERENCES credentials(id),
+  routing_requirement TEXT NOT NULL CHECK (routing_requirement IN ('direct-compatible', 'takeover-required')),
+  PRIMARY KEY (plan_id, position),
+  UNIQUE (plan_id, provider_id)
+);
+
+CREATE TABLE IF NOT EXISTS provider_route_health (
+  target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+  provider_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('healthy', 'degraded', 'unavailable')),
+  service_epoch TEXT NOT NULL,
+  consecutive_successes INTEGER NOT NULL CHECK (consecutive_successes >= 0),
+  consecutive_failures INTEGER NOT NULL CHECK (consecutive_failures >= 0),
+  total_attempts INTEGER NOT NULL CHECK (total_attempts >= 0),
+  failed_attempts INTEGER NOT NULL CHECK (failed_attempts >= 0 AND failed_attempts <= total_attempts),
+  observation_sequence INTEGER NOT NULL CHECK (observation_sequence >= 0),
+  last_outcome TEXT NOT NULL,
+  PRIMARY KEY (target, provider_id)
+);
+
 CREATE TABLE IF NOT EXISTS target_route_state (
   target TEXT PRIMARY KEY CHECK (target IN ('codex', 'claude')),
   management_revision INTEGER NOT NULL,
@@ -111,6 +162,7 @@ CREATE TABLE IF NOT EXISTS target_route_state (
   managed_config_path TEXT,
   managed_config_version INTEGER NOT NULL DEFAULT 1 CHECK (managed_config_version IN (1,2)),
   recovery_intent_id TEXT,
+  active_route_plan_id TEXT REFERENCES activated_route_plans(id),
   recovery_state TEXT NOT NULL
 );
 
@@ -186,7 +238,7 @@ CREATE TABLE IF NOT EXISTS reconciliation_intents (
   PRIMARY KEY (target, action_id)
 );
 
-INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '9');
+INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '10');
 INSERT OR IGNORE INTO universal_provider_catalog_state (
   singleton, revision, view_sequence
 ) VALUES (1, 0, 0);
@@ -204,3 +256,5 @@ INSERT OR IGNORE INTO target_route_state (
   takeover_state,
   recovery_state
 ) VALUES ('claude', 0, 0, 'inactive', 'clean');
+INSERT OR IGNORE INTO failover_drafts (target, draft_revision) VALUES ('codex', 1);
+INSERT OR IGNORE INTO failover_drafts (target, draft_revision) VALUES ('claude', 1);

@@ -516,6 +516,29 @@ pub enum TargetAction {
         acknowledge_version: Option<String>,
     },
     ResolveCompatibility(ResolveCompatibilityAction),
+    SaveFailoverDraft(SaveFailoverDraftAction),
+    ApplyFailoverChain(ApplyFailoverChainAction),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SaveFailoverDraftAction {
+    pub members: Vec<FailoverDraftMember>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FailoverDraftMember {
+    pub provider_id: Uuid,
+    #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+    pub provider_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApplyFailoverChainAction {
+    #[serde(deserialize_with = "deserialize_positive_provider_revision")]
+    pub draft_revision: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -675,6 +698,14 @@ impl fmt::Debug for TargetAction {
             Self::ResolveCompatibility(action) => formatter
                 .debug_struct("ResolveCompatibility")
                 .field("version", &action.version)
+                .finish(),
+            Self::SaveFailoverDraft(action) => formatter
+                .debug_struct("SaveFailoverDraft")
+                .field("members", &action.members)
+                .finish(),
+            Self::ApplyFailoverChain(action) => formatter
+                .debug_struct("ApplyFailoverChain")
+                .field("draft_revision", &action.draft_revision)
                 .finish(),
         }
     }
@@ -995,6 +1026,8 @@ pub struct TargetView {
     pub managed_configuration: ManagedConfigurationView,
     pub recovery: RecoveryView,
     pub activated_snapshot: Option<ActivatedSnapshotView>,
+    #[serde(default)]
+    pub failover: FailoverView,
     pub problems: Vec<ControlProblem>,
 }
 
@@ -1012,10 +1045,49 @@ pub struct TakeoverView {
     pub endpoint: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RouteHealthState {
+    #[default]
+    Unobserved,
+    Healthy,
+    Degraded,
+    Unavailable,
+    Stale,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteHealthView {
-    pub state: String,
+    pub state: RouteHealthState,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailoverView {
+    pub draft_revision: u64,
+    pub draft_members: Vec<FailoverDraftMember>,
+    pub active_plan: Option<ActivatedRoutePlanView>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivatedRoutePlanView {
+    pub id: Uuid,
+    pub epoch: Uuid,
+    pub members: Vec<ActivatedRoutePlanMemberView>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivatedRoutePlanMemberView {
+    pub position: u32,
+    pub provider_id: Uuid,
+    pub provider_revision: u64,
+    pub name: String,
+    pub model: String,
+    pub protocol: ProviderProtocol,
+    pub authentication: ProviderAuthentication,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1041,6 +1113,8 @@ pub struct ProviderView {
     pub synchronization: Option<UniversalSynchronizationState>,
     #[serde(default)]
     pub ownership: ProviderFieldOwnershipView,
+    #[serde(default)]
+    pub route_health: RouteHealthView,
     pub active_references: Vec<ProviderReferenceView>,
 }
 

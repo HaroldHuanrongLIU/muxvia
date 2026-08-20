@@ -56,6 +56,7 @@ function viewAtRevision(revision: number, sequence = revision, target: TargetVie
         protocol: "target-fixed", authentication: "target-provider",
         routingRequirement: "target-provider", credential: "target-provider",
       },
+      routeHealth: { state: "unobserved" },
       activeReferences: [],
     }],
     providerPresets: [],
@@ -64,6 +65,7 @@ function viewAtRevision(revision: number, sequence = revision, target: TargetVie
     managedConfiguration: { state: "unmanaged", path: null, restartRequired: false },
     recovery: { intentId: null, state: "clean" },
     activatedSnapshot: null,
+    failover: { draftRevision: 1, draftMembers: [], activePlan: null },
     problems: [],
   }
 }
@@ -431,6 +433,52 @@ test("act deeply captures nested ordinary action fields before queued execution"
   })
   server.replyApplied(viewAtRevision(3, 3))
   await queued
+  await session.close()
+  await server.close()
+})
+
+test("failover draft and Apply actions are deeply captured at the TargetSession boundary", async () => {
+  const initial = viewAtRevision(1)
+  const { session, server } = await openScriptedSession(initial)
+  const first = session.act({ kind: "activate-provider", providerId: "provider-1", mode: "direct" })
+  const members = [{
+    providerId: "00000000-0000-4000-8000-000000000061",
+    providerRevision: 4,
+  }]
+  const save = session.act({ kind: "save-failover-draft", members })
+  members[0]!.providerId = "00000000-0000-4000-8000-000000000099"
+  members[0]!.providerRevision = 99
+
+  await server.waitForRequests(2)
+  server.replyApplied(viewAtRevision(2, 2))
+  await first
+  await server.waitForRequests(3)
+  const saveOperation = server.requests()[2]!.operation
+  expect(saveOperation).toMatchObject({
+    kind: "act",
+    expectedRevision: 2,
+    action: {
+      kind: "save-failover-draft",
+      members: [{
+        providerId: "00000000-0000-4000-8000-000000000061",
+        providerRevision: 4,
+      }],
+    },
+  })
+  server.replyApplied(viewAtRevision(3, 3))
+  await save
+
+  const mutableApply = { kind: "apply-failover-chain", draftRevision: 7 } satisfies OrdinaryTargetAction
+  const apply = session.act(mutableApply)
+  mutableApply.draftRevision = 70
+  await server.waitForRequests(4)
+  expect(server.requests()[3]!.operation).toMatchObject({
+    kind: "act",
+    expectedRevision: 3,
+    action: { kind: "apply-failover-chain", draftRevision: 7 },
+  })
+  server.replyApplied(viewAtRevision(4, 4))
+  await apply
   await session.close()
   await server.close()
 })

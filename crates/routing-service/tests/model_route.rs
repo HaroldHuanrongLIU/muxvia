@@ -176,6 +176,8 @@ impl StoreFixture {
         self.set_routing_credential().await;
         let snapshot_id = Uuid::new_v4();
         let provider_id = Uuid::new_v4();
+        let plan_id = Uuid::new_v4();
+        let plan_epoch = Uuid::new_v4();
         let database = tokio_rusqlite::Connection::open(self.muxvia_home.database_path())
             .await
             .unwrap();
@@ -207,16 +209,45 @@ impl StoreFixture {
                     (
                         snapshot_id.to_string(),
                         provider_id.to_string(),
-                        upstream_base_url,
+                        upstream_base_url.clone(),
                         PROVIDER_SECRET,
                         Uuid::new_v4().to_string(),
                     ),
                 )?;
+                transaction.execute("DELETE FROM failover_draft_members WHERE target = 'codex'", [])?;
+                transaction.execute(
+                    "INSERT INTO failover_draft_members (target, position, provider_id, provider_revision)
+                     VALUES ('codex', 0, ?1, 1)",
+                    [provider_id.to_string()],
+                )?;
+                transaction.execute(
+                    "INSERT INTO activated_route_plans (id, target, epoch, created_revision)
+                     VALUES (?1, 'codex', ?2, 0)",
+                    (plan_id.to_string(), plan_epoch.to_string()),
+                )?;
+                transaction.execute(
+                    "INSERT INTO activated_route_plan_members
+                     (plan_id, position, provider_id, provider_revision, name, base_url, model,
+                      protocol, authentication, credential_id, routing_requirement)
+                     VALUES (?1, 0, ?2, 1, 'Fake upstream', ?3, 'gpt-test',
+                             'openai-responses', 'openai-bearer', ?4, 'direct-compatible')",
+                    (
+                        plan_id.to_string(),
+                        provider_id.to_string(),
+                        upstream_base_url,
+                        provider_id.to_string(),
+                    ),
+                )?;
                 transaction.execute(
                     "UPDATE target_route_state
-                     SET activated_snapshot_id = ?1, current_provider_id = ?2
+                     SET activated_snapshot_id = ?1, current_provider_id = ?2,
+                         active_route_plan_id = ?3
                      WHERE target = 'codex'",
-                    (snapshot_id.to_string(), provider_id.to_string()),
+                    (
+                        snapshot_id.to_string(),
+                        provider_id.to_string(),
+                        plan_id.to_string(),
+                    ),
                 )?;
                 transaction.commit()?;
                 Ok(())
@@ -623,10 +654,10 @@ impl FakeUpstream {
 }
 
 #[tokio::test]
-async fn request_first_chunk_reaches_upstream_before_client_body_eof() {
+async fn request_body_is_bounded_and_replayable_before_the_first_upstream_attempt() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let upstream_endpoint = listener.local_addr().unwrap();
-    let (first_tx, first_rx) = oneshot::channel();
+    let (first_tx, mut first_rx) = oneshot::channel();
     let router = Router::new()
         .route("/api/v1/responses", post(observe_streaming_request))
         .with_state(StreamingRequestState {
@@ -669,12 +700,18 @@ async fn request_first_chunk_reaches_upstream_before_client_body_eof() {
             .unwrap()
     });
 
+    assert!(
+        timeout(Duration::from_millis(250), &mut first_rx)
+            .await
+            .is_err(),
+        "the first upstream attempt began before the replayable request body reached EOF"
+    );
+    finish_tx.send(()).unwrap();
     let first = timeout(Duration::from_secs(1), first_rx)
         .await
-        .expect("proxy must forward before the incoming request reaches EOF")
+        .expect("the bounded request was not forwarded after EOF")
         .unwrap();
-    assert_eq!(first, b"first-request-chunk");
-    finish_tx.send(()).unwrap();
+    assert_eq!(first, b"first-request-chunklast-request-chunk");
     assert_eq!(request_task.await.unwrap().status(), StatusCode::OK);
 
     server.shutdown().await.unwrap();
@@ -820,7 +857,15 @@ impl UpstreamTransport for InvalidatingObservationUpstream {
             .unwrap();
         database
             .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
-                connection.execute("DELETE FROM activated_snapshots", [])?;
+                connection.execute(
+                    "UPDATE target_route_state SET active_route_plan_id = NULL
+                     WHERE target = 'codex'",
+                    [],
+                )?;
+                connection.execute(
+                    "DELETE FROM activated_route_plans WHERE target = 'codex'",
+                    [],
+                )?;
                 Ok(())
             })
             .await

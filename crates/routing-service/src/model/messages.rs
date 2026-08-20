@@ -13,10 +13,12 @@ use serde_json::Value;
 use super::{
     auth::bearer_routing_credential_matches,
     headers::{forward_claude_request_headers, forward_response_headers},
+    router::{pin_route_plan, route_pinned_plan},
     server::{ActiveRequestGuard, RouteState, body_with_active_guard},
     upstream::{UpstreamRequest, messages_url},
 };
 use crate::control::protocol::ProviderProtocol;
+use crate::state::RouteObservation;
 
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
@@ -37,16 +39,13 @@ pub(crate) async fn route_messages(
     if !bearer_routing_credential_matches(request.headers(), &expected) {
         return local_response(StatusCode::UNAUTHORIZED);
     }
-    let snapshot = match state.store.activated_snapshot_for(state.target).await {
-        Ok(Some(snapshot)) => snapshot,
-        Ok(None) | Err(_) => return local_response(StatusCode::SERVICE_UNAVAILABLE),
+    let plan = match pin_route_plan(&state.store, state.target).await {
+        Some(plan) => plan,
+        None => return local_response(StatusCode::SERVICE_UNAVAILABLE),
     };
     let Some(active_request) = ActiveRequestGuard::try_begin(Arc::clone(&state.admission)) else {
         return local_response(StatusCode::SERVICE_UNAVAILABLE);
     };
-    if snapshot.protocol() != ProviderProtocol::AnthropicMessages {
-        return local_response(StatusCode::SERVICE_UNAVAILABLE);
-    }
     let encoding = match content_encoding(request.headers()) {
         Ok(encoding) => encoding,
         Err(()) => return body_error(StatusCode::UNSUPPORTED_MEDIA_TYPE),
@@ -61,18 +60,8 @@ pub(crate) async fn route_messages(
         return body_error(StatusCode::PAYLOAD_TOO_LARGE);
     }
     let count_tokens = request.uri().path().ends_with("/count_tokens");
-    let url = match messages_url(snapshot.base_url(), count_tokens, request.uri().query()) {
-        Ok(url) => url,
-        Err(_) => return local_response(StatusCode::BAD_GATEWAY),
-    };
-    let headers = match forward_claude_request_headers(
-        request.headers(),
-        snapshot.authentication(),
-        snapshot.provider_credential(),
-    ) {
-        Ok(headers) => headers,
-        Err(_) => return local_response(StatusCode::BAD_GATEWAY),
-    };
+    let query = request.uri().query().map(str::to_owned);
+    let request_headers = request.headers().clone();
     let mut incoming = request.into_body().into_data_stream();
     let mut bytes = Vec::new();
     while let Some(chunk) = incoming.next().await {
@@ -89,37 +78,69 @@ pub(crate) async fn route_messages(
         Err(BodyDecodeError::Invalid) => return body_error(StatusCode::BAD_REQUEST),
         Err(BodyDecodeError::TooLarge) => return body_error(StatusCode::PAYLOAD_TOO_LARGE),
     };
-    let mut object = match serde_json::from_slice::<Value>(&bytes) {
+    let object = match serde_json::from_slice::<Value>(&bytes) {
         Ok(Value::Object(object)) => object,
         _ => return body_error(StatusCode::BAD_REQUEST),
     };
-    object.insert(
-        "model".to_owned(),
-        Value::String(snapshot.model().to_owned()),
-    );
-    let body = match serde_json::to_vec(&Value::Object(object)) {
-        Ok(body) => body,
-        Err(_) => return body_error(StatusCode::BAD_REQUEST),
-    };
-    let upstream = match state
-        .upstream
-        .send(UpstreamRequest {
-            method: Method::POST,
-            url,
-            headers,
-            body: ReqwestBody::from(body),
-        })
-        .await
-    {
-        Ok(response) => response,
-        Err(_) => return local_response(StatusCode::BAD_GATEWAY),
-    };
-    if upstream.status.is_success() {
+    let route = route_pinned_plan(
+        plan,
+        state.target,
+        &state.route_health,
+        &state.upstream,
+        |member| {
+            if member.protocol != ProviderProtocol::AnthropicMessages {
+                return None;
+            }
+            let mut body = object.clone();
+            body.insert("model".to_owned(), Value::String(member.model.clone()));
+            Some(UpstreamRequest {
+                method: Method::POST,
+                url: messages_url(&member.base_url, count_tokens, query.as_deref()).ok()?,
+                headers: forward_claude_request_headers(
+                    &request_headers,
+                    member.authentication,
+                    &member.provider_credential,
+                )
+                .ok()?,
+                body: ReqwestBody::from(serde_json::to_vec(&Value::Object(body)).ok()?),
+            })
+        },
+    )
+    .await;
+    let serving_provider = route
+        .routed
+        .as_ref()
+        .filter(|routed| routed.response.status.is_success())
+        .map(|routed| routed.provider_id);
+    if !route.observations.is_empty() {
+        let observations = route
+            .observations
+            .into_iter()
+            .map(|observation| RouteObservation {
+                provider_id: observation.provider_id,
+                state: observation.state.to_owned(),
+                consecutive_successes: observation.consecutive_successes,
+                consecutive_failures: observation.consecutive_failures,
+                total_attempts: observation.total_attempts,
+                failed_attempts: observation.failed_attempts,
+                outcome: observation.outcome.to_owned(),
+            })
+            .collect();
         let _ = state
             .store
-            .record_serving_for(state.target, snapshot.id())
+            .record_route_observations_for(
+                state.target,
+                route.plan_id,
+                route.plan_epoch,
+                observations,
+                serving_provider,
+            )
             .await;
     }
+    let Some(routed) = route.routed else {
+        return local_response(StatusCode::BAD_GATEWAY);
+    };
+    let upstream = routed.response;
     let mut response = Response::builder()
         .status(upstream.status)
         .body(body_with_active_guard(upstream.body, active_request))

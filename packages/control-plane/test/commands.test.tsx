@@ -19,7 +19,7 @@ type Handlers = Partial<Record<CommandId, () => void>>
 
 function CommandHarness(props: {
   handlers: Handlers
-  scope?: "home" | "codex" | "claude" | "reconciliation"
+  scope?: "home" | "codex" | "claude" | "reconciliation" | "route-editor"
   Overlay?: () => JSX.Element
   onExecute?: (id: CommandId) => void
   onDispatch: (name: string) => void
@@ -48,7 +48,7 @@ function CommandHarness(props: {
 
 async function commandHarness(options: {
   handlers: Handlers
-  scope?: "home" | "codex" | "claude" | "reconciliation"
+  scope?: "home" | "codex" | "claude" | "reconciliation" | "route-editor"
   Overlay?: () => JSX.Element
   onExecute?: (id: CommandId) => void
   onDispatch: (name: string) => void
@@ -353,6 +353,40 @@ test.each(["codex", "claude"] as const)(
         "target.reconciliation.apply",
         "target.reconciliation.cancel",
       ])
+    } finally {
+      modal.renderer.destroy()
+    }
+  },
+)
+
+test.each(["codex", "claude"] as const)(
+  "Failover routing uses one exact shared command family through the real %s keymap",
+  async (scope) => {
+    const executed: string[] = []
+    const ids = [
+      "route.open",
+      "route.move-up",
+      "route.move-down",
+      "route.add-provider",
+      "route.remove-provider",
+      "route.apply",
+    ] as const
+    const handlers = Object.fromEntries(ids.map((id) => [id, () => executed.push(id)])) as Handlers
+    const setup = await commandHarness({ handlers, onDispatch: () => {}, scope })
+    try {
+      expect(resolveSlash("/route", scope)).toBe("route.open")
+      setup.keymap.dispatchCommand(resolveSlash("/route", scope)!)
+      await setup.renderOnce()
+      expect(executed).toEqual(["route.open"])
+    } finally {
+      setup.renderer.destroy()
+    }
+
+    const modal = await commandHarness({ handlers, onDispatch: () => {}, scope: "route-editor" })
+    try {
+      for (const id of ids.slice(1)) modal.keymap.dispatchCommand(id)
+      await modal.renderOnce()
+      expect(executed).toEqual([...ids])
     } finally {
       modal.renderer.destroy()
     }

@@ -14,7 +14,7 @@ use crate::control::protocol::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -50,6 +50,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v8(connection)?;
             migrate_v9(connection)?;
             migrate_v10(connection)?;
+            migrate_v11(connection)?;
         }
         Some(2) => {
             migrate_v2(connection)?;
@@ -61,6 +62,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v8(connection)?;
             migrate_v9(connection)?;
             migrate_v10(connection)?;
+            migrate_v11(connection)?;
         }
         Some(3) => {
             migrate_v3(connection)?;
@@ -71,6 +73,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v8(connection)?;
             migrate_v9(connection)?;
             migrate_v10(connection)?;
+            migrate_v11(connection)?;
         }
         Some(4) => {
             migrate_v4(connection)?;
@@ -80,6 +83,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v8(connection)?;
             migrate_v9(connection)?;
             migrate_v10(connection)?;
+            migrate_v11(connection)?;
         }
         Some(5) => {
             migrate_v5(connection)?;
@@ -88,6 +92,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v8(connection)?;
             migrate_v9(connection)?;
             migrate_v10(connection)?;
+            migrate_v11(connection)?;
         }
         Some(6) => {
             migrate_v6(connection)?;
@@ -95,27 +100,157 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v8(connection)?;
             migrate_v9(connection)?;
             migrate_v10(connection)?;
+            migrate_v11(connection)?;
         }
         Some(7) => {
             migrate_v7(connection)?;
             migrate_v8(connection)?;
             migrate_v9(connection)?;
             migrate_v10(connection)?;
+            migrate_v11(connection)?;
         }
         Some(8) => {
             migrate_v8(connection)?;
             migrate_v9(connection)?;
             migrate_v10(connection)?;
+            migrate_v11(connection)?;
         }
         Some(9) => {
             migrate_v9(connection)?;
             migrate_v10(connection)?;
+            migrate_v11(connection)?;
         }
-        Some(10) => migrate_v10(connection)?,
+        Some(10) => {
+            migrate_v10(connection)?;
+            migrate_v11(connection)?;
+        }
+        Some(11) => migrate_v11(connection)?,
         Some(_) => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v11(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE providers_v12 (
+           id TEXT PRIMARY KEY,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           position INTEGER NOT NULL CHECK (position >= 0),
+           provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
+           name TEXT NOT NULL,
+           base_url TEXT NOT NULL,
+           model TEXT NOT NULL,
+           protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
+           authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer', 'codex-subscription')),
+           credential_id TEXT,
+           provenance_kind TEXT,
+           provenance_key TEXT,
+           generated_owner_id TEXT,
+           routing_requirement TEXT NOT NULL DEFAULT 'direct-compatible'
+             CHECK (routing_requirement IN ('direct-compatible', 'takeover-required')),
+           generated_source_revision INTEGER CHECK (generated_source_revision IS NULL OR generated_source_revision >= 1),
+           generated_overlay_revision INTEGER CHECK (generated_overlay_revision IS NULL OR generated_overlay_revision >= 1),
+           CHECK (
+             (target = 'codex' AND protocol = 'openai-responses' AND authentication = 'openai-bearer')
+             OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer', 'codex-subscription'))
+           ),
+           CHECK (
+             authentication != 'codex-subscription'
+             OR (
+               base_url = 'https://chatgpt.com/backend-api/codex'
+               AND credential_id IS NULL
+               AND routing_requirement = 'takeover-required'
+             )
+           ),
+           FOREIGN KEY (target, credential_id) REFERENCES credentials(target, id)
+         );
+         CREATE TABLE activated_snapshots_v12 (
+           id TEXT PRIMARY KEY,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           provider_id TEXT NOT NULL,
+           base_url TEXT NOT NULL,
+           model TEXT NOT NULL,
+           protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
+           authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer', 'codex-subscription')),
+           provider_bearer_token TEXT NOT NULL,
+           epoch TEXT NOT NULL,
+           CHECK (
+             (target = 'codex' AND protocol = 'openai-responses' AND authentication = 'openai-bearer')
+             OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer', 'codex-subscription'))
+           ),
+           CHECK (
+             authentication != 'codex-subscription'
+             OR (
+               base_url = 'https://chatgpt.com/backend-api/codex'
+               AND provider_bearer_token = ''
+             )
+           )
+         );
+         CREATE TABLE activated_route_plan_members_v12 (
+           plan_id TEXT NOT NULL REFERENCES activated_route_plans(id) ON DELETE CASCADE,
+           position INTEGER NOT NULL CHECK (position >= 0),
+           provider_id TEXT NOT NULL,
+           provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
+           name TEXT NOT NULL,
+           base_url TEXT NOT NULL,
+           model TEXT NOT NULL,
+           protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
+           authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer', 'codex-subscription')),
+           credential_id TEXT REFERENCES credentials(id),
+           routing_requirement TEXT NOT NULL CHECK (routing_requirement IN ('direct-compatible', 'takeover-required')),
+           CHECK (
+             (
+               authentication = 'codex-subscription'
+               AND base_url = 'https://chatgpt.com/backend-api/codex'
+               AND credential_id IS NULL
+               AND routing_requirement = 'takeover-required'
+             )
+             OR (authentication != 'codex-subscription' AND credential_id IS NOT NULL)
+           ),
+           PRIMARY KEY (plan_id, position),
+           UNIQUE (plan_id, provider_id)
+         );
+         CREATE TABLE subscription_provider_bindings_v12 (
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           provider_id TEXT NOT NULL REFERENCES providers_v12(id) ON DELETE CASCADE,
+           binding_kind TEXT NOT NULL CHECK (binding_kind IN ('fixed', 'follow-default')),
+           account_id TEXT,
+           CHECK (
+             (binding_kind = 'fixed' AND account_id IS NOT NULL AND length(account_id) > 0)
+             OR (binding_kind = 'follow-default' AND account_id IS NULL)
+           ),
+           PRIMARY KEY (target, provider_id)
+         );
+
+         INSERT INTO providers_v12 SELECT * FROM providers;
+         INSERT INTO activated_snapshots_v12 SELECT * FROM activated_snapshots;
+         INSERT INTO activated_route_plan_members_v12 SELECT * FROM activated_route_plan_members;
+         INSERT INTO subscription_provider_bindings_v12 SELECT * FROM subscription_provider_bindings;
+
+         DROP TABLE subscription_provider_bindings;
+         DROP TABLE activated_route_plan_members;
+         DROP TABLE activated_snapshots;
+         DROP TABLE providers;
+         ALTER TABLE providers_v12 RENAME TO providers;
+         ALTER TABLE activated_snapshots_v12 RENAME TO activated_snapshots;
+         ALTER TABLE activated_route_plan_members_v12 RENAME TO activated_route_plan_members;
+         ALTER TABLE subscription_provider_bindings_v12 RENAME TO subscription_provider_bindings;
+         CREATE UNIQUE INDEX providers_generated_owner_target
+           ON providers(generated_owner_id, target)
+           WHERE generated_owner_id IS NOT NULL;",
+    )?;
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.execute(
+        "UPDATE metadata SET value = '12' WHERE key = 'schema-version'",
+        [],
+    )?;
+    transaction.commit()
 }
 
 fn migrate_v10(connection: &mut Connection) -> Result<()> {

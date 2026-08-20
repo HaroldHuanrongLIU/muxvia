@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::{
     control::protocol::{
         ActionOutcome, ActionStatus, ControlProblem, FailoverDraftMember, ProviderAuthentication,
-        ProviderProtocol, ProviderRoutingRequirement, Target, TargetAction, TargetView,
-        UniversalProviderCatalogView,
+        ProviderProtocol, ProviderRoutingRequirement, SubscriptionProviderBinding, Target,
+        TargetAction, TargetView, UniversalProviderCatalogView,
     },
     domain::{
         activation::ActivatedSnapshot, provider::has_valid_provider_declaration,
@@ -163,9 +163,12 @@ pub(crate) struct RoutePlanMemberSnapshot {
     pub(crate) provider_id: Uuid,
     pub(crate) base_url: String,
     pub(crate) model: String,
-    pub(crate) provider_credential: SecretString,
+    pub(crate) provider_credential: Option<SecretString>,
     pub(crate) protocol: ProviderProtocol,
     pub(crate) authentication: ProviderAuthentication,
+    // Task 4 consumes the pinned binding when a Bridge member is attempted.
+    #[allow(dead_code)]
+    pub(crate) subscription_binding: Option<SubscriptionProviderBinding>,
 }
 
 pub(crate) struct RouteObservation {
@@ -578,25 +581,26 @@ impl StateStore {
                 let prior_recovery_payload =
                     committed_recovery.map(|expectation| expectation.payload);
                 let provider = connection.query_row(
-                    "SELECT p.base_url, p.model, c.bearer_token, p.protocol, p.authentication, p.routing_requirement
+                    "SELECT p.base_url, p.model, c.bearer_token, p.protocol, p.authentication,
+                            p.routing_requirement, binding.binding_kind, binding.account_id
                      FROM providers p LEFT JOIN credentials c ON c.id = p.credential_id
+                     LEFT JOIN subscription_provider_bindings binding
+                       ON binding.target = p.target AND binding.provider_id = p.id
                      WHERE p.id = ?1 AND p.target = ?2",
                     params![provider_id.to_string(), target.as_str()],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?, row.get::<_, String>(5)?)),
+                        row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?)),
                 );
-                let (base_url, model, credential, protocol, authentication, routing_requirement) = match provider {
+                let (base_url, model, credential, protocol, authentication, routing_requirement,
+                     binding_kind, binding_account_id) = match provider {
                     Ok(values) => values,
                     Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => {
                         return Ok(Err(failure(connection, "incomplete-provider", "Provider is missing or incomplete")));
                     }
                     Err(error) => return Err(StateError::Sqlite(error)),
                 };
-                if base_url.is_empty() || model.is_empty() || credential.is_none() {
-                    return Ok(Err(failure(connection, "incomplete-provider", "Provider is missing or incomplete")));
-                }
-                let credential = credential.expect("credential is present after completeness check");
                 let routing_requirement = match routing_requirement.as_str() {
                     "direct-compatible" => ProviderRoutingRequirement::DirectCompatible,
                     "takeover-required" => ProviderRoutingRequirement::TakeoverRequired,
@@ -611,9 +615,33 @@ impl StateStore {
                     "openai-bearer" => ProviderAuthentication::OpenaiBearer,
                     "anthropic-api-key" => ProviderAuthentication::AnthropicApiKey,
                     "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
+                    "codex-subscription" => ProviderAuthentication::CodexSubscription,
                     _ => return Err(StateError::InvalidActivatedSnapshot),
                 };
-                if !has_valid_provider_declaration(target, protocol, authentication) {
+                let has_subscription_binding = matches!(
+                    (binding_kind.as_deref(), binding_account_id.as_deref()),
+                    (Some("fixed"), Some(account_id)) if !account_id.is_empty()
+                ) || matches!(
+                    (binding_kind.as_deref(), binding_account_id.as_deref()),
+                    (Some("follow-default"), None)
+                );
+                let credential = match authentication {
+                    ProviderAuthentication::CodexSubscription
+                        if target == Target::Claude
+                            && base_url == crate::state::providers::CODEX_SUBSCRIPTION_BRIDGE_BASE_URL
+                            && routing_requirement == ProviderRoutingRequirement::TakeoverRequired
+                            && credential.is_none()
+                            && has_subscription_binding => String::new(),
+                    ProviderAuthentication::CodexSubscription => {
+                        return Ok(Err(failure(connection, "incomplete-provider", "Provider is missing or incomplete")));
+                    }
+                    _ => match credential {
+                        Some(credential) if !credential.is_empty() => credential,
+                        _ => return Ok(Err(failure(connection, "incomplete-provider", "Provider is missing or incomplete"))),
+                    },
+                };
+                if base_url.is_empty() || model.is_empty()
+                    || !has_valid_provider_declaration(target, protocol, authentication) {
                     return Ok(Err(failure(connection,
                         "incomplete-provider",
                         "Provider is missing or incomplete",
@@ -845,7 +873,20 @@ impl StateStore {
                         ?2, ?3, ?4, ?5, provider.credential_id, provider.routing_requirement
                  FROM providers provider
                  WHERE provider.id = ?6 AND provider.target = ?7
-                   AND provider.credential_id IS NOT NULL",
+                   AND (
+                     provider.credential_id IS NOT NULL
+                     OR (
+                       provider.authentication = 'codex-subscription'
+                       AND provider.target = 'claude'
+                       AND provider.base_url = ?8
+                       AND provider.routing_requirement = 'takeover-required'
+                       AND EXISTS (
+                         SELECT 1 FROM subscription_provider_bindings binding
+                         WHERE binding.target = provider.target
+                           AND binding.provider_id = provider.id
+                       )
+                     )
+                   )",
                 params![
                     snapshot.id.to_string(),
                     snapshot.base_url,
@@ -854,6 +895,7 @@ impl StateStore {
                     snapshot.authentication.to_string(),
                     snapshot.provider_id.to_string(),
                     target.as_str(),
+                    crate::state::providers::CODEX_SUBSCRIPTION_BRIDGE_BASE_URL,
                 ],
             )?;
             if inserted_plan_member != 1 {
@@ -1297,6 +1339,7 @@ impl StateStore {
                             "openai-bearer" => ProviderAuthentication::OpenaiBearer,
                             "anthropic-api-key" => ProviderAuthentication::AnthropicApiKey,
                             "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
+                            "codex-subscription" => ProviderAuthentication::CodexSubscription,
                             _ => return Err(StateError::InvalidActivatedSnapshot),
                         };
                         Ok(Some(RoutingSnapshot {
@@ -1348,12 +1391,16 @@ impl StateStore {
                     let members = connection
                         .prepare(
                             "SELECT member.provider_id, member.base_url, member.model,
-                                credential.bearer_token, member.protocol, member.authentication
+                                credential.bearer_token, member.protocol, member.authentication,
+                                member.routing_requirement, binding.binding_kind, binding.account_id
                          FROM activated_route_plan_members member
                          JOIN activated_route_plans plan ON plan.id = member.plan_id
-                         JOIN credentials credential
+                         LEFT JOIN credentials credential
                            ON credential.id = member.credential_id
                           AND credential.target = plan.target
+                         LEFT JOIN subscription_provider_bindings binding
+                           ON binding.target = plan.target
+                          AND binding.provider_id = member.provider_id
                          WHERE member.plan_id = ?1 ORDER BY member.position",
                         )?
                         .query_map([&id], |row| {
@@ -1361,9 +1408,12 @@ impl StateStore {
                                 row.get::<_, String>(0)?,
                                 row.get::<_, String>(1)?,
                                 row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
+                                row.get::<_, Option<String>>(3)?,
                                 row.get::<_, String>(4)?,
                                 row.get::<_, String>(5)?,
+                                row.get::<_, String>(6)?,
+                                row.get::<_, Option<String>>(7)?,
+                                row.get::<_, Option<String>>(8)?,
                             ))
                         })?
                         .collect::<Result<Vec<_>, _>>()?
@@ -1376,28 +1426,63 @@ impl StateStore {
                                 credential,
                                 protocol,
                                 authentication,
+                                routing_requirement,
+                                binding_kind,
+                                binding_account_id,
                             )| {
+                                let authentication = match authentication.as_str() {
+                                    "openai-bearer" => ProviderAuthentication::OpenaiBearer,
+                                    "anthropic-api-key" => {
+                                        ProviderAuthentication::AnthropicApiKey
+                                    }
+                                    "anthropic-bearer" => {
+                                        ProviderAuthentication::AnthropicBearer
+                                    }
+                                    "codex-subscription" => {
+                                        ProviderAuthentication::CodexSubscription
+                                    }
+                                    _ => return Err(StateError::InvalidActivatedSnapshot),
+                                };
+                                let subscription_binding = match (
+                                    binding_kind.as_deref(),
+                                    binding_account_id,
+                                ) {
+                                    (Some("fixed"), Some(account_id)) if !account_id.is_empty() => {
+                                        Some(SubscriptionProviderBinding::Fixed { account_id })
+                                    }
+                                    (Some("follow-default"), None) => {
+                                        Some(SubscriptionProviderBinding::FollowDefault)
+                                    }
+                                    (None, None) => None,
+                                    _ => return Err(StateError::InvalidActivatedSnapshot),
+                                };
+                                match authentication {
+                                    ProviderAuthentication::CodexSubscription
+                                        if target == Target::Claude
+                                            && base_url
+                                                == crate::state::providers::CODEX_SUBSCRIPTION_BRIDGE_BASE_URL
+                                            && routing_requirement == "takeover-required"
+                                            && credential.is_none()
+                                            && subscription_binding.is_some() => {}
+                                    ProviderAuthentication::CodexSubscription => {
+                                        return Err(StateError::InvalidActivatedSnapshot);
+                                    }
+                                    _ if credential.as_deref().is_some_and(|value| !value.is_empty()) => {}
+                                    _ => return Err(StateError::InvalidActivatedSnapshot),
+                                }
                                 Ok(RoutePlanMemberSnapshot {
                                     provider_id: Uuid::parse_str(&provider_id)
                                         .map_err(|_| StateError::InvalidActivatedSnapshot)?,
                                     base_url,
                                     model,
-                                    provider_credential: SecretString::from(credential),
+                                    provider_credential: credential.map(SecretString::from),
                                     protocol: match protocol.as_str() {
                                         "openai-responses" => ProviderProtocol::OpenaiResponses,
                                         "anthropic-messages" => ProviderProtocol::AnthropicMessages,
                                         _ => return Err(StateError::InvalidActivatedSnapshot),
                                     },
-                                    authentication: match authentication.as_str() {
-                                        "openai-bearer" => ProviderAuthentication::OpenaiBearer,
-                                        "anthropic-api-key" => {
-                                            ProviderAuthentication::AnthropicApiKey
-                                        }
-                                        "anthropic-bearer" => {
-                                            ProviderAuthentication::AnthropicBearer
-                                        }
-                                        _ => return Err(StateError::InvalidActivatedSnapshot),
-                                    },
+                                    authentication,
+                                    subscription_binding,
                                 })
                             },
                         )
@@ -1698,7 +1783,13 @@ impl StateStore {
                                 p.authentication, p.credential_id IS NOT NULL,
                                 p.generated_owner_id, p.generated_source_revision,
                                 p.generated_overlay_revision, u.provider_revision,
-                                overlay.overlay_revision, overlay.enabled
+                                overlay.overlay_revision, overlay.enabled,
+                                p.routing_requirement,
+                                EXISTS(
+                                  SELECT 1 FROM subscription_provider_bindings binding
+                                  WHERE binding.target = p.target
+                                    AND binding.provider_id = p.id
+                                )
                          FROM providers p
                          LEFT JOIN universal_providers u ON u.id = p.generated_owner_id
                          LEFT JOIN universal_provider_targets overlay
@@ -1721,6 +1812,8 @@ impl StateStore {
                                 row.get::<_, Option<u64>>(10)?,
                                 row.get::<_, Option<u64>>(11)?,
                                 row.get::<_, Option<bool>>(12)?,
+                                row.get::<_, String>(13)?,
+                                row.get::<_, bool>(14)?,
                             ))
                         },
                     );
@@ -1738,6 +1831,8 @@ impl StateStore {
                         source_revision,
                         overlay_revision,
                         enabled,
+                        routing_requirement,
+                        has_subscription_binding,
                     )) = declaration
                     else {
                         return failure(
@@ -1765,6 +1860,7 @@ impl StateStore {
                         "openai-bearer" => ProviderAuthentication::OpenaiBearer,
                         "anthropic-api-key" => ProviderAuthentication::AnthropicApiKey,
                         "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
+                        "codex-subscription" => ProviderAuthentication::CodexSubscription,
                         _ => {
                             return failure(
                                 "incomplete-route-plan-provider",
@@ -1772,10 +1868,20 @@ impl StateStore {
                             );
                         }
                     };
+                    let has_required_credential =
+                        match authentication {
+                            ProviderAuthentication::CodexSubscription => target == Target::Claude
+                                && base_url
+                                    == crate::state::providers::CODEX_SUBSCRIPTION_BRIDGE_BASE_URL
+                                && routing_requirement == "takeover-required"
+                                && !has_credential
+                                && has_subscription_binding,
+                            _ => has_credential,
+                        };
                     if name.trim().is_empty()
                         || base_url.trim().is_empty()
                         || model.trim().is_empty()
-                        || !has_credential
+                        || !has_required_credential
                         || !has_valid_provider_declaration(target, protocol, authentication)
                     {
                         return failure(
@@ -1935,6 +2041,11 @@ impl StateStore {
                                     provider.model, provider.protocol, provider.authentication,
                                     credential.id, credential.bearer_token,
                                     provider.routing_requirement,
+                                    EXISTS(
+                                      SELECT 1 FROM subscription_provider_bindings binding
+                                      WHERE binding.target = provider.target
+                                        AND binding.provider_id = provider.id
+                                    ),
                                     provider.generated_owner_id,
                                     provider.generated_source_revision,
                                     provider.generated_overlay_revision,
@@ -1944,7 +2055,7 @@ impl StateStore {
                              JOIN providers provider
                                ON provider.id = draft.provider_id
                               AND provider.target = draft.target
-                             JOIN credentials credential
+                             LEFT JOIN credentials credential
                                ON credential.id = provider.credential_id
                               AND credential.target = provider.target
                              LEFT JOIN universal_providers universal
@@ -1968,12 +2079,13 @@ impl StateStore {
                             credential_id: row.get(9)?,
                             provider_bearer_token: row.get(10)?,
                             routing_requirement: row.get(11)?,
-                            generated_owner_id: row.get(12)?,
-                            generated_source_revision: row.get(13)?,
-                            generated_overlay_revision: row.get(14)?,
-                            source_revision: row.get(15)?,
-                            overlay_revision: row.get(16)?,
-                            enabled: row.get(17)?,
+                            has_subscription_binding: row.get(12)?,
+                            generated_owner_id: row.get(13)?,
+                            generated_source_revision: row.get(14)?,
+                            generated_overlay_revision: row.get(15)?,
+                            source_revision: row.get(16)?,
+                            overlay_revision: row.get(17)?,
+                            enabled: row.get(18)?,
                         })
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -2017,6 +2129,7 @@ impl StateStore {
                         "openai-bearer" => ProviderAuthentication::OpenaiBearer,
                         "anthropic-api-key" => ProviderAuthentication::AnthropicApiKey,
                         "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
+                        "codex-subscription" => ProviderAuthentication::CodexSubscription,
                         _ => {
                             return failure(
                                 "incomplete-route-plan-provider",
@@ -2024,10 +2137,24 @@ impl StateStore {
                             );
                         }
                     };
+                    let has_valid_credential =
+                        match authentication {
+                            ProviderAuthentication::CodexSubscription => target == Target::Claude
+                                && member.base_url
+                                    == crate::state::providers::CODEX_SUBSCRIPTION_BRIDGE_BASE_URL
+                                && member.routing_requirement == "takeover-required"
+                                && member.credential_id.is_none()
+                                && member.provider_bearer_token.is_none()
+                                && member.has_subscription_binding,
+                            _ => member
+                                .provider_bearer_token
+                                .as_deref()
+                                .is_some_and(|credential| !credential.is_empty()),
+                        };
                     if member.name.trim().is_empty()
                         || member.base_url.trim().is_empty()
                         || member.model.trim().is_empty()
-                        || member.provider_bearer_token.is_empty()
+                        || !has_valid_credential
                         || !has_valid_provider_declaration(target, protocol, authentication)
                     {
                         return failure(
@@ -2512,6 +2639,7 @@ fn parse_provider_authentication(
         "openai-bearer" => Ok(ProviderAuthentication::OpenaiBearer),
         "anthropic-api-key" => Ok(ProviderAuthentication::AnthropicApiKey),
         "anthropic-bearer" => Ok(ProviderAuthentication::AnthropicBearer),
+        "codex-subscription" => Ok(ProviderAuthentication::CodexSubscription),
         _ => Err(StateError::InvalidActivatedSnapshot),
     }
 }
@@ -2741,9 +2869,10 @@ struct RoutePlanSnapshotMember {
     model: String,
     protocol: String,
     authentication: String,
-    credential_id: String,
-    provider_bearer_token: String,
+    credential_id: Option<String>,
+    provider_bearer_token: Option<String>,
     routing_requirement: String,
+    has_subscription_binding: bool,
     generated_owner_id: Option<String>,
     generated_source_revision: Option<u64>,
     generated_overlay_revision: Option<u64>,
@@ -2774,6 +2903,129 @@ pub(super) fn map_state_call_error(error: tokio_rusqlite::Error<StateError>) -> 
 mod failover_tests {
     use super::*;
     use crate::control::protocol::RouteHealthState;
+
+    #[tokio::test]
+    async fn bound_subscription_bridge_round_trips_in_a_credentialless_failover_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let home = MuxviaHome::from_user_home(root.path());
+        let store = StateStore::open(&home).await.unwrap();
+        let bridge = store
+            .apply_provider_action_for(
+                Target::Claude,
+                Uuid::new_v4(),
+                0,
+                serde_json::json!({
+                    "kind": "create-provider",
+                    "name": "Subscription Bridge",
+                    "baseUrl": crate::state::providers::CODEX_SUBSCRIPTION_BRIDGE_BASE_URL,
+                    "model": "gpt-5.6",
+                    "credential": { "kind": "remove" },
+                    "authentication": "codex-subscription",
+                    "presetKey": crate::state::providers::CODEX_SUBSCRIPTION_BRIDGE_PRESET_KEY
+                }),
+            )
+            .await
+            .unwrap();
+        let bridge = bridge.view.providers[0].clone();
+        store
+            .connection
+            .call({
+                let bridge_id = bridge.id.to_string();
+                move |connection| {
+                    connection.execute(
+                        "INSERT INTO subscription_provider_bindings
+                           (target, provider_id, binding_kind, account_id)
+                         VALUES ('claude', ?1, 'follow-default', NULL)",
+                        [bridge_id],
+                    )?;
+                    Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+                }
+            })
+            .await
+            .unwrap();
+        let fallback = store
+            .apply_provider_action_for(
+                Target::Claude,
+                Uuid::new_v4(),
+                1,
+                serde_json::json!({
+                    "kind": "create-provider",
+                    "name": "Anthropic fallback",
+                    "baseUrl": "https://fallback.example/v1",
+                    "model": "fallback-model",
+                    "credential": { "kind": "replace", "value": "FALLBACK_SECRET_81731" },
+                    "authentication": "anthropic-bearer",
+                    "presetKey": null
+                }),
+            )
+            .await
+            .unwrap();
+        let fallback = fallback.view.providers[1].clone();
+        store
+            .connection
+            .call({
+                let bridge_id = bridge.id.to_string();
+                move |connection| {
+                    connection.execute(
+                        "UPDATE target_route_state SET current_provider_id = ?1
+                         WHERE target = 'claude'",
+                        [bridge_id],
+                    )?;
+                    Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+                }
+            })
+            .await
+            .unwrap();
+
+        let draft = store
+            .save_failover_draft_for(
+                Target::Claude,
+                Uuid::new_v4(),
+                2,
+                vec![
+                    FailoverDraftMember {
+                        provider_id: bridge.id,
+                        provider_revision: bridge.provider_revision,
+                    },
+                    FailoverDraftMember {
+                        provider_id: fallback.id,
+                        provider_revision: fallback.provider_revision,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let applied = store
+            .apply_failover_chain_for(
+                Target::Claude,
+                Uuid::new_v4(),
+                draft.view.management_revision,
+                draft.view.failover.draft_revision,
+            )
+            .await
+            .unwrap();
+        let plan = store
+            .activated_route_plan_for(Target::Claude)
+            .await
+            .unwrap()
+            .expect("active route plan");
+        assert!(
+            applied
+                .view
+                .failover
+                .active_plan
+                .as_ref()
+                .is_some_and(|view| view.members.len() == 2)
+                && plan.members.len() == 2
+                && plan.members[0].provider_id == bridge.id
+                && plan.members[0].provider_credential.is_none()
+                && plan.members[0].authentication == ProviderAuthentication::CodexSubscription
+                && plan.members[0].subscription_binding
+                    == Some(SubscriptionProviderBinding::FollowDefault)
+                && plan.members[1].provider_credential.is_some(),
+            "credentialless Bridge did not round-trip through the active Failover Chain"
+        );
+    }
 
     #[tokio::test]
     async fn draft_save_is_revision_guarded_receipt_first_and_route_neutral() {

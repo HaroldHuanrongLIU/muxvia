@@ -68,7 +68,9 @@ pub fn forward_claude_request_headers(
                     .map_err(|_| HeaderPolicyError)?;
             forwarded.insert(header::AUTHORIZATION, authorization);
         }
-        ProviderAuthentication::OpenaiBearer => return Err(HeaderPolicyError),
+        ProviderAuthentication::OpenaiBearer | ProviderAuthentication::CodexSubscription => {
+            return Err(HeaderPolicyError);
+        }
     }
     Ok(forwarded)
 }

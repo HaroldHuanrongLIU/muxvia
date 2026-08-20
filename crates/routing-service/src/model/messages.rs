@@ -102,7 +102,7 @@ pub(crate) async fn route_messages(
                 headers: forward_claude_request_headers(
                     &request_headers,
                     member.authentication,
-                    &member.provider_credential,
+                    member.provider_credential.as_ref()?,
                 )
                 .ok()?,
                 body: ReqwestBody::from(serde_json::to_vec(&Value::Object(body)).ok()?),

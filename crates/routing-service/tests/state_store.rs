@@ -104,7 +104,7 @@ async fn fresh_schema_reopens_with_codex_and_claude_route_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, "11");
+    assert_eq!(version, "12");
     assert_eq!(targets, ["claude", "codex"]);
     let _ = fs::remove_dir_all(root);
 }
@@ -826,7 +826,7 @@ async fn credential_reference_foreign_key_rejects_cross_target_corruption() {
 }
 
 #[tokio::test]
-async fn claude_target_view_projects_only_the_messages_preset() {
+async fn claude_target_view_projects_only_its_two_target_presets() {
     let fixture = StoreFixture::new().await;
     let view = fixture.store.target_view_for(Target::Claude).await.unwrap();
     assert_eq!(view.target, Target::Claude);
@@ -834,15 +834,16 @@ async fn claude_target_view_projects_only_the_messages_preset() {
         view.route_health.state,
         muxvia_routing::control::protocol::RouteHealthState::Unobserved
     );
-    assert_eq!(view.provider_presets.len(), 1);
-    assert_eq!(view.provider_presets[0].key, "anthropic-api-messages");
-    assert_eq!(
-        view.provider_presets[0].protocol.to_string(),
-        "anthropic-messages"
-    );
-    assert_eq!(
-        view.provider_presets[0].authentication.to_string(),
-        "anthropic-api-key"
+    assert!(
+        view.provider_presets.len() == 2
+            && view.provider_presets[0].key == "anthropic-api-messages"
+            && view.provider_presets[0].protocol.to_string() == "anthropic-messages"
+            && view.provider_presets[0].authentication.to_string() == "anthropic-api-key"
+            && view.provider_presets[1].key == "codex-subscription-bridge"
+            && view.provider_presets[1].base_url == "https://chatgpt.com/backend-api/codex"
+            && view.provider_presets[1].protocol.to_string() == "anthropic-messages"
+            && view.provider_presets[1].authentication.to_string() == "codex-subscription",
+        "Claude Target preset catalog changed"
     );
 }
 

@@ -42,6 +42,10 @@ fn fixtures_round_trip_as_their_protocol_types() {
     let action: TargetAction = serde_json::from_value(save_provider.clone()).unwrap();
     assert_eq!(serde_json::to_value(action).unwrap(), save_provider);
 
+    let subscription_bridge = fixture("create-subscription-bridge-provider.json");
+    let action: TargetAction = serde_json::from_value(subscription_bridge.clone()).unwrap();
+    assert_eq!(serde_json::to_value(action).unwrap(), subscription_bridge);
+
     for name in [
         "reorder-providers.json",
         "delete-provider.json",
@@ -145,6 +149,30 @@ fn fixtures_round_trip_as_their_protocol_types() {
         let parsed: ServerFrame = serde_json::from_value(frame.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), frame);
     }
+}
+
+#[test]
+fn subscription_bridge_provider_contract_is_closed_and_credentialless() {
+    let action = fixture("create-subscription-bridge-provider.json");
+    let parsed: TargetAction = serde_json::from_value(action.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), action);
+
+    let mut credential = action.clone();
+    credential["credential"] = serde_json::json!({
+        "kind": "replace",
+        "value": "SUBSCRIPTION_BRIDGE_PROTOCOL_SECRET_12801"
+    });
+    assert!(serde_json::from_value::<TargetAction>(credential).is_ok());
+
+    let mut additive = action;
+    additive["accessToken"] = serde_json::json!("SUBSCRIPTION_BRIDGE_PROTOCOL_SECRET_12802");
+    let parsed: TargetAction = serde_json::from_value(additive).unwrap();
+    assert!(
+        !serde_json::to_string(&parsed)
+            .unwrap()
+            .contains("SUBSCRIPTION_BRIDGE_PROTOCOL_SECRET_12802"),
+        "additive subscription secret survived the typed action boundary"
+    );
 }
 
 #[test]
@@ -295,6 +323,12 @@ fn universal_provider_contracts_are_closed_schema_complete_and_secret_free() {
     assert!(has_branch("serverFrame", "universal-provider-view"));
     assert!(schema["$defs"].get("universalProviderAction").is_some());
     assert!(schema["$defs"].get("universalProviderCatalog").is_some());
+    assert!(
+        schema["$defs"]["universalProviderPresetTarget"]["properties"]["authentication"]["enum"]
+            .as_array()
+            .is_some_and(|values| { values.iter().all(|value| value != "codex-subscription") }),
+        "Subscription Bridge widened Universal Provider authentication"
+    );
     assert!(
         schema["oneOf"]
             .as_array()

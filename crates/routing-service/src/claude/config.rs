@@ -487,7 +487,7 @@ impl ClaudeConfigCodec {
             ProviderAuthentication::AnthropicApiKey => {
                 (None, Some(Value::String(provider_credential.to_owned())))
             }
-            ProviderAuthentication::OpenaiBearer => {
+            ProviderAuthentication::OpenaiBearer | ProviderAuthentication::CodexSubscription => {
                 return Err(ClaudeProblem::new("invalid-provider", None));
             }
         };

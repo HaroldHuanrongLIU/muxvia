@@ -17,6 +17,8 @@ pub const OPENAI_API_RESPONSES_PRESET_KEY: &str = "openai-api-responses";
 pub const OPENAI_API_RESPONSES_BASE_URL: &str = "https://api.openai.com/v1";
 pub const ANTHROPIC_API_MESSAGES_PRESET_KEY: &str = "anthropic-api-messages";
 pub const ANTHROPIC_API_MESSAGES_BASE_URL: &str = "https://api.anthropic.com/v1";
+pub const CODEX_SUBSCRIPTION_BRIDGE_PRESET_KEY: &str = "codex-subscription-bridge";
+pub const CODEX_SUBSCRIPTION_BRIDGE_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
 struct SourceDeclaration {
     target: String,
@@ -107,9 +109,16 @@ pub(crate) fn provider_presets(target: Target) -> Vec<ProviderPresetView> {
         protocol: ProviderProtocol::AnthropicMessages,
         authentication: ProviderAuthentication::AnthropicApiKey,
     };
+    let subscription_bridge = ProviderPresetView {
+        key: CODEX_SUBSCRIPTION_BRIDGE_PRESET_KEY.to_owned(),
+        base_url: CODEX_SUBSCRIPTION_BRIDGE_BASE_URL.to_owned(),
+        model: String::new(),
+        protocol: ProviderProtocol::AnthropicMessages,
+        authentication: ProviderAuthentication::CodexSubscription,
+    };
     match target {
         Target::Codex => vec![openai],
-        Target::Claude => vec![anthropic],
+        Target::Claude => vec![anthropic, subscription_bridge],
     }
 }
 
@@ -377,24 +386,39 @@ fn create_provider(
 ) -> Result<(), ProviderMutationError> {
     let name = normalized_name(name)?;
     let base_url = normalized_base_url(base_url)?;
+    let subscription_bridge = target == Target::Claude
+        && preset_key.as_deref() == Some(CODEX_SUBSCRIPTION_BRIDGE_PRESET_KEY);
     let preset_authentication = match preset_key.as_deref() {
         Some(key) if key == preset_key_for(target) => Some(preset_authentication_for(target)),
+        Some(CODEX_SUBSCRIPTION_BRIDGE_PRESET_KEY) if target == Target::Claude => {
+            Some(ProviderAuthentication::CodexSubscription)
+        }
         Some(_) => return Err(ProviderMutationError::Invalid),
         None => None,
     };
     let provenance = match preset_authentication {
-        Some(_) => (Some("preset"), Some(preset_key_for(target))),
+        Some(_) => (Some("preset"), preset_key.as_deref()),
         None => (None, None),
-    };
-    let credential_id = match credential {
-        CredentialEdit::Keep => return Err(ProviderMutationError::Invalid),
-        CredentialEdit::Remove => None,
-        CredentialEdit::Replace { value } => Some(insert_credential(transaction, target, value)?),
     };
     let authentication = authentication
         .or(preset_authentication)
         .or_else(|| (target == Target::Codex).then_some(ProviderAuthentication::OpenaiBearer))
         .ok_or(ProviderMutationError::Invalid)?;
+    if authentication == ProviderAuthentication::CodexSubscription
+        && (!subscription_bridge || base_url != CODEX_SUBSCRIPTION_BRIDGE_BASE_URL)
+    {
+        return Err(ProviderMutationError::Invalid);
+    }
+    let credential_id = match credential {
+        CredentialEdit::Keep => return Err(ProviderMutationError::Invalid),
+        CredentialEdit::Remove => None,
+        CredentialEdit::Replace { value }
+            if authentication != ProviderAuthentication::CodexSubscription =>
+        {
+            Some(insert_credential(transaction, target, value)?)
+        }
+        CredentialEdit::Replace { .. } => return Err(ProviderMutationError::Invalid),
+    };
     let protocol = protocol_for(target);
     if !has_valid_provider_declaration(target, protocol, authentication) {
         return Err(ProviderMutationError::Invalid);
@@ -413,7 +437,7 @@ fn create_provider(
               authentication, routing_requirement, credential_id, provenance_kind, provenance_key,
               generated_owner_id)
              VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8,
-                     'direct-compatible', ?9, ?10, ?11, NULL)",
+                     ?9, ?10, ?11, ?12, NULL)",
             params![
                 Uuid::new_v4().to_string(),
                 target.as_str(),
@@ -423,6 +447,11 @@ fn create_provider(
                 model,
                 protocol.to_string(),
                 authentication.to_string(),
+                if subscription_bridge {
+                    ProviderRoutingRequirement::TakeoverRequired.to_string()
+                } else {
+                    ProviderRoutingRequirement::DirectCompatible.to_string()
+                },
                 credential_id,
                 provenance.0,
                 provenance.1,
@@ -471,6 +500,9 @@ fn duplicate_provider(
         .ok_or(ProviderMutationError::Invalid)?;
     if source.provider_revision != source_provider_revision {
         return Err(ProviderMutationError::StaleProviderRevision);
+    }
+    if source.authentication == ProviderAuthentication::CodexSubscription.to_string() {
+        return Err(ProviderMutationError::Invalid);
     }
     let credential_id = match credential {
         DuplicateCredential::Without => None,
@@ -576,6 +608,19 @@ fn update_provider(
     if existing.protocol != protocol_for(target).to_string()
         || !has_valid_provider_declaration(target, protocol_for(target), authentication)
     {
+        return Err(ProviderMutationError::Invalid);
+    }
+    let existing_subscription =
+        existing.authentication == ProviderAuthentication::CodexSubscription.to_string();
+    if authentication == ProviderAuthentication::CodexSubscription {
+        if !existing_subscription
+            || base_url != CODEX_SUBSCRIPTION_BRIDGE_BASE_URL
+            || routing_requirement != ProviderRoutingRequirement::TakeoverRequired
+            || !matches!(&credential, CredentialEdit::Keep | CredentialEdit::Remove)
+        {
+            return Err(ProviderMutationError::Invalid);
+        }
+    } else if existing_subscription {
         return Err(ProviderMutationError::Invalid);
     }
 
@@ -778,6 +823,7 @@ fn parse_authentication(value: &str) -> ProviderAuthentication {
     match value {
         "anthropic-api-key" => ProviderAuthentication::AnthropicApiKey,
         "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
+        "codex-subscription" => ProviderAuthentication::CodexSubscription,
         _ => ProviderAuthentication::OpenaiBearer,
     }
 }

@@ -1,0 +1,11 @@
+{
+  "kind": "create-provider",
+  "name": "Codex Subscription",
+  "baseUrl": "https://chatgpt.com/backend-api/codex",
+  "model": "gpt-5.6",
+  "credential": {
+    "kind": "remove"
+  },
+  "authentication": "codex-subscription",
+  "presetKey": "codex-subscription-bridge"
+}

@@ -5,7 +5,8 @@ use muxvia_routing::{
     codex::CodexConfigCodec,
     codex::CommandCodexProbe,
     control::protocol::{
-        ActionStatus, CredentialPresence, ProviderCompleteness, ProviderReferenceView,
+        ActionStatus, ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState,
+        CredentialPresence, ProviderAuthentication, ProviderCompleteness, ProviderReferenceView,
         ProviderRequirement, ProviderRoutingRequirement, Target,
     },
     control::server::ControlServer,
@@ -298,7 +299,7 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
         .await
         .unwrap();
 
-    assert_eq!(version, "11");
+    assert_eq!(version, "12");
     assert_eq!(not_null, 1);
     assert_eq!(default_value.as_deref(), Some("1"));
     assert!(table_sql.contains("CHECK (managed_config_version IN (1,2))"));
@@ -353,7 +354,7 @@ async fn schema_v8_failed_migration_rolls_back_then_reruns() {
         connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'target_compatibility'", [], |row| row.get::<_, i64>(0)).unwrap(),
         connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'reconciliation_intents'", [], |row| row.get::<_, i64>(0)).unwrap(),
     );
-    assert_eq!(rerun, ("11".into(), 1, 1));
+    assert_eq!(rerun, ("12".into(), 1, 1));
 }
 
 fn v7_projection_fingerprint(connection: &Connection) -> Vec<u64> {
@@ -453,7 +454,7 @@ async fn schema_v9_migrates_real_v8_state_and_adds_universal_provider_tables() {
         })
         .unwrap();
 
-    assert_eq!(version, "11");
+    assert_eq!(version, "12");
     assert_eq!(present, [1, 1, 1, 1, 1, 1]);
     assert_eq!(catalog_state, (0, 0));
     assert_eq!(foreign_key_failures, 0);
@@ -509,7 +510,7 @@ async fn schema_v9_failed_migration_rolls_back_all_catalog_changes_then_reruns()
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(rerun, ("11".to_owned(), 2, 1));
+    assert_eq!(rerun, ("12".to_owned(), 2, 1));
 }
 
 fn upgrade_v8_fixture_to_v9(connection: &Connection) {
@@ -745,7 +746,7 @@ async fn schema_v10_migrates_v9_current_snapshot_into_one_member_plan() {
         )
         .unwrap();
 
-    assert_eq!(version, "11");
+    assert_eq!(version, "12");
     assert_eq!(present, [1, 1, 1, 1, 1]);
     assert_eq!(
         drafts,
@@ -939,7 +940,7 @@ async fn schema_v10_failed_migration_rolls_back_then_reruns() {
         )
         .unwrap();
     assert!(
-        rerun == ("11".into(), 1, 1),
+        rerun == ("12".into(), 1, 1),
         "migration rerun was incomplete"
     );
 }
@@ -970,7 +971,7 @@ async fn schema_v10_fresh_store_has_two_empty_drafts_and_no_active_plan() {
         )
         .unwrap();
     assert!(
-        state == ("11".into(), 2, 0, 0, 0),
+        state == ("12".into(), 2, 0, 0, 0),
         "fresh route-plan state was not empty"
     );
     let foreign_key_failures: i64 = connection
@@ -1058,13 +1059,175 @@ async fn schema_v11_migrates_v10_without_changing_existing_provider_state() {
         )
         .unwrap();
     assert!(
-        migrated == ("11".into(), 1, 0, 0, 0, 0),
+        migrated == ("12".into(), 1, 0, 0, 0, 0),
         "schema v11 subscription state was incomplete"
     );
     assert!(
         after == before,
         "schema v11 changed existing provider state"
     );
+}
+
+#[tokio::test]
+async fn schema_v12_migrates_real_v11_provider_state_and_widens_only_bridge_columns() {
+    let fixture = StoreFixture::new();
+    drop(StateStore::open(&fixture.home).await.unwrap());
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO credentials (id, target, bearer_token)
+               VALUES ('00000000-0000-4000-8000-000000001281', 'claude',
+                       'BRIDGE_MIGRATION_SECRET_12801');
+             INSERT INTO providers
+               (id, target, position, provider_revision, name, base_url, model, protocol,
+                authentication, credential_id, routing_requirement)
+             VALUES
+               ('00000000-0000-4000-8000-000000001282', 'claude', 0, 3, 'Existing',
+                'https://existing.example/v1', 'existing-model', 'anthropic-messages',
+                'anthropic-bearer', '00000000-0000-4000-8000-000000001281',
+                'takeover-required');
+             INSERT INTO activated_snapshots
+               (id, target, provider_id, base_url, model, protocol, authentication,
+                provider_bearer_token, epoch)
+             VALUES
+               ('00000000-0000-4000-8000-000000001283', 'claude',
+                '00000000-0000-4000-8000-000000001282',
+                'https://existing.example/v1', 'existing-model', 'anthropic-messages',
+                'anthropic-bearer', 'BRIDGE_MIGRATION_SECRET_12801',
+                '00000000-0000-4000-8000-000000001284');
+             INSERT INTO activated_route_plans (id, target, epoch, created_revision)
+               VALUES ('00000000-0000-4000-8000-000000001283', 'claude',
+                       '00000000-0000-4000-8000-000000001284', 3);
+             INSERT INTO activated_route_plan_members
+               (plan_id, position, provider_id, provider_revision, name, base_url, model,
+                protocol, authentication, credential_id, routing_requirement)
+             VALUES
+               ('00000000-0000-4000-8000-000000001283', 0,
+                '00000000-0000-4000-8000-000000001282', 3, 'Existing',
+                'https://existing.example/v1', 'existing-model', 'anthropic-messages',
+                'anthropic-bearer', '00000000-0000-4000-8000-000000001281',
+                'takeover-required');
+             INSERT INTO subscription_provider_bindings
+               (target, provider_id, binding_kind, account_id)
+             VALUES ('claude', '00000000-0000-4000-8000-000000001282',
+                     'follow-default', NULL);",
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             CREATE TABLE providers_v11 (
+               id TEXT PRIMARY KEY, target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+               position INTEGER NOT NULL CHECK (position >= 0),
+               provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
+               name TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL,
+               protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
+               authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
+               credential_id TEXT, provenance_kind TEXT, provenance_key TEXT,
+               generated_owner_id TEXT,
+               routing_requirement TEXT NOT NULL DEFAULT 'direct-compatible'
+                 CHECK (routing_requirement IN ('direct-compatible', 'takeover-required')),
+               generated_source_revision INTEGER CHECK (generated_source_revision IS NULL OR generated_source_revision >= 1),
+               generated_overlay_revision INTEGER CHECK (generated_overlay_revision IS NULL OR generated_overlay_revision >= 1),
+               CHECK ((target = 'codex' AND protocol = 'openai-responses' AND authentication = 'openai-bearer')
+                  OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer'))),
+               FOREIGN KEY (target, credential_id) REFERENCES credentials(target, id));
+             CREATE TABLE activated_snapshots_v11 (
+               id TEXT PRIMARY KEY, target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+               provider_id TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL,
+               protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
+               authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
+               provider_bearer_token TEXT NOT NULL, epoch TEXT NOT NULL,
+               CHECK ((target = 'codex' AND protocol = 'openai-responses' AND authentication = 'openai-bearer')
+                  OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer'))));
+             CREATE TABLE activated_route_plan_members_v11 (
+               plan_id TEXT NOT NULL REFERENCES activated_route_plans(id) ON DELETE CASCADE,
+               position INTEGER NOT NULL CHECK (position >= 0), provider_id TEXT NOT NULL,
+               provider_revision INTEGER NOT NULL CHECK (provider_revision >= 1),
+               name TEXT NOT NULL, base_url TEXT NOT NULL, model TEXT NOT NULL,
+               protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
+               authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
+               credential_id TEXT NOT NULL REFERENCES credentials(id),
+               routing_requirement TEXT NOT NULL CHECK (routing_requirement IN ('direct-compatible', 'takeover-required')),
+               PRIMARY KEY (plan_id, position), UNIQUE (plan_id, provider_id));
+             CREATE TABLE subscription_provider_bindings_v11 (
+               target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+               provider_id TEXT NOT NULL REFERENCES providers_v11(id) ON DELETE CASCADE,
+               binding_kind TEXT NOT NULL CHECK (binding_kind IN ('fixed', 'follow-default')),
+               account_id TEXT,
+               CHECK ((binding_kind = 'fixed' AND account_id IS NOT NULL AND length(account_id) > 0)
+                  OR (binding_kind = 'follow-default' AND account_id IS NULL)),
+               PRIMARY KEY (target, provider_id));
+             INSERT INTO providers_v11 SELECT * FROM providers;
+             INSERT INTO activated_snapshots_v11 SELECT * FROM activated_snapshots;
+             INSERT INTO activated_route_plan_members_v11 SELECT * FROM activated_route_plan_members;
+             INSERT INTO subscription_provider_bindings_v11 SELECT * FROM subscription_provider_bindings;
+             DROP TABLE subscription_provider_bindings;
+             DROP TABLE activated_route_plan_members;
+             DROP TABLE activated_snapshots;
+             DROP TABLE providers;
+             ALTER TABLE providers_v11 RENAME TO providers;
+             ALTER TABLE activated_snapshots_v11 RENAME TO activated_snapshots;
+             ALTER TABLE activated_route_plan_members_v11 RENAME TO activated_route_plan_members;
+             ALTER TABLE subscription_provider_bindings_v11 RENAME TO subscription_provider_bindings;
+             CREATE UNIQUE INDEX providers_generated_owner_target
+               ON providers(generated_owner_id, target) WHERE generated_owner_id IS NOT NULL;
+             UPDATE metadata SET value = '11' WHERE key = 'schema-version';",
+        )
+        .unwrap();
+    let before = v12_provider_projection_fingerprint(&connection);
+    drop(connection);
+
+    drop(StateStore::open(&fixture.home).await.unwrap());
+    let connection = Connection::open(fixture.home.database_path()).unwrap();
+    let after = v12_provider_projection_fingerprint(&connection);
+    assert!(
+        after == before,
+        "schema v12 changed existing Provider state"
+    );
+    let shape: (String, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+               (SELECT value FROM metadata WHERE key = 'schema-version'),
+               (SELECT COUNT(*) FROM pragma_table_info('activated_route_plan_members')
+                 WHERE name = 'credential_id' AND \"notnull\" = 0),
+               (SELECT instr(sql, 'codex-subscription') FROM sqlite_master
+                 WHERE type = 'table' AND name = 'providers'),
+               (SELECT COUNT(*) FROM pragma_foreign_key_check)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert!(
+        shape.0 == "12" && shape.1 == 1 && shape.2 > 0 && shape.3 == 0,
+        "schema v12 Bridge shape was incomplete"
+    );
+}
+
+fn v12_provider_projection_fingerprint(connection: &Connection) -> Vec<u64> {
+    [
+        "SELECT json_array(id, target, position, provider_revision, name, base_url, model, protocol, authentication, credential_id, provenance_kind, provenance_key, generated_owner_id, routing_requirement, generated_source_revision, generated_overlay_revision) FROM providers ORDER BY target, position, id",
+        "SELECT json_array(id, target, provider_id, base_url, model, protocol, authentication, provider_bearer_token, epoch) FROM activated_snapshots ORDER BY target, id",
+        "SELECT json_array(plan_id, position, provider_id, provider_revision, name, base_url, model, protocol, authentication, credential_id, routing_requirement) FROM activated_route_plan_members ORDER BY plan_id, position",
+        "SELECT json_array(target, provider_id, binding_kind, account_id) FROM subscription_provider_bindings ORDER BY target, provider_id",
+    ]
+    .into_iter()
+    .map(|projection| {
+        let mut fingerprint = fingerprint_bytes(0xcbf2_9ce4_8422_2325_u64, projection.as_bytes());
+        let rows = connection
+            .prepare(projection)
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for row in rows {
+            fingerprint = fingerprint_bytes(fingerprint, row.as_bytes());
+            fingerprint = fingerprint_bytes(fingerprint, &[0]);
+        }
+        fingerprint
+    })
+    .collect()
 }
 
 fn v8_projection_fingerprint(connection: &Connection) -> Vec<u64> {
@@ -1184,7 +1347,7 @@ async fn schema_v7_migrates_real_v5_claude_states_and_binds_the_unique_committed
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "11"
+            "12"
         );
         let route: (
             i64,
@@ -1578,7 +1741,7 @@ async fn schema_v7_does_not_guess_between_multiple_legacy_committed_intents() {
         .unwrap();
     assert_eq!(
         migrated,
-        ("11".to_owned(), None, "recovery-required".to_owned())
+        ("12".to_owned(), None, "recovery-required".to_owned())
     );
 }
 
@@ -2113,7 +2276,7 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "11");
+    assert_eq!(schema_version, "12");
     assert_eq!(
         view.providers[0].id,
         Uuid::parse_str(existing_provider_id).unwrap()
@@ -2343,7 +2506,7 @@ async fn schema_v4_migrates_v2_routing_requirement_and_historical_receipts() {
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "11");
+    assert_eq!(schema_version, "12");
     assert_eq!(
         store.target_view().await.unwrap().providers[0].routing_requirement,
         ProviderRoutingRequirement::DirectCompatible
@@ -2503,6 +2666,363 @@ async fn known_preset_key_records_provenance_without_overriding_submitted_draft_
     let provenance = provider.provenance.as_ref().unwrap();
     assert_eq!(provenance.kind, "preset");
     assert_eq!(provenance.key, "openai-api-responses");
+}
+
+#[tokio::test]
+async fn subscription_bridge_preset_requires_binding_but_never_a_static_credential() {
+    let fixture = StoreFixture::new();
+    let store = fixture.open().await;
+    let created = store
+        .apply_provider_action_for(
+            Target::Claude,
+            fixed_uuid(0x81),
+            0,
+            serde_json::from_str(include_str!(
+                "../../../protocol/fixtures/create-subscription-bridge-provider.json"
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let provider = created.view.providers.first().expect("Bridge Provider");
+    assert!(
+        provider.authentication == ProviderAuthentication::CodexSubscription,
+        "Bridge authentication changed"
+    );
+    assert!(
+        provider.routing_requirement == ProviderRoutingRequirement::TakeoverRequired,
+        "Bridge routing requirement changed"
+    );
+    assert!(
+        provider.credential == CredentialPresence::Missing,
+        "Bridge unexpectedly persisted a static credential"
+    );
+    assert!(
+        provider.completeness == ProviderCompleteness::Incomplete,
+        "unbound Bridge Provider was reported complete"
+    );
+    assert!(
+        serde_json::to_value(&provider.missing_fields).unwrap()
+            == serde_json::json!(["subscription-account-binding"]),
+        "unbound Bridge Provider requirements changed"
+    );
+    let provider_id = provider.id;
+    drop(created);
+
+    tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap()
+        .call(move |connection| {
+            connection.execute(
+                "INSERT INTO subscription_provider_bindings
+                   (target, provider_id, binding_kind, account_id)
+                 VALUES ('claude', ?1, 'follow-default', NULL)",
+                [provider_id.to_string()],
+            )?;
+            Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+    let bound = store.target_view_for(Target::Claude).await.unwrap();
+    let provider = bound.providers.first().expect("bound Bridge Provider");
+    assert!(
+        provider.completeness == ProviderCompleteness::Complete
+            && provider.missing_fields.is_empty(),
+        "bound Bridge Provider remained incomplete"
+    );
+    assert!(
+        bound.provider_presets.iter().any(|preset| {
+            preset.key == "codex-subscription-bridge"
+                && preset.base_url == "https://chatgpt.com/backend-api/codex"
+                && preset.authentication == ProviderAuthentication::CodexSubscription
+        }),
+        "Claude catalog omitted the fixed Subscription Bridge preset"
+    );
+}
+
+#[tokio::test]
+async fn subscription_bridge_rejects_credentials_redirects_and_direct_compatibility() {
+    let fixture = StoreFixture::new();
+    let store = fixture.open().await;
+    let cases = [
+        serde_json::json!({
+            "kind": "create-provider",
+            "name": "Credentialed Bridge",
+            "baseUrl": "https://chatgpt.com/backend-api/codex",
+            "model": "gpt-5.6",
+            "credential": { "kind": "replace", "value": "BRIDGE_PROVIDER_SECRET_12811" },
+            "authentication": "codex-subscription",
+            "presetKey": "codex-subscription-bridge"
+        }),
+        serde_json::json!({
+            "kind": "create-provider",
+            "name": "Redirected Bridge",
+            "baseUrl": "https://redirect.example/backend-api/codex",
+            "model": "gpt-5.6",
+            "credential": { "kind": "remove" },
+            "authentication": "codex-subscription",
+            "presetKey": "codex-subscription-bridge"
+        }),
+    ];
+    for (index, action) in cases.into_iter().enumerate() {
+        let failure = store
+            .apply_provider_action_for(Target::Claude, fixed_uuid(0x82 + index as u8), 0, action)
+            .await
+            .unwrap_err();
+        assert!(
+            failure.problem.code == "invalid-provider",
+            "unsafe Bridge declaration returned a different problem"
+        );
+    }
+    let view = store.target_view_for(Target::Claude).await.unwrap();
+    assert!(
+        view.management_revision == 0 && view.providers.is_empty(),
+        "unsafe Bridge declaration mutated Provider state"
+    );
+}
+
+#[tokio::test]
+async fn subscription_bridge_update_duplicate_and_direct_boundaries_are_closed() {
+    let fixture = StoreFixture::new();
+    let store = fixture.open().await;
+    let created = store
+        .apply_provider_action_for(
+            Target::Claude,
+            fixed_uuid(0x91),
+            0,
+            serde_json::from_str(include_str!(
+                "../../../protocol/fixtures/create-subscription-bridge-provider.json"
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let provider_id = created.view.providers[0].id;
+    tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap()
+        .call(move |connection| {
+            connection.execute(
+                "INSERT INTO subscription_provider_bindings
+                   (target, provider_id, binding_kind, account_id)
+                 VALUES ('claude', ?1, 'fixed', 'account-fixed-1')",
+                [provider_id.to_string()],
+            )?;
+            Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+    let updated = store
+        .apply_provider_action_for(
+            Target::Claude,
+            fixed_uuid(0x92),
+            1,
+            serde_json::json!({
+                "kind": "update-provider",
+                "providerId": provider_id,
+                "providerRevision": 1,
+                "name": "Subscription Bridge renamed",
+                "baseUrl": "https://chatgpt.com/backend-api/codex",
+                "model": "gpt-5.6-luna",
+                "credential": { "kind": "keep" },
+                "authentication": "codex-subscription",
+                "routingRequirement": "takeover-required"
+            }),
+        )
+        .await
+        .unwrap();
+    let provider = &updated.view.providers[0];
+    assert!(
+        provider.provider_revision == 2
+            && provider.model == "gpt-5.6-luna"
+            && provider.credential == CredentialPresence::Missing
+            && provider.completeness == ProviderCompleteness::Complete,
+        "safe Bridge update changed its closed declaration"
+    );
+
+    let unsafe_updates = [
+        serde_json::json!({
+            "kind": "update-provider", "providerId": provider_id,
+            "providerRevision": 2, "name": "Bridge",
+            "baseUrl": "https://redirect.example/backend-api/codex", "model": "gpt-5.6",
+            "credential": { "kind": "keep" }, "authentication": "codex-subscription",
+            "routingRequirement": "takeover-required"
+        }),
+        serde_json::json!({
+            "kind": "update-provider", "providerId": provider_id,
+            "providerRevision": 2, "name": "Bridge",
+            "baseUrl": "https://chatgpt.com/backend-api/codex", "model": "gpt-5.6",
+            "credential": { "kind": "keep" }, "authentication": "codex-subscription",
+            "routingRequirement": "direct-compatible"
+        }),
+        serde_json::json!({
+            "kind": "update-provider", "providerId": provider_id,
+            "providerRevision": 2, "name": "Bridge",
+            "baseUrl": "https://chatgpt.com/backend-api/codex", "model": "gpt-5.6",
+            "credential": { "kind": "replace", "value": "BRIDGE_UPDATE_SECRET_71913" },
+            "authentication": "codex-subscription", "routingRequirement": "takeover-required"
+        }),
+        serde_json::json!({
+            "kind": "update-provider", "providerId": provider_id,
+            "providerRevision": 2, "name": "Bridge",
+            "baseUrl": "https://chatgpt.com/backend-api/codex", "model": "gpt-5.6",
+            "credential": { "kind": "keep" }, "authentication": "anthropic-bearer",
+            "routingRequirement": "takeover-required"
+        }),
+    ];
+    for (index, action) in unsafe_updates.into_iter().enumerate() {
+        let failure = store
+            .apply_provider_action_for(
+                Target::Claude,
+                fixed_uuid(0x93 + index as u8),
+                updated.view.management_revision,
+                action,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            failure.problem.code == "invalid-provider",
+            "unsafe Bridge update returned a different problem"
+        );
+    }
+
+    for (index, credential) in [
+        serde_json::json!({ "kind": "without" }),
+        serde_json::json!({ "kind": "reuse-source" }),
+        serde_json::json!({ "kind": "replace", "value": "BRIDGE_DUPLICATE_SECRET_71914" }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let failure = store
+            .apply_provider_action_for(
+                Target::Claude,
+                fixed_uuid(0x97 + index as u8),
+                updated.view.management_revision,
+                serde_json::json!({
+                    "kind": "duplicate-provider",
+                    "sourceProviderId": provider_id,
+                    "sourceProviderRevision": 2,
+                    "name": "Bridge copy",
+                    "baseUrl": "https://chatgpt.com/backend-api/codex",
+                    "model": "gpt-5.6",
+                    "credential": credential
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            failure.problem.code == "invalid-provider",
+            "Bridge duplication returned a different problem"
+        );
+    }
+
+    let service = ActivationService::new(
+        Arc::clone(&store),
+        fixture.home.clone(),
+        Arc::new(CommandCodexProbe),
+        "/must/not/probe/codex".into(),
+        Arc::new(ReqwestUpstream::new().unwrap()),
+    )
+    .with_claude_runtime(
+        Arc::new(CommandClaudeProbe),
+        "/must/not/probe/claude".into(),
+    );
+    let failure = service
+        .apply_raw_for_with_context(
+            Target::Claude,
+            fixed_uuid(0x9a),
+            updated.view.management_revision,
+            serde_json::json!({
+                "kind": "activate-provider",
+                "providerId": provider_id,
+                "mode": "direct"
+            }),
+            Some(&ClaudePreflightContext {
+                claude_config_dir: None,
+                selector_state: ClaudeSelectorState::Unset,
+                blocking_selector: None,
+                host_managed_state: ClaudeHostManagedState::Unmanaged,
+                cwd: fixture.home.user_home().to_string_lossy().into_owned(),
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        failure.problem.code == "takeover-required",
+        "Bridge Direct activation did not fail at the routing boundary"
+    );
+    let after = store.target_view_for(Target::Claude).await.unwrap();
+    assert!(
+        after.management_revision == updated.view.management_revision
+            && after.providers.len() == 1
+            && after.activated_snapshot.is_none(),
+        "rejected Bridge mutations changed authoritative state"
+    );
+}
+
+#[tokio::test]
+async fn schema_v12_rejects_redirected_credentialed_or_direct_bridge_rows() {
+    let fixture = StoreFixture::new();
+    let store = fixture.open().await;
+    drop(store);
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    let rejected = database
+        .call(|connection| {
+            let attempts = [
+                (
+                    "https://redirect.example/backend-api/codex",
+                    None,
+                    "takeover-required",
+                ),
+                (
+                    "https://chatgpt.com/backend-api/codex",
+                    Some("00000000-0000-4000-8000-0000000009a1"),
+                    "takeover-required",
+                ),
+                (
+                    "https://chatgpt.com/backend-api/codex",
+                    None,
+                    "direct-compatible",
+                ),
+            ];
+            connection.execute(
+                "INSERT INTO credentials (id, target, bearer_token)
+                 VALUES ('00000000-0000-4000-8000-0000000009a1', 'claude', 'SCHEMA_SECRET_71915')",
+                [],
+            )?;
+            let mut rejected = 0;
+            for (index, (base_url, credential_id, routing_requirement)) in
+                attempts.into_iter().enumerate()
+            {
+                let result = connection.execute(
+                    "INSERT INTO providers
+                       (id, target, position, provider_revision, name, base_url, model,
+                        protocol, authentication, credential_id, routing_requirement)
+                     VALUES (?1, 'claude', ?2, 1, 'Bridge', ?3, 'gpt-5.6',
+                             'anthropic-messages', 'codex-subscription', ?4, ?5)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        index as u64,
+                        base_url,
+                        credential_id,
+                        routing_requirement,
+                    ],
+                );
+                rejected += usize::from(result.is_err());
+            }
+            Ok::<usize, tokio_rusqlite::rusqlite::Error>(rejected)
+        })
+        .await
+        .unwrap();
+    assert!(
+        rejected == 3,
+        "schema accepted an invalid Subscription Bridge row"
+    );
 }
 
 #[tokio::test]

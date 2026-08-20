@@ -66,11 +66,11 @@ const providerViewSchema = z.object({
   baseUrl: z.string(),
   model: z.string(),
   protocol: z.enum(["openai-responses", "anthropic-messages"]),
-  authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]),
+  authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"]),
   routingRequirement: z.enum(["direct-compatible", "takeover-required"]),
   credential: z.enum(["present", "missing"]),
   completeness: z.enum(["complete", "incomplete"]),
-  missingFields: z.array(z.enum(["base-url", "model", "credential"])),
+  missingFields: z.array(z.enum(["base-url", "model", "credential", "subscription-account-binding"])),
   provenance: z.object({
     kind: z.string(),
     key: z.string(),
@@ -106,6 +106,13 @@ const providerPresetSchema = z.discriminatedUnion("key", [
     protocol: z.literal("anthropic-messages"),
     authentication: z.literal("anthropic-api-key"),
   }),
+  z.object({
+    key: z.literal("codex-subscription-bridge"),
+    baseUrl: z.literal("https://chatgpt.com/backend-api/codex"),
+    model: z.literal(""),
+    protocol: z.literal("anthropic-messages"),
+    authentication: z.literal("codex-subscription"),
+  }),
 ])
 
 const activatedSnapshotSchema = z.object({
@@ -113,7 +120,7 @@ const activatedSnapshotSchema = z.object({
   providerId: z.string().uuid(),
   model: z.string(),
   protocol: z.enum(["openai-responses", "anthropic-messages"]),
-  authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]),
+  authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"]),
   epoch: z.string().uuid(),
 })
 
@@ -129,7 +136,7 @@ const activatedRoutePlanMemberSchema = z.object({
   name: z.string(),
   model: z.string(),
   protocol: z.enum(["openai-responses", "anthropic-messages"]),
-  authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]),
+  authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"]),
 }).strict()
 
 const failoverViewSchema = z.object({
@@ -205,7 +212,7 @@ const discoverySourceSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("draft"),
     baseUrl: z.string(),
-    authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]),
+    authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"]),
     credentialSource: draftCredentialSourceSchema,
   }),
 ])
@@ -260,8 +267,8 @@ const targetActionSchema = z.discriminatedUnion("kind", [
     baseUrl: z.string(),
     model: z.string(),
     credential: credentialEditSchema,
-    authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]).optional(),
-    presetKey: z.enum(["openai-api-responses", "anthropic-api-messages"]).nullable().optional(),
+    authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"]).optional(),
+    presetKey: z.enum(["openai-api-responses", "anthropic-api-messages", "codex-subscription-bridge"]).nullable().optional(),
   }),
   z.object({
     kind: z.literal("update-provider"),
@@ -271,7 +278,7 @@ const targetActionSchema = z.discriminatedUnion("kind", [
     baseUrl: z.string(),
     model: z.string(),
     credential: credentialEditSchema,
-    authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]).optional(),
+    authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"]).optional(),
     routingRequirement: z.enum(["direct-compatible", "takeover-required"]).optional(),
   }),
   z.object({

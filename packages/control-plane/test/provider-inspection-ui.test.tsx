@@ -84,7 +84,7 @@ type DiscoveryProjection =
   | {
     kind: "draft"
     baseUrl: string
-    authentication: "openai-bearer" | "anthropic-api-key" | "anthropic-bearer"
+    authentication: "openai-bearer" | "anthropic-api-key" | "anthropic-bearer" | "codex-subscription"
     credentialSource: "missing" | "ephemeral" | "saved"
     savedProviderId?: string
     savedProviderRevision?: number

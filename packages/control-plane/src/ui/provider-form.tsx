@@ -15,8 +15,8 @@ export interface ProviderDraft {
   model: string
   providerId?: string
   providerRevision?: number
-  presetKey?: "openai-api-responses" | "anthropic-api-messages" | null
-  authentication?: "openai-bearer" | "anthropic-api-key" | "anthropic-bearer"
+  presetKey?: "openai-api-responses" | "anthropic-api-messages" | "codex-subscription-bridge" | null
+  authentication?: "openai-bearer" | "anthropic-api-key" | "anthropic-bearer" | "codex-subscription"
 }
 
 export type ProviderFormResult = Extract<TargetAction,

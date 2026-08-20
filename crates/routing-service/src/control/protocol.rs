@@ -1461,6 +1461,7 @@ pub enum ProviderAuthentication {
     OpenaiBearer,
     AnthropicApiKey,
     AnthropicBearer,
+    CodexSubscription,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1494,6 +1495,7 @@ impl fmt::Display for ProviderAuthentication {
             Self::OpenaiBearer => "openai-bearer",
             Self::AnthropicApiKey => "anthropic-api-key",
             Self::AnthropicBearer => "anthropic-bearer",
+            Self::CodexSubscription => "codex-subscription",
         })
     }
 }
@@ -1520,6 +1522,7 @@ pub enum ProviderRequirement {
     BaseUrl,
     Model,
     Credential,
+    SubscriptionAccountBinding,
 }
 
 impl fmt::Display for ProviderRequirement {
@@ -1528,6 +1531,7 @@ impl fmt::Display for ProviderRequirement {
             Self::BaseUrl => "base-url",
             Self::Model => "model",
             Self::Credential => "credential",
+            Self::SubscriptionAccountBinding => "subscription-account-binding",
         })
     }
 }

@@ -104,7 +104,7 @@
     "discoverySource": {
       "oneOf": [
         { "type": "object", "properties": { "kind": { "const": "saved" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"] },
-        { "type": "object", "properties": { "kind": { "const": "draft" }, "baseUrl": { "type": "string" }, "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer"] }, "credentialSource": { "$ref": "#/$defs/draftCredentialSource" } }, "required": ["kind", "baseUrl", "authentication", "credentialSource"] }
+        { "type": "object", "properties": { "kind": { "const": "draft" }, "baseUrl": { "type": "string" }, "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"] }, "credentialSource": { "$ref": "#/$defs/draftCredentialSource" } }, "required": ["kind", "baseUrl", "authentication", "credentialSource"] }
       ]
     },
     "claudePreflightContext": {
@@ -199,8 +199,8 @@
     "targetAction": {
       "oneOf": [
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "disable-takeover" } }, "required": ["kind"] },
-        { "type": "object", "properties": { "kind": { "const": "create-provider" }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/credentialEdit" }, "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer"] }, "presetKey": { "oneOf": [{ "const": "openai-api-responses" }, { "const": "anthropic-api-messages" }, { "type": "null" }] } }, "required": ["kind", "name", "baseUrl", "model", "credential"] },
-        { "type": "object", "properties": { "kind": { "const": "update-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/credentialEdit" }, "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer"] }, "routingRequirement": { "enum": ["direct-compatible", "takeover-required"] } }, "required": ["kind", "providerId", "providerRevision", "name", "baseUrl", "model", "credential"] },
+        { "type": "object", "properties": { "kind": { "const": "create-provider" }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/credentialEdit" }, "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"] }, "presetKey": { "oneOf": [{ "const": "openai-api-responses" }, { "const": "anthropic-api-messages" }, { "const": "codex-subscription-bridge" }, { "type": "null" }] } }, "required": ["kind", "name", "baseUrl", "model", "credential"] },
+        { "type": "object", "properties": { "kind": { "const": "update-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/credentialEdit" }, "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"] }, "routingRequirement": { "enum": ["direct-compatible", "takeover-required"] } }, "required": ["kind", "providerId", "providerRevision", "name", "baseUrl", "model", "credential"] },
         { "type": "object", "properties": { "kind": { "const": "reorder-providers" }, "providerIds": { "type": "array", "items": { "type": "string", "format": "uuid" } } }, "required": ["kind", "providerIds"] },
         { "type": "object", "properties": { "kind": { "const": "delete-provider" }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "providerId", "providerRevision"] },
         { "type": "object", "properties": { "kind": { "const": "duplicate-provider" }, "sourceProviderId": { "type": "string", "format": "uuid" }, "sourceProviderRevision": { "type": "integer", "minimum": 1 }, "name": { "type": "string" }, "baseUrl": { "type": "string" }, "model": { "type": "string" }, "credential": { "$ref": "#/$defs/duplicateCredential" } }, "required": ["kind", "sourceProviderId", "sourceProviderRevision", "name", "baseUrl", "model", "credential"] },
@@ -429,7 +429,7 @@
         "name": { "type": "string" },
         "model": { "type": "string" },
         "protocol": { "enum": ["openai-responses", "anthropic-messages"] },
-        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer"] }
+        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"] }
       },
       "required": ["position", "providerId", "providerRevision", "name", "model", "protocol", "authentication"]
     },
@@ -499,11 +499,11 @@
         "baseUrl": { "type": "string" },
         "model": { "type": "string" },
         "protocol": { "enum": ["openai-responses", "anthropic-messages"] },
-        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer"] },
+        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"] },
         "routingRequirement": { "enum": ["direct-compatible", "takeover-required"] },
         "credential": { "enum": ["present", "missing"] },
         "completeness": { "enum": ["complete", "incomplete"] },
-        "missingFields": { "type": "array", "items": { "enum": ["base-url", "model", "credential"] } },
+        "missingFields": { "type": "array", "items": { "enum": ["base-url", "model", "credential", "subscription-account-binding"] } },
         "provenance": { "type": ["object", "null"] },
         "generated": { "type": "boolean" },
         "universalProviderId": { "type": ["string", "null"], "format": "uuid" },
@@ -533,11 +533,11 @@
     "providerPreset": {
       "type": "object",
       "properties": {
-        "key": { "enum": ["openai-api-responses", "anthropic-api-messages"] },
+        "key": { "enum": ["openai-api-responses", "anthropic-api-messages", "codex-subscription-bridge"] },
         "baseUrl": { "type": "string" },
         "model": { "const": "" },
         "protocol": { "enum": ["openai-responses", "anthropic-messages"] },
-        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer"] }
+        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"] }
       },
       "required": ["key", "baseUrl", "model", "protocol", "authentication"]
     },

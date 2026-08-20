@@ -402,6 +402,33 @@ impl InspectionFixture {
         (provider.id, provider.provider_revision)
     }
 
+    async fn create_subscription_bridge(&self) -> (Uuid, u64) {
+        let outcome = self
+            .store
+            .apply_provider_action_for(
+                Target::Claude,
+                Uuid::new_v4(),
+                self.store
+                    .target_view_for(Target::Claude)
+                    .await
+                    .unwrap()
+                    .management_revision,
+                json!({
+                    "kind": "create-provider",
+                    "name": "Subscription Bridge",
+                    "baseUrl": "https://chatgpt.com/backend-api/codex",
+                    "model": "gpt-5.6",
+                    "credential": { "kind": "remove" },
+                    "authentication": "codex-subscription",
+                    "presetKey": "codex-subscription-bridge"
+                }),
+            )
+            .await
+            .unwrap();
+        let provider = outcome.view.providers.last().unwrap();
+        (provider.id, provider.provider_revision)
+    }
+
     fn database_bytes(&self) -> Vec<u8> {
         fs::read(self.home.database_path()).unwrap()
     }
@@ -567,6 +594,45 @@ async fn claude_draft_discovery_uses_the_explicit_authentication_profile() {
         assert_eq!(
             request.headers.get("anthropic-version").map(String::as_str),
             Some("2023-06-01")
+        );
+    }
+}
+
+#[tokio::test]
+async fn subscription_bridge_model_discovery_is_a_fixed_local_deviation() {
+    let fixture = InspectionFixture::new().await;
+    let (provider_id, provider_revision) = fixture.create_subscription_bridge().await;
+    let sources = [
+        DiscoverySource::Saved {
+            provider_id,
+            provider_revision,
+        },
+        DiscoverySource::Draft {
+            base_url: "https://chatgpt.com/backend-api/codex".to_owned(),
+            authentication: ProviderAuthentication::CodexSubscription,
+            credential_source: DraftCredentialSource::Ephemeral {
+                value: "SUBSCRIPTION_DISCOVERY_SECRET_81732".to_owned(),
+            },
+        },
+    ];
+    for source in sources {
+        let result = fixture
+            .inspector()
+            .discover_models_for(Target::Claude, source)
+            .await;
+        assert!(
+            matches!(
+                result,
+                ModelDiscoveryResult::Failure {
+                    failure: muxvia_routing::service::provider_inspector::InspectionFailure {
+                        category: InspectionCategory::EndpointUnsupported,
+                        attempts: 0,
+                        endpoint_origin: None,
+                        ..
+                    }
+                }
+            ),
+            "Subscription Bridge model discovery did not fail locally"
         );
     }
 }

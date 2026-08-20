@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS providers (
   base_url TEXT NOT NULL,
   model TEXT NOT NULL,
   protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
-  authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
+  authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer', 'codex-subscription')),
   credential_id TEXT,
   provenance_kind TEXT,
   provenance_key TEXT,
@@ -30,7 +30,15 @@ CREATE TABLE IF NOT EXISTS providers (
   generated_overlay_revision INTEGER CHECK (generated_overlay_revision IS NULL OR generated_overlay_revision >= 1),
   CHECK (
     (target = 'codex' AND protocol = 'openai-responses' AND authentication = 'openai-bearer')
-    OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer'))
+    OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer', 'codex-subscription'))
+  ),
+  CHECK (
+    authentication != 'codex-subscription'
+    OR (
+      base_url = 'https://chatgpt.com/backend-api/codex'
+      AND credential_id IS NULL
+      AND routing_requirement = 'takeover-required'
+    )
   ),
   FOREIGN KEY (target, credential_id) REFERENCES credentials(target, id)
 );
@@ -165,9 +173,18 @@ CREATE TABLE IF NOT EXISTS activated_route_plan_members (
   base_url TEXT NOT NULL,
   model TEXT NOT NULL,
   protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
-  authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
-  credential_id TEXT NOT NULL REFERENCES credentials(id),
+  authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer', 'codex-subscription')),
+  credential_id TEXT REFERENCES credentials(id),
   routing_requirement TEXT NOT NULL CHECK (routing_requirement IN ('direct-compatible', 'takeover-required')),
+  CHECK (
+    (
+      authentication = 'codex-subscription'
+      AND base_url = 'https://chatgpt.com/backend-api/codex'
+      AND credential_id IS NULL
+      AND routing_requirement = 'takeover-required'
+    )
+    OR (authentication != 'codex-subscription' AND credential_id IS NOT NULL)
+  ),
   PRIMARY KEY (plan_id, position),
   UNIQUE (plan_id, provider_id)
 );
@@ -226,12 +243,19 @@ CREATE TABLE IF NOT EXISTS activated_snapshots (
   base_url TEXT NOT NULL,
   model TEXT NOT NULL,
   protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
-  authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer')),
+  authentication TEXT NOT NULL CHECK (authentication IN ('openai-bearer', 'anthropic-api-key', 'anthropic-bearer', 'codex-subscription')),
   provider_bearer_token TEXT NOT NULL,
   epoch TEXT NOT NULL,
   CHECK (
     (target = 'codex' AND protocol = 'openai-responses' AND authentication = 'openai-bearer')
-    OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer'))
+    OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer', 'codex-subscription'))
+  ),
+  CHECK (
+    authentication != 'codex-subscription'
+    OR (
+      base_url = 'https://chatgpt.com/backend-api/codex'
+      AND provider_bearer_token = ''
+    )
   )
 );
 
@@ -279,7 +303,7 @@ INSERT OR IGNORE INTO subscription_account_catalog_state
   (singleton, revision, view_sequence, recovery_state)
 VALUES (1, 0, 0, 'clean');
 
-INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '11');
+INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '12');
 INSERT OR IGNORE INTO universal_provider_catalog_state (
   singleton, revision, view_sequence
 ) VALUES (1, 0, 0);

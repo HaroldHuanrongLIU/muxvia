@@ -211,7 +211,9 @@ impl ProviderInspector {
                 ProviderAuthentication::AnthropicApiKey => {
                     request.header("x-api-key", credential.expose_secret())
                 }
-                ProviderAuthentication::AnthropicBearer | ProviderAuthentication::OpenaiBearer => {
+                ProviderAuthentication::AnthropicBearer
+                | ProviderAuthentication::OpenaiBearer
+                | ProviderAuthentication::CodexSubscription => {
                     request.bearer_auth(credential.expose_secret())
                 }
             };
@@ -220,7 +222,8 @@ impl ProviderInspector {
                 | ProviderAuthentication::AnthropicBearer => {
                     request.header("anthropic-version", "2023-06-01")
                 }
-                ProviderAuthentication::OpenaiBearer => request,
+                ProviderAuthentication::OpenaiBearer
+                | ProviderAuthentication::CodexSubscription => request,
             };
             let response = request.send().await;
             let response = match response {
@@ -387,7 +390,8 @@ impl ProviderInspector {
                         request.header("x-api-key", credential.expose_secret())
                     }
                     ProviderAuthentication::AnthropicBearer
-                    | ProviderAuthentication::OpenaiBearer => {
+                    | ProviderAuthentication::OpenaiBearer
+                    | ProviderAuthentication::CodexSubscription => {
                         request.bearer_auth(credential.expose_secret())
                     }
                 }
@@ -633,6 +637,9 @@ impl ProviderInspector {
                 let snapshot = self
                     .resolve_saved_provider(target, provider_id, provider_revision)
                     .await?;
+                if snapshot.authentication == ProviderAuthentication::CodexSubscription {
+                    return Err(InspectionCategory::EndpointUnsupported);
+                }
                 let credential = snapshot
                     .credential
                     .ok_or(InspectionCategory::MissingCredential)?;
@@ -643,6 +650,9 @@ impl ProviderInspector {
                 authentication,
                 credential_source,
             } => {
+                if authentication == ProviderAuthentication::CodexSubscription {
+                    return Err(InspectionCategory::EndpointUnsupported);
+                }
                 let credential = match credential_source {
                     DraftCredentialSource::Missing => {
                         return Err(InspectionCategory::MissingCredential);

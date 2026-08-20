@@ -70,6 +70,10 @@ pub(crate) fn project_target_view_for(
                 u.provider_revision, t.overlay_revision,
                 p.credential_id IS NOT NULL,
                 EXISTS(
+                    SELECT 1 FROM subscription_provider_bindings binding
+                    WHERE binding.target = p.target AND binding.provider_id = p.id
+                ),
+                EXISTS(
                     SELECT 1 FROM target_route_state r
                     WHERE r.target = ?1 AND r.current_provider_id = p.id
                 ),
@@ -97,6 +101,7 @@ pub(crate) fn project_target_view_for(
         .query_map([target_name], |row| {
             let id = uuid::Uuid::parse_str(&row.get::<_, String>(0)?).map_err(conversion_error)?;
             let has_credential: bool = row.get(16)?;
+            let has_subscription_binding: bool = row.get(17)?;
             let base_url: String = row.get(4)?;
             let model: String = row.get(5)?;
             let mut missing_fields = Vec::new();
@@ -105,9 +110,6 @@ pub(crate) fn project_target_view_for(
             }
             if model.is_empty() {
                 missing_fields.push(ProviderRequirement::Model);
-            }
-            if !has_credential {
-                missing_fields.push(ProviderRequirement::Credential);
             }
             let protocol = match row.get::<_, String>(6)?.as_str() {
                 "openai-responses" => ProviderProtocol::OpenaiResponses,
@@ -118,8 +120,16 @@ pub(crate) fn project_target_view_for(
                 "openai-bearer" => ProviderAuthentication::OpenaiBearer,
                 "anthropic-api-key" => ProviderAuthentication::AnthropicApiKey,
                 "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
+                "codex-subscription" => ProviderAuthentication::CodexSubscription,
                 _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
             };
+            if authentication == ProviderAuthentication::CodexSubscription {
+                if !has_subscription_binding {
+                    missing_fields.push(ProviderRequirement::SubscriptionAccountBinding);
+                }
+            } else if !has_credential {
+                missing_fields.push(ProviderRequirement::Credential);
+            }
             if !has_valid_provider_declaration(target, protocol, authentication) {
                 return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
             }
@@ -131,18 +141,18 @@ pub(crate) fn project_target_view_for(
                 _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
             };
             let mut active_references = Vec::new();
-            if row.get(17)? {
+            if row.get(18)? {
                 active_references.push(ProviderReferenceView::Current);
             }
-            if row.get(18)? {
+            if row.get(19)? {
                 active_references.push(ProviderReferenceView::ActivatedSnapshot);
             }
-            if row.get(19)? {
+            if row.get(20)? {
                 active_references.push(ProviderReferenceView::ActivatedRoutePlan);
             }
             let route_health = match (
-                row.get::<_, Option<String>>(20)?,
                 row.get::<_, Option<String>>(21)?,
+                row.get::<_, Option<String>>(22)?,
             ) {
                 (None, None) => RouteHealthState::Unobserved,
                 (Some(_), Some(epoch)) if epoch != service_epoch => RouteHealthState::Stale,
@@ -258,6 +268,7 @@ pub(crate) fn project_target_view_for(
                 "openai-bearer" => ProviderAuthentication::OpenaiBearer,
                 "anthropic-api-key" => ProviderAuthentication::AnthropicApiKey,
                 "anthropic-bearer" => ProviderAuthentication::AnthropicBearer,
+                "codex-subscription" => ProviderAuthentication::CodexSubscription,
                 _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
             };
             let epoch =
@@ -487,6 +498,7 @@ fn parse_authentication(value: &str) -> Result<ProviderAuthentication> {
         "openai-bearer" => Ok(ProviderAuthentication::OpenaiBearer),
         "anthropic-api-key" => Ok(ProviderAuthentication::AnthropicApiKey),
         "anthropic-bearer" => Ok(ProviderAuthentication::AnthropicBearer),
+        "codex-subscription" => Ok(ProviderAuthentication::CodexSubscription),
         _ => Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
 }

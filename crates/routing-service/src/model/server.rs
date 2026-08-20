@@ -542,8 +542,11 @@ async fn route_responses(
             Some(UpstreamRequest {
                 method: Method::POST,
                 url: responses_url(&member.base_url).ok()?,
-                headers: forward_request_headers(&request_headers, &member.provider_credential)
-                    .ok()?,
+                headers: forward_request_headers(
+                    &request_headers,
+                    member.provider_credential.as_ref()?,
+                )
+                .ok()?,
                 body: ReqwestBody::from(request_body.clone()),
             })
         },

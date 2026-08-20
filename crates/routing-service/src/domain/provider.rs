@@ -23,6 +23,10 @@ pub fn has_valid_provider_declaration(
             Target::Claude,
             ProviderProtocol::AnthropicMessages,
             ProviderAuthentication::AnthropicApiKey | ProviderAuthentication::AnthropicBearer
+        ) | (
+            Target::Claude,
+            ProviderProtocol::AnthropicMessages,
+            ProviderAuthentication::CodexSubscription
         )
     )
 }

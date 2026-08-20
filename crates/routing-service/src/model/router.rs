@@ -408,9 +408,10 @@ mod tests {
                     provider_id: Uuid::new_v4(),
                     base_url: format!("https://{name}.test/v1"),
                     model: format!("{name}-model"),
-                    provider_credential: SecretString::from(format!("{name}-secret")),
+                    provider_credential: Some(SecretString::from(format!("{name}-secret"))),
                     protocol: ProviderProtocol::OpenaiResponses,
                     authentication: ProviderAuthentication::OpenaiBearer,
+                    subscription_binding: None,
                 })
                 .collect(),
         }

@@ -24,6 +24,7 @@ test.each([
   ["initial-target-view.json", parseTargetView],
   ["failover-target-view.json", parseTargetView],
   ["save-provider.json", parseTargetAction],
+  ["create-subscription-bridge-provider.json", parseTargetAction],
   ["reorder-providers.json", parseTargetAction],
   ["delete-provider.json", parseTargetAction],
   ["duplicate-provider.json", parseTargetAction],
@@ -64,6 +65,25 @@ test.each([
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)
+})
+
+test("Subscription Bridge Provider contract is closed and credentialless", async () => {
+  const action = await readFixture("create-subscription-bridge-provider.json") as any
+  expect(parseTargetAction(action)).toEqual(action)
+
+  const additive = structuredClone(action)
+  additive.accessToken = "SUBSCRIPTION_BRIDGE_PROTOCOL_SECRET_12802"
+  expect(JSON.stringify(parseTargetAction(additive))).not.toContain("SUBSCRIPTION_BRIDGE_PROTOCOL_SECRET_12802")
+
+  const schema = JSON.parse(await readFile(
+    fileURLToPath(new URL("../../../protocol/control-v1.schema.json", import.meta.url)),
+    "utf8",
+  ))
+  const branch = schema.$defs.targetAction.oneOf.find(
+    (candidate: any) => candidate.properties?.kind?.const === "create-provider",
+  )
+  expect(branch.properties.authentication.enum).toContain("codex-subscription")
+  expect(branch.properties.presetKey.oneOf).toContainEqual({ const: "codex-subscription-bridge" })
 })
 
 test("Subscription Account contracts reject secret-bearing additive fields", async () => {
@@ -173,6 +193,8 @@ test("Universal Provider JSON schema exposes the complete closed catalog contrac
   expect(schema.$defs.universalProviderAction).toBeDefined()
   expect(schema.$defs.universalProviderCatalog).toBeDefined()
   expect(schema.oneOf).toContainEqual({ $ref: "#/$defs/universalProviderAction" })
+  expect(schema.$defs.universalProviderPresetTarget.properties.authentication.enum)
+    .not.toContain("codex-subscription")
 
   const action = await readFixture("create-universal-provider.json") as Record<string, unknown>
   action.additiveSecret = "UNIVERSAL_ADDITIVE_SECRET_99310"

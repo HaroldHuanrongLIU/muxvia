@@ -70,7 +70,7 @@ Before return, serialization is scanned for every credential and routing secret 
 
 The control frame remains capped at 1 MiB. A source payload is capped below that limit, a document has a bounded candidate count and bounded string fields, duplicate source identities and duplicate normalized declarations are rejected, and unknown export fields fail closed. CC-Switch query keys may appear at most once. URLs use the existing Provider URL safety rules: HTTPS, or loopback HTTP only, with no user information, query, or fragment.
 
-Preview errors use fixed categories and never echo input. Debug implementations redact pasted source text, secret-bearing plans, credentials, and exports under construction. Confirmation requires exactly one valid choice per candidate. Invalid, stale, missing, duplicated, or replayed choices fail before commit. All Provider rows, credentials, Import Provenance, catalog revisions, Target view revisions, and failover members commit together or roll back together.
+Preview errors use fixed categories and never echo input. Debug implementations redact pasted source text, secret-bearing plans, credentials, and exports under construction. Confirmation requires at least one selected candidate and exactly one valid choice for each selected candidate; unselected candidates remain unimported. Invalid, stale, missing, duplicated, or replayed choices fail before commit. All Provider rows, credentials, Import Provenance, catalog revisions, Target view revisions, and failover members commit together or roll back together.
 
 ## Control Plane
 

@@ -80,8 +80,22 @@ fn v12_state_fingerprint(connection: &Connection) -> Vec<(String, u64)> {
         .into_iter()
         .map(|table| {
             let escaped = table.replace('"', "\"\"");
+            let selected_columns = connection
+                .prepare(&format!("PRAGMA table_info(\"{escaped}\")"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|column| {
+                    let column = column.unwrap();
+                    (!column.starts_with("import_")).then_some(column)
+                })
+                .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", ");
             let mut statement = connection
-                .prepare(&format!("SELECT * FROM \"{escaped}\" ORDER BY rowid"))
+                .prepare(&format!(
+                    "SELECT {selected_columns} FROM \"{escaped}\" ORDER BY rowid"
+                ))
                 .unwrap();
             let columns = statement.column_count();
             let mut rows = statement.query([]).unwrap();
@@ -171,7 +185,7 @@ async fn fresh_schema_reopens_with_codex_and_claude_route_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, "15");
+    assert_eq!(version, "16");
     assert_eq!(targets, ["claude", "codex"]);
     let _ = fs::remove_dir_all(root);
 }
@@ -236,6 +250,135 @@ async fn schema_v15_declares_private_native_usage_retention_rollups_and_active_c
         ],
         "Native Usage cursor persisted a source path or transcript identity"
     );
+}
+
+#[tokio::test]
+async fn schema_v16_enforces_complete_bounded_provider_import_provenance() {
+    let fixture = StoreFixture::new().await;
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(|connection| {
+            let provider_columns = connection
+                .prepare("SELECT name FROM pragma_table_info('providers') WHERE name LIKE 'import_%' ORDER BY cid")?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            let universal_columns = connection
+                .prepare("SELECT name FROM pragma_table_info('universal_providers') WHERE name LIKE 'import_%' ORDER BY cid")?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            let expected = vec![
+                "import_source_product".to_owned(),
+                "import_source_target".to_owned(),
+                "import_source_identifier".to_owned(),
+                "import_configuration_fingerprint".to_owned(),
+            ];
+            if provider_columns != expected || universal_columns != expected {
+                return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+            }
+
+            let partial = connection.execute(
+                "INSERT INTO universal_providers
+                 (id, position, provider_revision, name, base_url, import_source_product)
+                 VALUES (?1, 0, 1, 'Partial', 'https://partial.example/v1', 'muxvia')",
+                [fixed_uuid(160).to_string()],
+            );
+            if partial.is_ok() {
+                return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+            }
+            let invalid_fingerprint = connection.execute(
+                "INSERT INTO universal_providers
+                 (id, position, provider_revision, name, base_url, import_source_product,
+                  import_source_target, import_source_identifier,
+                  import_configuration_fingerprint)
+                 VALUES (?1, 0, 1, 'Invalid', 'https://invalid.example/v1', 'muxvia',
+                         'universal', 'source', ?2)",
+                tokio_rusqlite::rusqlite::params![
+                    fixed_uuid(161).to_string(),
+                    "A".repeat(64),
+                ],
+            );
+            if invalid_fingerprint.is_ok() {
+                return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+            }
+            connection.execute(
+                "INSERT INTO universal_providers
+                 (id, position, provider_revision, name, base_url, import_source_product,
+                  import_source_target, import_source_identifier,
+                  import_configuration_fingerprint)
+                 VALUES (?1, 0, 1, 'Imported', 'https://imported.example/v1', 'muxvia',
+                         'universal', '00000000-0000-4000-8000-000000000162', ?2)",
+                tokio_rusqlite::rusqlite::params![
+                    fixed_uuid(162).to_string(),
+                    "a".repeat(64),
+                ],
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn schema_v16_migrates_v15_provider_rows_without_changing_their_identity() {
+    let root = std::env::temp_dir().join(format!("muxvia-schema-v15-{}", Uuid::new_v4()));
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    drop(StateStore::open(&home).await.unwrap());
+
+    let provider_id = fixed_uuid(163).to_string();
+    let universal_id = fixed_uuid(164).to_string();
+    let database = Connection::open(home.database_path()).unwrap();
+    database
+        .execute_batch(
+            "ALTER TABLE providers DROP COLUMN import_configuration_fingerprint;
+             ALTER TABLE providers DROP COLUMN import_source_identifier;
+             ALTER TABLE providers DROP COLUMN import_source_target;
+             ALTER TABLE providers DROP COLUMN import_source_product;
+             ALTER TABLE universal_providers DROP COLUMN import_configuration_fingerprint;
+             ALTER TABLE universal_providers DROP COLUMN import_source_identifier;
+             ALTER TABLE universal_providers DROP COLUMN import_source_target;
+             ALTER TABLE universal_providers DROP COLUMN import_source_product;
+             UPDATE metadata SET value = '15' WHERE key = 'schema-version';",
+        )
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO providers
+             (id, target, position, provider_revision, name, base_url, model, protocol,
+              authentication, routing_requirement)
+             VALUES (?1, 'codex', 0, 3, 'Before v16', 'https://v15.example/v1',
+                     'gpt-v15', 'openai-responses', 'openai-bearer', 'direct-compatible')",
+            [&provider_id],
+        )
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO universal_providers
+             (id, position, provider_revision, name, base_url)
+             VALUES (?1, 0, 2, 'Universal before v16', 'https://universal-v15.example/v1')",
+            [&universal_id],
+        )
+        .unwrap();
+    drop(database);
+
+    drop(StateStore::open(&home).await.unwrap());
+    let database = Connection::open(home.database_path()).unwrap();
+    let migrated: (String, String, String, u64) = database
+        .query_row(
+            "SELECT
+               (SELECT value FROM metadata WHERE key = 'schema-version'),
+               (SELECT id FROM providers WHERE name = 'Before v16'),
+               (SELECT id FROM universal_providers WHERE name = 'Universal before v16'),
+               (SELECT COUNT(*) FROM pragma_table_info('providers') WHERE name LIKE 'import_%')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(migrated, ("16".into(), provider_id, universal_id, 4));
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -453,7 +596,7 @@ async fn schema_v15_migration_preserves_v12_target_state() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "15");
+    assert_eq!(version, "16");
     assert_eq!(
         after, before,
         "schema-v15 migration changed existing v12 state"
@@ -484,6 +627,14 @@ async fn schema_v15_migrates_v13_to_parent_cascade_only_pricing_deletion() {
              DROP TABLE daily_usage_rollups;
              DROP TABLE usage_settings;
              DROP TABLE pricing_catalog_state;
+             ALTER TABLE providers DROP COLUMN import_configuration_fingerprint;
+             ALTER TABLE providers DROP COLUMN import_source_identifier;
+             ALTER TABLE providers DROP COLUMN import_source_target;
+             ALTER TABLE providers DROP COLUMN import_source_product;
+             ALTER TABLE universal_providers DROP COLUMN import_configuration_fingerprint;
+             ALTER TABLE universal_providers DROP COLUMN import_source_identifier;
+             ALTER TABLE universal_providers DROP COLUMN import_source_target;
+             ALTER TABLE universal_providers DROP COLUMN import_source_product;
              UPDATE metadata SET value = '13' WHERE key = 'schema-version';",
         )
         .unwrap();
@@ -532,7 +683,7 @@ async fn schema_v15_migrates_v13_to_parent_cascade_only_pricing_deletion() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "15");
+    assert_eq!(version, "16");
     assert!(
         database
             .execute("DELETE FROM pricing_snapshots", [])
@@ -597,7 +748,7 @@ async fn schema_v15_failed_migration_rolls_back_then_reruns() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(rerun, ("15".into(), 1, 1));
+    assert_eq!(rerun, ("16".into(), 1, 1));
     let _ = fs::remove_dir_all(root);
 }
 

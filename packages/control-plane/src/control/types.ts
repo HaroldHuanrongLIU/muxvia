@@ -58,6 +58,13 @@ const routeHealthSchema = z.object({
   state: z.enum(["unobserved", "healthy", "degraded", "unavailable", "stale"]),
 }).strict()
 
+const importProvenanceSchema = z.object({
+  sourceProduct: z.enum(["target-cli", "cc-switch", "muxvia"]),
+  sourceTarget: z.enum(["codex", "claude", "universal"]),
+  sourceIdentifier: z.string().min(1).max(256),
+  configurationFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict()
+
 const providerViewSchema = z.object({
   id: z.string(),
   position: z.number().int().nonnegative(),
@@ -75,6 +82,8 @@ const providerViewSchema = z.object({
     kind: z.string(),
     key: z.string(),
   }).nullable(),
+  importProvenance: importProvenanceSchema.optional(),
+  importedCurrent: z.boolean().optional(),
   generated: z.boolean(),
   universalProviderId: z.string().uuid().nullable(),
   synchronization: z.enum(["current", "pending"]).nullable(),
@@ -595,6 +604,7 @@ const universalProviderSchema = z.object({
   baseUrl: z.string(),
   credential: z.enum(["present", "missing"]),
   provenance: z.object({ kind: z.string(), key: z.string() }).nullable(),
+  importProvenance: importProvenanceSchema.optional(),
   targets: z.array(universalProviderTargetSchema),
 }).strict()
 

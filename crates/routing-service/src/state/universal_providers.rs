@@ -11,7 +11,10 @@ use crate::{
         UniversalProviderPresetView, UniversalProviderTargetDraft, UniversalProviderTargetView,
         UniversalProviderView, UniversalSynchronizationState,
     },
-    domain::{provider::normalize_provider_base_url, view::project_target_view_for},
+    domain::{
+        provider::normalize_provider_base_url,
+        view::{import_provenance, project_target_view_for},
+    },
 };
 
 use super::{
@@ -1492,7 +1495,8 @@ pub(super) fn project_universal_provider_catalog(
     )?;
     let mut statement = connection.prepare(
         "SELECT id, position, provider_revision, name, base_url, credential_id,
-                provenance_kind, provenance_key
+                provenance_kind, provenance_key, import_source_product, import_source_target,
+                import_source_identifier, import_configuration_fingerprint
          FROM universal_providers ORDER BY position, id",
     )?;
     let rows = statement.query_map([], |row| {
@@ -1505,11 +1509,28 @@ pub(super) fn project_universal_provider_catalog(
             row.get::<_, Option<String>>(5)?,
             row.get::<_, Option<String>>(6)?,
             row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
         ))
     })?;
     let mut providers = Vec::new();
     for row in rows {
-        let (id, position, provider_revision, name, base_url, credential_id, kind, key) = row?;
+        let (
+            id,
+            position,
+            provider_revision,
+            name,
+            base_url,
+            credential_id,
+            kind,
+            key,
+            import_product,
+            import_target,
+            import_identifier,
+            import_fingerprint,
+        ) = row?;
         let id = Uuid::parse_str(&id).map_err(|_| tokio_rusqlite::rusqlite::Error::InvalidQuery)?;
         let provenance = match (kind, key) {
             (None, None) => None,
@@ -1528,6 +1549,12 @@ pub(super) fn project_universal_provider_catalog(
                 CredentialPresence::Missing
             },
             provenance,
+            import_provenance: import_provenance(
+                import_product,
+                import_target,
+                import_identifier,
+                import_fingerprint,
+            )?,
             targets: project_targets(connection, id, provider_revision)?,
         });
     }

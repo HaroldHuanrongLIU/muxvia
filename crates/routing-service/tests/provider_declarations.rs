@@ -299,7 +299,7 @@ async fn schema_v8_migrates_real_v7_bytes_and_adds_reconciliation_tables_atomica
         .await
         .unwrap();
 
-    assert_eq!(version, "15");
+    assert_eq!(version, "16");
     assert_eq!(not_null, 1);
     assert_eq!(default_value.as_deref(), Some("1"));
     assert!(table_sql.contains("CHECK (managed_config_version IN (1,2))"));
@@ -354,7 +354,7 @@ async fn schema_v8_failed_migration_rolls_back_then_reruns() {
         connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'target_compatibility'", [], |row| row.get::<_, i64>(0)).unwrap(),
         connection.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'reconciliation_intents'", [], |row| row.get::<_, i64>(0)).unwrap(),
     );
-    assert_eq!(rerun, ("15".into(), 1, 1));
+    assert_eq!(rerun, ("16".into(), 1, 1));
 }
 
 fn v7_projection_fingerprint(connection: &Connection) -> Vec<u64> {
@@ -454,7 +454,7 @@ async fn schema_v9_migrates_real_v8_state_and_adds_universal_provider_tables() {
         })
         .unwrap();
 
-    assert_eq!(version, "15");
+    assert_eq!(version, "16");
     assert_eq!(present, [1, 1, 1, 1, 1, 1]);
     assert_eq!(catalog_state, (0, 0));
     assert_eq!(foreign_key_failures, 0);
@@ -510,7 +510,7 @@ async fn schema_v9_failed_migration_rolls_back_all_catalog_changes_then_reruns()
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(rerun, ("15".to_owned(), 2, 1));
+    assert_eq!(rerun, ("16".to_owned(), 2, 1));
 }
 
 fn upgrade_v8_fixture_to_v9(connection: &Connection) {
@@ -746,7 +746,7 @@ async fn schema_v10_migrates_v9_current_snapshot_into_one_member_plan() {
         )
         .unwrap();
 
-    assert_eq!(version, "15");
+    assert_eq!(version, "16");
     assert_eq!(present, [1, 1, 1, 1, 1]);
     assert_eq!(
         drafts,
@@ -940,7 +940,7 @@ async fn schema_v10_failed_migration_rolls_back_then_reruns() {
         )
         .unwrap();
     assert!(
-        rerun == ("15".into(), 1, 1),
+        rerun == ("16".into(), 1, 1),
         "migration rerun was incomplete"
     );
 }
@@ -971,7 +971,7 @@ async fn schema_v10_fresh_store_has_two_empty_drafts_and_no_active_plan() {
         )
         .unwrap();
     assert!(
-        state == ("15".into(), 2, 0, 0, 0),
+        state == ("16".into(), 2, 0, 0, 0),
         "fresh route-plan state was not empty"
     );
     let foreign_key_failures: i64 = connection
@@ -1019,6 +1019,14 @@ async fn schema_v11_migrates_v10_without_changing_existing_provider_state() {
              DROP TRIGGER IF EXISTS pricing_snapshots_immutable;
              DROP TABLE IF EXISTS pricing_snapshots;
              DROP TABLE IF EXISTS request_records;
+             ALTER TABLE providers DROP COLUMN import_configuration_fingerprint;
+             ALTER TABLE providers DROP COLUMN import_source_identifier;
+             ALTER TABLE providers DROP COLUMN import_source_target;
+             ALTER TABLE providers DROP COLUMN import_source_product;
+             ALTER TABLE universal_providers DROP COLUMN import_configuration_fingerprint;
+             ALTER TABLE universal_providers DROP COLUMN import_source_identifier;
+             ALTER TABLE universal_providers DROP COLUMN import_source_target;
+             ALTER TABLE universal_providers DROP COLUMN import_source_product;
              UPDATE metadata SET value = '10' WHERE key = 'schema-version';",
         )
         .unwrap();
@@ -1071,7 +1079,7 @@ async fn schema_v11_migrates_v10_without_changing_existing_provider_state() {
         )
         .unwrap();
     assert!(
-        migrated == ("15".into(), 1, 0, 0, 0, 0),
+        migrated == ("16".into(), 1, 0, 0, 0, 0),
         "schema v11 subscription state was incomplete"
     );
     assert!(
@@ -1170,7 +1178,16 @@ async fn schema_v12_migrates_real_v11_provider_state_and_widens_only_bridge_colu
                CHECK ((binding_kind = 'fixed' AND account_id IS NOT NULL AND length(account_id) > 0)
                   OR (binding_kind = 'follow-default' AND account_id IS NULL)),
                PRIMARY KEY (target, provider_id));
-             INSERT INTO providers_v11 SELECT * FROM providers;
+             INSERT INTO providers_v11
+               (id, target, position, provider_revision, name, base_url, model, protocol,
+                authentication, credential_id, provenance_kind, provenance_key,
+                generated_owner_id, routing_requirement, generated_source_revision,
+                generated_overlay_revision)
+             SELECT id, target, position, provider_revision, name, base_url, model, protocol,
+                    authentication, credential_id, provenance_kind, provenance_key,
+                    generated_owner_id, routing_requirement, generated_source_revision,
+                    generated_overlay_revision
+             FROM providers;
              INSERT INTO activated_snapshots_v11 SELECT * FROM activated_snapshots;
              INSERT INTO activated_route_plan_members_v11 SELECT * FROM activated_route_plan_members;
              INSERT INTO subscription_provider_bindings_v11 SELECT * FROM subscription_provider_bindings;
@@ -1196,6 +1213,10 @@ async fn schema_v12_migrates_real_v11_provider_state_and_widens_only_bridge_colu
              DROP TRIGGER IF EXISTS pricing_snapshots_immutable;
              DROP TABLE IF EXISTS pricing_snapshots;
              DROP TABLE IF EXISTS request_records;
+             ALTER TABLE universal_providers DROP COLUMN import_configuration_fingerprint;
+             ALTER TABLE universal_providers DROP COLUMN import_source_identifier;
+             ALTER TABLE universal_providers DROP COLUMN import_source_target;
+             ALTER TABLE universal_providers DROP COLUMN import_source_product;
              UPDATE metadata SET value = '11' WHERE key = 'schema-version';",
         )
         .unwrap();
@@ -1223,7 +1244,7 @@ async fn schema_v12_migrates_real_v11_provider_state_and_widens_only_bridge_colu
         )
         .unwrap();
     assert!(
-        shape.0 == "15" && shape.1 == 1 && shape.2 > 0 && shape.3 == 0,
+        shape.0 == "16" && shape.1 == 1 && shape.2 > 0 && shape.3 == 0,
         "schema v12 Bridge shape was incomplete"
     );
 }
@@ -1371,7 +1392,7 @@ async fn schema_v7_migrates_real_v5_claude_states_and_binds_the_unique_committed
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "15"
+            "16"
         );
         let route: (
             i64,
@@ -1765,7 +1786,7 @@ async fn schema_v7_does_not_guess_between_multiple_legacy_committed_intents() {
         .unwrap();
     assert_eq!(
         migrated,
-        ("15".to_owned(), None, "recovery-required".to_owned())
+        ("16".to_owned(), None, "recovery-required".to_owned())
     );
 }
 
@@ -2300,7 +2321,7 @@ async fn v1_database_migrates_provider_identity_order_credential_and_active_stat
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "15");
+    assert_eq!(schema_version, "16");
     assert_eq!(
         view.providers[0].id,
         Uuid::parse_str(existing_provider_id).unwrap()
@@ -2530,7 +2551,7 @@ async fn schema_v4_migrates_v2_routing_requirement_and_historical_receipts() {
         })
         .await
         .unwrap();
-    assert_eq!(schema_version, "15");
+    assert_eq!(schema_version, "16");
     assert_eq!(
         store.target_view().await.unwrap().providers[0].routing_requirement,
         ProviderRoutingRequirement::DirectCompatible

@@ -127,7 +127,13 @@ export function UniversalProviderPicker(props: UniversalProviderPickerProps) {
       <For each={props.providers()}>{(provider) => {
         const active = () => provider.id === selected()?.id
         return <text fg={active() ? theme.background : theme.text} bg={active() ? theme.primary : theme.panel}>
-          {`${provider.name} · ${props.t(provider.credential === "present" ? "provider.credential.present" : "provider.credential.absent")}`}
+          {`${provider.name} · ${props.t(provider.credential === "present" ? "provider.credential.present" : "provider.credential.absent")}${provider.importProvenance
+            ? ` · ${props.t("provider.import-origin", {
+              product: provider.importProvenance.sourceProduct,
+              target: provider.importProvenance.sourceTarget,
+              identifier: provider.importProvenance.sourceIdentifier,
+            })}`
+            : ""}`}
         </text>
       }}</For>
     </box>

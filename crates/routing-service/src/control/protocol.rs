@@ -1722,7 +1722,18 @@ pub struct UniversalProviderView {
     pub base_url: String,
     pub credential: CredentialPresence,
     pub provenance: Option<ProviderProvenanceView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_provenance: Option<ImportProvenanceView>,
     pub targets: Vec<UniversalProviderTargetView>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImportProvenanceView {
+    pub source_product: ProviderImportProduct,
+    pub source_target: ProviderImportSourceTarget,
+    pub source_identifier: String,
+    pub configuration_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -2008,6 +2019,10 @@ pub struct ProviderView {
     pub completeness: ProviderCompleteness,
     pub missing_fields: Vec<ProviderRequirement>,
     pub provenance: Option<ProviderProvenanceView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_provenance: Option<ImportProvenanceView>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub imported_current: bool,
     pub generated: bool,
     #[serde(default)]
     pub universal_provider_id: Option<Uuid>,
@@ -2018,6 +2033,10 @@ pub struct ProviderView {
     #[serde(default)]
     pub route_health: RouteHealthView,
     pub active_references: Vec<ProviderReferenceView>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]

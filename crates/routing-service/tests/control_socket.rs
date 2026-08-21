@@ -8175,6 +8175,53 @@ async fn provider_transfer_preview_and_export_are_target_scoped_and_secret_free_
     );
     assert!(!preview.to_string().contains(SECRET));
 
+    let preview_token = preview["result"]["preview"]["previewToken"]
+        .as_str()
+        .unwrap();
+    let candidate_id = preview["result"]["preview"]["candidates"][0]["candidateId"]
+        .as_str()
+        .unwrap();
+    let confirmed = request(
+        &mut stream,
+        "confirm-provider-transfer",
+        json!({
+            "kind": "confirm-provider-import",
+            "target": "codex",
+            "previewToken": preview_token,
+            "choices": [{
+                "candidateId": candidate_id,
+                "resolution": { "kind": "create" }
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(confirmed["type"], "response");
+    assert_eq!(confirmed["result"]["kind"], "provider-import-outcome");
+    assert_eq!(
+        confirmed["result"]["outcome"]["records"][0]["resolution"],
+        "created"
+    );
+    let provider_id = confirmed["result"]["outcome"]["records"][0]["providerId"]
+        .as_str()
+        .unwrap();
+    let push = read_frame(&mut stream).await.unwrap();
+    assert_eq!(push["type"], "target-view");
+    assert_eq!(push["view"]["providers"][0]["id"], provider_id);
+    assert_eq!(
+        push["view"]["providers"][0]["importProvenance"]["sourceProduct"],
+        "cc-switch"
+    );
+    assert_eq!(
+        push["view"]["providers"][0]["importProvenance"]["sourceTarget"],
+        "codex"
+    );
+    assert_eq!(push["view"]["providers"][0]["importedCurrent"], Value::Null);
+    assert!(!confirmed.to_string().contains(SECRET));
+    assert!(!push.to_string().contains(SECRET));
+    let persisted = fixture.store.target_view_for(Target::Codex).await.unwrap();
+    assert_eq!(persisted.providers[0].id.to_string(), provider_id);
+    assert_eq!(persisted.current_provider_id, None);
+
     let export = request(
         &mut stream,
         "export-provider-transfer",
@@ -8204,7 +8251,7 @@ async fn provider_transfer_preview_and_export_are_target_scoped_and_secret_free_
     )
     .await;
     assert_eq!(rejected["type"], "error");
-    assert_eq!(rejected["problem"]["code"], "provider-import-rejected");
+    assert_eq!(rejected["problem"]["code"], "duplicate-provider-import");
     assert!(!rejected.to_string().contains(SECRET));
 
     fixture.shutdown().await;

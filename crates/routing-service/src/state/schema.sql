@@ -28,6 +28,29 @@ CREATE TABLE IF NOT EXISTS providers (
     CHECK (routing_requirement IN ('direct-compatible', 'takeover-required')),
   generated_source_revision INTEGER CHECK (generated_source_revision IS NULL OR generated_source_revision >= 1),
   generated_overlay_revision INTEGER CHECK (generated_overlay_revision IS NULL OR generated_overlay_revision >= 1),
+  import_source_product TEXT
+    CHECK (import_source_product IS NULL OR import_source_product IN ('target-cli', 'cc-switch', 'muxvia')),
+  import_source_target TEXT
+    CHECK (
+      (import_source_target IS NULL) = (import_source_product IS NULL)
+      AND (import_source_target IS NULL OR import_source_target IN ('codex', 'claude', 'universal'))
+    ),
+  import_source_identifier TEXT
+    CHECK (
+      (import_source_identifier IS NULL) = (import_source_product IS NULL)
+      AND (import_source_identifier IS NULL OR length(import_source_identifier) BETWEEN 1 AND 256)
+    ),
+  import_configuration_fingerprint TEXT
+    CHECK (
+      (import_configuration_fingerprint IS NULL) = (import_source_product IS NULL)
+      AND (
+        import_configuration_fingerprint IS NULL
+        OR (
+          length(import_configuration_fingerprint) = 64
+          AND import_configuration_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      )
+    ),
   CHECK (
     (target = 'codex' AND protocol = 'openai-responses' AND authentication = 'openai-bearer')
     OR (target = 'claude' AND protocol = 'anthropic-messages' AND authentication IN ('anthropic-api-key', 'anthropic-bearer', 'codex-subscription'))
@@ -67,6 +90,29 @@ CREATE TABLE IF NOT EXISTS universal_providers (
   credential_id TEXT REFERENCES universal_credentials(id),
   provenance_kind TEXT,
   provenance_key TEXT,
+  import_source_product TEXT
+    CHECK (import_source_product IS NULL OR import_source_product IN ('target-cli', 'cc-switch', 'muxvia')),
+  import_source_target TEXT
+    CHECK (
+      (import_source_target IS NULL) = (import_source_product IS NULL)
+      AND (import_source_target IS NULL OR import_source_target IN ('codex', 'claude', 'universal'))
+    ),
+  import_source_identifier TEXT
+    CHECK (
+      (import_source_identifier IS NULL) = (import_source_product IS NULL)
+      AND (import_source_identifier IS NULL OR length(import_source_identifier) BETWEEN 1 AND 256)
+    ),
+  import_configuration_fingerprint TEXT
+    CHECK (
+      (import_configuration_fingerprint IS NULL) = (import_source_product IS NULL)
+      AND (
+        import_configuration_fingerprint IS NULL
+        OR (
+          length(import_configuration_fingerprint) = 64
+          AND import_configuration_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+      )
+    ),
   CHECK (
     (provenance_kind IS NULL AND provenance_key IS NULL)
     OR (provenance_kind IS NOT NULL AND provenance_key IS NOT NULL)
@@ -492,7 +538,7 @@ INSERT OR IGNORE INTO subscription_account_catalog_state
   (singleton, revision, view_sequence, recovery_state)
 VALUES (1, 0, 0, 'clean');
 
-INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '15');
+INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '16');
 INSERT OR IGNORE INTO usage_settings (singleton, detailed_retention_days) VALUES (1, 30);
 INSERT OR IGNORE INTO universal_provider_catalog_state (
   singleton, revision, view_sequence

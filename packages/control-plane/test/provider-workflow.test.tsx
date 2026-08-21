@@ -772,6 +772,13 @@ test("/providers renders provenance kinds and generated state with secret-free s
     id: "00000000-0000-4000-8000-000000000011",
     name: "Generated Provider",
     provenance: { kind: "universal-provider", key: "00000000-0000-4000-8000-000000000010" },
+    importProvenance: {
+      sourceProduct: "target-cli",
+      sourceTarget: "codex",
+      sourceIdentifier: "config.toml:profile.current",
+      configurationFingerprint: "a".repeat(64),
+    },
+    importedCurrent: true,
     generated: true,
     activeReferences: ["current", "activated-snapshot"],
   })
@@ -804,7 +811,7 @@ test("/providers renders provenance kinds and generated state with secret-free s
       epoch: "00000000-0000-4000-8000-000000000003",
     },
   }))
-  const setup = await testRender(() => <App session={session} />, { width: 80, height: 24, useThread: false, kittyKeyboard: true })
+  const setup = await testRender(() => <App session={session} />, { width: 100, height: 30, useThread: false, kittyKeyboard: true })
   try {
     await setup.renderOnce()
     setup.mockInput.pressKey("1")
@@ -821,6 +828,8 @@ test("/providers renders provenance kinds and generated state with secret-free s
     expect(frame).toContain("Preset")
     expect(frame).toContain("Ordinary")
     expect(frame).toContain("Other provenance")
+    expect(frame).toContain("Imported Current")
+    expect(frame).toContain("target-cli/codex · config.toml:profile.current")
     expect(frame).toContain("Generated")
     expect(frame).toContain("Credential Reference present")
     expect(frame).toContain("Current")
@@ -1291,7 +1300,19 @@ test("Preset source selection copies an ordinary draft without discovery and sav
 })
 
 test("either Target opens one shared Universal Provider catalog with dual synchronization rails", async () => {
-  const catalog = new MemoryUniversalProviderSession(universalCatalog())
+  const initialCatalog = universalCatalog()
+  const catalog = new MemoryUniversalProviderSession({
+    ...initialCatalog,
+    providers: initialCatalog.providers.map((provider) => ({
+      ...provider,
+      importProvenance: {
+        sourceProduct: "muxvia" as const,
+        sourceTarget: "universal" as const,
+        sourceIdentifier: "00000000-0000-4000-8000-000000000099",
+        configurationFingerprint: "b".repeat(64),
+      },
+    })),
+  })
   const codex = new MemoryTargetSession(view())
   const claude = new MemoryTargetSession(view({ target: "claude" }))
   const setup = await testRender(() => <App
@@ -1306,6 +1327,8 @@ test("either Target opens one shared Universal Provider catalog with dual synchr
       setup.mockInput.pressEnter()
       const frame = await setup.waitForFrame((next) => next.includes("Shared Frontier"))
       expect(frame).toContain("Universal Providers")
+      expect(frame).toContain("Shared Frontier · Present · From muxvia/universal")
+      expect(frame).toContain("00000000-0000-4000-8000-000000000099")
       expect(frame).toContain("Codex CLI · Current")
       expect(frame).toContain("Claude Code · Pending")
       setup.mockInput.pressEscape()

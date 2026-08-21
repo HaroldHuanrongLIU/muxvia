@@ -587,6 +587,7 @@
         "baseUrl": { "type": "string" },
         "credential": { "enum": ["present", "missing"] },
         "provenance": { "type": ["object", "null"], "properties": { "kind": { "type": "string" }, "key": { "type": "string" } }, "required": ["kind", "key"] },
+        "importProvenance": { "$ref": "#/$defs/importProvenance" },
         "targets": { "type": "array", "items": { "$ref": "#/$defs/universalProviderTarget" } }
       },
       "required": ["id", "position", "providerRevision", "name", "baseUrl", "credential", "provenance", "targets"]
@@ -831,6 +832,8 @@
         "completeness": { "enum": ["complete", "incomplete"] },
         "missingFields": { "type": "array", "items": { "enum": ["base-url", "model", "credential", "subscription-account-binding"] } },
         "provenance": { "type": ["object", "null"] },
+        "importProvenance": { "$ref": "#/$defs/importProvenance" },
+        "importedCurrent": { "type": "boolean" },
         "generated": { "type": "boolean" },
         "universalProviderId": { "type": ["string", "null"], "format": "uuid" },
         "synchronization": { "oneOf": [{ "enum": ["current", "pending"] }, { "type": "null" }] },
@@ -852,6 +855,17 @@
         "activeReferences": { "type": "array", "items": { "enum": ["current", "activated-snapshot", "activated-route-plan"] } }
       },
       "required": ["id", "position", "providerRevision", "name", "baseUrl", "model", "protocol", "authentication", "routingRequirement", "credential", "completeness", "missingFields", "provenance", "generated", "universalProviderId", "synchronization", "ownership", "routeHealth", "activeReferences"]
+    },
+    "importProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sourceProduct": { "enum": ["target-cli", "cc-switch", "muxvia"] },
+        "sourceTarget": { "enum": ["codex", "claude", "universal"] },
+        "sourceIdentifier": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "configurationFingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      },
+      "required": ["sourceProduct", "sourceTarget", "sourceIdentifier", "configurationFingerprint"]
     },
     "providerFieldOwner": {
       "enum": ["target-provider", "universal-provider", "target-overlay", "target-fixed"]

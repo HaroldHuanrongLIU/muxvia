@@ -214,6 +214,8 @@ export const zhCN = {
   "provider.provenance.ordinary": "普通",
   "provider.provenance.universal-provider": "通用 Provider",
   "provider.provenance.other": "其他来源",
+  "provider.imported-current": "已导入的当前配置",
+  "provider.import-origin": "来源 {product}/{target} · {identifier}",
   "provider.generated": "已生成",
   "generated-provider.lifecycle": "由其通用 Provider 管理 · 复制可解除绑定",
   "generated-provider.editor.title": "生成 Provider Target Overlay",

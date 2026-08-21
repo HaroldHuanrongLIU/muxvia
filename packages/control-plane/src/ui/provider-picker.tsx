@@ -132,6 +132,13 @@ export function ProviderPicker(props: ProviderPickerProps) {
     setKeyCapture(value)
   }
   const provenance = (provider: Provider) => {
+    if (provider.importProvenance) {
+      return props.t("provider.import-origin", {
+        product: provider.importProvenance.sourceProduct,
+        target: provider.importProvenance.sourceTarget,
+        identifier: provider.importProvenance.sourceIdentifier,
+      })
+    }
     switch (provider.provenance?.kind) {
       case undefined: return props.t("provider.provenance.ordinary")
       case "preset": return props.t("provider.provenance.preset")
@@ -185,7 +192,7 @@ export function ProviderPicker(props: ProviderPickerProps) {
       <For each={props.providers()}>{(provider) => {
         const active = () => provider.id === selected()?.id
         return <text fg={active() ? theme.background : theme.text} bg={active() ? theme.primary : theme.panel}>
-          {`${provider.name} · ${props.t(provider.completeness === "complete" ? "provider.complete" : "provider.incomplete")} · ${provenance(provider)}`}
+          {`${provider.importedCurrent ? `${props.t("provider.imported-current")} · ` : ""}${provider.name} · ${props.t(provider.completeness === "complete" ? "provider.complete" : "provider.incomplete")} · ${provenance(provider)}`}
         </text>
       }}</For>
     </box>

@@ -559,6 +559,13 @@ test("round-trips schema-v3 Provider declarations, Presets, and credential inten
     completeness: "complete",
     missingFields: [],
     provenance: null,
+    importProvenance: {
+      sourceProduct: "target-cli",
+      sourceTarget: "codex",
+      sourceIdentifier: "config.toml:profile.current",
+      configurationFingerprint: "a".repeat(64),
+    },
+    importedCurrent: true,
     generated: false,
     universalProviderId: null,
     synchronization: null,
@@ -595,6 +602,25 @@ test("round-trips schema-v3 Provider declarations, Presets, and credential inten
     problems: [],
   } satisfies TargetView
   expect(parseTargetView(view)).toEqual(view)
+
+  expect(() => parseTargetView({
+    ...view,
+    providers: [{
+      ...provider,
+      importProvenance: { ...provider.importProvenance, additiveSecret: "must-not-pass" },
+    }],
+  })).toThrow()
+  expect(() => parseTargetView({
+    ...view,
+    providers: [{
+      ...provider,
+      importProvenance: {
+        sourceProduct: "target-cli",
+        sourceTarget: "codex",
+        sourceIdentifier: "config.toml:profile.current",
+      },
+    }],
+  })).toThrow()
 
   expect(parseTargetAction({
     kind: "create-provider",

@@ -212,6 +212,8 @@ export const en = {
   "provider.provenance.ordinary": "Ordinary",
   "provider.provenance.universal-provider": "Universal Provider",
   "provider.provenance.other": "Other provenance",
+  "provider.imported-current": "Imported Current",
+  "provider.import-origin": "From {product}/{target} · {identifier}",
   "provider.generated": "Generated",
   "generated-provider.lifecycle": "Managed by its Universal Provider · duplicate to detach",
   "generated-provider.editor.title": "Generated Provider Target Overlay",

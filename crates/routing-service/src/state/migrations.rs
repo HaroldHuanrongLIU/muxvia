@@ -14,7 +14,7 @@ use crate::control::protocol::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -38,7 +38,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
         .transpose()?;
 
     match version {
-        None | Some(SCHEMA_VERSION) | Some(14) | Some(13) => {}
+        None | Some(SCHEMA_VERSION) | Some(15) | Some(14) | Some(13) => {}
         Some(1) => {
             migrate_v1(connection)?;
             migrate_v2(connection)?;
@@ -147,8 +147,52 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
     if version.is_some_and(|version| version < 15) {
         migrate_v14(connection)?;
     }
+    if version.is_some_and(|version| version < 16) {
+        migrate_v15(connection)?;
+    }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v15(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for table in ["providers", "universal_providers"] {
+        transaction.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN import_source_product TEXT
+               CHECK (import_source_product IS NULL OR import_source_product IN ('target-cli', 'cc-switch', 'muxvia'));
+             ALTER TABLE {table} ADD COLUMN import_source_target TEXT
+               CHECK (
+                 (import_source_target IS NULL) = (import_source_product IS NULL)
+                 AND (import_source_target IS NULL OR import_source_target IN ('codex', 'claude', 'universal'))
+               );
+             ALTER TABLE {table} ADD COLUMN import_source_identifier TEXT
+               CHECK (
+                 (import_source_identifier IS NULL) = (import_source_product IS NULL)
+                 AND (import_source_identifier IS NULL OR length(import_source_identifier) BETWEEN 1 AND 256)
+               );
+             ALTER TABLE {table} ADD COLUMN import_configuration_fingerprint TEXT
+               CHECK (
+                 (import_configuration_fingerprint IS NULL) = (import_source_product IS NULL)
+                 AND (
+                   import_configuration_fingerprint IS NULL
+                   OR (
+                     length(import_configuration_fingerprint) = 64
+                     AND import_configuration_fingerprint NOT GLOB '*[^0-9a-f]*'
+                   )
+                 )
+               );"
+        ))?;
+    }
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.execute(
+        "UPDATE metadata SET value = '16' WHERE key = 'schema-version'",
+        [],
+    )?;
+    transaction.commit()
 }
 
 fn migrate_v14(connection: &mut Connection) -> Result<()> {
@@ -1512,6 +1556,8 @@ impl LegacyV2ProviderView {
             completeness: self.completeness,
             missing_fields: self.missing_fields,
             provenance: self.provenance,
+            import_provenance: None,
+            imported_current: false,
             generated: self.generated,
             universal_provider_id: None,
             synchronization: None,
@@ -1652,6 +1698,8 @@ impl LegacyV3ProviderView {
             completeness: self.completeness,
             missing_fields: self.missing_fields,
             provenance: self.provenance,
+            import_provenance: None,
+            imported_current: false,
             generated: self.generated,
             universal_provider_id: None,
             synchronization: None,

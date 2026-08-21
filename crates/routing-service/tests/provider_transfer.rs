@@ -3,7 +3,8 @@ use std::{path::PathBuf, sync::Arc};
 use muxvia_routing::{
     control::protocol::{
         ProviderImportCandidateView, ProviderImportChoice, ProviderImportProduct,
-        ProviderImportResolution, ProviderImportSource, ProviderImportSourceTarget, Target,
+        ProviderImportRecordResolution, ProviderImportRecordView, ProviderImportResolution,
+        ProviderImportSource, ProviderImportSourceTarget, Target,
     },
     home::MuxviaHome,
     service::provider_transfer::{ProviderTransferError, ProviderTransferService},
@@ -167,6 +168,136 @@ async fn exact_existing_confirmation_is_one_shot_identity_safe_and_does_not_muta
 }
 
 #[tokio::test]
+async fn exact_existing_confirmation_revalidates_the_match_inside_the_commit_transaction() {
+    let (_root, _user_home, store, transfer) = fixture().await;
+    let initial = store.target_view_for(Target::Codex).await.unwrap();
+    let saved = store
+        .apply_provider_action_for(
+            Target::Codex,
+            Uuid::new_v4(),
+            initial.management_revision,
+            serde_json::json!({
+                "kind": "create-provider",
+                "name": "Initially Exact",
+                "baseUrl": "https://revalidate.example/v1",
+                "model": "gpt-before",
+                "credential": { "kind": "replace", "value": "revalidate-secret" },
+                "authentication": "openai-bearer",
+                "presetKey": null
+            }),
+        )
+        .await
+        .unwrap();
+    let existing = saved.view.providers[0].clone();
+    let preview = transfer
+        .preview(
+            Target::Codex,
+            ProviderImportSource::CcSwitch {
+                payload: "ccswitch://v1/import?resource=provider&app=codex&name=Previewed&endpoint=https%3A%2F%2Frevalidate.example%2Fv1&apiKey=revalidate-secret&model=gpt-before".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let candidate_id = match preview.candidates[0] {
+        ProviderImportCandidateView::TargetProvider { candidate_id, .. } => candidate_id,
+        _ => panic!("expected Target Provider candidate"),
+    };
+    let changed = store
+        .apply_provider_action_for(
+            Target::Codex,
+            Uuid::new_v4(),
+            saved.view.management_revision,
+            serde_json::json!({
+                "kind": "update-provider",
+                "providerId": existing.id,
+                "providerRevision": existing.provider_revision,
+                "name": existing.name,
+                "baseUrl": existing.base_url,
+                "model": "gpt-after",
+                "credential": { "kind": "keep" },
+                "authentication": "openai-bearer"
+            }),
+        )
+        .await
+        .unwrap();
+
+    let error = transfer
+        .confirm(
+            Target::Codex,
+            preview.preview_token,
+            vec![ProviderImportChoice {
+                candidate_id,
+                resolution: ProviderImportResolution::UseExisting {
+                    provider_id: existing.id,
+                },
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProviderTransferError::InvalidChoice));
+    let after = store.target_view_for(Target::Codex).await.unwrap();
+    assert_eq!(after.management_revision, changed.view.management_revision);
+    assert_eq!(after.providers, changed.view.providers);
+}
+
+#[tokio::test]
+async fn duplicate_and_unknown_confirmation_choices_are_one_shot_and_write_nothing() {
+    let (_root, _user_home, store, transfer) = fixture().await;
+    let before = store.target_view_for(Target::Codex).await.unwrap();
+    let source = || {
+        ProviderImportSource::CcSwitch {
+        payload: "ccswitch://v1/import?resource=provider&app=codex&name=Invalid+Choice&endpoint=https%3A%2F%2Finvalid-choice.example%2Fv1&model=gpt-invalid-choice".to_owned(),
+    }
+    };
+    let duplicate_preview = transfer.preview(Target::Codex, source()).await.unwrap();
+    let candidate_id = match duplicate_preview.candidates[0] {
+        ProviderImportCandidateView::TargetProvider { candidate_id, .. } => candidate_id,
+        _ => panic!("expected Target Provider candidate"),
+    };
+    let duplicate_choice = ProviderImportChoice {
+        candidate_id,
+        resolution: ProviderImportResolution::Create,
+    };
+
+    let error = transfer
+        .confirm(
+            Target::Codex,
+            duplicate_preview.preview_token,
+            vec![duplicate_choice.clone(), duplicate_choice.clone()],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProviderTransferError::InvalidChoice));
+    let replay = transfer
+        .confirm(
+            Target::Codex,
+            duplicate_preview.preview_token,
+            vec![duplicate_choice],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(replay, ProviderTransferError::PreviewExpired));
+
+    let unknown_preview = transfer.preview(Target::Codex, source()).await.unwrap();
+    let error = transfer
+        .confirm(
+            Target::Codex,
+            unknown_preview.preview_token,
+            vec![ProviderImportChoice {
+                candidate_id: Uuid::new_v4(),
+                resolution: ProviderImportResolution::Create,
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProviderTransferError::InvalidChoice));
+
+    let after = store.target_view_for(Target::Codex).await.unwrap();
+    assert_eq!(after.management_revision, before.management_revision);
+    assert_eq!(after.providers, before.providers);
+}
+
+#[tokio::test]
 async fn live_target_preview_marks_a_distinct_configuration_as_imported_current_without_rewrite() {
     let (_root, user_home, store, transfer) = fixture().await;
     let configuration_home = user_home.join(".codex");
@@ -219,6 +350,86 @@ supports_websockets = false
     assert_eq!(after.management_revision, before.management_revision);
     assert_eq!(after.current_provider_id, before.current_provider_id);
     assert!(after.providers.is_empty());
+}
+
+#[tokio::test]
+async fn live_target_confirmation_creates_a_fresh_imported_current_with_complete_provenance_without_rewrite()
+ {
+    let (_root, user_home, store, transfer) = fixture().await;
+    let configuration_home = user_home.join(".codex");
+    std::fs::create_dir(&configuration_home).unwrap();
+    let path = configuration_home.join("config.toml");
+    let live = r#"model = "gpt-live-created"
+model_provider = "operator-live-created"
+
+[model_providers.operator-live-created]
+name = "Operator Live Created"
+base_url = "https://live-created.example/v1/"
+wire_api = "responses"
+http_headers = { Authorization = "Bearer live-created-secret-must-not-escape" }
+supports_websockets = false
+"#;
+    std::fs::write(&path, live).unwrap();
+    let before = store.target_view_for(Target::Codex).await.unwrap();
+    let preview = transfer
+        .preview(Target::Codex, ProviderImportSource::LiveTarget)
+        .await
+        .unwrap();
+    let candidate_id = match preview.candidates[0] {
+        ProviderImportCandidateView::TargetProvider { candidate_id, .. } => candidate_id,
+        _ => panic!("expected Target Provider candidate"),
+    };
+
+    let outcome = transfer
+        .confirm(
+            Target::Codex,
+            preview.preview_token,
+            vec![ProviderImportChoice {
+                candidate_id,
+                resolution: ProviderImportResolution::Create,
+            }],
+        )
+        .await
+        .unwrap();
+
+    let [
+        ProviderImportRecordView::TargetProvider {
+            resolution,
+            provider_id,
+            ..
+        },
+    ] = outcome.records.as_slice()
+    else {
+        panic!("expected one created Target Provider record")
+    };
+    assert_eq!(*resolution, ProviderImportRecordResolution::Created);
+    assert_ne!(*provider_id, candidate_id);
+    let after = store.target_view_for(Target::Codex).await.unwrap();
+    assert_eq!(after.current_provider_id, before.current_provider_id);
+    assert_eq!(after.serving_provider_id, before.serving_provider_id);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), live);
+    let imported = after
+        .providers
+        .iter()
+        .find(|provider| provider.id == *provider_id)
+        .unwrap();
+    assert!(imported.imported_current);
+    let provenance = imported.import_provenance.as_ref().unwrap();
+    assert_eq!(provenance.source_product, ProviderImportProduct::TargetCli);
+    assert_eq!(provenance.source_target, ProviderImportSourceTarget::Codex);
+    assert_eq!(provenance.source_identifier, "operator-live-created");
+    assert_eq!(provenance.configuration_fingerprint.len(), 64);
+    assert!(
+        provenance
+            .configuration_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    assert!(
+        !serde_json::to_string(&after)
+            .unwrap()
+            .contains("live-created-secret-must-not-escape")
+    );
 }
 
 #[tokio::test]
@@ -417,6 +628,241 @@ async fn muxvia_export_preview_normalizes_redacted_universal_and_target_declarat
 }
 
 #[tokio::test]
+async fn muxvia_export_confirmation_round_trips_ordering_models_ownership_failover_and_provenance_with_fresh_ids()
+ {
+    let (_root, _user_home, store, transfer) = fixture().await;
+    let preview = transfer
+        .preview(
+            Target::Codex,
+            ProviderImportSource::MuxviaExport {
+                payload: serde_json::to_string(&muxvia_export_value()).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    let choices = preview
+        .candidates
+        .iter()
+        .map(|candidate| ProviderImportChoice {
+            candidate_id: match candidate {
+                ProviderImportCandidateView::TargetProvider { candidate_id, .. }
+                | ProviderImportCandidateView::UniversalProvider { candidate_id, .. } => {
+                    *candidate_id
+                }
+            },
+            resolution: ProviderImportResolution::Create,
+        })
+        .collect();
+
+    let outcome = transfer
+        .confirm(Target::Codex, preview.preview_token, choices)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.records.len(), 2);
+    let catalog = store.universal_provider_catalog().await.unwrap();
+    let codex = store.target_view_for(Target::Codex).await.unwrap();
+    let claude = store.target_view_for(Target::Claude).await.unwrap();
+    assert_eq!(catalog.providers.len(), 1);
+    assert_eq!(codex.providers.len(), 1);
+    assert_eq!(claude.providers.len(), 1);
+    let universal = &catalog.providers[0];
+    assert_ne!(
+        universal.id,
+        Uuid::parse_str("40000000-0000-4000-8000-000000000001").unwrap()
+    );
+    assert_eq!(universal.position, 0);
+    assert_eq!(universal.name, "Shared Relay");
+    assert_eq!(universal.targets[0].model, "gpt-shared");
+    assert_eq!(universal.targets[1].model, "");
+    assert_eq!(
+        universal.import_provenance.as_ref().unwrap().source_product,
+        ProviderImportProduct::Muxvia
+    );
+    assert_eq!(
+        universal
+            .import_provenance
+            .as_ref()
+            .unwrap()
+            .source_identifier,
+        "40000000-0000-4000-8000-000000000001"
+    );
+    assert!(codex.providers[0].generated);
+    assert_eq!(codex.providers[0].universal_provider_id, Some(universal.id));
+    assert_eq!(codex.providers[0].model, "gpt-shared");
+    assert_eq!(claude.providers[0].name, "Claude Relay");
+    assert_eq!(claude.providers[0].model, "claude-exported");
+    assert_ne!(
+        claude.providers[0].id,
+        Uuid::parse_str("50000000-0000-4000-8000-000000000002").unwrap()
+    );
+    assert_eq!(
+        codex.failover.draft_members[0].provider_id,
+        codex.providers[0].id
+    );
+    assert_eq!(
+        claude.failover.draft_members[0].provider_id,
+        claude.providers[0].id
+    );
+
+    let exported = transfer.export().await.unwrap();
+    assert_eq!(exported.universal_providers.len(), 1);
+    assert_eq!(exported.target_providers.len(), 2);
+    assert_eq!(exported.universal_providers[0].position, 0);
+    assert_eq!(exported.target_providers[0].target, Target::Codex);
+    assert_eq!(exported.target_providers[0].position, 0);
+    assert_eq!(
+        exported.target_providers[0].universal_provider_source_id,
+        Some(exported.universal_providers[0].source_id)
+    );
+    assert_eq!(exported.target_providers[1].target, Target::Claude);
+    assert_eq!(exported.target_providers[1].position, 0);
+    assert_eq!(exported.target_providers[1].model, "claude-exported");
+    assert_eq!(
+        exported.failover_drafts[0].provider_source_ids,
+        vec![exported.target_providers[0].source_id]
+    );
+    assert_eq!(
+        exported.failover_drafts[1].provider_source_ids,
+        vec![exported.target_providers[1].source_id]
+    );
+    let serialized = serde_json::to_string(&exported).unwrap();
+    for forbidden in ["credential", "token", "routingCredential", "recovery"] {
+        assert!(
+            !serialized
+                .to_ascii_lowercase()
+                .contains(&forbidden.to_ascii_lowercase())
+        );
+    }
+
+    let first_universal_id = universal.id;
+    let first_codex_id = codex.providers[0].id;
+    let first_claude_id = claude.providers[0].id;
+    let second_preview = transfer
+        .preview(
+            Target::Codex,
+            ProviderImportSource::MuxviaExport {
+                payload: serde_json::to_string(&muxvia_export_value()).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    let second_choices = second_preview
+        .candidates
+        .iter()
+        .map(|candidate| ProviderImportChoice {
+            candidate_id: match candidate {
+                ProviderImportCandidateView::TargetProvider { candidate_id, .. }
+                | ProviderImportCandidateView::UniversalProvider { candidate_id, .. } => {
+                    *candidate_id
+                }
+            },
+            resolution: ProviderImportResolution::Create,
+        })
+        .collect();
+    transfer
+        .confirm(Target::Codex, second_preview.preview_token, second_choices)
+        .await
+        .unwrap();
+
+    let second_catalog = store.universal_provider_catalog().await.unwrap();
+    let second_codex = store.target_view_for(Target::Codex).await.unwrap();
+    let second_claude = store.target_view_for(Target::Claude).await.unwrap();
+    assert_eq!(second_catalog.providers.len(), 2);
+    assert_eq!(second_codex.providers.len(), 2);
+    assert_eq!(second_claude.providers.len(), 2);
+    assert_eq!(second_catalog.providers[1].position, 1);
+    assert_eq!(second_codex.providers[1].position, 1);
+    assert_eq!(second_claude.providers[1].position, 1);
+    assert_eq!(
+        second_catalog.providers[0].name,
+        second_catalog.providers[1].name
+    );
+    assert_eq!(
+        second_codex.providers[0].name,
+        second_codex.providers[1].name
+    );
+    assert_eq!(
+        second_claude.providers[0].name,
+        second_claude.providers[1].name
+    );
+    assert_ne!(second_catalog.providers[1].id, first_universal_id);
+    assert_ne!(second_codex.providers[1].id, first_codex_id);
+    assert_ne!(second_claude.providers[1].id, first_claude_id);
+}
+
+#[tokio::test]
+async fn confirmation_rolls_back_every_record_and_revision_when_a_late_provider_write_fails() {
+    let (_root, user_home, store, transfer) = fixture().await;
+    let preview = transfer
+        .preview(
+            Target::Codex,
+            ProviderImportSource::MuxviaExport {
+                payload: serde_json::to_string(&muxvia_export_value()).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    let choices = preview
+        .candidates
+        .iter()
+        .map(|candidate| ProviderImportChoice {
+            candidate_id: match candidate {
+                ProviderImportCandidateView::TargetProvider { candidate_id, .. }
+                | ProviderImportCandidateView::UniversalProvider { candidate_id, .. } => {
+                    *candidate_id
+                }
+            },
+            resolution: ProviderImportResolution::Create,
+        })
+        .collect();
+    let before_codex = store.target_view_for(Target::Codex).await.unwrap();
+    let before_claude = store.target_view_for(Target::Claude).await.unwrap();
+    let before_catalog = store.universal_provider_catalog().await.unwrap();
+    let database =
+        tokio_rusqlite::Connection::open(MuxviaHome::from_user_home(&user_home).database_path())
+            .await
+            .unwrap();
+    database
+        .call(|connection| {
+            connection.execute_batch(
+                "CREATE TRIGGER reject_late_provider_import
+                 BEFORE INSERT ON providers
+                 WHEN NEW.target = 'claude'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected-provider-import-failure');
+                 END;",
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+    let error = transfer
+        .confirm(Target::Codex, preview.preview_token, choices)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ProviderTransferError::State));
+    assert!(!format!("{error:?}").contains("injected-provider-import-failure"));
+    let after_codex = store.target_view_for(Target::Codex).await.unwrap();
+    let after_claude = store.target_view_for(Target::Claude).await.unwrap();
+    let after_catalog = store.universal_provider_catalog().await.unwrap();
+    assert_eq!(
+        after_codex.management_revision,
+        before_codex.management_revision
+    );
+    assert_eq!(after_codex.providers, before_codex.providers);
+    assert_eq!(
+        after_claude.management_revision,
+        before_claude.management_revision
+    );
+    assert_eq!(after_claude.providers, before_claude.providers);
+    assert_eq!(after_catalog.revision, before_catalog.revision);
+    assert_eq!(after_catalog.providers, before_catalog.providers);
+}
+
+#[tokio::test]
 async fn corrupt_oversized_duplicate_and_hostile_previews_fail_atomically_without_secret_echo() {
     let (_root, _user_home, store, transfer) = fixture().await;
     let before_codex = store.target_view_for(Target::Codex).await.unwrap();
@@ -458,7 +904,7 @@ async fn corrupt_oversized_duplicate_and_hostile_previews_fail_atomically_withou
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, ProviderTransferError::HostileImport));
+    assert!(matches!(error, ProviderTransferError::DuplicateImport));
 
     let mut duplicate_ids = muxvia_export_value();
     duplicate_ids["targetProviders"][1]["sourceId"] =
@@ -472,7 +918,7 @@ async fn corrupt_oversized_duplicate_and_hostile_previews_fail_atomically_withou
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, ProviderTransferError::HostileImport));
+    assert!(matches!(error, ProviderTransferError::DuplicateImport));
 
     let mut mismatched_generated_owner = muxvia_export_value();
     mismatched_generated_owner["targetProviders"][0]["model"] = "tampered".into();
@@ -522,6 +968,41 @@ async fn oversized_live_target_configuration_is_rejected_before_parsing_without_
 }
 
 #[tokio::test]
+async fn oversized_live_target_credential_is_rejected_without_mutation_or_echo() {
+    let (_root, user_home, store, transfer) = fixture().await;
+    let configuration_home = user_home.join(".codex");
+    std::fs::create_dir(&configuration_home).unwrap();
+    let oversized_secret = format!("LIVE_OVERSIZED_SECRET_{}", "x".repeat(16_384));
+    std::fs::write(
+        configuration_home.join("config.toml"),
+        format!(
+            r#"model = "gpt-live-oversized"
+model_provider = "oversized"
+[model_providers.oversized]
+name = "Oversized"
+base_url = "https://oversized.example/v1"
+wire_api = "responses"
+http_headers = {{ Authorization = "Bearer {oversized_secret}" }}
+supports_websockets = false
+"#
+        ),
+    )
+    .unwrap();
+    let before = store.target_view_for(Target::Codex).await.unwrap();
+
+    let error = transfer
+        .preview(Target::Codex, ProviderImportSource::LiveTarget)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ProviderTransferError::ImportTooLarge));
+    assert!(!format!("{error:?}").contains(&oversized_secret));
+    let after = store.target_view_for(Target::Codex).await.unwrap();
+    assert_eq!(after.management_revision, before.management_revision);
+    assert_eq!(after.providers, before.providers);
+}
+
+#[tokio::test]
 async fn equal_names_with_distinct_normalized_configurations_coexist_in_preview_but_duplicate_configurations_do_not()
  {
     let (_root, _user_home, _store, transfer) = fixture().await;
@@ -562,7 +1043,7 @@ async fn equal_names_with_distinct_normalized_configurations_coexist_in_preview_
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, ProviderTransferError::HostileImport));
+    assert!(matches!(error, ProviderTransferError::DuplicateImport));
 }
 
 #[tokio::test]
@@ -701,4 +1182,33 @@ async fn export_is_an_atomic_always_redacted_snapshot_that_round_trips_through_p
             exact_matches.is_empty()
         }
     }));
+}
+
+#[tokio::test]
+async fn export_fails_closed_when_serialized_nonsecret_data_matches_a_known_credential() {
+    const COLLIDING_SECRET: &str = "provider-export-redaction-\"collision-16001";
+    let (_root, _user_home, store, transfer) = fixture().await;
+    let before = store.target_view_for(Target::Codex).await.unwrap();
+    store
+        .apply_provider_action_for(
+            Target::Codex,
+            Uuid::new_v4(),
+            before.management_revision,
+            serde_json::json!({
+                "kind": "create-provider",
+                "name": COLLIDING_SECRET,
+                "baseUrl": "https://redaction-collision.example/v1",
+                "model": "gpt-redaction",
+                "credential": { "kind": "replace", "value": COLLIDING_SECRET },
+                "authentication": "openai-bearer",
+                "presetKey": null
+            }),
+        )
+        .await
+        .unwrap();
+
+    let error = transfer.export().await.unwrap_err();
+
+    assert!(matches!(error, ProviderTransferError::RedactionFailed));
+    assert!(!format!("{error:?}").contains(COLLIDING_SECRET));
 }

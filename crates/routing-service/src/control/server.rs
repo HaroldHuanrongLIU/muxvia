@@ -1516,23 +1516,38 @@ async fn serve_session(
                         }
                     }
                     ControlOperation::ConfirmProviderImport(operation) => {
-                        let frame = match provider_transfer
-                            .confirm(
+                        let result = provider_transfer
+                            .confirm_with_views(
                                 operation.target,
                                 operation.preview_token,
                                 operation.choices,
                             )
-                            .await
-                        {
-                            Ok(outcome) => ServerFrame::Response {
+                            .await;
+                        let (frame, universal_view, target_views) = match result {
+                            Ok(commit) => (ServerFrame::Response {
                                 request_id,
                                 result: ControlResult::ProviderImportOutcome(
-                                    ProviderImportOutcomeResult { outcome },
+                                    ProviderImportOutcomeResult {
+                                        outcome: commit.outcome,
+                                    },
                                 ),
-                            },
-                            Err(error) => provider_transfer_problem(request_id, error),
+                            }, commit.universal_view, commit.target_views),
+                            Err(error) => (
+                                provider_transfer_problem(request_id, error),
+                                None,
+                                Vec::new(),
+                            ),
                         };
-                        if !enqueue_response(&responses, frame) {
+                        if !enqueue_universal_provider_action_response(
+                            &responses,
+                            frame,
+                            universal_view,
+                            target_views,
+                            None,
+                            &store,
+                        )
+                        .await
+                        {
                             break 'session;
                         }
                     }
@@ -1955,25 +1970,33 @@ async fn serve_session(
 fn provider_transfer_problem(request_id: String, error: ProviderTransferError) -> ServerFrame {
     let (code, message) = match error {
         ProviderTransferError::InvalidImport => {
-            ("provider-import-invalid", "Provider import is invalid")
+            ("invalid-provider-import", "Provider import is invalid")
         }
         ProviderTransferError::ImportTooLarge => {
             ("provider-import-too-large", "Provider import is too large")
         }
+        ProviderTransferError::DuplicateImport => (
+            "duplicate-provider-import",
+            "Provider import contains duplicates",
+        ),
         ProviderTransferError::HostileImport => {
-            ("provider-import-rejected", "Provider import was rejected")
+            ("hostile-provider-import", "Provider import was rejected")
         }
         ProviderTransferError::PreviewExpired => (
-            "provider-import-preview-expired",
+            "stale-provider-import-preview",
             "Provider import preview expired",
         ),
         ProviderTransferError::InvalidChoice => (
-            "provider-import-choice-invalid",
+            "invalid-provider-import-choice",
             "Provider import choice is invalid",
         ),
         ProviderTransferError::SecretRejected => (
             "provider-import-secret-rejected",
             "Provider import contains a managed routing credential",
+        ),
+        ProviderTransferError::RedactionFailed => (
+            "provider-export-redaction-failed",
+            "Provider export redaction failed",
         ),
         ProviderTransferError::State => ("state-store-error", "State store unavailable"),
     };

@@ -3,10 +3,11 @@ use tokio_rusqlite::rusqlite::{Connection, OptionalExtension, Result};
 use crate::control::protocol::{
     ActivatedRoutePlanMemberView, ActivatedRoutePlanView, ActivatedSnapshotView,
     ClaudeBlockingSelector, ControlProblem, CredentialPresence, FailoverDraftMember, FailoverView,
-    ManagedConfigurationView, ProviderAuthentication, ProviderCompleteness,
-    ProviderFieldOwnershipView, ProviderProtocol, ProviderProvenanceView, ProviderReferenceView,
-    ProviderRequirement, ProviderRoutingRequirement, ProviderView, RecoveryView, RouteHealthState,
-    RouteHealthView, ServiceView, TakeoverView, Target, TargetView, UniversalSynchronizationState,
+    ImportProvenanceView, ManagedConfigurationView, ProviderAuthentication, ProviderCompleteness,
+    ProviderFieldOwnershipView, ProviderImportProduct, ProviderImportSourceTarget,
+    ProviderProtocol, ProviderProvenanceView, ProviderReferenceView, ProviderRequirement,
+    ProviderRoutingRequirement, ProviderView, RecoveryView, RouteHealthState, RouteHealthView,
+    ServiceView, TakeoverView, Target, TargetView, UniversalSynchronizationState,
 };
 use crate::domain::provider::has_valid_provider_declaration;
 use crate::state::providers::provider_presets;
@@ -88,7 +89,9 @@ pub(crate) fn project_target_view_for(
                       ON member.plan_id = r.active_route_plan_id
                     WHERE r.target = ?1 AND member.provider_id = p.id
                 ),
-                health.state, health.service_epoch
+                health.state, health.service_epoch,
+                p.import_source_product, p.import_source_target,
+                p.import_source_identifier, p.import_configuration_fingerprint
          FROM providers p
          LEFT JOIN universal_providers u ON u.id = p.generated_owner_id
          LEFT JOIN universal_provider_targets t
@@ -140,6 +143,8 @@ pub(crate) fn project_target_view_for(
                 (None, None) => None,
                 _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
             };
+            let import_provenance =
+                import_provenance(row.get(23)?, row.get(24)?, row.get(25)?, row.get(26)?)?;
             let mut active_references = Vec::new();
             if row.get(18)? {
                 active_references.push(ProviderReferenceView::Current);
@@ -217,6 +222,10 @@ pub(crate) fn project_target_view_for(
                 },
                 missing_fields,
                 provenance,
+                imported_current: import_provenance
+                    .as_ref()
+                    .is_some_and(|value| value.source_product == ProviderImportProduct::TargetCli),
+                import_provenance,
                 generated: generated_state.is_some(),
                 universal_provider_id: generated_state.map(|value| value.0),
                 synchronization: generated_state.map(|value| value.1),
@@ -370,6 +379,40 @@ pub(crate) fn project_target_view_for(
         failover,
         problems,
     })
+}
+
+pub(crate) fn import_provenance(
+    product: Option<String>,
+    target: Option<String>,
+    identifier: Option<String>,
+    fingerprint: Option<String>,
+) -> Result<Option<ImportProvenanceView>> {
+    let (product, target, identifier, fingerprint) =
+        match (product, target, identifier, fingerprint) {
+            (None, None, None, None) => return Ok(None),
+            (Some(product), Some(target), Some(identifier), Some(fingerprint)) => {
+                (product, target, identifier, fingerprint)
+            }
+            _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+        };
+    let source_product = match product.as_str() {
+        "target-cli" => ProviderImportProduct::TargetCli,
+        "cc-switch" => ProviderImportProduct::CcSwitch,
+        "muxvia" => ProviderImportProduct::Muxvia,
+        _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+    };
+    let source_target = match target.as_str() {
+        "codex" => ProviderImportSourceTarget::Codex,
+        "claude" => ProviderImportSourceTarget::Claude,
+        "universal" => ProviderImportSourceTarget::Universal,
+        _ => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
+    };
+    Ok(Some(ImportProvenanceView {
+        source_product,
+        source_target,
+        source_identifier: identifier,
+        configuration_fingerprint: fingerprint,
+    }))
 }
 
 fn project_failover_view(connection: &Connection, target: Target) -> Result<FailoverView> {

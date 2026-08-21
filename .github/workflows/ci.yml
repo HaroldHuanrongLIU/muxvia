@@ -53,16 +53,13 @@ jobs:
         run: |
           cargo build --release --locked --target "${{ matrix.rust-target }}" -p muxvia-routing
           mkdir -p build
-          bun build packages/control-plane/src/release-index.ts --compile \
-            --no-compile-autoload-bunfig \
-            --no-compile-autoload-dotenv \
-            --target="${{ matrix.bun-target }}" \
-            --outfile=build/muxvia \
-            --config=packages/control-plane/bunfig.release.toml \
-            --define MUXVIA_BUNDLE_RELEASE='"0.1.0"' \
-            --define MUXVIA_ROUTING_RELEASE='"0.1.0"' \
-            --define MUXVIA_BUNDLE_TARGET='"${{ matrix.target }}"' \
-            --define MUXVIA_BUNDLE_BUILD='"${{ github.sha }}"'
+          bun run release:control-plane \
+            --target "${{ matrix.bun-target }}" \
+            --output build/muxvia \
+            --release 0.1.0 \
+            --routing-release 0.1.0 \
+            --bundle-target "${{ matrix.target }}" \
+            --build "${{ github.sha }}"
       - name: Inspect, scan, and smoke the native bundle
         run: |
           bun run release:bundle assemble \

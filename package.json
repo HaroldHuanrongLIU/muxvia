@@ -9,7 +9,10 @@
     "test:ts": "bun test packages/control-plane/test",
     "typecheck": "bun run --cwd packages/control-plane typecheck",
     "test:rust": "cargo test --workspace",
+    "release:control-plane": "bun scripts/build-control-plane.ts",
     "release:bundle": "bun scripts/release-bundle.ts",
+    "release:homebrew": "bun scripts/homebrew-formula.ts",
+    "release:homebrew:smoke": "bun scripts/homebrew-smoke.ts",
     "verify": "./scripts/verify-t01.sh"
   },
   "devDependencies": {

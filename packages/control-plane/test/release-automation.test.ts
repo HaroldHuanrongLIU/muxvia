@@ -3,7 +3,11 @@ import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 
 test("release automation owns all four native archives and every audit gate", async () => {
-  const workflow = await readFile(resolve(".github/workflows/release.yml"), "utf8")
+  const [workflow, ci, controlPlaneBuild] = await Promise.all([
+    readFile(resolve(".github/workflows/release.yml"), "utf8"),
+    readFile(resolve(".github/workflows/ci.yml"), "utf8"),
+    readFile(resolve("scripts/build-control-plane.ts"), "utf8"),
+  ])
   for (const target of [
     "darwin-arm64",
     "darwin-x64",
@@ -19,8 +23,11 @@ test("release automation owns all four native archives and every audit gate", as
   ]) expect(workflow).toContain(gate)
   expect(workflow).toContain("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
   expect(workflow).toContain("actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0")
-  expect(workflow).toContain("--no-compile-autoload-bunfig")
-  expect(workflow).toContain("--no-compile-autoload-dotenv")
+  expect(workflow).toContain("release:control-plane")
+  expect(ci).toContain("release:control-plane")
+  expect(controlPlaneBuild).toContain("plugins: [solidPlugin]")
+  expect(controlPlaneBuild).toContain("autoloadBunfig: false")
+  expect(controlPlaneBuild).toContain("autoloadDotenv: false")
 })
 
 test("release archives carry licenses, provenance, and accurate unsigned macOS guidance", async () => {
@@ -35,4 +42,60 @@ test("release archives carry licenses, provenance, and accurate unsigned macOS g
   expect(releaseDocumentation).toContain("unsigned and unnotarized")
   expect(releaseDocumentation).toContain("MUXVIA_UPDATE_CHECK=0")
   expect(releaseDocumentation).toContain("no product telemetry")
+})
+
+test("release automation gates the official Homebrew formula on both macOS architectures", async () => {
+  const [workflow, formula, smoke] = await Promise.all([
+    readFile(resolve(".github/workflows/release.yml"), "utf8"),
+    readFile(resolve("scripts/homebrew-formula.ts"), "utf8"),
+    readFile(resolve("scripts/homebrew-smoke.ts"), "utf8"),
+  ])
+  const homebrewJob = workflow.slice(workflow.indexOf("  homebrew:"), workflow.indexOf("  publish:"))
+  for (const value of [
+    "target: darwin-arm64",
+    "runner: macos-15",
+    "target: darwin-x64",
+    "runner: macos-15-intel",
+    "release:homebrew generate",
+    "release:homebrew verify",
+    "release:homebrew:smoke",
+  ]) expect(homebrewJob).toContain(value)
+  expect(workflow).toContain("needs: [bundle, homebrew]")
+  expect(workflow).toContain("--output release/muxvia.rb")
+
+  for (const value of [
+    'on_arm do',
+    'on_intel do',
+    'libexec.install(',
+    'bin.install_symlink libexec/"muxvia"',
+    'sha256',
+  ]) expect(formula).toContain(value)
+  for (const value of [
+    '["brew", "install"',
+    '"version", "--json"',
+    '"doctor", "--json"',
+    'smokeTui(',
+    '"--lifecycle-metadata"',
+    '["brew", "upgrade"',
+    '["brew", "uninstall"',
+  ]) expect(smoke).toContain(value)
+})
+
+test("the published GitHub Release updates the official Homebrew tap with its exact verified formula", async () => {
+  const workflow = await readFile(resolve(".github/workflows/release.yml"), "utf8")
+  const publishJob = workflow.slice(workflow.indexOf("  publish:"), workflow.indexOf("  publish-homebrew-tap:"))
+  const tapJob = workflow.slice(workflow.indexOf("  publish-homebrew-tap:"))
+
+  expect(publishJob).toContain('gh release create "$GITHUB_REF_NAME" release/*')
+  expect(tapJob).toContain("needs: publish")
+  expect(tapJob).toContain("repository: HaroldHuanrongLIU/homebrew-muxvia")
+  expect(tapJob).toContain("token: ${{ secrets.HOMEBREW_TAP_TOKEN }}")
+  expect(tapJob).toContain("--pattern muxvia-latest.json")
+  expect(tapJob).toContain("--pattern muxvia.rb")
+  expect(tapJob).toContain("--manifest released/muxvia-latest.json")
+  expect(tapJob).toContain("--formula released/muxvia.rb")
+  expect(tapJob).toContain("cp released/muxvia.rb homebrew-muxvia/Formula/muxvia.rb")
+  expect(tapJob).toContain("cmp -s released/muxvia.rb homebrew-muxvia/Formula/muxvia.rb")
+  expect(tapJob).toContain("git -C homebrew-muxvia add Formula/muxvia.rb")
+  expect(tapJob.indexOf("release:homebrew verify")).toBeLessThan(tapJob.indexOf("git -C homebrew-muxvia push origin HEAD"))
 })

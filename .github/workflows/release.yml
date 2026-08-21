@@ -58,16 +58,13 @@ jobs:
         run: |
           cargo build --release --locked --target "${{ matrix.rust-target }}" -p muxvia-routing
           mkdir -p build
-          bun build packages/control-plane/src/release-index.ts --compile \
-            --no-compile-autoload-bunfig \
-            --no-compile-autoload-dotenv \
-            --target="${{ matrix.bun-target }}" \
-            --outfile=build/muxvia \
-            --config=packages/control-plane/bunfig.release.toml \
-            --define MUXVIA_BUNDLE_RELEASE='"${{ steps.release.outputs.release }}"' \
-            --define MUXVIA_ROUTING_RELEASE='"${{ steps.release.outputs.release }}"' \
-            --define MUXVIA_BUNDLE_TARGET='"${{ matrix.target }}"' \
-            --define MUXVIA_BUNDLE_BUILD='"${{ github.sha }}"'
+          bun run release:control-plane \
+            --target "${{ matrix.bun-target }}" \
+            --output build/muxvia \
+            --release "${{ steps.release.outputs.release }}" \
+            --routing-release "${{ steps.release.outputs.release }}" \
+            --bundle-target "${{ matrix.target }}" \
+            --build "${{ github.sha }}"
       - name: Assemble and verify release archive
         run: |
           bundle="build/muxvia-${{ steps.release.outputs.release }}-${{ matrix.target }}"
@@ -99,9 +96,65 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  homebrew:
+    name: homebrew (${{ matrix.target }})
+    needs: bundle
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-15
+          - target: darwin-x64
+            runner: macos-15-intel
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # oven-sh/setup-bun v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      # actions/download-artifact v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          pattern: muxvia-*
+          path: release
+          merge-multiple: true
+      - name: Generate and verify the official tap formula
+        id: release
+        shell: bash
+        run: |
+          release="${GITHUB_REF_NAME#v}"
+          bun run release:bundle public-manifest \
+            --release "$release" \
+            --archives release \
+            --output release/muxvia-latest.json
+          bun run release:homebrew generate \
+            --manifest release/muxvia-latest.json \
+            --archive-base-url "file://${PWD}/release" \
+            --output build/homebrew/install/Formula/muxvia.rb
+          bun run release:homebrew generate \
+            --manifest release/muxvia-latest.json \
+            --archive-base-url "file://${PWD}/release" \
+            --revision 1 \
+            --output build/homebrew/upgrade/Formula/muxvia.rb
+          bun run release:homebrew verify \
+            --manifest release/muxvia-latest.json \
+            --archive-base-url "file://${PWD}/release" \
+            --formula build/homebrew/install/Formula/muxvia.rb
+          printf 'release=%s\n' "$release" >> "$GITHUB_OUTPUT"
+      - name: Smoke Homebrew ownership and complete-bundle lifecycle
+        run: |
+          bun run release:homebrew:smoke \
+            --formula build/homebrew/install/Formula/muxvia.rb \
+            --upgrade-formula build/homebrew/upgrade/Formula/muxvia.rb \
+            --release "${{ steps.release.outputs.release }}"
+
   publish:
     name: publish GitHub Release
-    needs: bundle
+    needs: [bundle, homebrew]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -129,6 +182,14 @@ jobs:
             --archives release \
             --output release/muxvia-latest.json
           printf 'release=%s\n' "$release" >> "$GITHUB_OUTPUT"
+      - name: Generate and verify the official tap formula
+        run: |
+          bun run release:homebrew generate \
+            --manifest release/muxvia-latest.json \
+            --output release/muxvia.rb
+          bun run release:homebrew verify \
+            --manifest release/muxvia-latest.json \
+            --formula release/muxvia.rb
       - name: Publish all verified artifacts together
         env:
           GH_TOKEN: ${{ github.token }}
@@ -137,3 +198,52 @@ jobs:
             --verify-tag \
             --generate-notes \
             --title "Muxvia ${{ steps.release.outputs.release }}"
+
+  publish-homebrew-tap:
+    name: publish official Homebrew tap
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # oven-sh/setup-bun v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - name: Download and verify the released formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern muxvia-latest.json \
+            --pattern muxvia.rb \
+            --dir released
+          bun run release:homebrew verify \
+            --manifest released/muxvia-latest.json \
+            --formula released/muxvia.rb
+      - name: Check out the official Homebrew tap
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: HaroldHuanrongLIU/homebrew-muxvia
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-muxvia
+      - name: Publish the exact verified formula
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p homebrew-muxvia/Formula
+          cp released/muxvia.rb homebrew-muxvia/Formula/muxvia.rb
+          cmp -s released/muxvia.rb homebrew-muxvia/Formula/muxvia.rb
+          git -C homebrew-muxvia add Formula/muxvia.rb
+          if git -C homebrew-muxvia diff --cached --quiet; then
+            echo "Official tap already contains $RELEASE_TAG"
+            exit 0
+          fi
+          git -C homebrew-muxvia config user.name "github-actions[bot]"
+          git -C homebrew-muxvia config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C homebrew-muxvia commit -m "muxvia ${RELEASE_TAG#v}"
+          git -C homebrew-muxvia push origin HEAD

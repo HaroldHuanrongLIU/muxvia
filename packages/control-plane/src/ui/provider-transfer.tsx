@@ -92,9 +92,7 @@ export function ProviderImportWizard(props: {
         if (candidate.kind !== "target-provider" || !candidate.importedCurrent) {
           selectedIds.add(candidate.candidateId)
         }
-        nextResolutions[candidate.candidateId] = candidate.exactMatches[0]
-          ? { kind: "use-existing", providerId: candidate.exactMatches[0].providerId }
-          : { kind: "create" }
+        nextResolutions[candidate.candidateId] = { kind: "create" }
       }
       setPreview(next)
       setSelected(selectedIds)
@@ -121,8 +119,8 @@ export function ProviderImportWizard(props: {
     const candidate = candidates()[selectedIndex()]
     if (!candidate || candidate.exactMatches.length === 0 || pending()) return
     const options: ProviderImportChoice["resolution"][] = [
-      ...candidate.exactMatches.map((match) => ({ kind: "use-existing" as const, providerId: match.providerId })),
       { kind: "create" },
+      ...candidate.exactMatches.map((match) => ({ kind: "use-existing" as const, providerId: match.providerId })),
     ]
     const current = resolutions()[candidate.candidateId]
     const index = options.findIndex((option) =>

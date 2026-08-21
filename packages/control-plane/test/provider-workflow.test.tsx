@@ -686,9 +686,14 @@ test("/import-providers previews pasted data before confirmation and /export-pro
     expect(session.providerImportSources).toEqual([{ kind: "cc-switch", payload }])
     const previewFrame = setup.captureCharFrame()
     expect(previewFrame).toContain("Imported Relay")
-    expect(previewFrame).toContain("Use exact existing · Exact Existing")
-    expect(previewFrame).toContain("Credential present; value hidden")
+    expect(previewFrame).toContain("Create new identity")
+    expect(previewFrame).toContain("Credential present;")
+    expect(previewFrame).toContain("value hidden")
     expect(previewFrame).not.toContain(transferSecret)
+
+    await setup.mockInput.typeText("m")
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Use exact existing · Exact Existing")
 
     setup.mockInput.pressEnter()
     await Bun.sleep(1)

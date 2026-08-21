@@ -33,7 +33,7 @@ This command confines Managed Configuration to the printed temporary home. Remov
 
 ## Releases
 
-GitHub Release tags build one complete, integrity-bound archive for macOS arm64, macOS x86-64, Linux glibc arm64, and Linux glibc x86-64. See [release installation, unsigned macOS behavior, and notify-only updates](./docs/releases.md).
+GitHub Release tags build one complete, integrity-bound archive for macOS arm64, macOS x86-64, Linux glibc arm64, and Linux glibc x86-64. See [verified-download installation and updates, archive installation, and unsigned macOS behavior](./docs/releases.md).
 
 ## Design sources
 

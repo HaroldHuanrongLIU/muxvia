@@ -91,6 +91,29 @@ jobs:
           bun run release:bundle smoke \
             --root "build/extracted/$(basename "$bundle")" \
             --release "${{ steps.release.outputs.release }}"
+          installer_assets="$(pwd)/build/installer-assets"
+          installer_release="$installer_assets/releases/v${{ steps.release.outputs.release }}"
+          installer_home="$(mktemp -d)"
+          mkdir -p "$installer_release"
+          cp "$archive" "$installer_release/$(basename "$archive")"
+          archive_sha="$(shasum -a 256 "$archive" | awk '{print $1}')"
+          printf '{\n  "schemaVersion": 1,\n  "product": "muxvia",\n  "release": "%s",\n  "bundles": [\n    {\n      "target": "%s",\n      "archive": "%s",\n      "sha256": "%s"\n    }\n  ]\n}\n' \
+            "${{ steps.release.outputs.release }}" \
+            "${{ matrix.target }}" \
+            "$(basename "$archive")" \
+            "$archive_sha" > "$installer_assets/muxvia-latest.json"
+          HOME="$installer_home" \
+            MUXVIA_INSTALLER_TESTING=1 \
+            MUXVIA_INSTALLER_TEST_MANIFEST_URL="file://$installer_assets/muxvia-latest.json" \
+            MUXVIA_INSTALLER_TEST_RELEASES_URL="file://$installer_assets/releases" \
+            sh scripts/install.sh
+          HOME="$installer_home" "$installer_home/.muxvia/bin/muxvia" version --json
+          HOME="$installer_home" \
+            PATH="$installer_home/.muxvia/bin:$PATH" \
+            MUXVIA_INSTALLER_TESTING=1 \
+            MUXVIA_INSTALLER_TEST_MANIFEST_URL="file://$installer_assets/muxvia-latest.json" \
+            MUXVIA_INSTALLER_TEST_RELEASES_URL="file://$installer_assets/releases" \
+            sh scripts/install.sh
       # actions/upload-artifact v4
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -133,6 +156,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          install -m 0755 scripts/install.sh release/install.sh
           gh release create "$GITHUB_REF_NAME" release/* \
             --verify-tag \
             --generate-notes \

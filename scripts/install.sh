@@ -267,6 +267,7 @@ EOF
     cmp -s "$desired" "$launcher" || fail ownership-conflict:launcher
   else
     mv "$desired" "$launcher" || fail launcher-install-failed
+    launcher_created=1
   fi
 }
 
@@ -291,6 +292,8 @@ activate() {
     fail activation-failed
   fi
   mv -f "$active_temporary" "$active_file" || fail activation-failed
+  active_temporary=
+  activation_committed=1
   printf 'Muxvia %s installed for %s. Add %s to PATH.\n' "$release" "$target" "$bin_dir"
 }
 
@@ -335,7 +338,16 @@ fi
 chmod 600 "$owner_file"
 
 stage=$(mktemp -d "$staging/install.XXXXXX") || fail staging-create-failed
+active_temporary=
+activation_committed=0
+launcher_created=0
 cleanup() {
+  if [ -n "$active_temporary" ]; then
+    rm -f "$active_temporary"
+  fi
+  if [ "$launcher_created" = 1 ] && [ "$activation_committed" = 0 ]; then
+    rm -f "$launcher"
+  fi
   rm -rf "$stage"
 }
 trap cleanup EXIT

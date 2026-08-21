@@ -78,7 +78,7 @@ async function publishRelease(options: {
   root: string
   release: string
   targets?: readonly BundleTarget[]
-  corruptBindingTarget?: BundleTarget
+  corruptBindingTargets?: readonly BundleTarget[]
   bundleProduct?: string
   publicProduct?: string
   corruptArchiveHash?: boolean
@@ -119,7 +119,7 @@ async function publishRelease(options: {
       rpc: { major: 1, minor: 0 },
       files,
     }, null, 2)}\n`, { mode: 0o644 })
-    if (options.corruptBindingTarget === target) {
+    if (options.corruptBindingTargets?.includes(target)) {
       await writeFile(join(bundleRoot, "muxvia-routing"), "tampered\n", { flag: "a" })
     }
     const archive = `${bundleName}.tar.gz`
@@ -194,48 +194,95 @@ test("the verified-download installer selects and activates each supported Relea
   }
 }, 15_000)
 
-test("updates reuse full validation and failed download, verification, or activation preserves the active version", async () => {
-  const assets = await temporaryRoot("rollback-assets")
-  const home = await temporaryRoot("rollback-home")
+test("a failed first activation leaves no active pointer or launcher", async () => {
+  const assets = await temporaryRoot("fresh-activation-assets")
+  const home = await temporaryRoot("fresh-activation-home")
   const target = "darwin-arm64" as const
   await publishRelease({ root: assets, release: "0.1.0", targets: [target] })
-  expect(await install({ home, assets, target })).toMatchObject({ exitCode: 0 })
-  const originalBundle = await activeBundle(home)
 
-  await publishRelease({ root: assets, release: "0.2.0", targets: [target] })
-  const activationFailure = await install({
+  const result = await install({
     home,
     assets,
     target,
     environment: { MUXVIA_INSTALLER_TEST_FAIL_BEFORE_ACTIVATION: "1" },
   })
-  expect(activationFailure).toMatchObject({ exitCode: 1, stderr: "muxvia-installer:activation-failed\n" })
-  expect(await activeBundle(home)).toBe(originalBundle)
-  expect((await launch(home)).stdout).toBe("0.1.0:darwin-arm64:control-plane\n")
+  expect(result).toMatchObject({ exitCode: 1, stderr: "muxvia-installer:activation-failed\n" })
+  expect(readFile(join(home, ".muxvia/install/active-version"), "utf8")).rejects.toThrow()
+  expect(readFile(join(home, ".muxvia/bin/muxvia"), "utf8")).rejects.toThrow()
+  expect(await readdir(join(home, ".muxvia/bin"))).toEqual([])
+  expect((await readdir(join(home, ".muxvia/install"))).filter((name) => name.startsWith(".active-version."))).toEqual([])
 
   expect(await install({ home, assets, target })).toMatchObject({ exitCode: 0, stderr: "" })
-  const updatedBundle = await activeBundle(home)
-  expect(updatedBundle).not.toBe(originalBundle)
-  expect((await launch(home)).stdout).toBe("0.2.0:darwin-arm64:control-plane\n")
-  expect(await readdir(originalBundle)).toContain("muxvia-routing")
-  expect(await readdir(updatedBundle)).toContain("muxvia-routing")
+  expect((await launch(home)).stdout).toBe("0.1.0:darwin-arm64:control-plane\n")
+})
 
-  await publishRelease({ root: assets, release: "0.3.0", targets: [target], corruptBindingTarget: target })
-  const verificationFailure = await install({ home, assets, target })
-  expect(verificationFailure.exitCode).toBe(1)
-  expect(verificationFailure.stderr).toContain("muxvia-installer:bundle-invalid:file-length:routing-service")
-  expect(await activeBundle(home)).toBe(updatedBundle)
+test("updates fully validate and preserve the active Release Bundle on every supported target", async () => {
+  const assets = await temporaryRoot("rollback-assets")
+  const homes = new Map<BundleTarget, string>()
+  const originalBundles = new Map<BundleTarget, string>()
+  const updatedBundles = new Map<BundleTarget, string>()
 
-  const downloadFailure = await install({
-    home,
-    assets,
-    target,
-    environment: { MUXVIA_INSTALLER_TEST_MANIFEST_URL: `file://${join(assets, "missing.json")}` },
+  await publishRelease({ root: assets, release: "0.1.0" })
+  for (const target of targets) {
+    const home = await temporaryRoot(`rollback-${target}`)
+    homes.set(target, home)
+    expect(await install({ home, assets, target })).toMatchObject({ exitCode: 0 })
+    originalBundles.set(target, await activeBundle(home))
+  }
+
+  await publishRelease({ root: assets, release: "0.2.0" })
+  for (const target of targets) {
+    const home = homes.get(target)!
+    const originalBundle = originalBundles.get(target)!
+    const originalLauncher = await readFile(join(home, ".muxvia/bin/muxvia"), "utf8")
+    const activationFailure = await install({
+      home,
+      assets,
+      target,
+      environment: { MUXVIA_INSTALLER_TEST_FAIL_BEFORE_ACTIVATION: "1" },
+    })
+    expect(activationFailure).toMatchObject({ exitCode: 1, stderr: "muxvia-installer:activation-failed\n" })
+    expect(await activeBundle(home)).toBe(originalBundle)
+    expect(await readFile(join(home, ".muxvia/bin/muxvia"), "utf8")).toBe(originalLauncher)
+    expect((await launch(home)).stdout).toBe(`0.1.0:${target}:control-plane\n`)
+
+    expect(await install({ home, assets, target })).toMatchObject({ exitCode: 0, stderr: "" })
+    const updatedBundle = await activeBundle(home)
+    updatedBundles.set(target, updatedBundle)
+    expect(updatedBundle).not.toBe(originalBundle)
+    expect((await launch(home)).stdout).toBe(`0.2.0:${target}:control-plane\n`)
+    expect(await readdir(originalBundle)).toContain("muxvia-routing")
+    expect(await readdir(updatedBundle)).toContain("muxvia-routing")
+  }
+
+  await publishRelease({
+    root: assets,
+    release: "0.3.0",
+    corruptBindingTargets: targets,
   })
-  expect(downloadFailure.exitCode).toBe(1)
-  expect(downloadFailure.stderr).toContain("muxvia-installer:download-failed")
-  expect(await activeBundle(home)).toBe(updatedBundle)
-}, 15_000)
+  for (const target of targets) {
+    const home = homes.get(target)!
+    const updatedBundle = updatedBundles.get(target)!
+    const updatedLauncher = await readFile(join(home, ".muxvia/bin/muxvia"), "utf8")
+    const verificationFailure = await install({ home, assets, target })
+    expect(verificationFailure.exitCode).toBe(1)
+    expect(verificationFailure.stderr).toContain("muxvia-installer:bundle-invalid:file-length:routing-service")
+    expect(await activeBundle(home)).toBe(updatedBundle)
+    expect(await readFile(join(home, ".muxvia/bin/muxvia"), "utf8")).toBe(updatedLauncher)
+
+    const downloadFailure = await install({
+      home,
+      assets,
+      target,
+      environment: { MUXVIA_INSTALLER_TEST_MANIFEST_URL: `file://${join(assets, "missing.json")}` },
+    })
+    expect(downloadFailure.exitCode).toBe(1)
+    expect(downloadFailure.stderr).toContain("muxvia-installer:download-failed")
+    expect(await activeBundle(home)).toBe(updatedBundle)
+    expect(await readFile(join(home, ".muxvia/bin/muxvia"), "utf8")).toBe(updatedLauncher)
+    expect((await launch(home)).stdout).toBe(`0.2.0:${target}:control-plane\n`)
+  }
+}, 30_000)
 
 test("release metadata, archive hash, and binding identity failures cannot create an active installation", async () => {
   for (const failure of ["public-product", "archive-hash", "bundle-product"] as const) {

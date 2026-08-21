@@ -1,3 +1,8 @@
+#![allow(
+    clippy::result_large_err,
+    reason = "action failures intentionally carry the authoritative projection required for recovery"
+)]
+
 pub mod claude;
 pub mod codex;
 mod config;

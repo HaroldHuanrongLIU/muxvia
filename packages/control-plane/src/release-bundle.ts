@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import { createReadStream } from "node:fs"
 import { lstat, readFile, readdir, realpath, stat } from "node:fs/promises"
-import { dirname, join } from "node:path"
+import { dirname, isAbsolute, join } from "node:path"
 import { z } from "zod"
 
 export const BUNDLE_MANIFEST_FILE = "muxvia-release.json"
@@ -135,12 +135,13 @@ function rejectUnless(condition: boolean, reason: string): asserts condition {
   if (!condition) throw new ReleaseBundleError(reason)
 }
 
-export async function validateReleaseBundle(
+async function validateReleaseBundleForTarget(
   controlPlanePath: string,
   expected: ExpectedBundleIdentity,
+  runtimeTarget: BundleTarget,
 ): Promise<ValidatedReleaseBundle> {
   try {
-    rejectUnless(expected.target === runtimeBundleTarget(), "runtime-target-mismatch")
+    rejectUnless(expected.target === runtimeTarget, "runtime-target-mismatch")
     rejectUnless(expected.release === expected.routingRelease, "component-release-mismatch")
     const canonicalControlPlane = await realpath(controlPlanePath)
     const root = dirname(canonicalControlPlane)
@@ -184,5 +185,33 @@ export async function validateReleaseBundle(
   } catch (error) {
     if (error instanceof ReleaseBundleError) throw error
     throw new ReleaseBundleError("unreadable")
+  }
+}
+
+export function validateReleaseBundle(
+  controlPlanePath: string,
+  expected: ExpectedBundleIdentity,
+): Promise<ValidatedReleaseBundle> {
+  return validateReleaseBundleForTarget(controlPlanePath, expected, runtimeBundleTarget())
+}
+
+export function validatePackagedReleaseBundle(
+  controlPlanePath: string,
+  expected: ExpectedBundleIdentity,
+): Promise<ValidatedReleaseBundle> {
+  return validateReleaseBundleForTarget(controlPlanePath, expected, expected.target)
+}
+
+export async function validatePassedBundleRoot(
+  passedRoot: string | undefined,
+  validatedRoot: string,
+): Promise<void> {
+  if (passedRoot === undefined) return
+  try {
+    rejectUnless(isAbsolute(passedRoot), "bundle-root")
+    rejectUnless(await realpath(passedRoot) === validatedRoot, "bundle-root")
+  } catch (error) {
+    if (error instanceof ReleaseBundleError) throw error
+    throw new ReleaseBundleError("bundle-root")
   }
 }

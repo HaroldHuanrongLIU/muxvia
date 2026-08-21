@@ -1,0 +1,28 @@
+{
+  "name": "muxvia",
+  "version": "0.1.0",
+  "description": "Platform launcher for the Muxvia terminal control plane",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HaroldHuanrongLIU/muxvia.git"
+  },
+  "bin": {
+    "muxvia": "bin/muxvia.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@muxvia/darwin-arm64": "0.1.0",
+    "@muxvia/darwin-x64": "0.1.0",
+    "@muxvia/linux-glibc-arm64": "0.1.0",
+    "@muxvia/linux-glibc-x64": "0.1.0"
+  }
+}

@@ -9,6 +9,7 @@ import {
 import {
   embeddedBundleIdentity,
   ReleaseBundleError,
+  validatePassedBundleRoot,
   validateReleaseBundle,
 } from "./release-bundle"
 import { checkForUpdate } from "./update-notification"
@@ -18,6 +19,7 @@ let bundledServicePath: string | undefined
 if (bundleIdentity) {
   try {
     const bundle = await validateReleaseBundle(process.execPath, bundleIdentity)
+    await validatePassedBundleRoot(process.env.MUXVIA_BUNDLE_ROOT, bundle.root)
     bundledServicePath = bundle.routingServicePath
   } catch (error) {
     const code = error instanceof ReleaseBundleError ? error.code : "release-bundle-invalid"

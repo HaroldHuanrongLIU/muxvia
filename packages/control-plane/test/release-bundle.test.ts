@@ -8,6 +8,7 @@ import {
   type BundleManifest,
   createBundleManifest,
   runtimeBundleTarget,
+  validatePassedBundleRoot,
   validateReleaseBundle,
 } from "../src/release-bundle"
 
@@ -57,6 +58,15 @@ test("a complete release bundle binds every required file", async () => {
   expect(result.manifest.files.map((file) => file.role)).toEqual([
     "control-plane", "routing-service", "license", "third-party-notices", "extraction-manifest",
   ])
+})
+
+test("accepts only the absolute canonical bundle root passed by a package launcher", async () => {
+  const { root } = await fixture()
+  const canonicalRoot = await realpath(root)
+  await validatePassedBundleRoot(canonicalRoot, canonicalRoot)
+  await validatePassedBundleRoot(undefined, canonicalRoot)
+  expect(validatePassedBundleRoot("relative", canonicalRoot)).rejects.toThrow("release-bundle-invalid")
+  expect(validatePassedBundleRoot(tmpdir(), canonicalRoot)).rejects.toThrow("release-bundle-invalid")
 })
 
 describe("closed release identity", () => {

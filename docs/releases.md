@@ -1,5 +1,24 @@
 # Release archives and updates
 
+## Install with npm
+
+On a supported macOS or glibc Linux machine with Node.js 18 or newer, install the public launcher and its exact-version optional platform package together:
+
+```sh
+npm install --global --include=optional muxvia
+muxvia version
+```
+
+The launcher selects only `@muxvia/darwin-arm64`, `@muxvia/darwin-x64`, `@muxvia/linux-glibc-arm64`, or `@muxvia/linux-glibc-x64` for the current machine. That platform package contains the complete Release Bundle. The launcher verifies the package version, product, target, build, RPC version, complete file set, modes, lengths, and SHA-256 hashes before starting `muxvia`; it passes the absolute bundle root and never looks up `muxvia-routing` through `PATH`.
+
+npm lifecycle scripts do not download or install executable content. If the selected optional package is missing or invalid, Muxvia does not start and prints one repair command. Run that command without replacing individual files:
+
+```sh
+npm install --global --include=optional muxvia@<version>
+```
+
+Upgrade this installation through npm, for example with `npm install --global --include=optional muxvia@latest`. Muxvia never writes into or self-upgrades the npm-owned package tree.
+
 ## Install a GitHub Release archive
 
 Download the archive matching the machine exactly:

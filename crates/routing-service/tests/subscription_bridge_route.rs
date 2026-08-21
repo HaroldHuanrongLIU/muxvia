@@ -19,7 +19,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
 };
 use base64::Engine as _;
-use futures_util::stream;
+use futures_util::{Stream, stream};
 use muxvia_routing::{
     claude::{ClaudeCapability, ClaudeProbe, ClaudeProblem, CommandClaudeProbe},
     codex::{CodexCapability, CodexProbe, CodexProblem, CommandCodexProbe},
@@ -42,6 +42,7 @@ use tokio::{
     net::{TcpListener, UnixStream},
     sync::{mpsc, oneshot},
 };
+use tokio_rusqlite::rusqlite::OptionalExtension;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -50,6 +51,7 @@ const PRIMARY_ACCESS: &str = "BRIDGE_PRIMARY_ACCESS_SECRET_12902";
 const SECONDARY_ACCESS: &str = "BRIDGE_SECONDARY_ACCESS_SECRET_12903";
 const PINNED_ACCESS: &str = "BRIDGE_PINNED_ACCESS_SECRET_12907";
 const ROUTING_SECRET_MARKER: &str = "ANTHROPIC_AUTH_TOKEN";
+const BRIDGE_ERROR_MARKER: &str = "BRIDGE_RAW_UPSTREAM_ERROR_SECRET_12908";
 
 struct TestedCodexProbe;
 
@@ -109,6 +111,16 @@ struct BridgeUpstream {
     native_statuses: Mutex<VecDeque<StatusCode>>,
     incomplete_bridge_response: AtomicBool,
     failed_bridge_response: AtomicBool,
+    hang_bridge_response: AtomicBool,
+    bridge_body_dropped: Arc<AtomicBool>,
+}
+
+struct BridgeBodyDropMarker(Arc<AtomicBool>);
+
+impl Drop for BridgeBodyDropMarker {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 #[tokio::test]
@@ -143,6 +155,8 @@ async fn bridge_listener_without_installed_account_runtime_fails_closed() {
         native_statuses: Mutex::new(VecDeque::new()),
         incomplete_bridge_response: AtomicBool::new(false),
         failed_bridge_response: AtomicBool::new(false),
+        hang_bridge_response: AtomicBool::new(false),
+        bridge_body_dropped: Arc::new(AtomicBool::new(false)),
     });
     let activation = ActivationService::new(
         store,
@@ -199,9 +213,15 @@ async fn bridge_listener_without_installed_account_runtime_fails_closed() {
 impl UpstreamTransport for BridgeUpstream {
     async fn send(&self, request: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
         let is_bridge = request.url.as_str() == "https://chatgpt.com/backend-api/codex/responses";
+        let authorization = request
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
         self.requests.lock().unwrap().push(CapturedBridgeRequest {
             url: request.url.to_string(),
-            headers: request.headers,
+            headers: request.headers.clone(),
             body: request.body.as_bytes().unwrap_or_default().to_vec(),
         });
         let mut headers = HeaderMap::new();
@@ -217,40 +237,65 @@ impl UpstreamTransport for BridgeUpstream {
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),
                 );
+                let payload =
+                    format!("BRIDGE_RAW_UPSTREAM_ERROR_SECRET_12908;authorization={authorization}");
                 return Ok(UpstreamResponse {
                     status,
                     headers,
-                    body: Box::pin(stream::once(async {
-                        Ok(Bytes::from_static(
-                            b"BRIDGE_RAW_UPSTREAM_ERROR_SECRET_12908",
-                        ))
-                    })),
+                    body: Box::pin(stream::once(async move { Ok(Bytes::from(payload)) })),
                 });
             }
             headers.insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("text/event-stream"),
             );
-            let body = if self.failed_bridge_response.swap(false, Ordering::SeqCst) {
-                Bytes::from_static(include_bytes!(
-                    "fixtures/subscription-bridge/responses-error.input.sse"
-                ))
-            } else if self
-                .incomplete_bridge_response
+            let body: Pin<Box<dyn Stream<Item = Result<Bytes, UpstreamError>> + Send>> = if self
+                .hang_bridge_response
                 .swap(false, Ordering::SeqCst)
             {
-                Bytes::from_static(include_bytes!(
-                    "fixtures/subscription-bridge/responses-incomplete.input.sse"
-                ))
+                self.bridge_body_dropped.store(false, Ordering::SeqCst);
+                let dropped = Arc::clone(&self.bridge_body_dropped);
+                let stream = stream::unfold(
+                    (0_u8, BridgeBodyDropMarker(dropped)),
+                    |(step, marker)| async move {
+                        if step == 0 {
+                            return Some((
+                                Ok(Bytes::from_static(include_bytes!(
+                                    "fixtures/subscription-bridge/cancellation-created.input.sse"
+                                ))),
+                                (1, marker),
+                            ));
+                        }
+                        std::future::pending::<
+                            Option<(Result<Bytes, UpstreamError>, (u8, BridgeBodyDropMarker))>,
+                        >()
+                        .await
+                    },
+                );
+                Box::pin(stream)
             } else {
-                Bytes::from_static(include_bytes!(
-                    "fixtures/subscription-bridge/responses-stream.input.sse"
-                ))
+                let body = if self.failed_bridge_response.swap(false, Ordering::SeqCst) {
+                    Bytes::from_static(include_bytes!(
+                        "fixtures/subscription-bridge/responses-error.input.sse"
+                    ))
+                } else if self
+                    .incomplete_bridge_response
+                    .swap(false, Ordering::SeqCst)
+                {
+                    Bytes::from_static(include_bytes!(
+                        "fixtures/subscription-bridge/responses-incomplete.input.sse"
+                    ))
+                } else {
+                    Bytes::from_static(include_bytes!(
+                        "fixtures/subscription-bridge/responses-stream.input.sse"
+                    ))
+                };
+                Box::pin(stream::once(async move { Ok(body) }))
             };
             Ok(UpstreamResponse {
                 status: StatusCode::OK,
                 headers,
-                body: Box::pin(stream::once(async move { Ok(body) })),
+                body,
             })
         } else {
             let status = self
@@ -372,6 +417,8 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
         native_statuses: Mutex::new(VecDeque::new()),
         incomplete_bridge_response: AtomicBool::new(false),
         failed_bridge_response: AtomicBool::new(false),
+        hang_bridge_response: AtomicBool::new(false),
+        bridge_body_dropped: Arc::new(AtomicBool::new(false)),
     });
     let activation = Arc::new(
         ActivationService::new(
@@ -523,6 +570,23 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
             )),
         "Fixed Bridge response conversion changed"
     );
+    let fixed_record = wait_for_first_request_record(&home).await;
+    assert!(
+        fixed_record.0 == "claude"
+            && fixed_record.1 == bridge_id.to_string()
+            && fixed_record.2 == "Codex Subscription Bridge"
+            && fixed_record.3 == "gpt-5.6-luna"
+            && fixed_record.4 == "anthropic-messages"
+            && fixed_record.5 == "success"
+            && (
+                fixed_record.6,
+                fixed_record.7,
+                fixed_record.8,
+                fixed_record.9
+            ) == (9, 2, 1, 4)
+            && fixed_record.10,
+        "Bridge request record did not preserve pre-conversion usage and final route identity"
+    );
 
     install_binding(&home, bridge_id, "follow-default", None).await;
     let primary = send_message(&client, endpoint, &routing_token).await;
@@ -541,6 +605,75 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
     );
     let _ = secondary.bytes().await.unwrap();
     assert_bridge_request(&upstream, 2, "account-secondary", SECONDARY_ACCESS);
+
+    let _ = wait_for_latest_request_record(&home, 3).await;
+    upstream
+        .bridge_statuses
+        .lock()
+        .unwrap()
+        .push_back(StatusCode::BAD_REQUEST);
+    let rejected = send_message(&client, endpoint, &routing_token).await;
+    let rejected_status = rejected.status();
+    let rejected_body = rejected.bytes().await.unwrap();
+    assert_bridge_record_surface_is_secret_free(
+        &rejected_body,
+        &[
+            FIXED_ACCESS,
+            PRIMARY_ACCESS,
+            SECONDARY_ACCESS,
+            PINNED_ACCESS,
+            "NATIVE_PROVIDER_SECRET_12904",
+            "BRIDGE_SESSION_SECRET_12905",
+            "refresh-fixed",
+            "refresh-primary",
+            "refresh-secondary",
+            "refresh-pinned",
+            "refresh-needs",
+            "refresh-transient",
+            "refresh-permanent",
+            "refresh-mismatch",
+            &routing_token,
+        ],
+        "Bridge downstream error",
+    );
+    let rejected_record = wait_for_latest_request_record(&home, 4).await;
+    let rejected_payload = rejected_record
+        .error_payload
+        .as_deref()
+        .expect("Bridge upstream error must retain its sanitized payload");
+    assert_bridge_record_surface_is_secret_free(
+        rejected_payload,
+        &[
+            FIXED_ACCESS,
+            PRIMARY_ACCESS,
+            SECONDARY_ACCESS,
+            PINNED_ACCESS,
+            "NATIVE_PROVIDER_SECRET_12904",
+            "BRIDGE_SESSION_SECRET_12905",
+            "refresh-fixed",
+            "refresh-primary",
+            "refresh-secondary",
+            "refresh-pinned",
+            "refresh-needs",
+            "refresh-transient",
+            "refresh-permanent",
+            "refresh-mismatch",
+            &routing_token,
+        ],
+        "Bridge stored error",
+    );
+    assert!(
+        rejected_status == StatusCode::BAD_REQUEST
+            && rejected_record.outcome == "upstream-error"
+            && rejected_record.http_status == Some(StatusCode::BAD_REQUEST.as_u16())
+            && rejected_record.provider_id == bridge_id.to_string()
+            && rejected_record.protocol == "anthropic-messages"
+            && rejected_payload
+                .windows(BRIDGE_ERROR_MARKER.len())
+                .any(|window| window == BRIDGE_ERROR_MARKER.as_bytes())
+            && !rejected_record.error_payload_truncated,
+        "Bridge failed Request Record did not preserve its final route and sanitized target-native payload"
+    );
 
     install_binding(&home, bridge_id, "fixed", Some("account-pinned")).await;
     let pinned_index = upstream.requests.lock().unwrap().len();
@@ -592,6 +725,17 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
     install_binding(&home, bridge_id, "fixed", Some("account-fixed")).await;
     send_and_assert_bridge_success(&client, endpoint, &routing_token, &upstream).await;
 
+    upstream.hang_bridge_response.store(true, Ordering::SeqCst);
+    cancel_bridge_request(endpoint, &routing_token, &upstream).await;
+    let cancelled_record = wait_for_latest_request_record(&home, 8).await;
+    assert!(
+        cancelled_record.provider_id == bridge_id.to_string()
+            && cancelled_record.outcome == "cancelled"
+            && cancelled_record.http_status == Some(StatusCode::OK.as_u16())
+            && cancelled_record.error_payload.is_none(),
+        "Bridge cancellation did not produce one final target-native Request Record"
+    );
+
     upstream
         .incomplete_bridge_response
         .store(true, Ordering::SeqCst);
@@ -612,6 +756,14 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
             })
             && upstream.requests.lock().unwrap().len() == before_incomplete + 1,
         "pre-output incomplete Bridge response bypassed its Anthropic conversion"
+    );
+    let incomplete_record = wait_for_latest_request_record(&home, 9).await;
+    assert!(
+        incomplete_record.provider_id == bridge_id.to_string()
+            && incomplete_record.outcome == "success"
+            && incomplete_record.http_status == Some(StatusCode::OK.as_u16())
+            && incomplete_record.error_payload.is_none(),
+        "incomplete Bridge response did not produce one payload-free completed Request Record"
     );
 
     upstream
@@ -638,6 +790,14 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
                 .any(|window| window == b"FIXTURE_RESPONSE_SECRET_7319")
             && upstream.requests.lock().unwrap().len() == before_failed + 1,
         "pre-output failed Bridge response bypassed its fixed Anthropic conversion"
+    );
+    let failed_record = wait_for_latest_request_record(&home, 10).await;
+    assert!(
+        failed_record.provider_id == bridge_id.to_string()
+            && failed_record.outcome == "semantic-error"
+            && failed_record.http_status == Some(StatusCode::OK.as_u16())
+            && failed_record.error_payload.is_none(),
+        "failed Bridge response did not produce one secret-free semantic Request Record"
     );
     let after_recovery = store.target_view_for(Target::Claude).await.unwrap();
     assert!(
@@ -721,6 +881,14 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
             && count.text().await.unwrap() == "subscription-bridge-count-tokens-unsupported"
             && upstream.requests.lock().unwrap().len() == before_count,
         "Bridge count_tokens contacted an account/upstream or returned the wrong deviation"
+    );
+    let count_record = wait_for_latest_request_record(&home, 23).await;
+    assert!(
+        count_record.provider_id == bridge_id.to_string()
+            && count_record.outcome == "route-unavailable"
+            && count_record.http_status == Some(StatusCode::NOT_IMPLEMENTED.as_u16())
+            && count_record.error_payload.is_none(),
+        "Bridge count_tokens deviation did not produce one fixed Request Record"
     );
 
     let mut replanning = UnixStream::connect(restarted.socket_path()).await.unwrap();
@@ -821,6 +989,13 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
             && refreshes.lock().unwrap().len() == before_fallback_refresh,
         "fallback Bridge count_tokens contacted its account/upstream or lost the named deviation"
     );
+    let fallback_count_record = wait_for_latest_request_record(&home, 24).await;
+    assert!(
+        fallback_count_record.provider_id == bridge_id.to_string()
+            && fallback_count_record.outcome == "route-unavailable"
+            && fallback_count_record.http_status == Some(StatusCode::NOT_IMPLEMENTED.as_u16()),
+        "native-to-Bridge count_tokens exhaustion lost the final Bridge attempt"
+    );
 
     let refresh_kinds = refreshes.lock().unwrap().clone();
     assert!(
@@ -837,6 +1012,11 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
         "binding resolution refreshed a substituted or unexpected account"
     );
     restarted.shutdown().await.unwrap();
+    let codex_record_count = request_record_count_for(&home, "codex").await;
+    assert!(
+        codex_record_count == 0,
+        "Claude Bridge traffic created a Codex Request Record"
+    );
     authority_task.abort();
     let _ = fs::remove_dir_all(root);
 }
@@ -854,6 +1034,208 @@ async fn send_message(
         .send()
         .await
         .unwrap()
+}
+
+async fn cancel_bridge_request(
+    endpoint: std::net::SocketAddr,
+    routing_token: &str,
+    upstream: &BridgeUpstream,
+) {
+    let mut cancelled = tokio::net::TcpStream::connect(endpoint).await.unwrap();
+    let body = include_bytes!("fixtures/subscription-bridge/messages-tools.input.json").as_slice();
+    let head = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {routing_token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    cancelled.write_all(head.as_bytes()).await.unwrap();
+    cancelled.write_all(body).await.unwrap();
+    let mut response = [0_u8; 1024];
+    let received = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        cancelled.read(&mut response),
+    )
+    .await
+    .expect("Bridge cancellation response head did not arrive")
+    .unwrap();
+    assert_bridge_record_surface_is_secret_free(
+        &response[..received],
+        &[FIXED_ACCESS, routing_token],
+        "Bridge cancellation response",
+    );
+    assert!(
+        String::from_utf8_lossy(&response[..received]).contains("200 OK"),
+        "Bridge cancellation did not reach a converted response"
+    );
+    drop(cancelled);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !upstream.bridge_body_dropped.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Bridge downstream cancellation did not drop the target-native upstream stream");
+}
+
+async fn wait_for_first_request_record(
+    home: &MuxviaHome,
+) -> (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    u64,
+    u64,
+    u64,
+    u64,
+    bool,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let database = tokio_rusqlite::Connection::open(home.database_path())
+                .await
+                .unwrap();
+            let record = database
+                .call(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT target, provider_id, provider_name, model, protocol, outcome,
+                                    input_tokens, cached_input_tokens,
+                                    cache_creation_input_tokens, output_tokens,
+                                    error_payload IS NULL
+                             FROM request_records ORDER BY sequence LIMIT 1",
+                            [],
+                            |row| {
+                                Ok((
+                                    row.get(0)?,
+                                    row.get(1)?,
+                                    row.get(2)?,
+                                    row.get(3)?,
+                                    row.get(4)?,
+                                    row.get(5)?,
+                                    row.get(6)?,
+                                    row.get(7)?,
+                                    row.get(8)?,
+                                    row.get(9)?,
+                                    row.get(10)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                })
+                .await
+                .unwrap();
+            if let Some(record) = record {
+                return record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Bridge Request Record was not persisted")
+}
+
+struct StoredBridgeRecord {
+    provider_id: String,
+    protocol: String,
+    outcome: String,
+    http_status: Option<u16>,
+    error_payload: Option<Vec<u8>>,
+    error_payload_truncated: bool,
+}
+
+async fn wait_for_latest_request_record(
+    home: &MuxviaHome,
+    minimum_count: u64,
+) -> StoredBridgeRecord {
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let database = tokio_rusqlite::Connection::open(home.database_path())
+                .await
+                .unwrap();
+            let result = database
+                .call(move |connection| {
+                    let count = connection.query_row(
+                        "SELECT COUNT(*) FROM request_records",
+                        [],
+                        |row| row.get::<_, u64>(0),
+                    )?;
+                    if count < minimum_count {
+                        return Ok(None);
+                    }
+                    connection
+                        .query_row(
+                            "SELECT provider_id, protocol, outcome, http_status,
+                                    error_payload, error_payload_truncated
+                             FROM request_records ORDER BY sequence DESC LIMIT 1",
+                            [],
+                            |row| {
+                                Ok(StoredBridgeRecord {
+                                    provider_id: row.get(0)?,
+                                    protocol: row.get(1)?,
+                                    outcome: row.get(2)?,
+                                    http_status: row.get(3)?,
+                                    error_payload: row.get(4)?,
+                                    error_payload_truncated: row.get(5)?,
+                                })
+                            },
+                        )
+                        .optional()
+                })
+                .await
+                .unwrap();
+            if let Some(record) = result {
+                return record;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("latest Bridge Request Record was not persisted")
+}
+
+async fn request_record_count_for(home: &MuxviaHome, target: &'static str) -> u64 {
+    let database = tokio_rusqlite::Connection::open(home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(move |connection| {
+            connection.query_row(
+                "SELECT COUNT(*) FROM request_records WHERE target = ?1",
+                [target],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .unwrap()
+}
+
+fn assert_bridge_record_surface_is_secret_free(
+    surface: &[u8],
+    secrets: &[&str],
+    label: &'static str,
+) {
+    let contains_secret = secrets.iter().any(|secret| {
+        let numeric = secret_numeric_bytes(secret);
+        !secret.is_empty()
+            && (surface
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes())
+                || surface
+                    .windows(numeric.len())
+                    .any(|window| window == numeric.as_bytes()))
+    });
+    assert!(!contains_secret, "{label} contained a designated secret");
+}
+
+fn secret_numeric_bytes(secret: &str) -> String {
+    secret
+        .as_bytes()
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 async fn send_and_assert_native_fallback(

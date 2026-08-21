@@ -180,6 +180,26 @@ impl StoreFixture {
             .unwrap();
         (snapshot_id, provider_id)
     }
+
+    async fn request_records(&self) -> Vec<(String, Option<u16>, Option<Vec<u8>>, bool)> {
+        let database = tokio_rusqlite::Connection::open(self.muxvia_home.database_path())
+            .await
+            .unwrap();
+        database
+            .call(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT outcome, http_status, error_payload, error_payload_truncated
+                     FROM request_records ORDER BY sequence",
+                )?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap()
+    }
 }
 
 struct CountingUpstream {
@@ -707,6 +727,15 @@ async fn count_tokens_uses_native_path_and_explicit_bearer_upstream_authenticati
     drop(requests);
 
     server.shutdown().await.unwrap();
+    let records = fixture.request_records().await;
+    assert!(
+        records.len() == 1
+            && records[0].0 == "success"
+            && records[0].1 == Some(StatusCode::OK.as_u16())
+            && records[0].2.is_none()
+            && !records[0].3,
+        "bearer-authenticated Claude count_tokens did not produce one payload-free Request Record"
+    );
 }
 
 #[tokio::test]
@@ -936,7 +965,7 @@ async fn a_successful_response_head_records_only_claude_serving_and_preserves_st
         .seed_claude_snapshot(
             "https://upstream.example/v1",
             ProviderAuthentication::AnthropicApiKey,
-            "claude-stream-model",
+            "claude-sonnet-4-5",
         )
         .await;
     let claude_before = fixture.store.target_view_for(Target::Claude).await.unwrap();
@@ -951,9 +980,14 @@ async fn a_successful_response_head_records_only_claude_serving_and_preserves_st
     headers.insert("connection", HeaderValue::from_static("x-remove-response"));
     headers.insert("x-remove-response", HeaderValue::from_static("hop-secret"));
     let chunks = vec![
-        Bytes::from_static(b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n"),
+        Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":0,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1}}}\n\n",
+        ),
         Bytes::from_static(
             b"event: content_block_delta\ndata: {\"delta\":{\"text\":\"hello\"}}\n\n",
+        ),
+        Bytes::from_static(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\n",
         ),
         Bytes::from_static(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
     ];
@@ -1002,6 +1036,53 @@ async fn a_successful_response_head_records_only_claude_serving_and_preserves_st
     assert_eq!(codex_after, codex_before);
 
     server.shutdown().await.unwrap();
+
+    let database = tokio_rusqlite::Connection::open(fixture.muxvia_home.database_path())
+        .await
+        .unwrap();
+    let record = database
+        .call(|connection| {
+            connection.query_row(
+                "SELECT request.target, request.provider_id, request.provider_name,
+                        request.model, request.protocol, request.outcome,
+                        request.input_tokens, request.cached_input_tokens,
+                        request.cache_creation_input_tokens, request.output_tokens,
+                        request.error_payload IS NULL, pricing.source_model,
+                        pricing.estimated_cost_nano_usd
+                 FROM request_records request
+                 JOIN pricing_snapshots pricing ON pricing.request_record_id = request.id",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, u64>(6)?,
+                        row.get::<_, u64>(7)?,
+                        row.get::<_, u64>(8)?,
+                        row.get::<_, u64>(9)?,
+                        row.get::<_, bool>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, u64>(12)?,
+                    ))
+                },
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(record.0, "claude");
+    assert_eq!(record.1, provider_id.to_string());
+    assert_eq!(record.2, "Claude upstream");
+    assert_eq!(record.3, "claude-sonnet-4-5");
+    assert_eq!(record.4, "anthropic-messages");
+    assert_eq!(record.5, "success");
+    assert_eq!((record.6, record.7, record.8, record.9), (12, 2, 1, 4));
+    assert!(record.10, "successful Claude payload was persisted");
+    assert_eq!(record.11, "claude-sonnet-4-5");
+    assert!(record.12 > 0, "priced Claude usage produced zero estimate");
 }
 
 #[test]
@@ -1098,6 +1179,16 @@ async fn reqwest_preserves_compressed_upstream_error_headers_and_exact_bytes() {
     assert_eq!(after.view_sequence, before.view_sequence + 1);
 
     server.shutdown().await.unwrap();
+    let records = fixture.request_records().await;
+    assert_eq!(records.len(), 1);
+    let stored_payload = records[0].2.as_deref().unwrap_or_default();
+    assert!(
+        stored_payload == raw_error,
+        "compressed Claude error was not stored as its bounded target-native payload"
+    );
+    assert_eq!(records[0].0, "upstream-error");
+    assert_eq!(records[0].1, Some(429));
+    assert!(!records[0].3);
     upstream_task.abort();
     let _ = upstream_task.await;
 }
@@ -1504,4 +1595,9 @@ async fn downstream_disconnect_drops_the_upstream_sse_stream_without_a_detached_
     .expect("disconnect must drop the upstream body stream");
 
     server.shutdown().await.unwrap();
+    let records = fixture.request_records().await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0, "cancelled");
+    assert_eq!(records[0].1, Some(200));
+    assert!(records[0].2.is_none());
 }

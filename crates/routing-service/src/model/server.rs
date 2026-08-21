@@ -14,7 +14,7 @@ use axum::{
     http::{Method, Request, Response, StatusCode},
     routing::post,
 };
-use futures_util::{StreamExt, stream};
+use futures_util::StreamExt;
 use reqwest::Body as ReqwestBody;
 use secrecy::ExposeSecret;
 use tokio::{
@@ -32,7 +32,8 @@ use super::{
     auth::routing_credential_matches,
     headers::{forward_request_headers, forward_response_headers},
     request_recorder::{
-        CodexUsageFormat, RequestRecordStart, RequestRecorder, recorded_codex_body, unix_time_ms,
+        RequestRecordStart, RequestRecorder, ResponseObservation, ResponseUsageFormat,
+        recorded_body, unix_time_ms,
     },
     router::{
         PreparedRouteAttempt, RouteAttemptFailure, RouteHealthRuntime, RouteResponseKind,
@@ -360,12 +361,16 @@ impl ModelServer {
             }
             task_status.store(ModelServerStatus::Running.encode(), Ordering::Release);
             let _ = running_tx.send(());
+            let request_recorder_task = tokio::spawn(request_recorder_actor.run());
             let result = axum::serve(reserved.listener, router)
                 .with_graceful_shutdown(async {
                     let _ = shutdown_rx.await;
                 })
                 .await;
-            request_recorder_actor.run().await;
+            if request_recorder_task.await.is_err() {
+                task_status.store(ModelServerStatus::Failed.encode(), Ordering::Release);
+                return Err(io::Error::other("request recorder task failed"));
+            }
             let final_status = if result.is_ok() && task_shutdown_requested.load(Ordering::Acquire)
             {
                 ModelServerStatus::Stopped
@@ -545,6 +550,7 @@ async fn route_responses(
             .as_ref()
             .map(|credential| credential.expose_secret().as_bytes().to_vec())
     }));
+    let observation = ResponseObservation::new(redactions);
     let mut record_start = RequestRecordStart {
         id: uuid::Uuid::new_v4(),
         target: state.target,
@@ -556,8 +562,7 @@ async fn route_responses(
         started_at_unix_ms,
         status: None,
         semantic_failure: false,
-        redactions,
-        usage_format: CodexUsageFormat::Unsupported,
+        observation,
     };
     let Some(reserved_record) = state.request_recorder.reserve() else {
         return fixed_local_response(
@@ -695,22 +700,34 @@ async fn route_responses(
     record_start.protocol = routed.protocol;
     record_start.status = Some(routed.response.status);
     record_start.semantic_failure = routed.semantic_failure;
-    record_start.usage_format = CodexUsageFormat::from_content_type(
+    record_start.observation.configure(
+        ResponseUsageFormat::codex(
+            routed
+                .response
+                .headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+        ),
+        routed.response.status,
         routed
             .response
             .headers
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
+            .get(axum::http::header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.eq_ignore_ascii_case("gzip") || value.eq_ignore_ascii_case("x-gzip")
+            }),
     );
     let upstream = routed.response;
 
     let mut response = Response::builder()
         .status(upstream.status)
-        .body(recorded_codex_body(
+        .body(recorded_body(
             upstream.body,
             active_request,
             reserved_record,
             record_start,
+            true,
         ))
         .expect("valid upstream status");
     *response.headers_mut() = forward_response_headers(&upstream.headers);
@@ -752,20 +769,6 @@ impl Drop for ActiveRequestGuard {
             self.admission.drained.notify_one();
         }
     }
-}
-
-pub(crate) fn body_with_active_guard(
-    body: std::pin::Pin<
-        Box<
-            dyn futures_util::Stream<Item = Result<axum::body::Bytes, super::UpstreamError>> + Send,
-        >,
-    >,
-    guard: ActiveRequestGuard,
-) -> Body {
-    let guarded = stream::unfold((body, Some(guard)), |(mut body, guard)| async move {
-        body.next().await.map(|item| (item, (body, guard)))
-    });
-    Body::from_stream(guarded)
 }
 
 fn local_response(status: StatusCode) -> Response<Body> {

@@ -1,6 +1,11 @@
-use std::{sync::Arc, time::SystemTime};
+use std::{
+    io::Read,
+    sync::{Arc, Mutex},
+    time::SystemTime,
+};
 
 use axum::{body::Bytes, http::StatusCode};
+use flate2::read::MultiGzDecoder;
 use futures_util::{StreamExt, stream};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -16,6 +21,7 @@ use super::{UpstreamError, server::ActiveRequestGuard};
 const COMPLETION_QUEUE_CAPACITY: usize = 64;
 const MAX_USAGE_EVENT_BYTES: usize = 256 * 1024;
 const MAX_ERROR_PAYLOAD_BYTES: usize = 65_536;
+const MAX_COMPRESSED_OBSERVATION_BYTES: usize = 1024 * 1024;
 const REDACTED: &[u8] = b"[REDACTED]";
 
 #[derive(Clone)]
@@ -40,28 +46,172 @@ pub(crate) struct RequestRecordStart {
     pub(crate) started_at_unix_ms: u64,
     pub(crate) status: Option<StatusCode>,
     pub(crate) semantic_failure: bool,
-    pub(crate) redactions: Vec<Vec<u8>>,
-    pub(crate) usage_format: CodexUsageFormat,
+    pub(crate) observation: ResponseObservation,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum CodexUsageFormat {
-    Sse,
-    Json,
+pub(crate) enum ResponseUsageFormat {
+    CodexSse,
+    CodexJson,
+    ClaudeSse,
+    ClaudeJson,
     Unsupported,
 }
 
-impl CodexUsageFormat {
-    pub(crate) fn from_content_type(content_type: Option<&str>) -> Self {
+impl ResponseUsageFormat {
+    pub(crate) fn codex(content_type: Option<&str>) -> Self {
+        Self::for_content_type(content_type, Self::CodexSse, Self::CodexJson)
+    }
+
+    pub(crate) fn claude(content_type: Option<&str>) -> Self {
+        Self::for_content_type(content_type, Self::ClaudeSse, Self::ClaudeJson)
+    }
+
+    fn for_content_type(content_type: Option<&str>, sse: Self, json: Self) -> Self {
         let normalized = content_type
             .and_then(|value| value.split(';').next())
             .map(str::trim);
         match normalized {
-            Some("text/event-stream") => Self::Sse,
-            Some("application/json") => Self::Json,
-            Some(value) if value.ends_with("+json") => Self::Json,
+            Some("text/event-stream") => sse,
+            Some("application/json") => json,
+            Some(value) if value.ends_with("+json") => json,
             _ => Self::Unsupported,
         }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ResponseObservation {
+    state: Arc<Mutex<ResponseObservationState>>,
+}
+
+struct ResponseObservationState {
+    usage: UsageParser,
+    capture_error_payload: bool,
+    error_payload: Vec<u8>,
+    error_payload_limit: usize,
+    error_payload_truncated: bool,
+    redactions: Vec<Vec<u8>>,
+    gzip: bool,
+    compressed: Vec<u8>,
+    compressed_truncated: bool,
+}
+
+impl ResponseObservation {
+    pub(crate) fn new(redactions: Vec<Vec<u8>>) -> Self {
+        let error_payload_limit = MAX_ERROR_PAYLOAD_BYTES
+            .saturating_add(redactions.iter().map(Vec::len).max().unwrap_or(0));
+        Self {
+            state: Arc::new(Mutex::new(ResponseObservationState {
+                usage: UsageParser::Unsupported,
+                capture_error_payload: false,
+                error_payload: Vec::new(),
+                error_payload_limit,
+                error_payload_truncated: false,
+                redactions,
+                gzip: false,
+                compressed: Vec::new(),
+                compressed_truncated: false,
+            })),
+        }
+    }
+
+    pub(crate) fn configure(&self, format: ResponseUsageFormat, status: StatusCode, gzip: bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.usage = UsageParser::new(format);
+        state.capture_error_payload = !status.is_success();
+        state.gzip = gzip;
+    }
+
+    pub(crate) fn add_redaction(&self, secret: &[u8]) {
+        if secret.is_empty() {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.error_payload_limit = state
+            .error_payload_limit
+            .max(MAX_ERROR_PAYLOAD_BYTES.saturating_add(secret.len()));
+        state.redactions.push(secret.to_vec());
+    }
+
+    pub(crate) fn observe(&self, bytes: &[u8]) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.gzip {
+            let remaining = MAX_COMPRESSED_OBSERVATION_BYTES.saturating_sub(state.compressed.len());
+            state
+                .compressed
+                .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+            if bytes.len() > remaining {
+                state.compressed_truncated = true;
+            }
+            return;
+        }
+        if !state.capture_error_payload {
+            state.usage.push(bytes);
+            return;
+        }
+        let remaining = state
+            .error_payload_limit
+            .saturating_sub(state.error_payload.len());
+        state
+            .error_payload
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        if bytes.len() > remaining {
+            state.error_payload_truncated = true;
+        }
+    }
+
+    fn finish(
+        &self,
+        outcome: RequestRecordOutcome,
+    ) -> (Option<RequestUsage>, Option<Vec<u8>>, bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.gzip && !state.compressed_truncated {
+            let limit = if state.capture_error_payload {
+                state.error_payload_limit
+            } else {
+                MAX_USAGE_EVENT_BYTES
+            };
+            let mut decoder =
+                MultiGzDecoder::new(state.compressed.as_slice()).take((limit + 1) as u64);
+            let mut decoded = Vec::new();
+            if decoder.read_to_end(&mut decoded).is_ok() && decoded.len() <= limit {
+                if state.capture_error_payload {
+                    state.error_payload = decoded;
+                } else {
+                    state.usage.push(&decoded);
+                }
+            } else if state.capture_error_payload {
+                state.error_payload.clear();
+                state.error_payload_truncated = true;
+            }
+        } else if state.gzip && state.capture_error_payload {
+            state.error_payload.clear();
+            state.error_payload_truncated = true;
+        }
+        let usage = state.usage.finish();
+        if outcome != RequestRecordOutcome::UpstreamError {
+            return (usage, None, false);
+        }
+        let mut payload = redact(&state.error_payload, &state.redactions);
+        if payload.len() > MAX_ERROR_PAYLOAD_BYTES {
+            payload.truncate(MAX_ERROR_PAYLOAD_BYTES);
+        }
+        let truncated =
+            state.error_payload_truncated || state.error_payload.len() > MAX_ERROR_PAYLOAD_BYTES;
+        (usage, Some(payload), truncated)
     }
 }
 
@@ -145,46 +295,21 @@ impl ReservedRequestRecord {
 struct StreamingRecord {
     reserved: Option<ReservedRequestRecord>,
     start: Option<RequestRecordStart>,
-    usage: CodexUsageParser,
-    error_payload: Vec<u8>,
-    error_payload_limit: usize,
-    error_payload_truncated: bool,
     terminated: bool,
 }
 
 impl StreamingRecord {
     fn new(reserved: ReservedRequestRecord, start: RequestRecordStart) -> Self {
-        let error_payload_limit = MAX_ERROR_PAYLOAD_BYTES
-            .saturating_add(start.redactions.iter().map(Vec::len).max().unwrap_or(0));
-        let usage = CodexUsageParser::new(start.usage_format);
         Self {
             reserved: Some(reserved),
             start: Some(start),
-            usage,
-            error_payload: Vec::new(),
-            error_payload_limit,
-            error_payload_truncated: false,
             terminated: false,
         }
     }
 
     fn observe(&mut self, bytes: &[u8]) {
-        if self
-            .start
-            .as_ref()
-            .and_then(|start| start.status)
-            .is_some_and(|status| status.is_success())
-        {
-            self.usage.push(bytes);
-            return;
-        }
-        let remaining = self
-            .error_payload_limit
-            .saturating_sub(self.error_payload.len());
-        self.error_payload
-            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
-        if bytes.len() > remaining {
-            self.error_payload_truncated = true;
+        if let Some(start) = &self.start {
+            start.observation.observe(bytes);
         }
     }
 
@@ -199,20 +324,7 @@ impl StreamingRecord {
             Some(_) => RequestRecordOutcome::Success,
             None => RequestRecordOutcome::RouteUnavailable,
         });
-        let (error_payload, error_payload_truncated) = if outcome
-            == RequestRecordOutcome::UpstreamError
-        {
-            let mut payload = redact(self.error_payload.as_slice(), &start.redactions);
-            if payload.len() > MAX_ERROR_PAYLOAD_BYTES {
-                payload.truncate(MAX_ERROR_PAYLOAD_BYTES);
-            }
-            (
-                Some(payload),
-                self.error_payload_truncated || self.error_payload.len() > MAX_ERROR_PAYLOAD_BYTES,
-            )
-        } else {
-            (None, false)
-        };
+        let (usage, error_payload, error_payload_truncated) = start.observation.finish(outcome);
         reserved.complete(RequestRecordCompletion {
             id: start.id,
             target: start.target,
@@ -225,7 +337,7 @@ impl StreamingRecord {
             finished_at_unix_ms: unix_time_ms().max(start.started_at_unix_ms),
             outcome,
             http_status: start.status.map(|status| status.as_u16()),
-            usage: self.usage.finish(),
+            usage,
             error_payload,
             error_payload_truncated,
         });
@@ -241,11 +353,12 @@ impl Drop for StreamingRecord {
     }
 }
 
-pub(crate) fn recorded_codex_body(
+pub(crate) fn recorded_body(
     body: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, UpstreamError>> + Send>>,
     active_request: ActiveRequestGuard,
     reserved: ReservedRequestRecord,
     start: RequestRecordStart,
+    observe_forwarded: bool,
 ) -> axum::body::Body {
     let recorded = stream::unfold(
         (
@@ -253,13 +366,15 @@ pub(crate) fn recorded_codex_body(
             StreamingRecord::new(reserved, start),
             Some(active_request),
         ),
-        |(mut body, mut record, active_request)| async move {
+        move |(mut body, mut record, active_request)| async move {
             if record.terminated {
                 return None;
             }
             match body.next().await {
                 Some(Ok(bytes)) => {
-                    record.observe(&bytes);
+                    if observe_forwarded {
+                        record.observe(&bytes);
+                    }
                     Some((Ok(bytes), (body, record, active_request)))
                 }
                 Some(Err(error)) => {
@@ -276,15 +391,78 @@ pub(crate) fn recorded_codex_body(
     axum::body::Body::from_stream(recorded)
 }
 
+pub(crate) fn observed_upstream_body(
+    body: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, UpstreamError>> + Send>>,
+    observation: ResponseObservation,
+) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, UpstreamError>> + Send>> {
+    Box::pin(stream::unfold(
+        (body, observation),
+        |(mut body, observation)| async move {
+            body.next().await.map(|item| {
+                if let Ok(bytes) = &item {
+                    observation.observe(bytes);
+                }
+                (item, (body, observation))
+            })
+        },
+    ))
+}
+
+enum UsageParser {
+    Codex(CodexUsageParser),
+    Claude(ClaudeUsageParser),
+    Unsupported,
+}
+
+impl UsageParser {
+    fn new(format: ResponseUsageFormat) -> Self {
+        match format {
+            ResponseUsageFormat::CodexSse => Self::Codex(CodexUsageParser::new(StreamFormat::Sse)),
+            ResponseUsageFormat::CodexJson => {
+                Self::Codex(CodexUsageParser::new(StreamFormat::Json))
+            }
+            ResponseUsageFormat::ClaudeSse => {
+                Self::Claude(ClaudeUsageParser::new(StreamFormat::Sse))
+            }
+            ResponseUsageFormat::ClaudeJson => {
+                Self::Claude(ClaudeUsageParser::new(StreamFormat::Json))
+            }
+            ResponseUsageFormat::Unsupported => Self::Unsupported,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Codex(parser) => parser.push(bytes),
+            Self::Claude(parser) => parser.push(bytes),
+            Self::Unsupported => {}
+        }
+    }
+
+    fn finish(&mut self) -> Option<RequestUsage> {
+        match self {
+            Self::Codex(parser) => parser.finish(),
+            Self::Claude(parser) => parser.finish(),
+            Self::Unsupported => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StreamFormat {
+    Sse,
+    Json,
+}
+
 struct CodexUsageParser {
-    format: CodexUsageFormat,
+    format: StreamFormat,
     pending: Vec<u8>,
     usage: Option<RequestUsage>,
     disabled: bool,
 }
 
 impl CodexUsageParser {
-    fn new(format: CodexUsageFormat) -> Self {
+    fn new(format: StreamFormat) -> Self {
         Self {
             format,
             pending: Vec::new(),
@@ -303,7 +481,7 @@ impl CodexUsageParser {
             return;
         }
         self.pending.extend_from_slice(bytes);
-        if !matches!(self.format, CodexUsageFormat::Sse) {
+        if !matches!(self.format, StreamFormat::Sse) {
             return;
         }
         while let Some(end) = self.pending.windows(2).position(|window| window == b"\n\n") {
@@ -313,14 +491,7 @@ impl CodexUsageParser {
     }
 
     fn observe_event(&mut self, event: &[u8]) {
-        for line in event.split(|byte| *byte == b'\n') {
-            let Some(data) = line.strip_prefix(b"data:") else {
-                continue;
-            };
-            let data = data.strip_prefix(b" ").unwrap_or(data);
-            let Ok(value) = serde_json::from_slice::<Value>(data) else {
-                continue;
-            };
+        if let Some(value) = sse_value(event) {
             self.observe_value(&value);
         }
     }
@@ -339,28 +510,134 @@ impl CodexUsageParser {
             return;
         };
         let details = usage.get("input_tokens_details");
-        let cached = details
-            .and_then(|value| value.get("cached_tokens"))
+        let cached = usage
+            .get("cache_read_input_tokens")
+            .or_else(|| details.and_then(|value| value.get("cached_tokens")))
             .and_then(Value::as_u64)
             .unwrap_or(0)
             .min(input);
+        let cache_creation = usage
+            .get("cache_creation_input_tokens")
+            .or_else(|| details.and_then(|value| value.get("cache_write_tokens")))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(input.saturating_sub(cached));
         self.usage = Some(RequestUsage {
-            input_tokens: input - cached,
+            input_tokens: input.saturating_sub(cached).saturating_sub(cache_creation),
             cached_input_tokens: cached,
-            cache_creation_input_tokens: 0,
+            cache_creation_input_tokens: cache_creation,
             output_tokens: output,
         });
     }
 
     fn finish(&mut self) -> Option<RequestUsage> {
         if !self.disabled
-            && matches!(self.format, CodexUsageFormat::Json)
+            && matches!(self.format, StreamFormat::Json)
             && let Ok(value) = serde_json::from_slice::<Value>(&self.pending)
         {
             self.observe_value(&value);
         }
         self.usage
     }
+}
+
+struct ClaudeUsageParser {
+    format: StreamFormat,
+    pending: Vec<u8>,
+    usage: RequestUsage,
+    observed: bool,
+    disabled: bool,
+}
+
+impl ClaudeUsageParser {
+    fn new(format: StreamFormat) -> Self {
+        Self {
+            format,
+            pending: Vec::new(),
+            usage: RequestUsage {
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                output_tokens: 0,
+            },
+            observed: false,
+            disabled: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if self.disabled {
+            return;
+        }
+        if self.pending.len().saturating_add(bytes.len()) > MAX_USAGE_EVENT_BYTES {
+            self.pending.clear();
+            self.disabled = true;
+            return;
+        }
+        self.pending.extend_from_slice(bytes);
+        if !matches!(self.format, StreamFormat::Sse) {
+            return;
+        }
+        while let Some(end) = self.pending.windows(2).position(|window| window == b"\n\n") {
+            let event = self.pending.drain(..end + 2).collect::<Vec<_>>();
+            if let Some(value) = sse_value(&event) {
+                self.observe_value(&value);
+            }
+        }
+    }
+
+    fn observe_value(&mut self, value: &Value) {
+        let usage = value
+            .get("message")
+            .and_then(|message| message.get("usage"))
+            .or_else(|| value.get("usage"));
+        let Some(usage) = usage else {
+            return;
+        };
+        if let Some(input) = usage.get("input_tokens").and_then(Value::as_u64) {
+            self.usage.input_tokens = input;
+            self.observed = true;
+        }
+        if let Some(cached) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+            self.usage.cached_input_tokens = cached;
+            self.observed = true;
+        }
+        if let Some(creation) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.usage.cache_creation_input_tokens = creation;
+            self.observed = true;
+        }
+        if let Some(output) = usage.get("output_tokens").and_then(Value::as_u64) {
+            self.usage.output_tokens = output;
+            self.observed = true;
+        }
+    }
+
+    fn finish(&mut self) -> Option<RequestUsage> {
+        if !self.disabled
+            && matches!(self.format, StreamFormat::Json)
+            && let Ok(value) = serde_json::from_slice::<Value>(&self.pending)
+        {
+            self.observe_value(&value);
+        }
+        self.observed.then_some(self.usage)
+    }
+}
+
+fn sse_value(event: &[u8]) -> Option<Value> {
+    let mut data = Vec::new();
+    for line in event.split(|byte| *byte == b'\n') {
+        let Some(value) = line.strip_prefix(b"data:") else {
+            continue;
+        };
+        if !data.is_empty() {
+            data.push(b'\n');
+        }
+        data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
+    }
+    serde_json::from_slice(&data).ok()
 }
 
 pub(crate) fn unix_time_ms() -> u64 {
@@ -407,7 +684,7 @@ mod tests {
 
     #[test]
     fn codex_usage_parser_handles_fragmented_sse_and_complete_json() {
-        let mut sse = CodexUsageParser::new(CodexUsageFormat::Sse);
+        let mut sse = CodexUsageParser::new(StreamFormat::Sse);
         for fragment in [
             b"data: {\"type\":\"response.completed\",\"response\":{\"usa".as_slice(),
             b"ge\":{\"input_tokens\":20,\"input_tokens_details\":{\"cached_tokens\":5},".as_slice(),
@@ -425,7 +702,7 @@ mod tests {
             })
         );
 
-        let mut json = CodexUsageParser::new(CodexUsageFormat::Json);
+        let mut json = CodexUsageParser::new(StreamFormat::Json);
         json.push(br#"{"id":"response","usage":{"input_tokens":9,"output_tokens":4}}"#);
         assert_eq!(
             json.finish(),
@@ -439,8 +716,26 @@ mod tests {
     }
 
     #[test]
+    fn claude_usage_parser_merges_message_start_and_delta_without_generic_wire_state() {
+        let mut parser = ClaudeUsageParser::new(StreamFormat::Sse);
+        let bytes = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12,\"output_tokens\":0,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\n";
+        for fragment in bytes.chunks(17) {
+            parser.push(fragment);
+        }
+        assert_eq!(
+            parser.finish(),
+            Some(RequestUsage {
+                input_tokens: 12,
+                cached_input_tokens: 2,
+                cache_creation_input_tokens: 1,
+                output_tokens: 4,
+            })
+        );
+    }
+
+    #[test]
     fn usage_parser_discards_oversized_state_instead_of_retaining_a_success_body() {
-        let mut parser = CodexUsageParser::new(CodexUsageFormat::Json);
+        let mut parser = CodexUsageParser::new(StreamFormat::Json);
         parser.push(&vec![b'x'; MAX_USAGE_EVENT_BYTES + 1]);
         assert!(parser.finish().is_none());
         assert!(parser.pending.is_empty());

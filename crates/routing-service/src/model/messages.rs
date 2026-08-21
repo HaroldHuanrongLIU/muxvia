@@ -8,17 +8,22 @@ use axum::{
 use flate2::read::MultiGzDecoder;
 use futures_util::StreamExt;
 use reqwest::Body as ReqwestBody;
+use secrecy::ExposeSecret;
 use serde_json::Value;
 use url::Url;
 
 use super::{
     auth::bearer_routing_credential_matches,
     headers::{forward_claude_request_headers, forward_response_headers},
+    request_recorder::{
+        RequestRecordStart, ReservedRequestRecord, ResponseObservation, ResponseUsageFormat,
+        observed_upstream_body, recorded_body, unix_time_ms,
+    },
     router::{
         PreparedRouteAttempt, RouteAttemptFailure, RouteResponseKind, pin_route_plan,
         route_pinned_plan,
     },
-    server::{ActiveRequestGuard, RouteState, body_with_active_guard},
+    server::{ActiveRequestGuard, RouteState},
     upstream::{UpstreamRequest, messages_url},
 };
 use crate::state::RouteObservation;
@@ -54,29 +59,83 @@ pub(crate) async fn route_messages(
         Some(plan) => plan,
         None => return local_response(StatusCode::SERVICE_UNAVAILABLE),
     };
+    let started_at_unix_ms = unix_time_ms();
+    let mut redactions = vec![expected.expose_secret().as_bytes().to_vec()];
+    redactions.extend(plan.members.iter().filter_map(|member| {
+        member
+            .provider_credential
+            .as_ref()
+            .map(|credential| credential.expose_secret().as_bytes().to_vec())
+    }));
+    let observation = ResponseObservation::new(redactions);
+    let primary = &plan.members[0];
+    let mut record_start = RequestRecordStart {
+        id: uuid::Uuid::new_v4(),
+        target: state.target,
+        plan_id: plan.id,
+        plan_epoch: plan.epoch,
+        provider: Some(crate::request_history::RecordedProvider {
+            id: primary.provider_id,
+            name: primary.name.clone(),
+        }),
+        model: primary.model.clone(),
+        protocol: primary.protocol,
+        started_at_unix_ms,
+        status: None,
+        semantic_failure: false,
+        observation,
+    };
+    let Some(reserved_record) = state.request_recorder.reserve() else {
+        return fixed_failure_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "request-recording-unavailable",
+        );
+    };
     let count_tokens = request.uri().path().ends_with("/count_tokens");
     let primary_is_bridge = plan
         .members
         .first()
         .is_some_and(|member| member.authentication == ProviderAuthentication::CodexSubscription);
     if count_tokens && primary_is_bridge {
-        return fixed_failure_response(
+        return complete_after_plan(
+            reserved_record,
+            record_start,
             StatusCode::NOT_IMPLEMENTED,
-            "subscription-bridge-count-tokens-unsupported",
+            fixed_failure_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "subscription-bridge-count-tokens-unsupported",
+            ),
         );
     }
     let Some(active_request) = ActiveRequestGuard::try_begin(Arc::clone(&state.admission)) else {
-        return local_response(StatusCode::SERVICE_UNAVAILABLE);
+        return complete_after_plan(
+            reserved_record,
+            record_start,
+            StatusCode::SERVICE_UNAVAILABLE,
+            local_response(StatusCode::SERVICE_UNAVAILABLE),
+        );
     };
     let encoding = match content_encoding(request.headers()) {
         Ok(encoding) => encoding,
         Err(()) if primary_is_bridge => {
-            return fixed_failure_response(
+            return complete_after_plan(
+                reserved_record,
+                record_start,
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "subscription-bridge-invalid-request",
+                fixed_failure_response(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "subscription-bridge-invalid-request",
+                ),
             );
         }
-        Err(()) => return body_error(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        Err(()) => {
+            return complete_after_plan(
+                reserved_record,
+                record_start,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                body_error(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+            );
+        }
     };
     if request
         .headers()
@@ -85,7 +144,7 @@ pub(crate) async fn route_messages(
         .and_then(|value| value.parse::<u64>().ok())
         .is_some_and(|length| length > MAX_BODY_BYTES as u64)
     {
-        return if primary_is_bridge {
+        let response = if primary_is_bridge {
             fixed_failure_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "subscription-bridge-invalid-request",
@@ -93,6 +152,12 @@ pub(crate) async fn route_messages(
         } else {
             body_error(StatusCode::PAYLOAD_TOO_LARGE)
         };
+        return complete_after_plan(
+            reserved_record,
+            record_start,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            response,
+        );
     }
     let request_path = request.uri().path().to_owned();
     let query = request.uri().query().map(str::to_owned);
@@ -101,7 +166,7 @@ pub(crate) async fn route_messages(
     let mut bytes = Vec::new();
     while let Some(chunk) = incoming.next().await {
         let Ok(chunk) = chunk else {
-            return if primary_is_bridge {
+            let response = if primary_is_bridge {
                 fixed_failure_response(
                     StatusCode::BAD_REQUEST,
                     "subscription-bridge-invalid-request",
@@ -109,9 +174,15 @@ pub(crate) async fn route_messages(
             } else {
                 body_error(StatusCode::BAD_REQUEST)
             };
+            return complete_after_plan(
+                reserved_record,
+                record_start,
+                StatusCode::BAD_REQUEST,
+                response,
+            );
         };
         if bytes.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
-            return if primary_is_bridge {
+            let response = if primary_is_bridge {
                 fixed_failure_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "subscription-bridge-invalid-request",
@@ -119,36 +190,79 @@ pub(crate) async fn route_messages(
             } else {
                 body_error(StatusCode::PAYLOAD_TOO_LARGE)
             };
+            return complete_after_plan(
+                reserved_record,
+                record_start,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                response,
+            );
         }
         bytes.extend_from_slice(&chunk);
     }
     let bytes = match decode_body(encoding, bytes) {
         Ok(bytes) => bytes,
         Err(BodyDecodeError::Invalid) if primary_is_bridge => {
-            return fixed_failure_response(
+            return complete_after_plan(
+                reserved_record,
+                record_start,
                 StatusCode::BAD_REQUEST,
-                "subscription-bridge-invalid-request",
+                fixed_failure_response(
+                    StatusCode::BAD_REQUEST,
+                    "subscription-bridge-invalid-request",
+                ),
             );
         }
         Err(BodyDecodeError::TooLarge) if primary_is_bridge => {
-            return fixed_failure_response(
+            return complete_after_plan(
+                reserved_record,
+                record_start,
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "subscription-bridge-invalid-request",
+                fixed_failure_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "subscription-bridge-invalid-request",
+                ),
             );
         }
-        Err(BodyDecodeError::Invalid) => return body_error(StatusCode::BAD_REQUEST),
-        Err(BodyDecodeError::TooLarge) => return body_error(StatusCode::PAYLOAD_TOO_LARGE),
+        Err(BodyDecodeError::Invalid) => {
+            return complete_after_plan(
+                reserved_record,
+                record_start,
+                StatusCode::BAD_REQUEST,
+                body_error(StatusCode::BAD_REQUEST),
+            );
+        }
+        Err(BodyDecodeError::TooLarge) => {
+            return complete_after_plan(
+                reserved_record,
+                record_start,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                body_error(StatusCode::PAYLOAD_TOO_LARGE),
+            );
+        }
     };
     let object = match serde_json::from_slice::<Value>(&bytes) {
         Ok(Value::Object(object)) => object,
         _ if primary_is_bridge => {
-            return fixed_failure_response(
+            return complete_after_plan(
+                reserved_record,
+                record_start,
                 StatusCode::BAD_REQUEST,
-                "subscription-bridge-invalid-request",
+                fixed_failure_response(
+                    StatusCode::BAD_REQUEST,
+                    "subscription-bridge-invalid-request",
+                ),
             );
         }
-        _ => return body_error(StatusCode::BAD_REQUEST),
+        _ => {
+            return complete_after_plan(
+                reserved_record,
+                record_start,
+                StatusCode::BAD_REQUEST,
+                body_error(StatusCode::BAD_REQUEST),
+            );
+        }
     };
+    let response_observation = record_start.observation.clone();
     let route = route_pinned_plan(
         plan,
         state.target,
@@ -167,6 +281,7 @@ pub(crate) async fn route_messages(
             let request_headers = request_headers.clone();
             let query = query.clone();
             let request_path = request_path.clone();
+            let response_observation = response_observation.clone();
             async move {
                 if protocol != ProviderProtocol::AnthropicMessages {
                     return Err(RouteAttemptFailure::Configuration);
@@ -191,6 +306,8 @@ pub(crate) async fn route_messages(
                                 RouteAttemptFailure::SubscriptionAccountNeedsReauthorization
                             }
                         })?;
+                    response_observation
+                        .add_redaction(access.access_token().expose_secret().as_bytes());
                     let prepared = SubscriptionBridgeAdapter::prepare(BridgeRequestInput {
                         path: &request_path,
                         provider_model: &model,
@@ -240,6 +357,21 @@ pub(crate) async fn route_messages(
         },
     )
     .await;
+    let outcome_without_response = if route
+        .observations
+        .iter()
+        .any(|observation| observation.outcome == "transport-failure")
+    {
+        crate::control::protocol::RequestRecordOutcome::TransportError
+    } else if route
+        .observations
+        .iter()
+        .any(|observation| observation.outcome == "semantic-failure")
+    {
+        crate::control::protocol::RequestRecordOutcome::SemanticError
+    } else {
+        crate::control::protocol::RequestRecordOutcome::RouteUnavailable
+    };
     let serving_provider = route
         .routed
         .as_ref()
@@ -271,26 +403,71 @@ pub(crate) async fn route_messages(
             .await;
     }
     let Some(routed) = route.routed else {
-        return fixed_failure_response(
-            match route.failure {
-                Some(RouteAttemptFailure::SubscriptionBridgeInvalidRequest) => {
-                    StatusCode::BAD_REQUEST
-                }
-                Some(RouteAttemptFailure::SubscriptionBridgeCountTokensUnsupported) => {
-                    StatusCode::NOT_IMPLEMENTED
-                }
-                _ => StatusCode::BAD_GATEWAY,
-            },
-            route
-                .failure
-                .map(RouteAttemptFailure::code)
-                .unwrap_or("model-route-unavailable"),
-        );
+        if let Some(attempt) = route.last_attempt {
+            record_start.provider = Some(crate::request_history::RecordedProvider {
+                id: attempt.provider_id,
+                name: attempt.provider_name,
+            });
+            record_start.model = attempt.model;
+            record_start.protocol = attempt.protocol;
+        }
+        let status = match route.failure {
+            Some(RouteAttemptFailure::SubscriptionBridgeInvalidRequest) => StatusCode::BAD_REQUEST,
+            Some(RouteAttemptFailure::SubscriptionBridgeCountTokensUnsupported) => {
+                StatusCode::NOT_IMPLEMENTED
+            }
+            _ => StatusCode::BAD_GATEWAY,
+        };
+        let code = route
+            .failure
+            .map(RouteAttemptFailure::code)
+            .unwrap_or("model-route-unavailable");
+        record_start.status = Some(status);
+        reserved_record.complete_terminal(record_start, outcome_without_response);
+        return fixed_failure_response(status, code);
     };
+    record_start.provider = Some(crate::request_history::RecordedProvider {
+        id: routed.provider_id,
+        name: routed.provider_name.clone(),
+    });
+    record_start.model = routed.model.clone();
+    record_start.protocol = routed.protocol;
+    record_start.status = Some(routed.response.status);
+    record_start.semantic_failure = routed.semantic_failure;
+    let observe_forwarded = routed.response_kind == RouteResponseKind::Native;
+    let usage_format = match routed.response_kind {
+        RouteResponseKind::Native => ResponseUsageFormat::claude(
+            routed
+                .response
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+        ),
+        RouteResponseKind::SubscriptionBridge => ResponseUsageFormat::codex(
+            routed
+                .response
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+        ),
+    };
+    record_start.observation.configure(
+        usage_format,
+        routed.response.status,
+        routed
+            .response
+            .headers
+            .get(header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.eq_ignore_ascii_case("gzip") || value.eq_ignore_ascii_case("x-gzip")
+            }),
+    );
     let mut upstream = routed.response;
     if routed.response_kind == RouteResponseKind::SubscriptionBridge {
         if upstream.status.is_success() {
-            let converted = SubscriptionBridgeAdapter::convert_stream(upstream.body);
+            let observed = observed_upstream_body(upstream.body, record_start.observation.clone());
+            let converted = SubscriptionBridgeAdapter::convert_stream(observed);
             upstream.body = Box::pin(converted.map(Ok));
             upstream.headers = axum::http::HeaderMap::new();
             upstream.headers.insert(
@@ -300,23 +477,25 @@ pub(crate) async fn route_messages(
         } else {
             let status = upstream.status;
             let mut error_body = Vec::new();
+            let mut valid = true;
             while let Some(chunk) = upstream.body.next().await {
                 let Ok(chunk) = chunk else {
-                    return fixed_bridge_response(status, active_request);
+                    valid = false;
+                    break;
                 };
+                record_start.observation.observe(&chunk);
                 if error_body.len().saturating_add(chunk.len())
                     > crate::subscription_bridge::MAX_BRIDGE_ERROR_BODY_BYTES
                 {
-                    return fixed_bridge_response(status, active_request);
+                    valid = false;
+                    break;
                 }
                 error_body.extend_from_slice(&chunk);
             }
-            let failure = match SubscriptionBridgeAdapter::map_non_success(status, &error_body) {
-                Ok(failure) => failure,
-                Err(_) => {
-                    return fixed_bridge_response(status, active_request);
-                }
-            };
+            let failure = valid
+                .then(|| SubscriptionBridgeAdapter::map_non_success(status, &error_body).ok())
+                .flatten()
+                .unwrap_or_else(|| SubscriptionBridgeAdapter::invalid_response(status));
             upstream.status = failure.status();
             upstream.body = Box::pin(futures_util::stream::once(std::future::ready(Ok(failure
                 .event()
@@ -330,7 +509,13 @@ pub(crate) async fn route_messages(
     }
     let mut response = Response::builder()
         .status(upstream.status)
-        .body(body_with_active_guard(upstream.body, active_request))
+        .body(recorded_body(
+            upstream.body,
+            active_request,
+            reserved_record,
+            record_start,
+            observe_forwarded,
+        ))
         .expect("valid upstream status");
     *response.headers_mut() = forward_response_headers(&upstream.headers);
     response
@@ -405,12 +590,16 @@ fn fixed_failure_response(status: StatusCode, code: &'static str) -> Response<Bo
         .expect("valid fixed failure response")
 }
 
-fn fixed_bridge_response(status: StatusCode, active_request: ActiveRequestGuard) -> Response<Body> {
-    let failure = SubscriptionBridgeAdapter::invalid_response(status);
-    let body = futures_util::stream::once(std::future::ready(Ok(failure.event().clone())));
-    Response::builder()
-        .status(failure.status())
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .body(body_with_active_guard(Box::pin(body), active_request))
-        .expect("valid fixed bridge failure response")
+fn complete_after_plan(
+    reserved: ReservedRequestRecord,
+    mut start: RequestRecordStart,
+    status: StatusCode,
+    response: Response<Body>,
+) -> Response<Body> {
+    start.status = Some(status);
+    reserved.complete_terminal(
+        start,
+        crate::control::protocol::RequestRecordOutcome::RouteUnavailable,
+    );
+    response
 }

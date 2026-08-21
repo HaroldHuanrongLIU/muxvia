@@ -9,6 +9,7 @@ import {
 import {
   embeddedBundleIdentity,
   ReleaseBundleError,
+  validatePassedBundleRoot,
   validateReleaseBundle,
 } from "./release-bundle"
 import { checkForUpdate } from "./update-notification"
@@ -19,6 +20,7 @@ let bundledControlPlanePath: string | undefined
 if (bundleIdentity) {
   try {
     const bundle = await validateReleaseBundle(process.execPath, bundleIdentity)
+    await validatePassedBundleRoot(process.env.MUXVIA_BUNDLE_ROOT, bundle.root)
     bundledControlPlanePath = resolve(bundle.root, "muxvia")
     bundledServicePath = bundle.routingServicePath
   } catch (error) {

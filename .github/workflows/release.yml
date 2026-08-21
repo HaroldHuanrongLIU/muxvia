@@ -43,6 +43,10 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: 1.3.14
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
       - run: bun install --frozen-lockfile
       - name: Match tag to the locked product release
         id: release
@@ -50,6 +54,7 @@ jobs:
         run: |
           release="${GITHUB_REF_NAME#v}"
           test "$release" = "$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/routing-service/Cargo.toml | head -1)"
+          test "$release" = "$(node -p "require('./packages/npm-launcher/package.json').version")"
           printf 'release=%s\n' "$release" >> "$GITHUB_OUTPUT"
       - name: Build release executables
         env:
@@ -111,11 +116,44 @@ jobs:
             MUXVIA_INSTALLER_TEST_MANIFEST_URL="file://$installer_assets/muxvia-latest.json" \
             MUXVIA_INSTALLER_TEST_RELEASES_URL="file://$installer_assets/releases" \
             sh scripts/install.sh
+      - name: Pack and smoke the npm installation
+        run: |
+          package_root="build/npm/platform"
+          tarballs="build/npm/tarballs"
+          smoke_root="$(pwd)/build/npm/smoke"
+          mkdir -p "$tarballs" "$smoke_root"
+          bun run release:npm assemble-platform \
+            --root "build/muxvia-${{ steps.release.outputs.release }}-${{ matrix.target }}" \
+            --release "${{ steps.release.outputs.release }}" \
+            --target "${{ matrix.target }}" \
+            --build "${{ github.sha }}" \
+            --output "$package_root"
+          bun run release:npm inspect-platform \
+            --root "$package_root" \
+            --release "${{ steps.release.outputs.release }}" \
+            --target "${{ matrix.target }}" \
+            --build "${{ github.sha }}"
+          bun run release:npm inspect-launcher \
+            --root packages/npm-launcher \
+            --release "${{ steps.release.outputs.release }}"
+          npm pack "$package_root" --pack-destination "$tarballs" --silent
+          npm pack packages/npm-launcher --pack-destination "$tarballs" --silent
+          npm install \
+            --prefix "$smoke_root" \
+            --offline \
+            --ignore-scripts \
+            --omit=optional \
+            --package-lock=false \
+            "$tarballs/muxvia-${{ steps.release.outputs.release }}.tgz" \
+            "$tarballs/muxvia-${{ matrix.target }}-${{ steps.release.outputs.release }}.tgz"
+          MUXVIA_UPDATE_CHECK=0 "$smoke_root/node_modules/.bin/muxvia" version --json
       # actions/upload-artifact v4
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: muxvia-${{ steps.release.outputs.release }}-${{ matrix.target }}
-          path: build/muxvia-${{ steps.release.outputs.release }}-${{ matrix.target }}.tar.gz
+          path: |
+            build/muxvia-${{ steps.release.outputs.release }}-${{ matrix.target }}.tar.gz
+            build/npm/tarballs/muxvia-${{ matrix.target }}-${{ steps.release.outputs.release }}.tgz
           if-no-files-found: error
           retention-days: 7
 
@@ -176,7 +214,7 @@ jobs:
             --release "${{ steps.release.outputs.release }}"
 
   publish:
-    name: publish GitHub Release
+    name: publish release channels
     needs: [bundle, homebrew]
     runs-on: ubuntu-24.04
     permissions:
@@ -188,6 +226,11 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: 1.3.14
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
       - run: bun install --frozen-lockfile
       # actions/download-artifact v5
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
@@ -213,12 +256,61 @@ jobs:
           bun run release:homebrew verify \
             --manifest release/muxvia-latest.json \
             --formula release/muxvia.rb
+      - name: Publish and verify every npm platform package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          release="${{ steps.release.outputs.release }}"
+          staging_tag="release-${GITHUB_RUN_ID}"
+          mkdir -p release/npm-verified
+          for target in darwin-arm64 darwin-x64 linux-glibc-arm64 linux-glibc-x64; do
+            npm publish "release/muxvia-${target}-${release}.tgz" \
+              --access public \
+              --tag "$staging_tag"
+          done
+          for target in darwin-arm64 darwin-x64 linux-glibc-arm64 linux-glibc-x64; do
+            verified="release/npm-verified/${target}"
+            mkdir -p "$verified/extracted"
+            tarball="$(npm pack "@muxvia/${target}@${release}" --pack-destination "$verified" --silent)"
+            tar -xzf "$verified/$tarball" -C "$verified/extracted"
+            bun run release:npm inspect-platform \
+              --root "$verified/extracted/package" \
+              --release "$release" \
+              --target "$target" \
+              --build "${{ github.sha }}"
+          done
+      - name: Publish and verify the npm launcher without moving its public tag
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          release="${{ steps.release.outputs.release }}"
+          staging_tag="release-${GITHUB_RUN_ID}"
+          bun run release:npm inspect-launcher --root packages/npm-launcher --release "$release"
+          launcher_tarball="$(npm pack packages/npm-launcher --pack-destination release --silent)"
+          npm publish "release/$launcher_tarball" --access public --tag "$staging_tag"
+          mkdir -p release/npm-verified/launcher/extracted
+          verified_tarball="$(npm pack "muxvia@${release}" \
+            --pack-destination release/npm-verified/launcher \
+            --silent)"
+          tar -xzf "release/npm-verified/launcher/$verified_tarball" \
+            -C release/npm-verified/launcher/extracted
+          bun run release:npm inspect-launcher \
+            --root release/npm-verified/launcher/extracted/package \
+            --release "$release"
+      - name: Move the verified npm launcher to the public distribution tag
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm dist-tag add "muxvia@${{ steps.release.outputs.release }}" latest
       - name: Publish all verified artifacts together
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           install -m 0755 scripts/install.sh release/install.sh
-          gh release create "$GITHUB_REF_NAME" release/* \
+          gh release create "$GITHUB_REF_NAME" \
+            release/*.tar.gz \
+            release/muxvia-latest.json \
+            release/muxvia.rb \
+            release/install.sh \
             --verify-tag \
             --generate-notes \
             --title "Muxvia ${{ steps.release.outputs.release }}"

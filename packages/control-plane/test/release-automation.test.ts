@@ -33,6 +33,37 @@ test("release automation owns all four native archives and every audit gate", as
   expect(workflow.match(/MUXVIA_INSTALLER_TESTING=1/g)).toHaveLength(2)
 })
 
+test("npm release automation smokes every platform and moves latest only after published verification", async () => {
+  const workflow = await readFile(resolve(".github/workflows/release.yml"), "utf8")
+  for (const target of [
+    "darwin-arm64",
+    "darwin-x64",
+    "linux-glibc-arm64",
+    "linux-glibc-x64",
+  ]) {
+    expect(workflow).toContain(`target: ${target}`)
+  }
+  expect(workflow).toContain("@muxvia/${target}@${release}")
+  for (const gate of [
+    "release:npm assemble-platform",
+    "release:npm inspect-platform",
+    "release:npm inspect-launcher",
+    "npm install",
+    "--offline",
+    "--ignore-scripts",
+    "node_modules/.bin/muxvia",
+    "npm publish",
+    "npm pack",
+    "npm dist-tag add",
+  ]) expect(workflow).toContain(gate)
+  expect(workflow.indexOf("Publish and verify every npm platform package")).toBeLessThan(
+    workflow.indexOf("Publish and verify the npm launcher without moving its public tag"),
+  )
+  expect(workflow.indexOf("Publish and verify the npm launcher without moving its public tag")).toBeLessThan(
+    workflow.indexOf("Move the verified npm launcher to the public distribution tag"),
+  )
+})
+
 test("release archives carry licenses, provenance, and accurate unsigned macOS guidance", async () => {
   const [notices, extraction, releaseDocumentation] = await Promise.all([
     readFile(resolve("THIRD_PARTY_NOTICES.md"), "utf8"),

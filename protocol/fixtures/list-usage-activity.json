@@ -1,0 +1,10 @@
+{
+  "type": "request",
+  "requestId": "usage-activity-list",
+  "operation": {
+    "kind": "list-usage-activity",
+    "target": "codex",
+    "beforeCursor": "usage-v1-cursor",
+    "limit": 20
+  }
+}

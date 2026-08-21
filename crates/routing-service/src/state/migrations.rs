@@ -14,7 +14,7 @@ use crate::control::protocol::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -38,7 +38,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
         .transpose()?;
 
     match version {
-        None | Some(SCHEMA_VERSION) | Some(13) => {}
+        None | Some(SCHEMA_VERSION) | Some(14) | Some(13) => {}
         Some(1) => {
             migrate_v1(connection)?;
             migrate_v2(connection)?;
@@ -141,11 +141,128 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
         Some(12) => migrate_v12(connection)?,
         Some(_) => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
-    if version.is_some_and(|version| version < SCHEMA_VERSION) {
+    if version.is_some_and(|version| version < 14) {
         migrate_v13(connection)?;
+    }
+    if version.is_some_and(|version| version < 15) {
+        migrate_v14(connection)?;
     }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v14(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE native_usage_records (
+           sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+           id TEXT NOT NULL UNIQUE,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           source_record_fingerprint TEXT NOT NULL CHECK (length(source_record_fingerprint) = 64),
+           model TEXT NOT NULL CHECK (length(model) > 0),
+           observed_at_unix_ms INTEGER NOT NULL CHECK (observed_at_unix_ms >= 0),
+           input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+           cached_input_tokens INTEGER NOT NULL CHECK (cached_input_tokens >= 0),
+           cache_creation_input_tokens INTEGER NOT NULL CHECK (cache_creation_input_tokens >= 0),
+           output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+           CHECK (
+             input_tokens > 0 OR cached_input_tokens > 0
+             OR cache_creation_input_tokens > 0 OR output_tokens > 0
+           ),
+           UNIQUE (target, source_record_fingerprint)
+         );
+         CREATE INDEX native_usage_records_target_sequence
+           ON native_usage_records(target, sequence DESC);
+         CREATE TRIGGER native_usage_records_immutable
+         BEFORE UPDATE ON native_usage_records
+         BEGIN
+           SELECT RAISE(ABORT, 'immutable-native-usage-record');
+         END;
+         CREATE TABLE native_usage_pricing_snapshots (
+           native_usage_record_id TEXT PRIMARY KEY
+             REFERENCES native_usage_records(id) ON DELETE CASCADE,
+           catalog_version TEXT NOT NULL,
+           source TEXT NOT NULL,
+           source_model TEXT NOT NULL,
+           input_nano_usd_per_million INTEGER NOT NULL CHECK (input_nano_usd_per_million >= 0),
+           output_nano_usd_per_million INTEGER NOT NULL CHECK (output_nano_usd_per_million >= 0),
+           cache_read_multiplier_ppm INTEGER NOT NULL CHECK (cache_read_multiplier_ppm >= 0),
+           cache_creation_multiplier_ppm INTEGER NOT NULL CHECK (cache_creation_multiplier_ppm >= 0),
+           priced_at_unix_ms INTEGER NOT NULL CHECK (priced_at_unix_ms >= 0),
+           estimated_cost_nano_usd INTEGER NOT NULL CHECK (estimated_cost_nano_usd > 0)
+         );
+         CREATE TRIGGER native_usage_pricing_snapshots_immutable
+         BEFORE UPDATE ON native_usage_pricing_snapshots
+         BEGIN
+           SELECT RAISE(ABORT, 'immutable-native-usage-pricing-snapshot');
+         END;
+         CREATE TRIGGER native_usage_pricing_snapshots_delete_with_record
+         BEFORE DELETE ON native_usage_pricing_snapshots
+         WHEN EXISTS (
+           SELECT 1 FROM native_usage_records WHERE id = OLD.native_usage_record_id
+         )
+         BEGIN
+           SELECT RAISE(ABORT, 'immutable-native-usage-pricing-snapshot');
+         END;
+         CREATE TABLE native_usage_import_cursors (
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           source_fingerprint TEXT NOT NULL CHECK (length(source_fingerprint) = 64),
+           modified_unix_nanos INTEGER NOT NULL CHECK (modified_unix_nanos >= 0),
+           byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+           completed_line_count INTEGER NOT NULL CHECK (completed_line_count >= 0),
+           PRIMARY KEY (target, source_fingerprint)
+         );
+         CREATE TABLE daily_usage_rollups (
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           local_date TEXT NOT NULL CHECK (
+             length(local_date) = 10
+             AND local_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+           ),
+           request_record_count INTEGER NOT NULL CHECK (request_record_count >= 0),
+           native_usage_record_count INTEGER NOT NULL CHECK (native_usage_record_count >= 0),
+           successful_request_count INTEGER NOT NULL CHECK (successful_request_count >= 0),
+           failed_request_count INTEGER NOT NULL CHECK (failed_request_count >= 0),
+           input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+           cached_input_tokens INTEGER NOT NULL CHECK (cached_input_tokens >= 0),
+           cache_creation_input_tokens INTEGER NOT NULL CHECK (cache_creation_input_tokens >= 0),
+           output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+           priced_record_count INTEGER NOT NULL CHECK (priced_record_count >= 0),
+           unpriced_record_count INTEGER NOT NULL CHECK (unpriced_record_count >= 0),
+           estimated_cost_nano_usd INTEGER NOT NULL CHECK (estimated_cost_nano_usd >= 0),
+           latency_observation_count INTEGER NOT NULL CHECK (latency_observation_count >= 0),
+           total_latency_ms INTEGER NOT NULL CHECK (total_latency_ms >= 0),
+           CHECK (successful_request_count + failed_request_count = request_record_count),
+           CHECK (
+             priced_record_count + unpriced_record_count
+               = request_record_count + native_usage_record_count
+           ),
+           CHECK (latency_observation_count = request_record_count),
+           PRIMARY KEY (target, local_date)
+         );
+         CREATE TABLE usage_settings (
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+           detailed_retention_days INTEGER NOT NULL
+             CHECK (detailed_retention_days BETWEEN 1 AND 3650)
+         );
+         INSERT INTO usage_settings (singleton, detailed_retention_days) VALUES (1, 30);
+         CREATE TABLE pricing_catalog_state (
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+           catalog_version TEXT NOT NULL CHECK (length(catalog_version) > 0),
+           source TEXT NOT NULL CHECK (length(source) > 0),
+           catalog_json TEXT NOT NULL CHECK (length(catalog_json) > 0),
+           updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= 0)
+         );",
+    )?;
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.execute(
+        "UPDATE metadata SET value = '15' WHERE key = 'schema-version'",
+        [],
+    )?;
+    transaction.commit()
 }
 
 fn migrate_v13(connection: &mut Connection) -> Result<()> {

@@ -66,6 +66,11 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "probe-compatibility.json",
         "list-request-records.json",
         "inspect-request-record.json",
+        "list-usage-activity.json",
+        "refresh-native-usage.json",
+        "set-usage-retention.json",
+        "clear-usage.json",
+        "update-pricing-catalog.json",
         "open-universal-providers.json",
         "prepare-handover.json",
     ] {
@@ -83,6 +88,18 @@ fn fixtures_round_trip_as_their_protocol_types() {
     assert_eq!(serde_json::to_value(parsed).unwrap(), handover_prepared);
 
     for name in ["request-record-page.json", "request-record-detail.json"] {
+        let frame = fixture(name);
+        let parsed: ServerFrame = serde_json::from_value(frame.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), frame);
+    }
+
+    for name in [
+        "usage-activity-page.json",
+        "native-usage-refresh.json",
+        "usage-retention-outcome.json",
+        "usage-clear-outcome.json",
+        "pricing-catalog-update-outcome.json",
+    ] {
         let frame = fixture(name);
         let parsed: ServerFrame = serde_json::from_value(frame.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), frame);
@@ -156,6 +173,55 @@ fn fixtures_round_trip_as_their_protocol_types() {
         let frame = fixture(name);
         let parsed: ServerFrame = serde_json::from_value(frame.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), frame);
+    }
+}
+
+#[test]
+fn usage_lifecycle_contract_is_closed_target_bound_and_secret_free() {
+    let client_fixtures = [
+        "list-usage-activity.json",
+        "refresh-native-usage.json",
+        "set-usage-retention.json",
+        "clear-usage.json",
+        "update-pricing-catalog.json",
+    ];
+    let server_fixtures = [
+        "usage-activity-page.json",
+        "native-usage-refresh.json",
+        "usage-retention-outcome.json",
+        "usage-clear-outcome.json",
+        "pricing-catalog-update-outcome.json",
+    ];
+    for name in client_fixtures {
+        let mut frame = fixture(name);
+        frame["operation"]["nativeContent"] =
+            serde_json::json!("NATIVE_USAGE_PROTOCOL_SECRET_14001");
+        assert!(
+            serde_json::from_value::<ClientFrame>(frame).is_err(),
+            "accepted additive native usage content in {name}"
+        );
+    }
+    for name in server_fixtures {
+        let mut frame = fixture(name);
+        frame["result"]["sourcePath"] = serde_json::json!("NATIVE_USAGE_PROTOCOL_SECRET_14002");
+        assert!(
+            serde_json::from_value::<ServerFrame>(frame).is_err(),
+            "accepted additive native source path in {name}"
+        );
+    }
+
+    let schema = fixture("../control-v1.schema.json");
+    for definition in [
+        "nativeUsageRecordSummary",
+        "dailyUsageRollup",
+        "usageActivityEntry",
+        "usageActivityPage",
+        "nativeUsageRefresh",
+        "usageRetentionOutcome",
+        "usageClearOutcome",
+        "pricingCatalogUpdateOutcome",
+    ] {
+        assert_eq!(schema["$defs"][definition]["additionalProperties"], false);
     }
 }
 

@@ -1,0 +1,8 @@
+{
+  "type": "request",
+  "requestId": "pricing-catalog-update",
+  "operation": {
+    "kind": "update-pricing-catalog",
+    "target": "codex"
+  }
+}

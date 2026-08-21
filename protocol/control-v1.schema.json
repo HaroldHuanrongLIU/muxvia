@@ -141,6 +141,86 @@
       },
       "required": ["target", "record", "pricingSnapshot", "errorPayload", "errorPayloadSensitive"]
     },
+    "nativeUsageRecordSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "model": { "type": "string" },
+        "observedAtUnixMs": { "type": "integer", "minimum": 0 },
+        "usage": { "$ref": "#/$defs/requestUsage" },
+        "estimatedCostNanoUsd": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] }
+      },
+      "required": ["id", "model", "observedAtUnixMs", "usage", "estimatedCostNanoUsd"]
+    },
+    "dailyUsageRollup": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "localDate": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+        "requestRecordCount": { "type": "integer", "minimum": 0 },
+        "nativeUsageRecordCount": { "type": "integer", "minimum": 0 },
+        "successfulRequestCount": { "type": "integer", "minimum": 0 },
+        "failedRequestCount": { "type": "integer", "minimum": 0 },
+        "usage": { "$ref": "#/$defs/requestUsage" },
+        "pricedRecordCount": { "type": "integer", "minimum": 0 },
+        "unpricedRecordCount": { "type": "integer", "minimum": 0 },
+        "estimatedCostNanoUsd": { "type": "integer", "minimum": 0 },
+        "latencyObservationCount": { "type": "integer", "minimum": 0 },
+        "totalLatencyMs": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["localDate", "requestRecordCount", "nativeUsageRecordCount", "successfulRequestCount", "failedRequestCount", "usage", "pricedRecordCount", "unpricedRecordCount", "estimatedCostNanoUsd", "latencyObservationCount", "totalLatencyMs"]
+    },
+    "usageActivityEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["request-record", "native-usage-record", "daily-usage-rollup"] },
+        "record": { "oneOf": [{ "$ref": "#/$defs/requestRecordSummary" }, { "$ref": "#/$defs/nativeUsageRecordSummary" }] },
+        "rollup": { "$ref": "#/$defs/dailyUsageRollup" }
+      },
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "request-record" }, "record": { "$ref": "#/$defs/requestRecordSummary" } }, "required": ["kind", "record"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "native-usage-record" }, "record": { "$ref": "#/$defs/nativeUsageRecordSummary" } }, "required": ["kind", "record"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "daily-usage-rollup" }, "rollup": { "$ref": "#/$defs/dailyUsageRollup" } }, "required": ["kind", "rollup"] }
+      ]
+    },
+    "usageActivityPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": { "enum": ["codex", "claude"] },
+        "entries": { "type": "array", "items": { "$ref": "#/$defs/usageActivityEntry" } },
+        "nextCursor": { "type": ["string", "null"] },
+        "detailedRetentionDays": { "type": "integer", "minimum": 1, "maximum": 3650 },
+        "catalogVersion": { "type": "string" }
+      },
+      "required": ["target", "entries", "nextCursor", "detailedRetentionDays", "catalogVersion"]
+    },
+    "nativeUsageRefresh": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "target": { "enum": ["codex", "claude"] }, "importedRecords": { "type": "integer", "minimum": 0 }, "scannedFiles": { "type": "integer", "minimum": 0 } },
+      "required": ["target", "importedRecords", "scannedFiles"]
+    },
+    "usageRetentionOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "target": { "enum": ["codex", "claude"] }, "detailedRetentionDays": { "type": "integer", "minimum": 1, "maximum": 3650 }, "rolledUpDays": { "type": "integer", "minimum": 0 }, "prunedRequestRecords": { "type": "integer", "minimum": 0 }, "prunedNativeUsageRecords": { "type": "integer", "minimum": 0 } },
+      "required": ["target", "detailedRetentionDays", "rolledUpDays", "prunedRequestRecords", "prunedNativeUsageRecords"]
+    },
+    "usageClearOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "target": { "enum": ["codex", "claude"] }, "clearedRequestRecords": { "type": "integer", "minimum": 0 }, "clearedNativeUsageRecords": { "type": "integer", "minimum": 0 }, "clearedDailyRollups": { "type": "integer", "minimum": 0 }, "clearedImportCursors": { "type": "integer", "minimum": 0 } },
+      "required": ["target", "clearedRequestRecords", "clearedNativeUsageRecords", "clearedDailyRollups", "clearedImportCursors"]
+    },
+    "pricingCatalogUpdateOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "target": { "enum": ["codex", "claude"] }, "catalogVersion": { "type": "string" }, "source": { "type": "string" }, "backfilledRequestRecords": { "type": "integer", "minimum": 0 }, "backfilledNativeUsageRecords": { "type": "integer", "minimum": 0 } },
+      "required": ["target", "catalogVersion", "source", "backfilledRequestRecords", "backfilledNativeUsageRecords"]
+    },
     "clientFrame": {
       "oneOf": [
         { "type": "object", "properties": { "type": { "const": "hello" }, "rpc": { "$ref": "#/$defs/rpc" }, "release": { "type": "string" } }, "required": ["type", "rpc", "release"] },
@@ -175,7 +255,12 @@
         { "type": "object", "properties": { "kind": { "const": "preview-reconciliation" }, "target": { "enum": ["codex", "claude"] }, "strategy": { "$ref": "#/$defs/reconciliationStrategy" }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind", "target", "strategy"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "probe-compatibility" }, "target": { "enum": ["codex", "claude"] } }, "required": ["kind", "target"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "list-request-records" }, "target": { "enum": ["codex", "claude"] }, "beforeCursor": { "type": ["string", "null"] }, "limit": { "type": "integer", "minimum": 1, "maximum": 100 } }, "required": ["kind", "target", "limit"] },
-        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "inspect-request-record" }, "target": { "enum": ["codex", "claude"] }, "recordId": { "type": "string", "format": "uuid" } }, "required": ["kind", "target", "recordId"] }
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "inspect-request-record" }, "target": { "enum": ["codex", "claude"] }, "recordId": { "type": "string", "format": "uuid" } }, "required": ["kind", "target", "recordId"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "list-usage-activity" }, "target": { "enum": ["codex", "claude"] }, "beforeCursor": { "type": ["string", "null"] }, "limit": { "type": "integer", "minimum": 1, "maximum": 100 } }, "required": ["kind", "target", "limit"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "refresh-native-usage" }, "target": { "enum": ["codex", "claude"] } }, "required": ["kind", "target"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "set-usage-retention" }, "target": { "enum": ["codex", "claude"] }, "detailedRetentionDays": { "type": "integer", "minimum": 1, "maximum": 3650 } }, "required": ["kind", "target", "detailedRetentionDays"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "clear-usage" }, "target": { "enum": ["codex", "claude"] } }, "required": ["kind", "target"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "update-pricing-catalog" }, "target": { "enum": ["codex", "claude"] } }, "required": ["kind", "target"] }
       ]
     },
     "discoverySource": {
@@ -252,7 +337,12 @@
         { "type": "object", "properties": { "kind": { "const": "reconciliation-preview" }, "preview": { "$ref": "#/$defs/reconciliationPreview" } }, "required": ["kind", "preview"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "compatibility-probe" }, "probe": { "$ref": "#/$defs/compatibilityProbe" } }, "required": ["kind", "probe"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "request-record-page" }, "page": { "$ref": "#/$defs/requestRecordPage" } }, "required": ["kind", "page"] },
-        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "request-record-detail" }, "detail": { "$ref": "#/$defs/requestRecordDetail" } }, "required": ["kind", "detail"] }
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "request-record-detail" }, "detail": { "$ref": "#/$defs/requestRecordDetail" } }, "required": ["kind", "detail"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "usage-activity-page" }, "page": { "$ref": "#/$defs/usageActivityPage" } }, "required": ["kind", "page"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "native-usage-refresh" }, "refresh": { "$ref": "#/$defs/nativeUsageRefresh" } }, "required": ["kind", "refresh"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "usage-retention-outcome" }, "outcome": { "$ref": "#/$defs/usageRetentionOutcome" } }, "required": ["kind", "outcome"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "usage-clear-outcome" }, "outcome": { "$ref": "#/$defs/usageClearOutcome" } }, "required": ["kind", "outcome"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "pricing-catalog-update-outcome" }, "outcome": { "$ref": "#/$defs/pricingCatalogUpdateOutcome" } }, "required": ["kind", "outcome"] }
       ]
     },
     "inspectionCategory": {

@@ -1628,7 +1628,12 @@ async fn serve_session(
                     | ControlOperation::PreviewReconciliation { .. }
                     | ControlOperation::ProbeCompatibility(_)
                     | ControlOperation::ListRequestRecords(_)
-                    | ControlOperation::InspectRequestRecord(_)) => {
+                    | ControlOperation::InspectRequestRecord(_)
+                    | ControlOperation::ListUsageActivity(_)
+                    | ControlOperation::RefreshNativeUsage(_)
+                    | ControlOperation::SetUsageRetention(_)
+                    | ControlOperation::ClearUsage(_)
+                    | ControlOperation::UpdatePricingCatalog(_)) => {
                         if let ControlOperation::DiscoverModels {
                             source: DiscoverySource::Draft { authentication, .. },
                             ..
@@ -1792,6 +1797,11 @@ fn operation_target(operation: &ControlOperation) -> Option<Target> {
         ControlOperation::ProbeCompatibility(operation) => Some(operation.target),
         ControlOperation::ListRequestRecords(operation) => Some(operation.target),
         ControlOperation::InspectRequestRecord(operation) => Some(operation.target),
+        ControlOperation::ListUsageActivity(operation) => Some(operation.target),
+        ControlOperation::RefreshNativeUsage(operation)
+        | ControlOperation::ClearUsage(operation)
+        | ControlOperation::UpdatePricingCatalog(operation) => Some(operation.target),
+        ControlOperation::SetUsageRetention(operation) => Some(operation.target),
     }
 }
 
@@ -2034,6 +2044,16 @@ async fn inspect_and_queue(
                     )
                 })
                 .map_err(request_history_problem),
+            ControlOperation::ListUsageActivity(_)
+            | ControlOperation::RefreshNativeUsage(_)
+            | ControlOperation::SetUsageRetention(_)
+            | ControlOperation::ClearUsage(_)
+            | ControlOperation::UpdatePricingCatalog(_) => Err(ControlProblem {
+                code: "native-usage-unavailable".into(),
+                message: "Native usage is unavailable".into(),
+                source: None,
+                selector: None,
+            }),
             _ => unreachable!(),
         }
     };

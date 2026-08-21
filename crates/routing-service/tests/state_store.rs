@@ -63,8 +63,12 @@ fn v12_state_fingerprint(connection: &Connection) -> Vec<(String, u64)> {
         .prepare(
             "SELECT name FROM sqlite_schema
              WHERE type = 'table'
-               AND name NOT IN ('metadata', 'request_records', 'pricing_snapshots',
-                                'sqlite_sequence')
+               AND name NOT IN (
+                 'metadata', 'request_records', 'pricing_snapshots', 'sqlite_sequence',
+                 'native_usage_records', 'native_usage_pricing_snapshots',
+                 'native_usage_import_cursors', 'daily_usage_rollups',
+                 'usage_settings', 'pricing_catalog_state'
+               )
              ORDER BY name",
         )
         .unwrap()
@@ -167,9 +171,71 @@ async fn fresh_schema_reopens_with_codex_and_claude_route_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, "14");
+    assert_eq!(version, "15");
     assert_eq!(targets, ["claude", "codex"]);
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn schema_v15_declares_private_native_usage_retention_rollups_and_active_catalog() {
+    let fixture = StoreFixture::new().await;
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    let (tables, retention_days, cursor_columns): (Vec<String>, u64, Vec<String>) = database
+        .call(|connection| {
+            let tables = connection
+                .prepare(
+                    "SELECT name FROM sqlite_schema
+                     WHERE type = 'table' AND name IN (
+                       'native_usage_records', 'native_usage_pricing_snapshots',
+                       'native_usage_import_cursors', 'daily_usage_rollups',
+                       'usage_settings', 'pricing_catalog_state'
+                     ) ORDER BY name",
+                )?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            let retention_days = connection.query_row(
+                "SELECT detailed_retention_days FROM usage_settings WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            let cursor_columns = connection
+                .prepare("SELECT name FROM pragma_table_info('native_usage_import_cursors') ORDER BY cid")?
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>((
+                tables,
+                retention_days,
+                cursor_columns,
+            ))
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        tables,
+        [
+            "daily_usage_rollups",
+            "native_usage_import_cursors",
+            "native_usage_pricing_snapshots",
+            "native_usage_records",
+            "pricing_catalog_state",
+            "usage_settings",
+        ]
+    );
+    assert_eq!(retention_days, 30);
+    assert_eq!(
+        cursor_columns,
+        [
+            "target",
+            "source_fingerprint",
+            "modified_unix_nanos",
+            "byte_length",
+            "completed_line_count",
+        ],
+        "Native Usage cursor persisted a source path or transcript identity"
+    );
 }
 
 #[tokio::test]
@@ -311,7 +377,7 @@ async fn request_record_schema_bounds_failed_payload_and_freezes_pricing_snapsho
 }
 
 #[tokio::test]
-async fn schema_v14_migration_preserves_v12_target_state() {
+async fn schema_v15_migration_preserves_v12_target_state() {
     let root = std::env::temp_dir().join(format!("muxvia-schema-v12-{}", Uuid::new_v4()));
     let user_home = root.join("home");
     fs::create_dir_all(&user_home).unwrap();
@@ -378,22 +444,26 @@ async fn schema_v14_migration_preserves_v12_target_state() {
     let tables: u64 = database
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
-             WHERE type = 'table' AND name IN ('request_records', 'pricing_snapshots')",
+             WHERE type = 'table' AND name IN (
+               'request_records', 'pricing_snapshots', 'native_usage_records',
+               'native_usage_pricing_snapshots', 'native_usage_import_cursors',
+               'daily_usage_rollups', 'usage_settings', 'pricing_catalog_state'
+             )",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "14");
+    assert_eq!(version, "15");
     assert_eq!(
         after, before,
-        "schema-v14 migration changed existing v12 state"
+        "schema-v15 migration changed existing v12 state"
     );
-    assert_eq!(tables, 2);
+    assert_eq!(tables, 8);
     let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn schema_v14_migrates_v13_to_parent_cascade_only_pricing_deletion() {
+async fn schema_v15_migrates_v13_to_parent_cascade_only_pricing_deletion() {
     let root = std::env::temp_dir().join(format!("muxvia-schema-v13-{}", Uuid::new_v4()));
     let user_home = root.join("home");
     fs::create_dir_all(&user_home).unwrap();
@@ -405,6 +475,15 @@ async fn schema_v14_migrates_v13_to_parent_cascade_only_pricing_deletion() {
     database
         .execute_batch(
             "DROP TRIGGER pricing_snapshots_delete_with_request_record;
+             DROP TRIGGER native_usage_pricing_snapshots_delete_with_record;
+             DROP TRIGGER native_usage_pricing_snapshots_immutable;
+             DROP TRIGGER native_usage_records_immutable;
+             DROP TABLE native_usage_pricing_snapshots;
+             DROP TABLE native_usage_records;
+             DROP TABLE native_usage_import_cursors;
+             DROP TABLE daily_usage_rollups;
+             DROP TABLE usage_settings;
+             DROP TABLE pricing_catalog_state;
              UPDATE metadata SET value = '13' WHERE key = 'schema-version';",
         )
         .unwrap();
@@ -453,12 +532,12 @@ async fn schema_v14_migrates_v13_to_parent_cascade_only_pricing_deletion() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "14");
+    assert_eq!(version, "15");
     assert!(
         database
             .execute("DELETE FROM pricing_snapshots", [])
             .is_err(),
-        "schema-v14 migration still allowed direct Pricing Snapshot deletion"
+        "schema-v15 migration still allowed direct Pricing Snapshot deletion"
     );
     database
         .execute("DELETE FROM request_records WHERE id = ?1", [&record_id])
@@ -473,7 +552,7 @@ async fn schema_v14_migrates_v13_to_parent_cascade_only_pricing_deletion() {
 }
 
 #[tokio::test]
-async fn schema_v14_failed_migration_rolls_back_then_reruns() {
+async fn schema_v15_failed_migration_rolls_back_then_reruns() {
     let root = std::env::temp_dir().join(format!("muxvia-schema-v13-failure-{}", Uuid::new_v4()));
     let user_home = root.join("home");
     fs::create_dir_all(&user_home).unwrap();
@@ -518,7 +597,7 @@ async fn schema_v14_failed_migration_rolls_back_then_reruns() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(rerun, ("14".into(), 1, 1));
+    assert_eq!(rerun, ("15".into(), 1, 1));
     let _ = fs::remove_dir_all(root);
 }
 

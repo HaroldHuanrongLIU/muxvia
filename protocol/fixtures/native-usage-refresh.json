@@ -1,0 +1,12 @@
+{
+  "type": "response",
+  "requestId": "native-usage-refresh",
+  "result": {
+    "kind": "native-usage-refresh",
+    "refresh": {
+      "target": "codex",
+      "importedRecords": 2,
+      "scannedFiles": 3
+    }
+  }
+}

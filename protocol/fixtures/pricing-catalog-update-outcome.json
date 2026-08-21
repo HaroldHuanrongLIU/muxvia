@@ -1,0 +1,14 @@
+{
+  "type": "response",
+  "requestId": "pricing-catalog-update",
+  "result": {
+    "kind": "pricing-catalog-update-outcome",
+    "outcome": {
+      "target": "codex",
+      "catalogVersion": "models.dev-sha256:0123456789abcdef",
+      "source": "models.dev",
+      "backfilledRequestRecords": 2,
+      "backfilledNativeUsageRecords": 3
+    }
+  }
+}

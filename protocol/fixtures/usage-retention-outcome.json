@@ -1,0 +1,14 @@
+{
+  "type": "response",
+  "requestId": "usage-retention",
+  "result": {
+    "kind": "usage-retention-outcome",
+    "outcome": {
+      "target": "codex",
+      "detailedRetentionDays": 45,
+      "rolledUpDays": 2,
+      "prunedRequestRecords": 3,
+      "prunedNativeUsageRecords": 4
+    }
+  }
+}

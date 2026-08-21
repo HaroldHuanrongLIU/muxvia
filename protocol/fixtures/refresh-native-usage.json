@@ -1,0 +1,8 @@
+{
+  "type": "request",
+  "requestId": "native-usage-refresh",
+  "operation": {
+    "kind": "refresh-native-usage",
+    "target": "codex"
+  }
+}

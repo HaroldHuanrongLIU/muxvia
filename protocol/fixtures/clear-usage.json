@@ -1,0 +1,8 @@
+{
+  "type": "request",
+  "requestId": "usage-clear",
+  "operation": {
+    "kind": "clear-usage",
+    "target": "codex"
+  }
+}

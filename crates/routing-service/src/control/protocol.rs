@@ -205,6 +205,11 @@ pub enum ControlOperation {
     ProbeCompatibility(ProbeCompatibilityOperation),
     ListRequestRecords(ListRequestRecordsOperation),
     InspectRequestRecord(InspectRequestRecordOperation),
+    ListUsageActivity(ListUsageActivityOperation),
+    RefreshNativeUsage(TargetUsageOperation),
+    SetUsageRetention(SetUsageRetentionOperation),
+    ClearUsage(TargetUsageOperation),
+    UpdatePricingCatalog(TargetUsageOperation),
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -257,6 +262,42 @@ pub struct ListRequestRecordsOperation {
 pub struct InspectRequestRecordOperation {
     pub target: Target,
     pub record_id: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListUsageActivityOperation {
+    pub target: Target,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_cursor: Option<String>,
+    #[serde(deserialize_with = "deserialize_request_history_limit")]
+    pub limit: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TargetUsageOperation {
+    pub target: Target,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetUsageRetentionOperation {
+    pub target: Target,
+    #[serde(deserialize_with = "deserialize_retention_days")]
+    pub detailed_retention_days: u16,
+}
+
+fn deserialize_retention_days<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let days = u16::deserialize(deserializer)?;
+    if (1..=3650).contains(&days) {
+        Ok(days)
+    } else {
+        Err(D::Error::custom("invalid-usage-retention-days"))
+    }
 }
 
 fn deserialize_request_history_limit<'de, D>(deserializer: D) -> Result<u16, D::Error>
@@ -568,6 +609,32 @@ impl fmt::Debug for ControlOperation {
                 .debug_struct("InspectRequestRecord")
                 .field("target", &operation.target)
                 .field("record_id", &operation.record_id)
+                .finish(),
+            Self::ListUsageActivity(operation) => formatter
+                .debug_struct("ListUsageActivity")
+                .field("target", &operation.target)
+                .field("before_cursor", &operation.before_cursor)
+                .field("limit", &operation.limit)
+                .finish(),
+            Self::RefreshNativeUsage(operation) => formatter
+                .debug_struct("RefreshNativeUsage")
+                .field("target", &operation.target)
+                .finish(),
+            Self::SetUsageRetention(operation) => formatter
+                .debug_struct("SetUsageRetention")
+                .field("target", &operation.target)
+                .field(
+                    "detailed_retention_days",
+                    &operation.detailed_retention_days,
+                )
+                .finish(),
+            Self::ClearUsage(operation) => formatter
+                .debug_struct("ClearUsage")
+                .field("target", &operation.target)
+                .finish(),
+            Self::UpdatePricingCatalog(operation) => formatter
+                .debug_struct("UpdatePricingCatalog")
+                .field("target", &operation.target)
                 .finish(),
         }
     }
@@ -973,6 +1040,11 @@ pub enum ControlResult {
     CompatibilityProbe(CompatibilityProbeResult),
     RequestRecordPage(RequestRecordPageResult),
     RequestRecordDetail(RequestRecordDetailResult),
+    UsageActivityPage(UsageActivityPageResult),
+    NativeUsageRefresh(NativeUsageRefreshResult),
+    UsageRetentionOutcome(UsageRetentionOutcomeResult),
+    UsageClearOutcome(UsageClearOutcomeResult),
+    PricingCatalogUpdateOutcome(PricingCatalogUpdateOutcomeResult),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -985,6 +1057,36 @@ pub struct RequestRecordPageResult {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestRecordDetailResult {
     pub detail: RequestRecordDetail,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsageActivityPageResult {
+    pub page: UsageActivityPage,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeUsageRefreshResult {
+    pub refresh: NativeUsageRefresh,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsageRetentionOutcomeResult {
+    pub outcome: UsageRetentionOutcome,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsageClearOutcomeResult {
+    pub outcome: UsageClearOutcome,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PricingCatalogUpdateOutcomeResult {
+    pub outcome: PricingCatalogUpdateOutcome,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1049,6 +1151,93 @@ pub struct RequestRecordPage {
     pub target: Target,
     pub records: Vec<RequestRecordSummary>,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeUsageRecordSummary {
+    pub id: Uuid,
+    pub model: String,
+    pub observed_at_unix_ms: u64,
+    pub usage: RequestUsageView,
+    pub estimated_cost_nano_usd: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DailyUsageRollup {
+    pub local_date: String,
+    pub request_record_count: u64,
+    pub native_usage_record_count: u64,
+    pub successful_request_count: u64,
+    pub failed_request_count: u64,
+    pub usage: RequestUsageView,
+    pub priced_record_count: u64,
+    pub unpriced_record_count: u64,
+    pub estimated_cost_nano_usd: u64,
+    pub latency_observation_count: u64,
+    pub total_latency_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum UsageActivityEntry {
+    RequestRecord { record: RequestRecordSummary },
+    NativeUsageRecord { record: NativeUsageRecordSummary },
+    DailyUsageRollup { rollup: DailyUsageRollup },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsageActivityPage {
+    pub target: Target,
+    pub entries: Vec<UsageActivityEntry>,
+    pub next_cursor: Option<String>,
+    pub detailed_retention_days: u16,
+    pub catalog_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeUsageRefresh {
+    pub target: Target,
+    pub imported_records: u64,
+    pub scanned_files: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsageRetentionOutcome {
+    pub target: Target,
+    pub detailed_retention_days: u16,
+    pub rolled_up_days: u64,
+    pub pruned_request_records: u64,
+    pub pruned_native_usage_records: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsageClearOutcome {
+    pub target: Target,
+    pub cleared_request_records: u64,
+    pub cleared_native_usage_records: u64,
+    pub cleared_daily_rollups: u64,
+    pub cleared_import_cursors: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PricingCatalogUpdateOutcome {
+    pub target: Target,
+    pub catalog_version: String,
+    pub source: String,
+    pub backfilled_request_records: u64,
+    pub backfilled_native_usage_records: u64,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]

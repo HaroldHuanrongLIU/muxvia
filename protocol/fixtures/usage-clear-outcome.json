@@ -1,0 +1,14 @@
+{
+  "type": "response",
+  "requestId": "usage-clear",
+  "result": {
+    "kind": "usage-clear-outcome",
+    "outcome": {
+      "target": "codex",
+      "clearedRequestRecords": 3,
+      "clearedNativeUsageRecords": 4,
+      "clearedDailyRollups": 2,
+      "clearedImportCursors": 5
+    }
+  }
+}

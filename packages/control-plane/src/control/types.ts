@@ -406,6 +406,20 @@ const controlOperationSchema = z.discriminatedUnion("kind", [
     target: targetSchema,
     recordId: z.string().uuid(),
   }).strict(),
+  z.object({
+    kind: z.literal("list-usage-activity"),
+    target: targetSchema,
+    beforeCursor: z.string().optional(),
+    limit: z.number().int().min(1).max(100),
+  }).strict(),
+  z.object({ kind: z.literal("refresh-native-usage"), target: targetSchema }).strict(),
+  z.object({
+    kind: z.literal("set-usage-retention"),
+    target: targetSchema,
+    detailedRetentionDays: z.number().int().min(1).max(3_650),
+  }).strict(),
+  z.object({ kind: z.literal("clear-usage"), target: targetSchema }).strict(),
+  z.object({ kind: z.literal("update-pricing-catalog"), target: targetSchema }).strict(),
 ])
 
 const compatibilityProbeSchema = z.object({
@@ -710,6 +724,72 @@ const requestRecordDetailSchema = z.object({
   errorPayloadSensitive: z.boolean(),
 }).strict()
 
+const nativeUsageRecordSummarySchema = z.object({
+  id: z.string().uuid(),
+  model: z.string(),
+  observedAtUnixMs: z.number().int().nonnegative(),
+  usage: requestUsageSchema,
+  estimatedCostNanoUsd: z.number().int().nonnegative().nullable(),
+}).strict()
+
+const dailyUsageRollupSchema = z.object({
+  localDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  requestRecordCount: z.number().int().nonnegative(),
+  nativeUsageRecordCount: z.number().int().nonnegative(),
+  successfulRequestCount: z.number().int().nonnegative(),
+  failedRequestCount: z.number().int().nonnegative(),
+  usage: requestUsageSchema,
+  pricedRecordCount: z.number().int().nonnegative(),
+  unpricedRecordCount: z.number().int().nonnegative(),
+  estimatedCostNanoUsd: z.number().int().nonnegative(),
+  latencyObservationCount: z.number().int().nonnegative(),
+  totalLatencyMs: z.number().int().nonnegative(),
+}).strict()
+
+const usageActivityEntrySchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("request-record"), record: requestRecordSummarySchema }).strict(),
+  z.object({ kind: z.literal("native-usage-record"), record: nativeUsageRecordSummarySchema }).strict(),
+  z.object({ kind: z.literal("daily-usage-rollup"), rollup: dailyUsageRollupSchema }).strict(),
+])
+
+const usageActivityPageSchema = z.object({
+  target: targetSchema,
+  entries: z.array(usageActivityEntrySchema),
+  nextCursor: z.string().nullable(),
+  detailedRetentionDays: z.number().int().min(1).max(3_650),
+  catalogVersion: z.string(),
+}).strict()
+
+const nativeUsageRefreshSchema = z.object({
+  target: targetSchema,
+  importedRecords: z.number().int().nonnegative(),
+  scannedFiles: z.number().int().nonnegative(),
+}).strict()
+
+const usageRetentionOutcomeSchema = z.object({
+  target: targetSchema,
+  detailedRetentionDays: z.number().int().min(1).max(3_650),
+  rolledUpDays: z.number().int().nonnegative(),
+  prunedRequestRecords: z.number().int().nonnegative(),
+  prunedNativeUsageRecords: z.number().int().nonnegative(),
+}).strict()
+
+const usageClearOutcomeSchema = z.object({
+  target: targetSchema,
+  clearedRequestRecords: z.number().int().nonnegative(),
+  clearedNativeUsageRecords: z.number().int().nonnegative(),
+  clearedDailyRollups: z.number().int().nonnegative(),
+  clearedImportCursors: z.number().int().nonnegative(),
+}).strict()
+
+const pricingCatalogUpdateOutcomeSchema = z.object({
+  target: targetSchema,
+  catalogVersion: z.string(),
+  source: z.string(),
+  backfilledRequestRecords: z.number().int().nonnegative(),
+  backfilledNativeUsageRecords: z.number().int().nonnegative(),
+}).strict()
+
 const controlResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("handover-prepared"), release: z.string() }).strict(),
   z.object({ kind: z.literal("target-view"), view: targetViewSchema }),
@@ -748,6 +828,11 @@ const controlResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("compatibility-probe"), probe: compatibilityProbeSchema }).strict(),
   z.object({ kind: z.literal("request-record-page"), page: requestRecordPageSchema }).strict(),
   z.object({ kind: z.literal("request-record-detail"), detail: requestRecordDetailSchema }).strict(),
+  z.object({ kind: z.literal("usage-activity-page"), page: usageActivityPageSchema }).strict(),
+  z.object({ kind: z.literal("native-usage-refresh"), refresh: nativeUsageRefreshSchema }).strict(),
+  z.object({ kind: z.literal("usage-retention-outcome"), outcome: usageRetentionOutcomeSchema }).strict(),
+  z.object({ kind: z.literal("usage-clear-outcome"), outcome: usageClearOutcomeSchema }).strict(),
+  z.object({ kind: z.literal("pricing-catalog-update-outcome"), outcome: pricingCatalogUpdateOutcomeSchema }).strict(),
 ])
 
 const clientFrameSchema = z.discriminatedUnion("type", [
@@ -812,6 +897,14 @@ export type RequestRecordSummary = z.infer<typeof requestRecordSummarySchema>
 export type RequestRecordPage = z.infer<typeof requestRecordPageSchema>
 export type RequestRecordDetail = z.infer<typeof requestRecordDetailSchema>
 export type PricingSnapshot = z.infer<typeof pricingSnapshotSchema>
+export type NativeUsageRecordSummary = z.infer<typeof nativeUsageRecordSummarySchema>
+export type DailyUsageRollup = z.infer<typeof dailyUsageRollupSchema>
+export type UsageActivityEntry = z.infer<typeof usageActivityEntrySchema>
+export type UsageActivityPage = z.infer<typeof usageActivityPageSchema>
+export type NativeUsageRefresh = z.infer<typeof nativeUsageRefreshSchema>
+export type UsageRetentionOutcome = z.infer<typeof usageRetentionOutcomeSchema>
+export type UsageClearOutcome = z.infer<typeof usageClearOutcomeSchema>
+export type PricingCatalogUpdateOutcome = z.infer<typeof pricingCatalogUpdateOutcomeSchema>
 export type UniversalProviderOutcome = Extract<
   ControlResult,
   { kind: "universal-provider-outcome" }

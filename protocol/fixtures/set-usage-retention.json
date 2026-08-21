@@ -1,0 +1,9 @@
+{
+  "type": "request",
+  "requestId": "usage-retention",
+  "operation": {
+    "kind": "set-usage-retention",
+    "target": "codex",
+    "detailedRetentionDays": 45
+  }
+}

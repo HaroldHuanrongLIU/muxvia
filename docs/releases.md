@@ -46,7 +46,7 @@ brew test muxvia
 muxvia doctor
 ```
 
-Third-party notices remain inside the installed bundle at `$(brew --prefix muxvia)/libexec/THIRD_PARTY_NOTICES.md`. Each tag build deterministically generates `muxvia.rb` from the public release manifest, verifies it, and smoke-tests install, diagnostics, Control Plane and sidecar startup, a Homebrew-owned revision upgrade, and uninstall on native Apple silicon and Intel runners before publishing it with the Release. The official tap publishes that generated formula unchanged; this repository needs no tap credential to reproduce or verify it.
+Third-party notices remain inside the installed bundle at `$(brew --prefix muxvia)/libexec/THIRD_PARTY_NOTICES.md`. Each tag build deterministically generates `muxvia.rb` from the public release manifest, verifies it, and smoke-tests install, diagnostics, Control Plane and sidecar startup, a Homebrew-owned revision upgrade, and uninstall on native Apple silicon and Intel runners before publishing it with the GitHub Release. Only after that Release succeeds, the workflow downloads the released manifest and formula, verifies them together again, and automatically commits the exact formula to `Formula/muxvia.rb` in the official `HaroldHuanrongLIU/homebrew-muxvia` tap. Only this final publication job receives the dedicated `HOMEBREW_TAP_TOKEN`; generation, verification, and smoke testing require no tap credential.
 
 ## Update notifications
 

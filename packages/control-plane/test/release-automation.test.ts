@@ -80,3 +80,22 @@ test("release automation gates the official Homebrew formula on both macOS archi
     '["brew", "uninstall"',
   ]) expect(smoke).toContain(value)
 })
+
+test("the published GitHub Release updates the official Homebrew tap with its exact verified formula", async () => {
+  const workflow = await readFile(resolve(".github/workflows/release.yml"), "utf8")
+  const publishJob = workflow.slice(workflow.indexOf("  publish:"), workflow.indexOf("  publish-homebrew-tap:"))
+  const tapJob = workflow.slice(workflow.indexOf("  publish-homebrew-tap:"))
+
+  expect(publishJob).toContain('gh release create "$GITHUB_REF_NAME" release/*')
+  expect(tapJob).toContain("needs: publish")
+  expect(tapJob).toContain("repository: HaroldHuanrongLIU/homebrew-muxvia")
+  expect(tapJob).toContain("token: ${{ secrets.HOMEBREW_TAP_TOKEN }}")
+  expect(tapJob).toContain("--pattern muxvia-latest.json")
+  expect(tapJob).toContain("--pattern muxvia.rb")
+  expect(tapJob).toContain("--manifest released/muxvia-latest.json")
+  expect(tapJob).toContain("--formula released/muxvia.rb")
+  expect(tapJob).toContain("cp released/muxvia.rb homebrew-muxvia/Formula/muxvia.rb")
+  expect(tapJob).toContain("cmp -s released/muxvia.rb homebrew-muxvia/Formula/muxvia.rb")
+  expect(tapJob).toContain("git -C homebrew-muxvia add Formula/muxvia.rb")
+  expect(tapJob.indexOf("release:homebrew verify")).toBeLessThan(tapJob.indexOf("git -C homebrew-muxvia push origin HEAD"))
+})

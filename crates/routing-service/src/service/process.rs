@@ -79,7 +79,12 @@ impl ServiceLock {
             }
             // SAFETY: fstat returned success and initialized `stat`.
             let stat = unsafe { stat.assume_init() };
-            if metadata.dev() != stat.st_dev as u64 || metadata.ino() != stat.st_ino {
+            #[allow(
+                clippy::unnecessary_cast,
+                reason = "st_dev is narrower than u64 on some supported Unix targets"
+            )]
+            let device = stat.st_dev as u64;
+            if metadata.dev() != device || metadata.ino() != stat.st_ino {
                 return Err(ProcessError::LockCollision);
             }
             // SAFETY: successful fstat proves this is an open descriptor transferred by exec.

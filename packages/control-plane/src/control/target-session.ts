@@ -8,6 +8,11 @@ import type {
   ClaudePreflightContext,
   ModelDiscoveryResult,
   OrdinaryTargetAction,
+  ProviderConfigurationExport,
+  ProviderImportChoice,
+  ProviderImportOutcome,
+  ProviderImportPreview,
+  ProviderImportSource,
   ReachabilityResult,
   ReconciliationPreview,
   ReconciliationStrategy,
@@ -64,6 +69,12 @@ export interface TargetSession {
   setUsageRetention(detailedRetentionDays: number, signal?: AbortSignal): Promise<UsageRetentionOutcome>
   clearUsage(signal?: AbortSignal): Promise<UsageClearOutcome>
   updatePricingCatalog(signal?: AbortSignal): Promise<PricingCatalogUpdateOutcome>
+  previewProviderImport?(source: ProviderImportSource): Promise<ProviderImportPreview>
+  confirmProviderImport?(
+    previewToken: string,
+    choices: ProviderImportChoice[],
+  ): Promise<ProviderImportOutcome>
+  exportProviderConfiguration?(): Promise<ProviderConfigurationExport>
   applyReconciliation(input: {
     strategy: ReconciliationStrategy
     observationToken: string
@@ -344,6 +355,61 @@ class TargetSessionImpl implements TargetSession {
       throw new ControlError("invalid-response", "Pricing catalog update did not match Target")
     }
     return freezeOwnedValue(structuredClone(response.outcome))
+  }
+
+  async previewProviderImport(source: ProviderImportSource): Promise<ProviderImportPreview> {
+    if (this.#closed) {
+      throw new ControlError("connection-closed", "Target session is closed")
+    }
+    const capturedSource = structuredClone(source)
+    const response = await this.#rpc.request({
+      kind: "preview-provider-import",
+      target: this.#target,
+      source: capturedSource,
+    })
+    if (response.kind !== "provider-import-preview") {
+      throw new ControlError("invalid-response", "Expected a Provider Import preview")
+    }
+    return freezeOwnedValue(structuredClone(response.preview))
+  }
+
+  confirmProviderImport(
+    previewToken: string,
+    choices: ProviderImportChoice[],
+  ): Promise<ProviderImportOutcome> {
+    if (this.#closed) {
+      return Promise.reject(new ControlError("connection-closed", "Target session is closed"))
+    }
+    const capturedToken = previewToken
+    const capturedChoices = structuredClone(choices)
+    const result = this.#actions.then(async () => {
+      const response = await this.#rpc.request({
+        kind: "confirm-provider-import",
+        target: this.#target,
+        previewToken: capturedToken,
+        choices: capturedChoices,
+      })
+      if (response.kind !== "provider-import-outcome") {
+        throw new ControlError("invalid-response", "Expected a Provider Import outcome")
+      }
+      return freezeOwnedValue(structuredClone(response.outcome))
+    })
+    this.#actions = result.then(() => undefined, () => undefined)
+    return result
+  }
+
+  async exportProviderConfiguration(): Promise<ProviderConfigurationExport> {
+    if (this.#closed) {
+      throw new ControlError("connection-closed", "Target session is closed")
+    }
+    const response = await this.#rpc.request({
+      kind: "export-provider-configuration",
+      target: this.#target,
+    })
+    if (response.kind !== "provider-configuration-export") {
+      throw new ControlError("invalid-response", "Expected a Provider Configuration export")
+    }
+    return freezeOwnedValue(structuredClone(response.export))
   }
 
   applyReconciliation(input: {

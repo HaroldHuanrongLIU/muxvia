@@ -11,6 +11,11 @@ import type {
   DiscoverySource,
   ModelDiscoveryResult,
   OrdinaryTargetAction,
+  ProviderConfigurationExport,
+  ProviderImportChoice,
+  ProviderImportOutcome,
+  ProviderImportPreview,
+  ProviderImportSource,
   ReachabilityResult,
   ReconciliationPreview,
   ReconciliationStrategy,
@@ -137,6 +142,8 @@ class MemoryTargetSession implements TargetSession {
   readonly compatibilityResolutions: CompatibilityResolution[] = []
   readonly reachabilityChecks: string[] = []
   readonly discoveryRequests: DiscoverySource[] = []
+  readonly providerImportSources: ProviderImportSource[] = []
+  readonly providerImportConfirmations: Array<{ previewToken: string; choices: ProviderImportChoice[] }> = []
   lastError: unknown
   readonly #listeners = new Set<(next: TargetView) => void>()
   #view: TargetView
@@ -151,6 +158,9 @@ class MemoryTargetSession implements TargetSession {
   }) => Promise<ActionOutcome>
   reachabilityHandler?: (providerId: string, providerRevision: number, signal?: AbortSignal) => Promise<ReachabilityResult>
   discoveryHandler?: (source: DiscoverySource, signal?: AbortSignal) => Promise<ModelDiscoveryResult>
+  providerImportPreviewHandler?: (source: ProviderImportSource) => Promise<ProviderImportPreview>
+  providerImportConfirmHandler?: (previewToken: string, choices: ProviderImportChoice[]) => Promise<ProviderImportOutcome>
+  providerExportHandler?: () => Promise<ProviderConfigurationExport>
 
   constructor(
     initial: TargetView,
@@ -219,6 +229,20 @@ class MemoryTargetSession implements TargetSession {
   async clearUsage(): Promise<never> { throw new Error("usage activity not configured in this fixture") }
   async updatePricingCatalog(): Promise<never> { throw new Error("usage activity not configured in this fixture") }
   async inspectRequestRecord(): Promise<never> { throw new Error("request history not configured in this fixture") }
+  async previewProviderImport(source: ProviderImportSource): Promise<ProviderImportPreview> {
+    this.providerImportSources.push(structuredClone(source))
+    if (!this.providerImportPreviewHandler) throw new Error("Provider Import preview not configured in this fixture")
+    return await this.providerImportPreviewHandler(source)
+  }
+  async confirmProviderImport(previewToken: string, choices: ProviderImportChoice[]): Promise<ProviderImportOutcome> {
+    this.providerImportConfirmations.push({ previewToken, choices: structuredClone(choices) })
+    if (!this.providerImportConfirmHandler) throw new Error("Provider Import confirmation not configured in this fixture")
+    return await this.providerImportConfirmHandler(previewToken, choices)
+  }
+  async exportProviderConfiguration(): Promise<ProviderConfigurationExport> {
+    if (!this.providerExportHandler) throw new Error("Provider export not configured in this fixture")
+    return await this.providerExportHandler()
+  }
   async applyReconciliation(input: {
     strategy: ReconciliationStrategy
     observationToken: string
@@ -592,6 +616,151 @@ async function waitForReconciliationState(
     label,
   )
 }
+
+test("/import-providers previews pasted data before confirmation and /export-providers is visibly always redacted", async () => {
+  const transferSecret = "provider-transfer-ui-secret-must-not-render"
+  const candidateId = "00000000-0000-4000-8000-000000000161"
+  const existingId = "00000000-0000-4000-8000-000000000162"
+  const previewToken = "00000000-0000-4000-8000-000000000163"
+  const session = new MemoryTargetSession(view())
+  session.providerImportPreviewHandler = async () => ({
+    previewToken,
+    source: { product: "cc-switch", target: "codex" },
+    candidates: [{
+      kind: "target-provider",
+      candidateId,
+      target: "codex",
+      name: "Imported Relay",
+      baseUrl: "https://relay.example/v1",
+      model: "gpt-imported",
+      protocol: "openai-responses",
+      authentication: "openai-bearer",
+      routingRequirement: "direct-compatible",
+      credential: "present",
+      importedCurrent: false,
+      exactMatches: [{ providerId: existingId, name: "Exact Existing" }],
+    }],
+  })
+  session.providerImportConfirmHandler = async () => ({
+    records: [{
+      kind: "target-provider",
+      candidateId,
+      resolution: "existing",
+      target: "codex",
+      providerId: existingId,
+    }],
+  })
+  session.providerExportHandler = async () => ({
+    format: "muxvia-provider-configuration",
+    version: 1,
+    universalProviders: [],
+    targetProviders: [],
+    failoverDrafts: [
+      { target: "codex", providerSourceIds: [] },
+      { target: "claude", providerSourceIds: [] },
+    ],
+  })
+  const setup = await testRender(() => <App session={session} />, {
+    width: 100,
+    height: 30,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    await setup.mockInput.typeText("/import-providers")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("Import Provider declarations")
+    setup.mockInput.pressKey("down")
+    await setup.renderOnce()
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    const payload = `ccswitch://v1/import?resource=provider&app=codex&name=Relay&apiKey=${transferSecret}`
+    await setup.mockInput.typeText(payload)
+    setup.mockInput.pressEnter()
+    await Bun.sleep(1)
+    await setup.renderOnce()
+    expect(session.providerImportSources).toEqual([{ kind: "cc-switch", payload }])
+    const previewFrame = setup.captureCharFrame()
+    expect(previewFrame).toContain("Imported Relay")
+    expect(previewFrame).toContain("Use exact existing · Exact Existing")
+    expect(previewFrame).toContain("Credential present; value hidden")
+    expect(previewFrame).not.toContain(transferSecret)
+
+    setup.mockInput.pressEnter()
+    await Bun.sleep(1)
+    await setup.renderOnce()
+    expect(session.providerImportConfirmations).toEqual([{
+      previewToken,
+      choices: [{ candidateId, resolution: { kind: "use-existing", providerId: existingId } }],
+    }])
+    expect(setup.captureCharFrame()).toContain("Imported 1 Provider record(s).")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+
+    await setup.mockInput.typeText("/export-providers")
+    setup.mockInput.pressEnter()
+    await Bun.sleep(1)
+    await setup.renderOnce()
+    const exportFrame = setup.captureCharFrame()
+    expect(exportFrame).toContain("Redacted Provider configuration")
+    expect(exportFrame).toContain("Credentials and runtime state are always excluded.")
+    expect(exportFrame).toContain("muxvia-provider-configuration")
+    expect(exportFrame).not.toContain(transferSecret)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("a distinct live Target preview labels Imported Current and leaves it unselected", async () => {
+  const session = new MemoryTargetSession(view())
+  session.providerImportPreviewHandler = async () => ({
+    previewToken: "00000000-0000-4000-8000-000000000171",
+    source: { product: "target-cli", target: "codex" },
+    candidates: [{
+      kind: "target-provider",
+      candidateId: "00000000-0000-4000-8000-000000000172",
+      target: "codex",
+      name: "Current Codex configuration",
+      baseUrl: "https://current.example/v1",
+      model: "gpt-current",
+      protocol: "openai-responses",
+      authentication: "openai-bearer",
+      routingRequirement: "direct-compatible",
+      credential: "present",
+      importedCurrent: true,
+      exactMatches: [],
+    }],
+  })
+  session.providerImportConfirmHandler = async () => ({ records: [] })
+  const setup = await testRender(() => <App session={session} />, {
+    width: 100,
+    height: 24,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    await setup.mockInput.typeText("/import-providers")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    setup.mockInput.pressEnter()
+    await Bun.sleep(1)
+    await setup.renderOnce()
+    expect(session.providerImportSources).toEqual([{ kind: "live-target" }])
+    expect(setup.captureCharFrame()).toContain("[ ] Imported Current · Current Codex configuration")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    expect(session.providerImportConfirmations).toEqual([])
+  } finally {
+    setup.renderer.destroy()
+  }
+})
 
 test("/providers renders provenance kinds and generated state with secret-free selected Provider detail", async () => {
   const first = provider({

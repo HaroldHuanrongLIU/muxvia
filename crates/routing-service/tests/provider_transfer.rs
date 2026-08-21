@@ -2,8 +2,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use muxvia_routing::{
     control::protocol::{
-        ProviderImportCandidateView, ProviderImportProduct, ProviderImportSource,
-        ProviderImportSourceTarget, Target,
+        ProviderImportCandidateView, ProviderImportChoice, ProviderImportProduct,
+        ProviderImportResolution, ProviderImportSource, ProviderImportSourceTarget, Target,
     },
     home::MuxviaHome,
     service::provider_transfer::{ProviderTransferError, ProviderTransferService},
@@ -93,6 +93,77 @@ async fn pasted_ccswitch_preview_finds_only_an_exact_normalized_match_without_mu
     let after = store.target_view_for(Target::Codex).await.unwrap();
     assert_eq!(after.management_revision, revision_before_preview);
     assert_eq!(after.providers.len(), 1);
+}
+
+#[tokio::test]
+async fn exact_existing_confirmation_is_one_shot_identity_safe_and_does_not_mutate_the_match() {
+    let (_root, _user_home, store, transfer) = fixture().await;
+    let before = store.target_view_for(Target::Codex).await.unwrap();
+    let saved = store
+        .apply_provider_action_for(
+            Target::Codex,
+            Uuid::new_v4(),
+            before.management_revision,
+            serde_json::json!({
+                "kind": "create-provider",
+                "name": "Existing Identity",
+                "baseUrl": "https://exact.example/v1",
+                "model": "gpt-exact",
+                "credential": { "kind": "replace", "value": "exact-confirm-secret" },
+                "authentication": "openai-bearer",
+                "presetKey": null
+            }),
+        )
+        .await
+        .unwrap();
+    let existing = saved.view.providers[0].clone();
+    let preview = transfer
+        .preview(
+            Target::Codex,
+            ProviderImportSource::CcSwitch {
+                payload: "ccswitch://v1/import?resource=provider&app=codex&name=Different+Imported+Name&endpoint=https%3A%2F%2Fexact.example%2Fv1%2F&apiKey=exact-confirm-secret&model=gpt-exact".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let candidate_id = match preview.candidates[0] {
+        ProviderImportCandidateView::TargetProvider { candidate_id, .. } => candidate_id,
+        _ => panic!("expected target candidate"),
+    };
+
+    let outcome = transfer
+        .confirm(
+            Target::Codex,
+            preview.preview_token,
+            vec![ProviderImportChoice {
+                candidate_id,
+                resolution: ProviderImportResolution::UseExisting {
+                    provider_id: existing.id,
+                },
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.records.len(), 1);
+    let after = store.target_view_for(Target::Codex).await.unwrap();
+    assert_eq!(after.management_revision, saved.view.management_revision);
+    assert_eq!(after.providers[0].id, existing.id);
+    assert_eq!(after.providers[0].name, "Existing Identity");
+
+    let replay = transfer
+        .confirm(
+            Target::Codex,
+            preview.preview_token,
+            vec![ProviderImportChoice {
+                candidate_id,
+                resolution: ProviderImportResolution::UseExisting {
+                    provider_id: existing.id,
+                },
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(replay, ProviderTransferError::PreviewExpired));
 }
 
 #[tokio::test]
@@ -191,6 +262,56 @@ async fn live_claude_preview_preserves_api_key_authentication_without_rewrite() 
     let after = store.target_view_for(Target::Claude).await.unwrap();
     assert_eq!(after.management_revision, before.management_revision);
     assert_eq!(after.current_provider_id, before.current_provider_id);
+}
+
+#[tokio::test]
+async fn a_live_muxvia_routing_credential_is_rejected_without_echo_or_mutation() {
+    const ROUTING_SECRET: &str = "muxvia-routing-secret-must-not-be-imported";
+    let (_root, user_home, store, transfer) = fixture().await;
+    let database =
+        tokio_rusqlite::Connection::open(MuxviaHome::from_user_home(&user_home).database_path())
+            .await
+            .unwrap();
+    database
+        .call(
+            |connection| -> Result<(), tokio_rusqlite::rusqlite::Error> {
+                connection.execute(
+                    "UPDATE target_route_state SET routing_credential = ?1 WHERE target = 'claude'",
+                    [ROUTING_SECRET],
+                )?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    let configuration_home = user_home.join(".claude");
+    std::fs::create_dir(&configuration_home).unwrap();
+    let path = configuration_home.join("settings.json");
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "env": {
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:4567",
+            "ANTHROPIC_AUTH_TOKEN": ROUTING_SECRET,
+            "ANTHROPIC_MODEL": "routed-model"
+        }
+    }))
+    .unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+
+    let error = transfer
+        .preview(Target::Claude, ProviderImportSource::LiveTarget)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProviderTransferError::SecretRejected));
+    assert!(!format!("{error:?}").contains(ROUTING_SECRET));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(
+        store
+            .target_view_for(Target::Claude)
+            .await
+            .unwrap()
+            .providers
+            .is_empty()
+    );
 }
 
 fn muxvia_export_value() -> serde_json::Value {

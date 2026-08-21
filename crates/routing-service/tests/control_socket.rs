@@ -8137,3 +8137,75 @@ fn frame_error_type_is_used_by_real_socket_helpers() {
     let error = FrameError::FrameTooLarge;
     assert_eq!(error.to_string(), "frame-too-large");
 }
+
+#[tokio::test]
+async fn provider_transfer_preview_and_export_are_target_scoped_and_secret_free_over_the_real_socket()
+ {
+    const SECRET: &str = "SOCKET_PROVIDER_IMPORT_SECRET_16001";
+    let mut fixture = ControlFixture::start().await;
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    request(
+        &mut stream,
+        "open-provider-transfer",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+
+    let preview = request(
+        &mut stream,
+        "preview-provider-transfer",
+        json!({
+            "kind": "preview-provider-import",
+            "target": "codex",
+            "source": {
+                "kind": "cc-switch",
+                "payload": format!(
+                    "ccswitch://v1/import?resource=provider&app=codex&name=Socket&endpoint=https%3A%2F%2Fsocket.example%2Fv1&apiKey={SECRET}&model=gpt-socket"
+                )
+            }
+        }),
+    )
+    .await;
+    assert_eq!(preview["type"], "response");
+    assert_eq!(preview["result"]["kind"], "provider-import-preview");
+    assert_eq!(
+        preview["result"]["preview"]["candidates"][0]["credential"],
+        "present"
+    );
+    assert!(!preview.to_string().contains(SECRET));
+
+    let export = request(
+        &mut stream,
+        "export-provider-transfer",
+        json!({ "kind": "export-provider-configuration", "target": "codex" }),
+    )
+    .await;
+    assert_eq!(export["type"], "response");
+    assert_eq!(export["result"]["kind"], "provider-configuration-export");
+    let export_text = export.to_string().to_ascii_lowercase();
+    for forbidden in ["credential", "token", "recovery", "activatedsnapshot"] {
+        assert!(!export_text.contains(forbidden));
+    }
+
+    let rejected = request(
+        &mut stream,
+        "reject-provider-transfer",
+        json!({
+            "kind": "preview-provider-import",
+            "target": "codex",
+            "source": {
+                "kind": "cc-switch",
+                "payload": format!(
+                    "ccswitch://v1/import?resource=provider&app=codex&name=Socket&apiKey={SECRET}&apiKey=duplicate"
+                )
+            }
+        }),
+    )
+    .await;
+    assert_eq!(rejected["type"], "error");
+    assert_eq!(rejected["problem"]["code"], "provider-import-rejected");
+    assert!(!rejected.to_string().contains(SECRET));
+
+    fixture.shutdown().await;
+}

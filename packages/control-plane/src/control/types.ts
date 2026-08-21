@@ -1038,6 +1038,7 @@ export type PricingCatalogUpdateOutcome = z.infer<typeof pricingCatalogUpdateOut
 export type ProviderImportSource = z.infer<typeof providerImportSourceSchema>
 export type ProviderImportChoice = z.infer<typeof providerImportChoiceSchema>
 export type ProviderImportPreview = z.infer<typeof providerImportPreviewSchema>
+export type ProviderImportCandidateView = ProviderImportPreview["candidates"][number]
 export type ProviderImportOutcome = z.infer<typeof providerImportOutcomeSchema>
 export type ProviderConfigurationExport = z.infer<typeof providerConfigurationExportSchema>
 export type UniversalProviderOutcome = Extract<

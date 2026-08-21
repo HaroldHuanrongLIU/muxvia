@@ -19,6 +19,8 @@ export const commandCatalog = [
   command("target.sidebar.toggle", "command.target.sidebar", "sidebar", ["<leader>b"], ["codex", "claude"], true),
   command("provider.create", "command.provider.create", "provider", ["<leader>p"], ["codex", "claude", "provider-source-picker"], true),
   command("provider.list", "command.provider.list", "providers", ["<leader>l"], ["codex", "claude"], true),
+  command("provider.import", "command.provider.import", "import-providers", [], ["codex", "claude"], true),
+  command("provider.export", "command.provider.export", "export-providers", [], ["codex", "claude"], true),
   command("provider.edit", "command.provider.edit", null, ["return"], ["provider-picker", "provider-picker-claude"], false),
   command("provider.move-up", "command.provider.move-up", null, ["<leader>u"], ["provider-picker", "provider-picker-claude"], false),
   command("provider.move-down", "command.provider.move-down", null, ["<leader>n"], ["provider-picker", "provider-picker-claude"], false),

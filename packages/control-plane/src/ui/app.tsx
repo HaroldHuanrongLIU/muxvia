@@ -23,6 +23,7 @@ import { ProviderCredentialConfirmation } from "./provider-credential-confirmati
 import { ProviderForm, type ProviderDraft, type ProviderFormRef, type ProviderFormResult } from "./provider-form"
 import { ProviderPicker } from "./provider-picker"
 import { ProviderSourcePicker, type ProviderSource } from "./provider-source-picker"
+import { ProviderExportView, ProviderImportWizard } from "./provider-transfer"
 import { Reconciliation, type ReconciliationUiState } from "./reconciliation"
 import { RequestHistory, type RequestHistoryUiState } from "./request-history"
 import { RouteEditor } from "./route-editor"
@@ -364,6 +365,7 @@ function Shell(props: {
   let exitScheduled = false
   const providerPickerScheduled: Record<Target, boolean> = { codex: false, claude: false }
   const providerSourcePickerScheduled: Record<Target, boolean> = { codex: false, claude: false }
+  const providerTransferScheduled: Record<Target, boolean> = { codex: false, claude: false }
   const reconciliationScheduled: Record<Target, boolean> = { codex: false, claude: false }
   const reconciliationGenerations: Record<Target, number> = { codex: 0, claude: 0 }
   const requestHistoryScheduled: Record<Target, boolean> = { codex: false, claude: false }
@@ -1343,6 +1345,56 @@ function Shell(props: {
       })
     })
   }
+  const openProviderImport = () => {
+    const target = activeTarget()
+    const originSession = session(target)
+    if (
+      !target
+      || !originSession?.previewProviderImport
+      || !originSession.confirmProviderImport
+      || providerTransferScheduled[target]
+      || overlay.depth > 0
+    ) return
+    providerTransferScheduled[target] = true
+    queueMicrotask(() => {
+      providerTransferScheduled[target] = false
+      if (disposed || exiting || activeTarget() !== target || props.sessions()[target] !== originSession || overlay.depth > 0) return
+      const token = Symbol(`provider-import-${target}`)
+      overlay.replace({
+        id: "provider-import",
+        token,
+        render: () => <ProviderImportWizard
+          target={target}
+          t={props.t}
+          onPreview={(source) => originSession.previewProviderImport!(source)}
+          onConfirm={(previewToken, choices) => originSession.confirmProviderImport!(previewToken, choices)}
+          onClose={() => overlay.close(token)}
+        />,
+      })
+    })
+  }
+  const openProviderExport = () => {
+    const target = activeTarget()
+    const originSession = session(target)
+    if (
+      !target
+      || !originSession?.exportProviderConfiguration
+      || providerTransferScheduled[target]
+      || overlay.depth > 0
+    ) return
+    providerTransferScheduled[target] = true
+    queueMicrotask(() => {
+      providerTransferScheduled[target] = false
+      if (disposed || exiting || activeTarget() !== target || props.sessions()[target] !== originSession || overlay.depth > 0) return
+      overlay.replace({
+        id: "provider-export",
+        render: () => <ProviderExportView
+          t={props.t}
+          load={() => originSession.exportProviderConfiguration!()}
+        />,
+      })
+    })
+  }
 
   const openDuplicateEditor = (provider: TargetViewProjection["providers"][number], choice: "without" | "reuse-source") => {
     overlay.clear()
@@ -2008,6 +2060,8 @@ function Shell(props: {
         openProviderSourcePicker()
       },
       "provider.list": openProviderPicker,
+      "provider.import": openProviderImport,
+      "provider.export": openProviderExport,
       "universal-provider.list": openUniversalProviders,
       "subscription-account.list": openSubscriptionAccounts,
       "target.direct.apply": () => applyDefaultProvider("direct"),
@@ -2027,6 +2081,8 @@ function Shell(props: {
       "target.sidebar.toggle": () => setSidebarOpen((open) => !open),
       "provider.create": openProviderSourcePicker,
       "provider.list": openProviderPicker,
+      "provider.import": openProviderImport,
+      "provider.export": openProviderExport,
       "universal-provider.list": openUniversalProviders,
       "subscription-account.list": openSubscriptionAccounts,
       "target.direct.apply": () => applyDefaultProvider("direct"),

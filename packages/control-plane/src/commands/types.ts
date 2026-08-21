@@ -6,6 +6,8 @@ export type CommandId =
   | "target.sidebar.toggle"
   | "provider.create"
   | "provider.list"
+  | "provider.import"
+  | "provider.export"
   | "provider.edit"
   | "provider.move-up"
   | "provider.move-down"

@@ -4,7 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
+use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use url::Url;
 use uuid::Uuid;
@@ -16,9 +17,11 @@ use crate::{
         CredentialPresence, ExportedFailoverDraft, ExportedTargetProvider,
         ExportedUniversalProvider, ProviderAuthentication, ProviderConfigurationExport,
         ProviderConfigurationFormat, ProviderConfigurationVersion, ProviderImportCandidateView,
-        ProviderImportPreview, ProviderImportProduct, ProviderImportSource,
-        ProviderImportSourceTarget, ProviderImportSourceView, ProviderProtocol,
-        ProviderRoutingRequirement, Target, TargetView, UniversalProviderTargetDraft,
+        ProviderImportChoice, ProviderImportOutcome, ProviderImportPreview, ProviderImportProduct,
+        ProviderImportRecordResolution, ProviderImportRecordView, ProviderImportResolution,
+        ProviderImportSource, ProviderImportSourceTarget, ProviderImportSourceView,
+        ProviderProtocol, ProviderRoutingRequirement, Target, TargetView,
+        UniversalProviderTargetDraft,
     },
     domain::provider::normalize_provider_base_url,
     home::MuxviaHome,
@@ -41,6 +44,12 @@ pub enum ProviderTransferError {
     ImportTooLarge,
     #[error("provider import is hostile")]
     HostileImport,
+    #[error("provider import preview expired")]
+    PreviewExpired,
+    #[error("provider import choice is invalid")]
+    InvalidChoice,
+    #[error("provider import contains a Muxvia routing credential")]
+    SecretRejected,
     #[error("state store operation failed")]
     State,
 }
@@ -182,6 +191,24 @@ impl ProviderTransferService {
         for candidate in &candidates {
             match candidate {
                 PendingCandidate::Target(candidate) => {
+                    if self
+                        .store
+                        .routing_credential_for(candidate.target)
+                        .await
+                        .map_err(|_| ProviderTransferError::State)?
+                        .as_ref()
+                        .is_some_and(|routing_credential| {
+                            candidate.credential.as_ref().is_some_and(|credential| {
+                                routing_credential
+                                    .expose_secret()
+                                    .as_bytes()
+                                    .ct_eq(credential.expose_secret().as_bytes())
+                                    .into()
+                            })
+                        })
+                    {
+                        return Err(ProviderTransferError::SecretRejected);
+                    }
                     let exact_matches = self
                         .store
                         .exact_target_provider_import_matches(
@@ -314,6 +341,111 @@ impl ProviderTransferService {
             target_providers,
             failover_drafts,
         })
+    }
+
+    pub async fn confirm(
+        &self,
+        target: Target,
+        preview_token: Uuid,
+        choices: Vec<ProviderImportChoice>,
+    ) -> Result<ProviderImportOutcome, ProviderTransferError> {
+        let preview = {
+            let mut pending = self.pending.lock().await;
+            pending.prune();
+            pending
+                .entries
+                .remove(&preview_token)
+                .ok_or(ProviderTransferError::PreviewExpired)?
+        };
+        if preview.target != target || choices.is_empty() {
+            return Err(ProviderTransferError::InvalidChoice);
+        }
+        let mut chosen = HashSet::new();
+        if choices
+            .iter()
+            .any(|choice| !chosen.insert(choice.candidate_id))
+        {
+            return Err(ProviderTransferError::InvalidChoice);
+        }
+
+        let mut records = Vec::with_capacity(choices.len());
+        for choice in choices {
+            let candidate = preview
+                .candidates
+                .iter()
+                .find(|candidate| candidate.id() == choice.candidate_id)
+                .ok_or(ProviderTransferError::InvalidChoice)?;
+            match (&choice.resolution, candidate) {
+                (ProviderImportResolution::Create, _) => {
+                    return Err(ProviderTransferError::InvalidChoice);
+                }
+                (
+                    ProviderImportResolution::UseExisting { provider_id },
+                    PendingCandidate::Target(candidate),
+                ) => {
+                    let exact = self
+                        .store
+                        .exact_target_provider_import_matches(
+                            candidate.target,
+                            candidate.base_url.clone(),
+                            candidate.model.clone(),
+                            candidate.protocol,
+                            candidate.authentication,
+                            candidate.routing_requirement.clone(),
+                            candidate.credential.clone(),
+                        )
+                        .await
+                        .map_err(|_| ProviderTransferError::State)?;
+                    if !exact
+                        .iter()
+                        .any(|matched| matched.provider_id == *provider_id)
+                    {
+                        return Err(ProviderTransferError::InvalidChoice);
+                    }
+                    records.push(ProviderImportRecordView::TargetProvider {
+                        candidate_id: candidate.candidate_id,
+                        resolution: ProviderImportRecordResolution::Existing,
+                        target: candidate.target,
+                        provider_id: *provider_id,
+                    });
+                }
+                (
+                    ProviderImportResolution::UseExisting { provider_id },
+                    PendingCandidate::Universal(candidate),
+                ) => {
+                    let exact = self
+                        .store
+                        .exact_universal_provider_import_matches(
+                            candidate.base_url.clone(),
+                            candidate.targets.clone(),
+                            candidate.credential.clone(),
+                        )
+                        .await
+                        .map_err(|_| ProviderTransferError::State)?;
+                    if !exact
+                        .iter()
+                        .any(|matched| matched.provider_id == *provider_id)
+                    {
+                        return Err(ProviderTransferError::InvalidChoice);
+                    }
+                    records.push(ProviderImportRecordView::UniversalProvider {
+                        candidate_id: candidate.candidate_id,
+                        resolution: ProviderImportRecordResolution::Existing,
+                        provider_id: *provider_id,
+                    });
+                }
+            }
+        }
+        Ok(ProviderImportOutcome { records })
+    }
+}
+
+impl PendingCandidate {
+    fn id(&self) -> Uuid {
+        match self {
+            Self::Target(candidate) => candidate.candidate_id,
+            Self::Universal(candidate) => candidate.candidate_id,
+        }
     }
 }
 

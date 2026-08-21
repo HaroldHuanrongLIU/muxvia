@@ -11,6 +11,10 @@ import type {
   ClaudePreflightContext,
   CompatibilityProbe,
   OrdinaryTargetAction,
+  ProviderConfigurationExport,
+  ProviderImportChoice,
+  ProviderImportOutcome,
+  ProviderImportPreview,
   ReconciliationPreview,
   RequestRecordDetail,
   RequestRecordPage,
@@ -245,6 +249,33 @@ class ScriptedServer {
     })
   }
 
+  replyProviderImportPreview(index: number, preview: ProviderImportPreview): void {
+    const frame = this.requests()[index]!
+    this.send({
+      type: "response",
+      requestId: frame.requestId,
+      result: { kind: "provider-import-preview", preview },
+    })
+  }
+
+  replyProviderImportOutcome(index: number, outcome: ProviderImportOutcome): void {
+    const frame = this.requests()[index]!
+    this.send({
+      type: "response",
+      requestId: frame.requestId,
+      result: { kind: "provider-import-outcome", outcome },
+    })
+  }
+
+  replyProviderConfigurationExport(index: number, exportValue: ProviderConfigurationExport): void {
+    const frame = this.requests()[index]!
+    this.send({
+      type: "response",
+      requestId: frame.requestId,
+      result: { kind: "provider-configuration-export", export: exportValue },
+    })
+  }
+
   replyHandoverPrepared(index: number, release: string): void {
     const frame = this.requests()[index]!
     this.send({
@@ -357,6 +388,94 @@ test("a TargetSession lists and inspects target-bound immutable request history"
   expect(Object.isFrozen(detail.record)).toBe(true)
 
   await session.close()
+  await server.close()
+})
+
+test("a TargetSession owns the closed preview-confirm-export Provider Transfer workflow", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(0))
+  const source = {
+    kind: "cc-switch",
+    payload: "ccswitch://v1/import?resource=provider&app=codex&name=Relay",
+  } as const
+  const previewing = session.previewProviderImport!(source)
+  await server.waitForRequests(2)
+  expect(server.requests()[1]!.operation).toEqual({
+    kind: "preview-provider-import",
+    target: "codex",
+    source,
+  })
+  const preview: ProviderImportPreview = {
+    previewToken: "00000000-0000-4000-8000-000000000161",
+    source: { product: "cc-switch", target: "codex" },
+    candidates: [{
+      kind: "target-provider",
+      candidateId: "00000000-0000-4000-8000-000000000162",
+      target: "codex",
+      name: "Relay",
+      baseUrl: "https://relay.example/v1",
+      model: "gpt-relay",
+      protocol: "openai-responses",
+      authentication: "openai-bearer",
+      routingRequirement: "direct-compatible",
+      credential: "present",
+      importedCurrent: false,
+      exactMatches: [],
+    }],
+  }
+  server.replyProviderImportPreview(1, preview)
+  const receivedPreview = await previewing
+  expect(receivedPreview).toEqual(preview)
+  expect(Object.isFrozen(receivedPreview.candidates[0])).toBe(true)
+
+  const choices: ProviderImportChoice[] = [{
+    candidateId: preview.candidates[0]!.candidateId,
+    resolution: { kind: "create" },
+  }]
+  const confirming = session.confirmProviderImport!(preview.previewToken, choices)
+  await server.waitForRequests(3)
+  expect(server.requests()[2]!.operation).toEqual({
+    kind: "confirm-provider-import",
+    target: "codex",
+    previewToken: preview.previewToken,
+    choices,
+  })
+  const outcome: ProviderImportOutcome = {
+    records: [{
+      kind: "target-provider",
+      candidateId: preview.candidates[0]!.candidateId,
+      resolution: "created",
+      target: "codex",
+      providerId: "00000000-0000-4000-8000-000000000163",
+    }],
+  }
+  server.replyProviderImportOutcome(2, outcome)
+  expect(await confirming).toEqual(outcome)
+
+  const exporting = session.exportProviderConfiguration!()
+  await server.waitForRequests(4)
+  expect(server.requests()[3]!.operation).toEqual({
+    kind: "export-provider-configuration",
+    target: "codex",
+  })
+  const exportValue: ProviderConfigurationExport = {
+    format: "muxvia-provider-configuration",
+    version: 1,
+    universalProviders: [],
+    targetProviders: [],
+    failoverDrafts: [
+      { target: "codex", providerSourceIds: [] },
+      { target: "claude", providerSourceIds: [] },
+    ],
+  }
+  server.replyProviderConfigurationExport(3, exportValue)
+  const receivedExport = await exporting
+  expect(receivedExport).toEqual(exportValue)
+  expect(Object.isFrozen(receivedExport.failoverDrafts)).toBe(true)
+
+  await session.close()
+  await expect(session.previewProviderImport!(source)).rejects.toMatchObject({ code: "connection-closed" })
+  await expect(session.confirmProviderImport!(preview.previewToken, [])).rejects.toMatchObject({ code: "connection-closed" })
+  await expect(session.exportProviderConfiguration!()).rejects.toMatchObject({ code: "connection-closed" })
   await server.close()
 })
 

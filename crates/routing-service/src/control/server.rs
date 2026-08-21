@@ -27,7 +27,8 @@ use crate::{
         protocol::{
             ActionStatus, ClaudePreflightContext, ClientFrame, CompatibilityProbeResult,
             ControlOperation, ControlProblem, ControlResult, DiscoverySource, FrameLimit,
-            HandoverPreparedResult, ReconciliationStrategy, RpcVersion, ServerFrame, Target,
+            HandoverPreparedResult, ProviderConfigurationExportResult, ProviderImportOutcomeResult,
+            ProviderImportPreviewResult, ReconciliationStrategy, RpcVersion, ServerFrame, Target,
             TargetAction, TargetView, UniversalProviderAction, UniversalProviderCatalogView,
         },
     },
@@ -40,6 +41,7 @@ use crate::{
         handover::{PreparedHandover, probe_candidate},
         provider_inspector::ProviderInspector,
         provider_synchronization::ProviderSynchronizationService,
+        provider_transfer::{ProviderTransferError, ProviderTransferService},
         reconcile::ReconciliationService,
         reconciliation_adapter::ReconciliationContext,
         route_plan::RoutePlanCoordinator,
@@ -188,6 +190,7 @@ struct SessionServices {
     reconciliation: Arc<ReconciliationService>,
     route_plans: Arc<RoutePlanCoordinator>,
     provider_synchronization: Arc<ProviderSynchronizationService>,
+    provider_transfer: Arc<ProviderTransferService>,
     device_authorization: Arc<DeviceAuthorizationManager>,
     subscription_account_coordinator: Arc<SubscriptionAccountCoordinator>,
     native_usage: Arc<NativeUsageService>,
@@ -387,6 +390,10 @@ impl ControlServer {
             Arc::clone(&store),
             reconciliation_runtime.clone(),
         ));
+        let provider_transfer = Arc::new(ProviderTransferService::new(
+            Arc::clone(&store),
+            home.clone(),
+        ));
         let reconciliation = Arc::new(ReconciliationService::from_runtime(
             Arc::clone(&store),
             reconciliation_runtime,
@@ -564,6 +571,7 @@ impl ControlServer {
                         let reconciliation = Arc::clone(&reconciliation);
                         let route_plans = Arc::clone(&route_plans);
                         let provider_synchronization = Arc::clone(&provider_synchronization);
+                        let provider_transfer = Arc::clone(&provider_transfer);
                         let device_authorization = Arc::clone(&device_authorization);
                         let subscription_account_coordinator =
                             Arc::clone(&subscription_account_coordinator);
@@ -579,6 +587,7 @@ impl ControlServer {
                             reconciliation,
                             route_plans,
                             provider_synchronization,
+                            provider_transfer,
                             device_authorization,
                             subscription_account_coordinator,
                             native_usage,
@@ -795,6 +804,7 @@ async fn serve_session(
         reconciliation,
         route_plans,
         provider_synchronization,
+        provider_transfer,
         device_authorization,
         subscription_account_coordinator,
         native_usage,
@@ -1474,18 +1484,55 @@ async fn serve_session(
                     | ControlOperation::UniversalProviderAct { .. } => {
                         unreachable!("catalog operations are handled before target dispatch")
                     }
-                    ControlOperation::PreviewProviderImport(_)
-                    | ControlOperation::ConfirmProviderImport(_)
-                    | ControlOperation::ExportProviderConfiguration(_) => {
-                        if !enqueue_response(
-                            &responses,
-                            problem_frame(
-                                Some(request_id),
-                                "unsupported-operation",
-                                "Provider transfer is not available",
-                                None,
-                            ),
-                        ) {
+                    ControlOperation::PreviewProviderImport(operation) => {
+                        let frame = match provider_transfer
+                            .preview(operation.target, operation.source)
+                            .await
+                        {
+                            Ok(preview) => ServerFrame::Response {
+                                request_id,
+                                result: ControlResult::ProviderImportPreview(
+                                    ProviderImportPreviewResult { preview },
+                                ),
+                            },
+                            Err(error) => provider_transfer_problem(request_id, error),
+                        };
+                        if !enqueue_response(&responses, frame) {
+                            break 'session;
+                        }
+                    }
+                    ControlOperation::ExportProviderConfiguration(_) => {
+                        let frame = match provider_transfer.export().await {
+                            Ok(export) => ServerFrame::Response {
+                                request_id,
+                                result: ControlResult::ProviderConfigurationExport(
+                                    ProviderConfigurationExportResult { export },
+                                ),
+                            },
+                            Err(error) => provider_transfer_problem(request_id, error),
+                        };
+                        if !enqueue_response(&responses, frame) {
+                            break 'session;
+                        }
+                    }
+                    ControlOperation::ConfirmProviderImport(operation) => {
+                        let frame = match provider_transfer
+                            .confirm(
+                                operation.target,
+                                operation.preview_token,
+                                operation.choices,
+                            )
+                            .await
+                        {
+                            Ok(outcome) => ServerFrame::Response {
+                                request_id,
+                                result: ControlResult::ProviderImportOutcome(
+                                    ProviderImportOutcomeResult { outcome },
+                                ),
+                            },
+                            Err(error) => provider_transfer_problem(request_id, error),
+                        };
+                        if !enqueue_response(&responses, frame) {
                             break 'session;
                         }
                     }
@@ -1903,6 +1950,34 @@ async fn serve_session(
         writer_task.abort();
         let _ = writer_task.await;
     }
+}
+
+fn provider_transfer_problem(request_id: String, error: ProviderTransferError) -> ServerFrame {
+    let (code, message) = match error {
+        ProviderTransferError::InvalidImport => {
+            ("provider-import-invalid", "Provider import is invalid")
+        }
+        ProviderTransferError::ImportTooLarge => {
+            ("provider-import-too-large", "Provider import is too large")
+        }
+        ProviderTransferError::HostileImport => {
+            ("provider-import-rejected", "Provider import was rejected")
+        }
+        ProviderTransferError::PreviewExpired => (
+            "provider-import-preview-expired",
+            "Provider import preview expired",
+        ),
+        ProviderTransferError::InvalidChoice => (
+            "provider-import-choice-invalid",
+            "Provider import choice is invalid",
+        ),
+        ProviderTransferError::SecretRejected => (
+            "provider-import-secret-rejected",
+            "Provider import contains a managed routing credential",
+        ),
+        ProviderTransferError::State => ("state-store-error", "State store unavailable"),
+    };
+    problem_frame(Some(request_id), code, message, None)
 }
 
 fn operation_target(operation: &ControlOperation) -> Option<Target> {

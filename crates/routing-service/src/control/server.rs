@@ -1733,6 +1733,7 @@ async fn serve_session(
                     ControlOperation::Act { target, action_id, expected_revision, action } => {
                         lifecycle.pending_actions.fetch_add(1, Ordering::AcqRel);
                         let mut action_guard = Some(ActionGuard(Arc::clone(&lifecycle)));
+                        wait_for_test_action_barrier().await;
                         let parsed_action =
                             serde_json::from_value::<TargetAction>(action.clone()).ok();
                         let reconcile_action = parsed_action.as_ref().and_then(|action| match action {
@@ -2917,6 +2918,24 @@ async fn should_exit_idle(store: &StateStore, lifecycle: &ServerLifecycle) -> bo
         && lifecycle.active_sessions.load(Ordering::Acquire) == 0
         && lifecycle.pending_actions.load(Ordering::Acquire) == 0
         && matches!(store.service_lifecycle_required().await, Ok(false))
+}
+
+async fn wait_for_test_action_barrier() {
+    if std::env::var("MUXVIA_INTEGRATION_TEST").as_deref() != Ok("1") {
+        return;
+    }
+    let (Some(started), Some(release)) = (
+        std::env::var_os("MUXVIA_TEST_ACTION_STARTED_FILE"),
+        std::env::var_os("MUXVIA_TEST_ACTION_RELEASE_FILE"),
+    ) else {
+        return;
+    };
+    if fs::write(started, b"started\n").is_err() {
+        return;
+    }
+    while !fs::metadata(&release).is_ok_and(|metadata| metadata.is_file()) {
+        tokio::task::yield_now().await;
+    }
 }
 
 fn find_codex_executable() -> PathBuf {

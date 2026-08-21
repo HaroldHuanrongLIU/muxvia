@@ -21,6 +21,9 @@ use tempfile::TempDir;
 const UNRELATED: &str = include_str!("fixtures/claude/unrelated.json");
 const SEMANTIC_VALUES: &str = include_str!("fixtures/claude/semantic-values.json");
 
+#[cfg(unix)]
+static COMMAND_PROBE_LOCK: Mutex<()> = Mutex::new(());
+
 fn context(cwd: &Path) -> ClaudePreflightContext {
     ClaudePreflightContext {
         claude_config_dir: None,
@@ -469,6 +472,7 @@ fn fake_claude(temp: &TempDir, version: &str, help: &str, exit: i32) -> (PathBuf
 #[cfg(unix)]
 #[test]
 fn command_probe_uses_only_read_only_version_and_help_surfaces() {
+    let _guard = COMMAND_PROBE_LOCK.lock().unwrap();
     let temp = TempDir::new().unwrap();
     let (executable, log) = fake_claude(
         &temp,
@@ -486,6 +490,7 @@ fn command_probe_uses_only_read_only_version_and_help_surfaces() {
 #[cfg(unix)]
 #[test]
 fn reconciliation_probe_projects_only_exact_version_and_closed_classification() {
+    let _guard = COMMAND_PROBE_LOCK.lock().unwrap();
     let temp = TempDir::new().unwrap();
     let (executable, _) = fake_claude(
         &temp,
@@ -509,6 +514,7 @@ fn reconciliation_probe_projects_only_exact_version_and_closed_classification() 
 #[cfg(unix)]
 #[test]
 fn reconciliation_probe_rejects_malformed_missing_contradictory_and_non_utf8_output() {
+    let _guard = COMMAND_PROBE_LOCK.lock().unwrap();
     for (case, version_command, help_command) in [
         (
             "dot-only version",
@@ -582,6 +588,7 @@ fn reconciliation_probe_rejects_malformed_missing_contradictory_and_non_utf8_out
 #[cfg(unix)]
 #[test]
 fn reconciliation_probe_preserves_valid_version_when_help_is_incompatible() {
+    let _guard = COMMAND_PROBE_LOCK.lock().unwrap();
     let temp = TempDir::new().unwrap();
     let executable = temp.path().join("claude-versioned-incompatible-fixture");
     fs::write(
@@ -602,6 +609,7 @@ fn reconciliation_probe_preserves_valid_version_when_help_is_incompatible() {
 #[cfg(unix)]
 #[test]
 fn command_probe_classifies_unknown_compatible_and_incompatible_fake_versions() {
+    let _guard = COMMAND_PROBE_LOCK.lock().unwrap();
     let unknown = TempDir::new().unwrap();
     let (unknown_executable, _) = fake_claude(
         &unknown,

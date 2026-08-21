@@ -27,7 +27,7 @@ use muxvia_routing::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncReadExt,
     net::{TcpListener, UnixStream},
     process::{Child, Command},
     sync::Notify,
@@ -1490,7 +1490,25 @@ async fn unresolved_claude_recovery_or_drift_keeps_control_only_process_alive() 
 
 #[tokio::test]
 async fn disconnected_pending_action_commits_before_inactive_exit() {
-    let mut fixture = ProcessFixture::start().await;
+    let root = TempDir::new().unwrap();
+    let user_home = root.path().join("home");
+    let home = user_home.join(".muxvia");
+    let shutdown_file = root.path().join("shutdown");
+    let action_started = root.path().join("action-started");
+    let action_release = root.path().join("action-release");
+    fs::create_dir_all(&user_home).unwrap();
+    let child = command(&home, &shutdown_file)
+        .env("MUXVIA_TEST_ACTION_STARTED_FILE", &action_started)
+        .env("MUXVIA_TEST_ACTION_RELEASE_FILE", &action_release)
+        .spawn()
+        .unwrap();
+    wait_for_socket(&home.join("run/control.sock")).await;
+    let mut fixture = ProcessFixture {
+        _root: root,
+        home,
+        shutdown_file,
+        child,
+    };
     let mut stream = fixture.connect().await;
     hello(&mut stream).await;
     request(
@@ -1518,7 +1536,21 @@ async fn disconnected_pending_action_commits_before_inactive_exit() {
     )
     .await
     .unwrap();
-    stream.shutdown().await.unwrap();
+    timeout(PROCESS_TIMEOUT, async {
+        while !action_started.is_file() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("service did not accept the pending action");
+    drop(stream);
+    assert!(
+        timeout(Duration::from_millis(100), fixture.child.wait())
+            .await
+            .is_err(),
+        "service exited before its pending action finished"
+    );
+    fs::write(action_release, b"release\n").unwrap();
 
     assert!(
         timeout(PROCESS_TIMEOUT, fixture.child.wait())

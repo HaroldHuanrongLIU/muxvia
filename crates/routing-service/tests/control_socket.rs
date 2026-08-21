@@ -10,7 +10,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -902,8 +902,16 @@ async fn request_history_pages_and_details_are_target_bound_over_real_uds() {
     let database = tokio_rusqlite::Connection::open(home.database_path())
         .await
         .unwrap();
+    let recent_base = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+        - 1_000;
     database
-        .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
+        .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
             connection.execute(
                 "INSERT INTO credentials (id, target, bearer_token) VALUES (?1, 'codex', ?2)",
                 params!["00000000-0000-4000-8000-000000001400", HISTORY_CREDENTIAL],
@@ -912,7 +920,7 @@ async fn request_history_pages_and_details_are_target_bound_over_real_uds() {
                 (
                     "00000000-0000-4000-8000-000000001400",
                     "codex",
-                    100_i64,
+                    recent_base + 100,
                     "route-unavailable",
                     None,
                     None,
@@ -920,7 +928,7 @@ async fn request_history_pages_and_details_are_target_bound_over_real_uds() {
                 (
                     "00000000-0000-4000-8000-000000001401",
                     "codex",
-                    110_i64,
+                    recent_base + 110,
                     "success",
                     Some(200_i64),
                     None,
@@ -928,7 +936,7 @@ async fn request_history_pages_and_details_are_target_bound_over_real_uds() {
                 (
                     "00000000-0000-4000-8000-000000001402",
                     "claude",
-                    120,
+                    recent_base + 120,
                     "upstream-error",
                     Some(429),
                     Some(b"claude sanitized failure".as_slice()),
@@ -936,7 +944,7 @@ async fn request_history_pages_and_details_are_target_bound_over_real_uds() {
                 (
                     "00000000-0000-4000-8000-000000001403",
                     "codex",
-                    130,
+                    recent_base + 130,
                     "upstream-error",
                     Some(429),
                     Some(b"codex sanitized failure".as_slice()),
@@ -944,7 +952,7 @@ async fn request_history_pages_and_details_are_target_bound_over_real_uds() {
                 (
                     "00000000-0000-4000-8000-000000001404",
                     "codex",
-                    140,
+                    recent_base + 140,
                     "success",
                     Some(200),
                     None,
@@ -986,8 +994,8 @@ async fn request_history_pages_and_details_are_target_bound_over_real_uds() {
                     cache_read_multiplier_ppm, cache_creation_multiplier_ppm,
                     priced_at_unix_ms, estimated_cost_nano_usd)
                  VALUES (?1, 'history-catalog-v1', 'history-test', 'history-model',
-                         1, 2, 3, 4, 130, 5)",
-                ["00000000-0000-4000-8000-000000001403"],
+                         1, 2, 3, 4, ?2, 5)",
+                params!["00000000-0000-4000-8000-000000001403", recent_base + 130,],
             )?;
             Ok(())
         })

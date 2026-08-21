@@ -20,6 +20,7 @@ impl StateStore {
         &self,
         target: Target,
         files: Vec<ParsedNativeFile>,
+        now_unix_ms: u64,
     ) -> Result<u64, NativeUsageError> {
         self.connection
             .call(move |connection| -> Result<u64, NativeUsageError> {
@@ -119,6 +120,14 @@ impl StateStore {
                         )
                         .map_err(sql_error)?;
                 }
+                let detailed_retention_days = transaction
+                    .query_row(
+                        "SELECT detailed_retention_days FROM usage_settings WHERE singleton = 1",
+                        [],
+                        |row| row.get::<_, u16>(0),
+                    )
+                    .map_err(sql_error)?;
+                roll_up_usage(&transaction, target, detailed_retention_days, now_unix_ms)?;
                 transaction.commit().map_err(sql_error)?;
                 Ok(imported)
             })
@@ -286,7 +295,7 @@ impl StateStore {
             })
             .await
             .map_err(|_| NativeUsageError::Unavailable)?;
-        items.sort_by(|left, right| right.key.cmp(&left.key));
+        items.sort_by_key(|item| std::cmp::Reverse(item.key));
         if let Some(before) = before {
             items.retain(|item| item.key < before);
         }
@@ -321,64 +330,14 @@ impl StateStore {
                         [detailed_retention_days],
                     )
                     .map_err(sql_error)?;
-                let cutoff = transaction
-                    .query_row(
-                        "SELECT date(?1 / 1000, 'unixepoch', 'localtime', printf('-%d days', ?2 - 1))",
-                        params![now_unix_ms, detailed_retention_days],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .map_err(sql_error)?;
-                let dates = {
-                    let mut statement = transaction
-                        .prepare(
-                            "SELECT local_date FROM (
-                               SELECT DISTINCT date(finished_at_unix_ms / 1000, 'unixepoch', 'localtime') AS local_date
-                               FROM request_records WHERE target = ?1
-                               UNION
-                               SELECT DISTINCT date(observed_at_unix_ms / 1000, 'unixepoch', 'localtime') AS local_date
-                               FROM native_usage_records WHERE target = ?1
-                             ) WHERE local_date < ?2 ORDER BY local_date",
-                        )
-                        .map_err(sql_error)?;
-                    statement
-                        .query_map(params![target.as_str(), cutoff], |row| row.get::<_, String>(0))
-                        .map_err(sql_error)?
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(sql_error)?
-                };
-                let mut pruned_requests = 0_u64;
-                let mut pruned_native = 0_u64;
-                for date in &dates {
-                    let mut aggregate = read_rollup(&transaction, target, date)?.unwrap_or_default();
-                    let (requests, native) = aggregate_date(&transaction, target, date, &mut aggregate)?;
-                    write_rollup(&transaction, target, date, &aggregate)?;
-                    transaction
-                        .execute(
-                            "DELETE FROM request_records
-                             WHERE target = ?1
-                               AND date(finished_at_unix_ms / 1000, 'unixepoch', 'localtime') = ?2",
-                            params![target.as_str(), date],
-                        )
-                        .map_err(sql_error)?;
-                    transaction
-                        .execute(
-                            "DELETE FROM native_usage_records
-                             WHERE target = ?1
-                               AND date(observed_at_unix_ms / 1000, 'unixepoch', 'localtime') = ?2",
-                            params![target.as_str(), date],
-                        )
-                        .map_err(sql_error)?;
-                    pruned_requests = checked_add(pruned_requests, requests)?;
-                    pruned_native = checked_add(pruned_native, native)?;
-                }
-                transaction.commit().map_err(sql_error)?;
-                Ok(UsageRetentionOutcome {
+                let outcome = roll_up_usage(
+                    &transaction,
                     target,
                     detailed_retention_days,
-                    rolled_up_days: dates.len() as u64,
-                    pruned_request_records: pruned_requests,
-                    pruned_native_usage_records: pruned_native,
-                })
+                    now_unix_ms,
+                )?;
+                transaction.commit().map_err(sql_error)?;
+                Ok(outcome)
             })
             .await
             .map_err(|_| NativeUsageError::Unavailable)
@@ -483,6 +442,73 @@ impl StateStore {
             .await
             .map_err(|_| NativeUsageError::Unavailable)
     }
+}
+
+fn roll_up_usage(
+    transaction: &Transaction<'_>,
+    target: Target,
+    detailed_retention_days: u16,
+    now_unix_ms: u64,
+) -> Result<UsageRetentionOutcome, NativeUsageError> {
+    let cutoff = transaction
+        .query_row(
+            "SELECT date(?1 / 1000, 'unixepoch', 'localtime', printf('-%d days', ?2 - 1))",
+            params![now_unix_ms, detailed_retention_days],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(sql_error)?;
+    let dates = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT local_date FROM (
+                   SELECT DISTINCT date(finished_at_unix_ms / 1000, 'unixepoch', 'localtime') AS local_date
+                   FROM request_records WHERE target = ?1
+                   UNION
+                   SELECT DISTINCT date(observed_at_unix_ms / 1000, 'unixepoch', 'localtime') AS local_date
+                   FROM native_usage_records WHERE target = ?1
+                 ) WHERE local_date < ?2 ORDER BY local_date",
+            )
+            .map_err(sql_error)?;
+        statement
+            .query_map(params![target.as_str(), cutoff], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?
+    };
+    let mut pruned_requests = 0_u64;
+    let mut pruned_native = 0_u64;
+    for date in &dates {
+        let mut aggregate = read_rollup(transaction, target, date)?.unwrap_or_default();
+        let (requests, native) = aggregate_date(transaction, target, date, &mut aggregate)?;
+        write_rollup(transaction, target, date, &aggregate)?;
+        transaction
+            .execute(
+                "DELETE FROM request_records
+                 WHERE target = ?1
+                   AND date(finished_at_unix_ms / 1000, 'unixepoch', 'localtime') = ?2",
+                params![target.as_str(), date],
+            )
+            .map_err(sql_error)?;
+        transaction
+            .execute(
+                "DELETE FROM native_usage_records
+                 WHERE target = ?1
+                   AND date(observed_at_unix_ms / 1000, 'unixepoch', 'localtime') = ?2",
+                params![target.as_str(), date],
+            )
+            .map_err(sql_error)?;
+        pruned_requests = checked_add(pruned_requests, requests)?;
+        pruned_native = checked_add(pruned_native, native)?;
+    }
+    Ok(UsageRetentionOutcome {
+        target,
+        detailed_retention_days,
+        rolled_up_days: dates.len() as u64,
+        pruned_request_records: pruned_requests,
+        pruned_native_usage_records: pruned_native,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

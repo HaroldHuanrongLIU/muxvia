@@ -208,6 +208,28 @@ struct InspectionServices {
     native_usage: Arc<NativeUsageService>,
 }
 
+#[derive(Clone, Copy)]
+struct ServerRuntime {
+    exit_when_idle: bool,
+    native_usage_scan_interval: Duration,
+}
+
+impl ServerRuntime {
+    fn session() -> Self {
+        Self {
+            exit_when_idle: false,
+            native_usage_scan_interval: Duration::from_secs(60),
+        }
+    }
+
+    fn process(native_usage_scan_interval: Duration) -> Self {
+        Self {
+            exit_when_idle: true,
+            native_usage_scan_interval,
+        }
+    }
+}
+
 impl ControlServer {
     pub async fn bind(
         home: &MuxviaHome,
@@ -231,10 +253,9 @@ impl ControlServer {
             store,
             release,
             activation,
-            false,
             None,
             None,
-            Duration::from_secs(60),
+            ServerRuntime::session(),
         )
         .await
     }
@@ -250,10 +271,9 @@ impl ControlServer {
             store,
             release,
             activation,
-            false,
             None,
             None,
-            Duration::from_secs(60),
+            ServerRuntime::session(),
         )
         .await
     }
@@ -275,10 +295,9 @@ impl ControlServer {
             store,
             release,
             activation,
-            false,
             Some(authority),
             None,
-            Duration::from_secs(60),
+            ServerRuntime::session(),
         )
         .await
     }
@@ -294,10 +313,9 @@ impl ControlServer {
             store,
             release,
             activation,
-            true,
             None,
             None,
-            Duration::from_secs(60),
+            ServerRuntime::process(Duration::from_secs(60)),
         )
         .await
     }
@@ -315,10 +333,9 @@ impl ControlServer {
             store,
             release,
             activation,
-            true,
             None,
             None,
-            scan_interval,
+            ServerRuntime::process(scan_interval),
         )
         .await
     }
@@ -341,10 +358,9 @@ impl ControlServer {
             store,
             release,
             activation,
-            true,
             Some(authority),
             refresh_account_id,
-            Duration::from_secs(60),
+            ServerRuntime::process(Duration::from_secs(60)),
         )
         .await
     }
@@ -354,12 +370,11 @@ impl ControlServer {
         store: Arc<StateStore>,
         release: impl Into<String>,
         activation: Arc<ActivationService>,
-        exit_when_idle: bool,
         device_authority: Option<
             Arc<dyn crate::subscription::device_authorization::DeviceAuthorizationAuthority>,
         >,
         startup_refresh_account_id: Option<String>,
-        native_usage_scan_interval: Duration,
+        runtime: ServerRuntime,
     ) -> Result<ControlServerHandle, ControlServerError> {
         let reconciliation_runtime = activation.reconciliation_runtime();
         if reconciliation_runtime.home.root() != home.root() {
@@ -493,7 +508,7 @@ impl ControlServer {
         let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
         let (completed_tx, completed) = watch::channel(false);
         let (handover_tx, handover_rx) = mpsc::channel(1);
-        let handover = exit_when_idle.then_some(handover_tx);
+        let handover = runtime.exit_when_idle.then_some(handover_tx);
         let lifecycle = Arc::new(ServerLifecycle::default());
         let handle_lifecycle = Arc::clone(&lifecycle);
         let task_path = socket_path.clone();
@@ -502,7 +517,7 @@ impl ControlServer {
         let periodic_store = Arc::clone(&store);
         let mut periodic_shutdown = session_shutdown_rx.clone();
         let periodic_usage_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(native_usage_scan_interval);
+            let mut interval = tokio::time::interval(runtime.native_usage_scan_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await;
             loop {
@@ -534,7 +549,7 @@ impl ControlServer {
                         break;
                     }
                     _ = sessions.join_next(), if !sessions.is_empty() => {
-                        if exit_when_idle && should_exit_idle(&store, &lifecycle).await {
+                        if runtime.exit_when_idle && should_exit_idle(&store, &lifecycle).await {
                             let _ = session_shutdown_tx.send(true);
                             break;
                         }
@@ -597,7 +612,7 @@ impl ControlServer {
             completed,
             lifecycle: handle_lifecycle,
             reconciliation: handle_reconciliation,
-            handover: exit_when_idle.then_some(handover_rx),
+            handover: runtime.exit_when_idle.then_some(handover_rx),
         })
     }
 }

@@ -94,7 +94,10 @@ impl NativeUsageService {
             .map_err(|_| NativeUsageError::Unavailable)??;
         let scanned_files =
             u64::try_from(files.len()).map_err(|_| NativeUsageError::Unavailable)?;
-        let imported_records = self.store.import_native_usage(target, files).await?;
+        let imported_records = self
+            .store
+            .import_native_usage(target, files, unix_time_ms())
+            .await?;
         Ok(NativeUsageRefresh {
             target,
             imported_records,
@@ -820,13 +823,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_enforces_default_retention_without_operator_action() {
+        let (_root, home, _store, service) = fixture().await;
+        let directory = home.user_home().join(".claude/projects/default-retention");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("record.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"assistant\",\"sessionId\":\"old-session\",\"timestamp\":\"2020-01-02T03:04:05Z\",\"message\":{\"id\":\"old-message\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":3}}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            service.scan(Target::Claude).await.unwrap().imported_records,
+            1
+        );
+        let page = service.list(Target::Claude, None, 10).await.unwrap();
+        assert_eq!(page.detailed_retention_days, 30);
+        assert!(matches!(
+            page.entries.as_slice(),
+            [UsageActivityEntry::DailyUsageRollup { .. }]
+        ));
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                b"{\"type\":\"assistant\",\"sessionId\":\"old-session\",\"timestamp\":\"2020-01-02T04:04:05Z\",\"message\":{\"id\":\"late-message\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":7,\"output_tokens\":2}}}\n",
+            )
+            .unwrap();
+        assert_eq!(
+            service.scan(Target::Claude).await.unwrap().imported_records,
+            1
+        );
+        let page = service.list(Target::Claude, None, 10).await.unwrap();
+        let UsageActivityEntry::DailyUsageRollup { rollup } = &page.entries[0] else {
+            panic!("late old detail was not merged into its rollup")
+        };
+        assert_eq!(rollup.native_usage_record_count, 2);
+        assert_eq!(rollup.usage.input_tokens, 17);
+        let database = Connection::open(home.database_path()).unwrap();
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM native_usage_records", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn imports_claude_usage_then_rolls_up_and_atomically_clears_usage() {
         let (_root, home, store, service) = fixture().await;
         let directory = home.user_home().join(".claude/projects/project-marker");
         fs::create_dir_all(&directory).unwrap();
         fs::write(
             directory.join("session-marker.jsonl"),
-            "{\"type\":\"assistant\",\"sessionId\":\"secret-session\",\"timestamp\":\"2020-01-02T03:04:05Z\",\"message\":{\"id\":\"message-marker\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1,\"output_tokens\":3}}}\n",
+            "{\"type\":\"assistant\",\"sessionId\":\"secret-session\",\"timestamp\":\"2026-08-01T03:04:05Z\",\"message\":{\"id\":\"message-marker\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":1,\"output_tokens\":3}}}\n",
         )
         .unwrap();
         assert_eq!(
@@ -835,7 +889,7 @@ mod tests {
         );
         let now = parse_rfc3339_ms("2026-08-21T12:00:00Z").unwrap();
         let retained = store
-            .apply_usage_retention(Target::Claude, 30, now)
+            .apply_usage_retention(Target::Claude, 7, now)
             .await
             .unwrap();
         assert_eq!(retained.rolled_up_days, 1);
@@ -863,7 +917,7 @@ mod tests {
                 })
                 .unwrap(),
         );
-        assert_eq!(retained_state, (30, 1));
+        assert_eq!(retained_state, (7, 1));
     }
 
     #[tokio::test]
@@ -873,7 +927,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(
             directory.join("record.jsonl"),
-            "{\"type\":\"assistant\",\"sessionId\":\"overflow-session\",\"timestamp\":\"2020-01-02T03:04:05Z\",\"message\":{\"id\":\"overflow-message\",\"model\":\"overflow-model\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n",
+            "{\"type\":\"assistant\",\"sessionId\":\"overflow-session\",\"timestamp\":\"2026-08-01T03:04:05Z\",\"message\":{\"id\":\"overflow-message\",\"model\":\"overflow-model\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n",
         )
         .unwrap();
         service.scan(Target::Claude).await.unwrap();
@@ -886,7 +940,7 @@ mod tests {
                     cached_input_tokens, cache_creation_input_tokens, output_tokens,
                     priced_record_count, unpriced_record_count, estimated_cost_nano_usd,
                     latency_observation_count, total_latency_ms)
-                 VALUES ('claude', '2020-01-02', 0, 0, 0, 0, ?1, 0, 0, 0, 0, 0, 0, 0, 0)",
+                 VALUES ('claude', '2026-08-01', 0, 0, 0, 0, ?1, 0, 0, 0, 0, 0, 0, 0, 0)",
                 [i64::MAX],
             )
             .unwrap();
@@ -901,7 +955,7 @@ mod tests {
                 "SELECT
                    (SELECT detailed_retention_days FROM usage_settings),
                    (SELECT input_tokens FROM daily_usage_rollups
-                    WHERE target = 'claude' AND local_date = '2020-01-02'),
+                    WHERE target = 'claude' AND local_date = '2026-08-01'),
                    (SELECT COUNT(*) FROM native_usage_records)",
                 [],
                 |row| {
@@ -935,8 +989,10 @@ mod tests {
                 async move {
                     if request == 0 {
                         r#"{"openai":{"models":{"future-model":{"cost":{"input":2,"output":10}}}},"anthropic":{"models":{}}}"#
-                    } else {
+                    } else if request == 1 {
                         r#"{"openai":{"models":{"future-model":{"cost":{"input":4,"output":20}}}},"anthropic":{"models":{}}}"#
+                    } else {
+                        r#"{"openai":{"models":{"duplicate":{"cost":{"input":1,"output":1}}}},"anthropic":{"models":{"duplicate":{"cost":{"input":1,"output":1}}}}}"#
                     }
                 }
             }),
@@ -976,6 +1032,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(still_frozen, outcome.catalog_version);
+        assert_eq!(
+            service.update_catalog(Target::Codex).await,
+            Err(NativeUsageError::InvalidCatalog)
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        let active_after_rejection = database
+            .query_row(
+                "SELECT catalog_version FROM pricing_catalog_state",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(active_after_rejection, replacement.catalog_version);
 
         let completion = RequestRecordCompletion {
             id: Uuid::new_v4(),
@@ -1013,19 +1082,50 @@ mod tests {
 
     #[tokio::test]
     async fn failed_clear_rolls_back_details_and_import_cursors() {
-        let (_root, home, _store, service) = fixture().await;
+        let (_root, home, store, service) = fixture().await;
         let directory = home.user_home().join(".claude/projects/clear-test");
         fs::create_dir_all(&directory).unwrap();
         fs::write(
             directory.join("record.jsonl"),
-            "{\"type\":\"assistant\",\"sessionId\":\"clear-session\",\"timestamp\":\"2026-08-21T10:00:00Z\",\"message\":{\"id\":\"clear-message\",\"model\":\"unpriced-clear-model\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n",
+            "{\"type\":\"assistant\",\"sessionId\":\"clear-session\",\"timestamp\":\"2026-08-21T10:00:00Z\",\"message\":{\"id\":\"clear-message\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n",
         )
         .unwrap();
         service.scan(Target::Claude).await.unwrap();
+        store
+            .record_request_completion(RequestRecordCompletion {
+                id: Uuid::new_v4(),
+                target: Target::Codex,
+                plan_id: Uuid::new_v4(),
+                plan_epoch: Uuid::new_v4(),
+                provider: None,
+                model: "gpt-5.6".to_owned(),
+                protocol: ProviderProtocol::OpenaiResponses,
+                started_at_unix_ms: 1,
+                finished_at_unix_ms: 2,
+                outcome: RequestRecordOutcome::UpstreamError,
+                http_status: Some(500),
+                usage: Some(RequestUsage {
+                    input_tokens: 1,
+                    cached_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    output_tokens: 1,
+                }),
+                error_payload: Some(b"retained-error-marker".to_vec()),
+                error_payload_truncated: false,
+            })
+            .await
+            .unwrap();
         let database = Connection::open(home.database_path()).unwrap();
         database
             .execute_batch(
-                "CREATE TRIGGER fail_usage_clear BEFORE DELETE ON native_usage_records
+                "INSERT INTO daily_usage_rollups
+                   (target, local_date, request_record_count, native_usage_record_count,
+                    successful_request_count, failed_request_count, input_tokens,
+                    cached_input_tokens, cache_creation_input_tokens, output_tokens,
+                    priced_record_count, unpriced_record_count, estimated_cost_nano_usd,
+                    latency_observation_count, total_latency_ms)
+                 VALUES ('codex', '2020-01-01', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                 CREATE TRIGGER fail_usage_clear BEFORE DELETE ON native_usage_records
                  BEGIN SELECT RAISE(ABORT, 'test-clear-failure'); END;",
             )
             .unwrap();
@@ -1033,20 +1133,49 @@ mod tests {
             service.clear(Target::Claude).await,
             Err(NativeUsageError::Unavailable)
         );
-        let counts = (
-            database
-                .query_row("SELECT COUNT(*) FROM native_usage_records", [], |row| {
-                    row.get::<_, u64>(0)
-                })
-                .unwrap(),
+        let usage_counts = |database: &Connection| {
             database
                 .query_row(
-                    "SELECT COUNT(*) FROM native_usage_import_cursors",
+                    "SELECT
+                       (SELECT COUNT(*) FROM request_records),
+                       (SELECT COUNT(*) FROM pricing_snapshots),
+                       (SELECT COUNT(*) FROM request_records WHERE error_payload IS NOT NULL),
+                       (SELECT COUNT(*) FROM native_usage_records),
+                       (SELECT COUNT(*) FROM native_usage_pricing_snapshots),
+                       (SELECT COUNT(*) FROM daily_usage_rollups),
+                       (SELECT COUNT(*) FROM native_usage_import_cursors)",
                     [],
-                    |row| row.get::<_, u64>(0),
+                    |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, u64>(2)?,
+                            row.get::<_, u64>(3)?,
+                            row.get::<_, u64>(4)?,
+                            row.get::<_, u64>(5)?,
+                            row.get::<_, u64>(6)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(usage_counts(&database), (1, 1, 1, 1, 1, 1, 1));
+        database
+            .execute_batch("DROP TRIGGER fail_usage_clear")
+            .unwrap();
+        service.clear(Target::Codex).await.unwrap();
+        assert_eq!(usage_counts(&database), (0, 0, 0, 0, 0, 0, 0));
+        assert_eq!(
+            database
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM usage_settings),
+                       (SELECT COUNT(*) FROM pricing_catalog_state)",
+                    [],
+                    |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
                 )
                 .unwrap(),
+            (1, 1)
         );
-        assert_eq!(counts, (1, 1));
     }
 }

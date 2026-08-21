@@ -33,7 +33,7 @@ This command confines Managed Configuration to the printed temporary home. Remov
 
 ## Releases
 
-GitHub Release tags build one complete, integrity-bound archive for macOS arm64, macOS x86-64, Linux glibc arm64, and Linux glibc x86-64. The official Homebrew tap selects and verifies the matching macOS archive while retaining the complete bundle under Homebrew ownership. See [release and Homebrew installation, repair, unsigned macOS behavior, and notify-only updates](./docs/releases.md).
+GitHub Release tags build one complete, integrity-bound archive for macOS arm64, macOS x86-64, Linux glibc arm64, and Linux glibc x86-64. The official Homebrew tap selects and verifies the matching macOS archive while retaining the complete bundle under Homebrew ownership, and the verified-download installer stages and atomically activates the matching bundle on every supported target. See [release installation, repair, unsigned macOS behavior, and notify-only updates](./docs/releases.md).
 
 ## Design sources
 

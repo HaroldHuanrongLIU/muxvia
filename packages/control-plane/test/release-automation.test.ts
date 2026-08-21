@@ -19,6 +19,7 @@ test("release automation owns all four native archives and every audit gate", as
     "release:bundle scan",
     "release:bundle smoke",
     "release:bundle public-manifest",
+    "sh scripts/install.sh",
     "gh release create",
   ]) expect(workflow).toContain(gate)
   expect(workflow).toContain("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
@@ -28,6 +29,8 @@ test("release automation owns all four native archives and every audit gate", as
   expect(controlPlaneBuild).toContain("plugins: [solidPlugin]")
   expect(controlPlaneBuild).toContain("autoloadBunfig: false")
   expect(controlPlaneBuild).toContain("autoloadDotenv: false")
+  expect(workflow).toContain("install -m 0755 scripts/install.sh release/install.sh")
+  expect(workflow.match(/MUXVIA_INSTALLER_TESTING=1/g)).toHaveLength(2)
 })
 
 test("release archives carry licenses, provenance, and accurate unsigned macOS guidance", async () => {
@@ -40,6 +43,9 @@ test("release archives carry licenses, provenance, and accurate unsigned macOS g
   expect(notices).toContain("Copyright (c) 2025 opencode")
   expect(JSON.parse(extraction).materials.length).toBeGreaterThan(0)
   expect(releaseDocumentation).toContain("unsigned and unnotarized")
+  expect(releaseDocumentation).toContain("verified-download installation")
+  expect(releaseDocumentation).toContain("brew upgrade muxvia")
+  expect(releaseDocumentation).toContain("Approval may be required separately")
   expect(releaseDocumentation).toContain("MUXVIA_UPDATE_CHECK=0")
   expect(releaseDocumentation).toContain("no product telemetry")
 })

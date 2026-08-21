@@ -444,7 +444,7 @@
       "oneOf": [
         { "type": "object", "properties": { "type": { "const": "hello-ack" }, "rpc": { "$ref": "#/$defs/rpc" }, "release": { "type": "string" }, "serviceEpoch": { "type": "string", "format": "uuid" }, "frameLimit": { "const": 1048576 } }, "required": ["type", "rpc", "release", "serviceEpoch", "frameLimit"] },
         { "type": "object", "properties": { "type": { "const": "response" }, "requestId": { "type": "string" }, "result": { "$ref": "#/$defs/controlResult" } }, "required": ["type", "requestId", "result"] },
-        { "type": "object", "properties": { "type": { "const": "error" }, "requestId": { "type": ["string", "null"] }, "problem": { "$ref": "#/$defs/controlProblem" }, "authoritativeView": { "$ref": "#/$defs/targetView" }, "authoritativeUniversalProviderView": { "$ref": "#/$defs/universalProviderCatalog" }, "authoritativeSubscriptionAccountView": { "$ref": "#/$defs/subscriptionAccountCatalog" } }, "required": ["type", "requestId", "problem"] },
+        { "type": "object", "properties": { "type": { "const": "error" }, "requestId": { "type": ["string", "null"] }, "problem": { "$ref": "#/$defs/controlProblem" }, "recoveryBackupPath": { "type": "string" }, "authoritativeView": { "$ref": "#/$defs/targetView" }, "authoritativeUniversalProviderView": { "$ref": "#/$defs/universalProviderCatalog" }, "authoritativeSubscriptionAccountView": { "$ref": "#/$defs/subscriptionAccountCatalog" } }, "required": ["type", "requestId", "problem"] },
         { "type": "object", "properties": { "type": { "const": "target-view" }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["type", "view"] },
         { "type": "object", "additionalProperties": false, "properties": { "type": { "const": "universal-provider-view" }, "view": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["type", "view"] },
         { "type": "object", "additionalProperties": false, "properties": { "type": { "const": "subscription-account-view" }, "view": { "$ref": "#/$defs/subscriptionAccountCatalog" } }, "required": ["type", "view"] }
@@ -454,6 +454,7 @@
       "oneOf": [
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "create-recovery-backup" } }, "required": ["kind"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "inspect-recovery-backup" }, "path": { "type": "string" } }, "required": ["kind", "path"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "restore-recovery-backup" }, "path": { "type": "string" }, "acknowledgement": { "const": "replace-current-installation" }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind", "path", "acknowledgement"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "prepare-handover" }, "candidatePath": { "type": "string" }, "expectedRelease": { "type": "string" } }, "required": ["kind", "candidatePath", "expectedRelease"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "force-stop" }, "acknowledgement": { "const": "managed-target-files-may-remain-pointed-at-dead-endpoint" } }, "required": ["kind", "acknowledgement"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "open-universal-providers" }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind"] },
@@ -566,7 +567,8 @@
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "provider-import-outcome" }, "outcome": { "$ref": "#/$defs/providerImportOutcome" } }, "required": ["kind", "outcome"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "provider-configuration-export" }, "export": { "$ref": "#/$defs/providerConfigurationExport" } }, "required": ["kind", "export"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "recovery-backup-created" }, "path": { "type": "string" }, "inspection": { "$ref": "#/$defs/recoveryBackupInspection" } }, "required": ["kind", "path", "inspection"] },
-        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "recovery-backup-inspection" }, "inspection": { "$ref": "#/$defs/recoveryBackupInspection" } }, "required": ["kind", "inspection"] }
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "recovery-backup-inspection" }, "inspection": { "$ref": "#/$defs/recoveryBackupInspection" } }, "required": ["kind", "inspection"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "recovery-backup-restored" }, "restoredSnapshotId": { "type": "string", "format": "uuid" }, "preRestoreSnapshotId": { "type": "string", "format": "uuid" }, "preRestoreBackupPath": { "type": "string" }, "resumedTakeovers": { "type": "array", "maxItems": 2, "items": { "enum": ["codex", "claude"] } }, "restartTargetClis": { "const": true }, "sensitive": { "const": true } }, "required": ["kind", "restoredSnapshotId", "preRestoreSnapshotId", "preRestoreBackupPath", "resumedTakeovers", "restartTargetClis", "sensitive"] }
       ]
     },
     "inspectionCategory": {

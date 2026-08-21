@@ -17,6 +17,7 @@ type Invocation = {
   json: boolean
   force: boolean
   forceAcknowledged: boolean
+  backupRestoreAcknowledged: boolean
   servicePath: string
   socketPath: string
   problem?: {
@@ -93,6 +94,7 @@ export function parseInvocation(args: string[], environment = process.env): Invo
       "--json",
       "--force",
       "--acknowledge-managed-target-files-may-remain-pointed-at-dead-endpoint",
+      "--acknowledge-replace-current-installation",
       "--service",
       "--socket",
     ].includes(argument)
@@ -115,6 +117,7 @@ export function parseInvocation(args: string[], environment = process.env): Invo
     "--json",
     "--force",
     "--acknowledge-managed-target-files-may-remain-pointed-at-dead-endpoint",
+    "--acknowledge-replace-current-installation",
   ].includes(argument) && !optionValues.has(index))
   const command = positional[0]
   const subcommand = positional[1]
@@ -123,18 +126,25 @@ export function parseInvocation(args: string[], environment = process.env): Invo
   const forceAcknowledged = args.includes(
     "--acknowledge-managed-target-files-may-remain-pointed-at-dead-endpoint",
   )
+  const backupRestoreAcknowledged = args.includes(
+    "--acknowledge-replace-current-installation",
+  )
   if (!isAbsolute(servicePath) || !isAbsolute(socketPath)) invalid = true
   if (
     (command === "service" && !["start", "stop"].includes(subcommand ?? ""))
-    || (command === "backup" && !["create", "inspect"].includes(subcommand ?? ""))
+    || (command === "backup" && !["create", "inspect", "restore"].includes(subcommand ?? ""))
     || (["paths", "version", "status", "doctor"].includes(command ?? "") && positional.length !== 1)
     || (command === "service" && positional.length !== 2)
     || (command === "backup" && subcommand === "create" && positional.length !== 2)
     || (command === "backup" && subcommand === "inspect" && (
       positional.length !== 3 || !backupPath || !isAbsolute(backupPath)
     ))
+    || (command === "backup" && subcommand === "restore" && (
+      positional.length !== 3 || !backupPath || !isAbsolute(backupPath)
+    ))
     || (force && (command !== "service" || subcommand !== "stop"))
     || (forceAcknowledged && !force)
+    || (backupRestoreAcknowledged && (command !== "backup" || subcommand !== "restore"))
   ) {
     invalid = true
   }
@@ -145,6 +155,7 @@ export function parseInvocation(args: string[], environment = process.env): Invo
     json: args.includes("--json"),
     force,
     forceAcknowledged,
+    backupRestoreAcknowledged,
     servicePath,
     socketPath,
     ...(invalid
@@ -290,6 +301,26 @@ export async function dispatchDiagnostic(invocation: Invocation): Promise<boolea
     }
     return true
   }
+  if (invocation.command === "backup" && invocation.subcommand === "restore") {
+    if (!invocation.backupRestoreAcknowledged) {
+      writeFailure(
+        invocation,
+        "recovery-backup-restore-acknowledgement-required",
+        "Recovery Backup restore requires explicit acknowledgement that it replaces the current installation",
+        64,
+      )
+      return true
+    }
+    try {
+      const result = await restoreRecoveryBackup(invocation)
+      process.stdout.write(invocation.json
+        ? `${JSON.stringify(result)}\n`
+        : formatRecoveryBackupRestore(result))
+    } catch (error) {
+      writeRecoveryBackupRestoreFailure(invocation, error)
+    }
+    return true
+  }
   if (invocation.command === "service" && invocation.subcommand === "start") {
     try {
       const result = await startService(invocation)
@@ -384,6 +415,39 @@ async function inspectRecoveryBackup(invocation: Invocation) {
   }
 }
 
+async function restoreRecoveryBackup(invocation: Invocation) {
+  const path = invocation.backupPath
+  if (!path || !isAbsolute(path)) throw new Error("invalid-recovery-backup-path")
+  const client = await connectForBackup(invocation)
+  try {
+    const result = await client.request({
+      kind: "restore-recovery-backup",
+      path,
+      acknowledgement: "replace-current-installation",
+      claudeContext: claudePreflightContext(process.env),
+    })
+    if (
+      result.kind !== "recovery-backup-restored"
+      || !isAbsolute(result.preRestoreBackupPath)
+    ) {
+      throw new Error("unexpected-recovery-backup-response")
+    }
+    return {
+      ok: true,
+      command: "backup",
+      operation: "restore",
+      sensitive: true,
+      restoredSnapshotId: result.restoredSnapshotId,
+      preRestoreSnapshotId: result.preRestoreSnapshotId,
+      preRestoreBackupPath: result.preRestoreBackupPath,
+      resumedTakeovers: result.resumedTakeovers,
+      restartTargetClis: result.restartTargetClis,
+    } as const
+  } finally {
+    await client.close().catch(() => {})
+  }
+}
+
 async function connectForBackup(invocation: Invocation): Promise<RpcClient> {
   const cancellation = new AbortController()
   const deadline = setTimeout(() => cancellation.abort(), probeTimeoutMs)
@@ -417,6 +481,41 @@ function formatRecoveryBackup(
     entries,
     "",
   ].join("\n")
+}
+
+function formatRecoveryBackupRestore(
+  result: Awaited<ReturnType<typeof restoreRecoveryBackup>>,
+): string {
+  const resumed = result.resumedTakeovers.length === 0
+    ? "none"
+    : result.resumedTakeovers.join(", ")
+  return [
+    "SENSITIVE RECOVERY BACKUP restored; the prior installation remains recoverable",
+    `Restored snapshot: ${result.restoredSnapshotId}`,
+    `Pre-restore Recovery Backup: ${result.preRestoreBackupPath}`,
+    `Resumed takeovers: ${resumed}`,
+    "Start new Target CLI processes; existing processes retain their prior configuration.",
+    "",
+  ].join("\n")
+}
+
+function writeRecoveryBackupRestoreFailure(invocation: Invocation, error: unknown): void {
+  const controlError = error instanceof ControlError ? error : undefined
+  const source = controlError?.recoveryBackupPath && isAbsolute(controlError.recoveryBackupPath)
+    ? controlError.recoveryBackupPath
+    : undefined
+  const failure = {
+    ok: false,
+    problem: {
+      code: controlError?.code ?? "recovery-backup-restore-failed",
+      message: controlError?.message ?? "Sensitive Recovery Backup could not be restored",
+      ...(source ? { source } : {}),
+    },
+  }
+  process.exitCode = controlError?.code === "recovery-backup-recovery-required" ? 78 : 70
+  process.stderr.write(invocation.json
+    ? `${JSON.stringify(failure)}\n`
+    : `${failure.problem.message}${source ? `; recovery point: ${source}` : ""}\n`)
 }
 
 function writeFailure(

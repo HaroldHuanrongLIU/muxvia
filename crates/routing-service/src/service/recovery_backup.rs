@@ -3,6 +3,7 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -10,21 +11,26 @@ use std::{
 use ring::digest::{Context, SHA256, digest};
 use rustix::fs::RenameFlags;
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
+    claude::ClaudeConfigCodec,
+    codex::CodexConfigCodec,
     config::managed_file::{ManagedFile, ManagedFileContents},
     control::protocol::{
-        RecoveryBackupCompatibility, RecoveryBackupEntryKind, RecoveryBackupEntrySummary,
-        RecoveryBackupInspection,
+        ClaudePreflightContext, RecoveryBackupCompatibility, RecoveryBackupEntryKind,
+        RecoveryBackupEntrySummary, RecoveryBackupInspection, Target,
     },
     home::MuxviaHome,
     state::{SCHEMA_VERSION, StateStore},
-    subscription::{SubscriptionAccountCoordinator, SubscriptionAccountStore},
+    subscription::{
+        DeviceAuthorizationManager, SubscriptionAccountCoordinator, SubscriptionAccountStore,
+    },
 };
 
-use super::reconcile::ReconciliationService;
+use super::{activate::ActivationService, reconcile::ReconciliationService};
 
 const MAGIC: &[u8] = b"MUXVIA-RECOVERY-V1\n";
 const FORMAT: &str = "muxvia-recovery-backup";
@@ -33,6 +39,7 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_RELEASE_BYTES: usize = 256;
+const MAX_NON_DATABASE_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const ENTRY_KINDS: [RecoveryBackupEntryKind; 4] = [
     RecoveryBackupEntryKind::SqliteState,
     RecoveryBackupEntryKind::SubscriptionAccounts,
@@ -40,7 +47,7 @@ const ENTRY_KINDS: [RecoveryBackupEntryKind; 4] = [
     RecoveryBackupEntryKind::ClaudeManagedConfiguration,
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum RecoveryBackupError {
     #[error("Recovery Backup path is invalid")]
     InvalidPath,
@@ -52,6 +59,22 @@ pub(crate) enum RecoveryBackupError {
     SnapshotChanged,
     #[error("Recovery Backup could not be created")]
     CreationFailed,
+    #[error("Recovery Backup is not compatible with this release")]
+    Incompatible,
+    #[error("Recovery Backup preflight failed")]
+    PreflightFailed,
+    #[error("Recovery Backup restore step failed at {stage}")]
+    RestoreStepFailed { stage: &'static str },
+    #[error("Recovery Backup restore failed and the prior installation was recovered")]
+    RestoreFailed {
+        pre_restore_backup_path: PathBuf,
+        stage: &'static str,
+    },
+    #[error("Recovery Backup restore requires manual recovery")]
+    RecoveryRequired {
+        pre_restore_backup_path: PathBuf,
+        stage: &'static str,
+    },
 }
 
 pub(crate) struct CreatedRecoveryBackup {
@@ -59,31 +82,68 @@ pub(crate) struct CreatedRecoveryBackup {
     pub(crate) inspection: RecoveryBackupInspection,
 }
 
+pub(crate) struct RestoredRecoveryBackup {
+    pub(crate) restored_snapshot_id: Uuid,
+    pub(crate) pre_restore_snapshot_id: Uuid,
+    pub(crate) pre_restore_backup_path: PathBuf,
+    pub(crate) resumed_takeovers: Vec<crate::control::protocol::Target>,
+}
+
 type BeforeInstallHook = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+type RestoreHook = Arc<dyn Fn(RecoveryRestoreStage) -> io::Result<()> + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryRestoreStage {
+    AfterDatabase,
+    AfterAccounts,
+    AfterCodex,
+    AfterClaude,
+    BeforeRuntimeResume,
+    Verification,
+    BeforeRollback,
+}
+
+const fn restore_stage_name(stage: RecoveryRestoreStage) -> &'static str {
+    match stage {
+        RecoveryRestoreStage::AfterDatabase => "database",
+        RecoveryRestoreStage::AfterAccounts => "subscription-accounts",
+        RecoveryRestoreStage::AfterCodex => "codex-configuration",
+        RecoveryRestoreStage::AfterClaude => "claude-configuration",
+        RecoveryRestoreStage::BeforeRuntimeResume => "runtime",
+        RecoveryRestoreStage::Verification => "verification",
+        RecoveryRestoreStage::BeforeRollback => "rollback",
+    }
+}
 
 #[derive(Default)]
 struct RecoveryBackupHooks {
     before_install: Option<BeforeInstallHook>,
+    restore: Option<RestoreHook>,
 }
 
 pub(crate) struct RecoveryBackupService {
     store: Arc<StateStore>,
     home: MuxviaHome,
     reconciliation: Arc<ReconciliationService>,
+    activation: Arc<ActivationService>,
     accounts: Arc<SubscriptionAccountStore>,
     account_coordinator: Arc<SubscriptionAccountCoordinator>,
+    device_authorization: Arc<DeviceAuthorizationManager>,
     release: String,
     creation_gate: Mutex<()>,
     hooks: RecoveryBackupHooks,
 }
 
 impl RecoveryBackupService {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         store: Arc<StateStore>,
         home: MuxviaHome,
         reconciliation: Arc<ReconciliationService>,
+        activation: Arc<ActivationService>,
         accounts: Arc<SubscriptionAccountStore>,
         account_coordinator: Arc<SubscriptionAccountCoordinator>,
+        device_authorization: Arc<DeviceAuthorizationManager>,
         release: String,
     ) -> Result<Self, RecoveryBackupError> {
         if release.is_empty()
@@ -98,8 +158,10 @@ impl RecoveryBackupService {
             store,
             home,
             reconciliation,
+            activation,
             accounts,
             account_coordinator,
+            device_authorization,
             release,
             creation_gate: Mutex::new(()),
             hooks: RecoveryBackupHooks::default(),
@@ -109,6 +171,12 @@ impl RecoveryBackupService {
     #[cfg(test)]
     fn with_before_install_hook(mut self, hook: BeforeInstallHook) -> Self {
         self.hooks.before_install = Some(hook);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_restore_hook(mut self, hook: RestoreHook) -> Self {
+        self.hooks.restore = Some(hook);
         self
     }
 
@@ -124,6 +192,10 @@ impl RecoveryBackupService {
             .await;
         let _accounts = self.account_coordinator.lock_recovery_snapshot().await;
 
+        self.create_locked().await
+    }
+
+    async fn create_locked(&self) -> Result<CreatedRecoveryBackup, RecoveryBackupError> {
         let backups = self
             .home
             .prepare_backups_dir()
@@ -232,6 +304,237 @@ impl RecoveryBackupService {
         })
     }
 
+    pub(crate) async fn restore(
+        &self,
+        path: &Path,
+        claude_context: Option<ClaudePreflightContext>,
+    ) -> Result<RestoredRecoveryBackup, RecoveryBackupError> {
+        let _creation = self.creation_gate.lock().await;
+        let _codex = self
+            .reconciliation
+            .lock_target_mutation(crate::control::protocol::Target::Codex)
+            .await;
+        let _claude = self
+            .reconciliation
+            .lock_target_mutation(crate::control::protocol::Target::Claude)
+            .await;
+        let _accounts = self.account_coordinator.lock_recovery_snapshot().await;
+        let backups = self
+            .home
+            .prepare_backups_dir()
+            .map_err(|_| RecoveryBackupError::PreflightFailed)?;
+        let selected = extract_artifact(path, &backups)?;
+        if selected.manifest.database_schema_version > SCHEMA_VERSION {
+            return Err(RecoveryBackupError::Incompatible);
+        }
+        let account_document = validate_recovery_snapshot(&selected)?;
+        let preparation =
+            StateStore::prepare_recovery_database(selected.database_path.clone(), account_document)
+                .await
+                .map_err(|_| RecoveryBackupError::PreflightFailed)?;
+        if preparation.source_schema_version != selected.manifest.database_schema_version {
+            return Err(RecoveryBackupError::PreflightFailed);
+        }
+        self.preflight_restore(&preparation.takeover_ports, claude_context.as_ref())
+            .await?;
+
+        let pre_restore = self.create_locked().await?;
+        let rollback = extract_artifact(&pre_restore.path, &backups)?;
+        if self.activation.shutdown_models().await.is_err() {
+            let recovered = self.resume_takeovers_locked().await.is_ok();
+            return if recovered {
+                Err(RecoveryBackupError::RestoreFailed {
+                    pre_restore_backup_path: pre_restore.path,
+                    stage: "runtime",
+                })
+            } else {
+                let _ = self.store.mark_recovery_restore_required().await;
+                Err(RecoveryBackupError::RecoveryRequired {
+                    pre_restore_backup_path: pre_restore.path,
+                    stage: "runtime",
+                })
+            };
+        }
+        let port_reservations = self
+            .reserve_takeover_ports(&preparation.takeover_ports)
+            .await;
+        let port_reservations = match port_reservations {
+            Ok(reservations) => reservations,
+            Err(error) => {
+                let recovered = self.resume_takeovers_locked().await.is_ok();
+                return if recovered {
+                    Err(RecoveryBackupError::RestoreFailed {
+                        pre_restore_backup_path: pre_restore.path,
+                        stage: "runtime",
+                    })
+                } else {
+                    let _ = self.store.mark_recovery_restore_required().await;
+                    Err(RecoveryBackupError::RecoveryRequired {
+                        pre_restore_backup_path: pre_restore.path,
+                        stage: match error {
+                            RecoveryBackupError::RestoreStepFailed { stage } => stage,
+                            _ => "runtime",
+                        },
+                    })
+                };
+            }
+        };
+        self.device_authorization.reset_for_recovery_restore().await;
+        let applied = async {
+            self.store
+                .restore_database_from(selected.database_path.clone())
+                .await
+                .map_err(|_| RecoveryBackupError::RestoreStepFailed { stage: "database" })?;
+            self.run_restore_hook(RecoveryRestoreStage::AfterDatabase)?;
+            apply_recovery_snapshot(&self.home, &selected, self.hooks.restore.as_ref())?;
+            self.run_restore_hook(RecoveryRestoreStage::Verification)?;
+            verify_live_snapshot(&self.home, &selected)?;
+            self.run_restore_hook(RecoveryRestoreStage::BeforeRuntimeResume)?;
+            drop(port_reservations);
+            self.resume_takeovers_locked().await
+        }
+        .await;
+        let resumed_takeovers = match applied {
+            Ok(targets) => targets,
+            Err(error) => {
+                let stage = match error {
+                    RecoveryBackupError::RestoreStepFailed { stage } => stage,
+                    _ => "unknown",
+                };
+                let runtimes_stopped = self.activation.shutdown_models().await.is_ok();
+                let rolled_back = self
+                    .run_restore_hook(RecoveryRestoreStage::BeforeRollback)
+                    .is_ok()
+                    && runtimes_stopped
+                    && self
+                        .store
+                        .restore_database_from(rollback.database_path.clone())
+                        .await
+                        .and_then(|_| {
+                            apply_recovery_snapshot(&self.home, &rollback, None)
+                                .map_err(|_| crate::state::StateError::Unavailable)
+                        })
+                        .is_ok()
+                    && verify_live_snapshot(&self.home, &rollback).is_ok()
+                    && self.resume_takeovers_locked().await.is_ok();
+                if rolled_back {
+                    Err(RecoveryBackupError::RestoreFailed {
+                        pre_restore_backup_path: pre_restore.path.clone(),
+                        stage,
+                    })
+                } else {
+                    let _ = self.store.mark_recovery_restore_required().await;
+                    Err(RecoveryBackupError::RecoveryRequired {
+                        pre_restore_backup_path: pre_restore.path.clone(),
+                        stage,
+                    })
+                }?
+            }
+        };
+        self.store.reset_recovery_publication_tracking();
+
+        drop(rollback);
+        Ok(RestoredRecoveryBackup {
+            restored_snapshot_id: selected.manifest.snapshot_id,
+            pre_restore_snapshot_id: pre_restore.inspection.snapshot_id,
+            pre_restore_backup_path: pre_restore.path,
+            resumed_takeovers,
+        })
+    }
+
+    async fn preflight_restore(
+        &self,
+        takeover_ports: &[(Target, u16)],
+        claude_context: Option<&ClaudePreflightContext>,
+    ) -> Result<(), RecoveryBackupError> {
+        let (_, profile_shadow) = CodexConfigCodec::for_user_home(self.home.user_home())
+            .and_then(|codec| codec.reconciliation_snapshot())
+            .map_err(|_| RecoveryBackupError::PreflightFailed)?;
+        if profile_shadow {
+            return Err(RecoveryBackupError::PreflightFailed);
+        }
+        let claude_context = claude_context.ok_or(RecoveryBackupError::PreflightFailed)?;
+        ClaudeConfigCodec::for_user_home(self.home.user_home())
+            .and_then(|codec| codec.preflight(claude_context))
+            .map_err(|_| RecoveryBackupError::PreflightFailed)?;
+
+        let mut active_ports = Vec::new();
+        for target in [Target::Codex, Target::Claude] {
+            if let Some(endpoint) = self.activation.model_endpoint_for(target).await {
+                active_ports.push(endpoint.port());
+            }
+        }
+        for (target, port) in takeover_ports {
+            self.activation
+                .preflight_recovery_compatibility(*target)
+                .map_err(|_| RecoveryBackupError::PreflightFailed)?;
+            if !active_ports.contains(port) {
+                TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, *port))
+                    .await
+                    .map_err(|_| RecoveryBackupError::PreflightFailed)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn reserve_takeover_ports(
+        &self,
+        takeover_ports: &[(Target, u16)],
+    ) -> Result<Vec<TcpListener>, RecoveryBackupError> {
+        let mut reservations = Vec::with_capacity(takeover_ports.len());
+        for (_, port) in takeover_ports {
+            reservations.push(
+                TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, *port))
+                    .await
+                    .map_err(|_| RecoveryBackupError::RestoreStepFailed { stage: "runtime" })?,
+            );
+        }
+        Ok(reservations)
+    }
+
+    async fn resume_takeovers_locked(
+        &self,
+    ) -> Result<Vec<crate::control::protocol::Target>, RecoveryBackupError> {
+        let mut resumed = Vec::new();
+        for target in [
+            crate::control::protocol::Target::Codex,
+            crate::control::protocol::Target::Claude,
+        ] {
+            self.activation
+                .bootstrap_committed_takeover_for_locked(target)
+                .await
+                .map_err(|_| RecoveryBackupError::RestoreStepFailed { stage: "runtime" })?;
+            let takeover = self
+                .store
+                .committed_takeover_for(target)
+                .await
+                .map_err(|_| RecoveryBackupError::RestoreStepFailed { stage: "runtime" })?;
+            if takeover.is_some() {
+                if self.activation.model_endpoint_for(target).await.is_none() {
+                    return Err(RecoveryBackupError::RestoreStepFailed { stage: "runtime" });
+                }
+                resumed.push(target);
+            }
+            self.store
+                .clear_startup_problems_for(target)
+                .await
+                .map_err(|_| RecoveryBackupError::RestoreStepFailed { stage: "runtime" })?;
+        }
+        Ok(resumed)
+    }
+
+    fn run_restore_hook(&self, stage: RecoveryRestoreStage) -> Result<(), RecoveryBackupError> {
+        self.hooks
+            .restore
+            .as_ref()
+            .map(|hook| hook(stage))
+            .transpose()
+            .map_err(|_| RecoveryBackupError::RestoreStepFailed {
+                stage: restore_stage_name(stage),
+            })?;
+        Ok(())
+    }
+
     pub(crate) fn inspect(
         &self,
         path: &Path,
@@ -272,6 +575,305 @@ enum CapturedData {
 struct CapturedEntry {
     manifest: RecoveryBackupEntryManifest,
     data: CapturedData,
+}
+
+#[derive(Clone)]
+struct RecoveryFileEntry {
+    present: bool,
+    mode: Option<u32>,
+    bytes: Vec<u8>,
+}
+
+struct ExtractedRecoverySnapshot {
+    manifest: RecoveryBackupManifest,
+    database_path: PathBuf,
+    accounts: RecoveryFileEntry,
+    codex: RecoveryFileEntry,
+    claude: RecoveryFileEntry,
+    _staging: PendingDirectory,
+}
+
+fn extract_artifact(
+    artifact_path: &Path,
+    backups: &Path,
+) -> Result<ExtractedRecoverySnapshot, RecoveryBackupError> {
+    let inspection = inspect_artifact(artifact_path)?;
+    if inspection.compatibility == RecoveryBackupCompatibility::UnsupportedDatabaseSchema {
+        return Err(RecoveryBackupError::Incompatible);
+    }
+    let (mut artifact, manifest) = open_container_at_content(artifact_path)?;
+    if manifest.snapshot_id != inspection.snapshot_id {
+        return Err(RecoveryBackupError::InvalidArtifact);
+    }
+    let staging_path = backups.join(format!(".restore-{}.staging", Uuid::new_v4()));
+    fs::create_dir(&staging_path).map_err(|_| RecoveryBackupError::PreflightFailed)?;
+    fs::set_permissions(&staging_path, fs::Permissions::from_mode(0o700))
+        .map_err(|_| RecoveryBackupError::PreflightFailed)?;
+    let staging = PendingDirectory::new(staging_path.clone());
+    let database_path = staging_path.join("muxvia.db");
+    let mut files = Vec::with_capacity(3);
+    for (index, entry) in manifest.entries.iter().enumerate() {
+        if index == 0 {
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true).mode(PRIVATE_FILE_MODE);
+            let mut output = options
+                .open(&database_path)
+                .map_err(|_| RecoveryBackupError::PreflightFailed)?;
+            let copied = io::copy(
+                &mut Read::by_ref(&mut artifact).take(entry.byte_length),
+                &mut output,
+            )
+            .map_err(|_| RecoveryBackupError::PreflightFailed)?;
+            if copied != entry.byte_length {
+                return Err(RecoveryBackupError::InvalidArtifact);
+            }
+            output
+                .flush()
+                .and_then(|_| output.sync_all())
+                .map_err(|_| RecoveryBackupError::PreflightFailed)?;
+            set_private_permissions(&database_path)?;
+            let (length, hash) = hash_file(&database_path)?;
+            if length != entry.byte_length || hash != entry.sha256 {
+                return Err(RecoveryBackupError::InvalidArtifact);
+            }
+            continue;
+        }
+        if entry.byte_length > MAX_NON_DATABASE_ENTRY_BYTES {
+            return Err(RecoveryBackupError::InvalidArtifact);
+        }
+        let length =
+            usize::try_from(entry.byte_length).map_err(|_| RecoveryBackupError::InvalidArtifact)?;
+        let mut bytes = vec![0_u8; length];
+        artifact
+            .read_exact(&mut bytes)
+            .map_err(|_| RecoveryBackupError::InvalidArtifact)?;
+        if sha256_hex(&bytes) != entry.sha256 {
+            return Err(RecoveryBackupError::InvalidArtifact);
+        }
+        files.push(RecoveryFileEntry {
+            present: entry.present,
+            mode: entry.mode,
+            bytes,
+        });
+    }
+    sync_directory(&staging_path).map_err(|_| RecoveryBackupError::PreflightFailed)?;
+    let [accounts, codex, claude]: [RecoveryFileEntry; 3] = files
+        .try_into()
+        .map_err(|_| RecoveryBackupError::InvalidArtifact)?;
+    Ok(ExtractedRecoverySnapshot {
+        manifest,
+        database_path,
+        accounts,
+        codex,
+        claude,
+        _staging: staging,
+    })
+}
+
+fn open_container_at_content(
+    path: &Path,
+) -> Result<(File, RecoveryBackupManifest), RecoveryBackupError> {
+    if !path.is_absolute() || path.as_os_str().len() > MAX_PATH_BYTES {
+        return Err(RecoveryBackupError::InvalidPath);
+    }
+    if fs::symlink_metadata(path)
+        .map_err(|_| RecoveryBackupError::InvalidPath)?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(RecoveryBackupError::InvalidPath);
+    }
+    let mut file = File::open(path).map_err(|_| RecoveryBackupError::InvalidPath)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| RecoveryBackupError::InvalidPath)?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(RecoveryBackupError::UnsafePermissions);
+    }
+    let mut magic = vec![0_u8; MAGIC.len()];
+    file.read_exact(&mut magic)
+        .map_err(|_| RecoveryBackupError::InvalidArtifact)?;
+    if magic != MAGIC {
+        return Err(RecoveryBackupError::InvalidArtifact);
+    }
+    let mut header_length = [0_u8; 4];
+    file.read_exact(&mut header_length)
+        .map_err(|_| RecoveryBackupError::InvalidArtifact)?;
+    let header_length = u32::from_be_bytes(header_length) as usize;
+    if header_length == 0 || header_length > MAX_HEADER_BYTES {
+        return Err(RecoveryBackupError::InvalidArtifact);
+    }
+    let mut header = vec![0_u8; header_length];
+    file.read_exact(&mut header)
+        .map_err(|_| RecoveryBackupError::InvalidArtifact)?;
+    let manifest =
+        serde_json::from_slice(&header).map_err(|_| RecoveryBackupError::InvalidArtifact)?;
+    validate_manifest(&manifest)?;
+    Ok((file, manifest))
+}
+
+fn validate_recovery_snapshot(
+    snapshot: &ExtractedRecoverySnapshot,
+) -> Result<crate::subscription::SubscriptionAccountDocument, RecoveryBackupError> {
+    let account_document =
+        crate::subscription::SubscriptionAccountStore::validate_recovery_contents(
+            snapshot.accounts.present,
+            snapshot.accounts.mode,
+            &snapshot.accounts.bytes,
+        )
+        .map_err(|_| RecoveryBackupError::PreflightFailed)?;
+    validate_configuration_entry(&snapshot.codex, true)?;
+    validate_configuration_entry(&snapshot.claude, false)?;
+    Ok(account_document)
+}
+
+fn validate_configuration_entry(
+    entry: &RecoveryFileEntry,
+    codex: bool,
+) -> Result<(), RecoveryBackupError> {
+    if !entry.present {
+        return if entry.mode.is_none() && entry.bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(RecoveryBackupError::PreflightFailed)
+        };
+    }
+    let mode = entry.mode.ok_or(RecoveryBackupError::PreflightFailed)?;
+    if mode == 0 || mode & 0o022 != 0 {
+        return Err(RecoveryBackupError::PreflightFailed);
+    }
+    if codex {
+        let document =
+            std::str::from_utf8(&entry.bytes).map_err(|_| RecoveryBackupError::PreflightFailed)?;
+        let document = toml_edit::DocumentMut::from_str(document)
+            .map_err(|_| RecoveryBackupError::PreflightFailed)?;
+        if document
+            .get("profile")
+            .is_some_and(|profile| !profile.is_none())
+        {
+            return Err(RecoveryBackupError::PreflightFailed);
+        }
+    } else {
+        let value: serde_json::Value = serde_json::from_slice(&entry.bytes)
+            .map_err(|_| RecoveryBackupError::PreflightFailed)?;
+        if !value.is_object() {
+            return Err(RecoveryBackupError::PreflightFailed);
+        }
+    }
+    Ok(())
+}
+
+fn apply_recovery_snapshot(
+    home: &MuxviaHome,
+    snapshot: &ExtractedRecoverySnapshot,
+    hook: Option<&RestoreHook>,
+) -> Result<(), RecoveryBackupError> {
+    replace_recovery_file(
+        ManagedFile::in_configuration_home(home.root(), "state", "subscription-accounts.json")
+            .map_err(|_| RecoveryBackupError::RestoreStepFailed {
+                stage: "subscription-accounts",
+            })?,
+        &snapshot.accounts,
+    )
+    .map_err(|_| RecoveryBackupError::RestoreStepFailed {
+        stage: "subscription-accounts",
+    })?;
+    run_restore_hook(hook, RecoveryRestoreStage::AfterAccounts)?;
+    replace_recovery_file(
+        ManagedFile::in_configuration_home(home.user_home(), ".codex", "config.toml").map_err(
+            |_| RecoveryBackupError::RestoreStepFailed {
+                stage: "codex-configuration",
+            },
+        )?,
+        &snapshot.codex,
+    )
+    .map_err(|_| RecoveryBackupError::RestoreStepFailed {
+        stage: "codex-configuration",
+    })?;
+    run_restore_hook(hook, RecoveryRestoreStage::AfterCodex)?;
+    replace_recovery_file(
+        ManagedFile::in_configuration_home(home.user_home(), ".claude", "settings.json").map_err(
+            |_| RecoveryBackupError::RestoreStepFailed {
+                stage: "claude-configuration",
+            },
+        )?,
+        &snapshot.claude,
+    )
+    .map_err(|_| RecoveryBackupError::RestoreStepFailed {
+        stage: "claude-configuration",
+    })?;
+    run_restore_hook(hook, RecoveryRestoreStage::AfterClaude)?;
+    Ok(())
+}
+
+fn run_restore_hook(
+    hook: Option<&RestoreHook>,
+    stage: RecoveryRestoreStage,
+) -> Result<(), RecoveryBackupError> {
+    hook.map(|hook| hook(stage)).transpose().map_err(|_| {
+        RecoveryBackupError::RestoreStepFailed {
+            stage: restore_stage_name(stage),
+        }
+    })?;
+    Ok(())
+}
+
+fn replace_recovery_file(
+    file: ManagedFile,
+    desired: &RecoveryFileEntry,
+) -> Result<(), RecoveryBackupError> {
+    let current = file
+        .read()
+        .map_err(|_| RecoveryBackupError::RestoreStepFailed {
+            stage: "managed-file",
+        })?;
+    if !current.identity.exists() && !desired.present {
+        return Ok(());
+    }
+    file.replace_with_mode(
+        &current.identity,
+        &desired.bytes,
+        !desired.present,
+        desired.mode.unwrap_or(PRIVATE_FILE_MODE),
+    )
+    .map_err(|_| RecoveryBackupError::RestoreStepFailed {
+        stage: "managed-file",
+    })
+}
+
+fn verify_live_snapshot(
+    home: &MuxviaHome,
+    snapshot: &ExtractedRecoverySnapshot,
+) -> Result<(), RecoveryBackupError> {
+    for (stage, file, desired) in [
+        (
+            "subscription-accounts",
+            ManagedFile::in_configuration_home(home.root(), "state", "subscription-accounts.json"),
+            &snapshot.accounts,
+        ),
+        (
+            "codex-configuration",
+            ManagedFile::in_configuration_home(home.user_home(), ".codex", "config.toml"),
+            &snapshot.codex,
+        ),
+        (
+            "claude-configuration",
+            ManagedFile::in_configuration_home(home.user_home(), ".claude", "settings.json"),
+            &snapshot.claude,
+        ),
+    ] {
+        let current = file
+            .map_err(|_| RecoveryBackupError::RestoreStepFailed { stage })?
+            .read()
+            .map_err(|_| RecoveryBackupError::RestoreStepFailed { stage })?;
+        if current.identity.exists() != desired.present
+            || current.bytes != desired.bytes
+            || current.identity.mode().map(|mode| mode & 0o777) != desired.mode
+        {
+            return Err(RecoveryBackupError::RestoreStepFailed { stage });
+        }
+    }
+    Ok(())
 }
 
 impl CapturedEntry {
@@ -590,6 +1192,25 @@ impl Drop for PendingFile {
     }
 }
 
+struct PendingDirectory {
+    path: PathBuf,
+}
+
+impl PendingDirectory {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for PendingDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+        if let Some(parent) = self.path.parent() {
+            let _ = sync_directory(parent);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -602,14 +1223,20 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{MAGIC, RecoveryBackupError, RecoveryBackupService, inspect_artifact};
+    use super::{
+        MAGIC, RecoveryBackupError, RecoveryBackupService, RecoveryRestoreStage, inspect_artifact,
+    };
     use crate::{
         codex::CommandCodexProbe,
+        control::protocol::{ClaudeHostManagedState, ClaudePreflightContext, ClaudeSelectorState},
         home::MuxviaHome,
         model::ReqwestUpstream,
         service::{activate::ActivationService, reconcile::ReconciliationService},
         state::StateStore,
-        subscription::{SubscriptionAccountCoordinator, SubscriptionAccountStore},
+        subscription::{
+            DeviceAuthorizationManager, ReqwestDeviceAuthorizationAuthority,
+            SubscriptionAccountCoordinator, SubscriptionAccountStore,
+        },
     };
 
     async fn fixture() -> (TempDir, MuxviaHome, Arc<StateStore>, RecoveryBackupService) {
@@ -618,13 +1245,13 @@ mod tests {
         fs::create_dir(&user_home).expect("user home");
         let home = MuxviaHome::from_user_home(&user_home);
         let store = Arc::new(StateStore::open(&home).await.expect("state store"));
-        let activation = ActivationService::new(
+        let activation = Arc::new(ActivationService::new(
             Arc::clone(&store),
             home.clone(),
             Arc::new(CommandCodexProbe),
             PathBuf::from("/usr/bin/false"),
             Arc::new(ReqwestUpstream::new().expect("upstream")),
-        );
+        ));
         let reconciliation = Arc::new(ReconciliationService::from_runtime(
             Arc::clone(&store),
             activation.reconciliation_runtime(),
@@ -634,12 +1261,19 @@ mod tests {
             Arc::clone(&store),
             Arc::clone(&accounts),
         ));
+        let device_authorization = Arc::new(DeviceAuthorizationManager::new(
+            Arc::clone(&accounts),
+            Arc::clone(&account_coordinator),
+            Arc::new(ReqwestDeviceAuthorizationAuthority::new().expect("device authority")),
+        ));
         let service = RecoveryBackupService::new(
             Arc::clone(&store),
             home.clone(),
             reconciliation,
+            activation,
             accounts,
             account_coordinator,
+            device_authorization,
             "0.1.0".to_owned(),
         )
         .expect("Recovery Backup service");
@@ -650,6 +1284,16 @@ mod tests {
         fs::create_dir_all(path.parent().expect("file parent")).expect("create file parent");
         fs::write(path, bytes).expect("write private fixture");
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("private fixture mode");
+    }
+
+    fn claude_context(home: &MuxviaHome) -> ClaudePreflightContext {
+        ClaudePreflightContext {
+            claude_config_dir: None,
+            selector_state: ClaudeSelectorState::Unset,
+            blocking_selector: None,
+            host_managed_state: ClaudeHostManagedState::Unmanaged,
+            cwd: home.user_home().display().to_string(),
+        }
     }
 
     async fn install_sensitive_state(home: &MuxviaHome) {
@@ -678,6 +1322,34 @@ mod tests {
             })
             .await
             .expect("seed private database state");
+    }
+
+    async fn replace_sensitive_state(home: &MuxviaHome) {
+        write_private(
+            &home.subscription_accounts_path(),
+            br#"{"version":1,"accounts":{"account-replacement":{"account_id":"account-replacement","email":"replacement@example.test","refresh_token":"RECOVERY_REFRESH_REPLACEMENT_18001","authenticated_at":1800000000,"state":"authorized"}},"default_account_id":"account-replacement"}"#,
+        );
+        write_private(
+            &home.user_home().join(".codex/config.toml"),
+            b"model = \"replacement-model\"\n# RECOVERY_CODEX_REPLACEMENT_18002\n",
+        );
+        write_private(
+            &home.user_home().join(".claude/settings.json"),
+            br#"{"env":{"ANTHROPIC_AUTH_TOKEN":"RECOVERY_CLAUDE_REPLACEMENT_18003"}}"#,
+        );
+        let database = tokio_rusqlite::Connection::open(home.database_path())
+            .await
+            .expect("open replacement database");
+        database
+            .call(|connection| {
+                connection.execute(
+                    "UPDATE metadata SET value = 'RECOVERY_DATABASE_REPLACEMENT_18004' WHERE key = 'recovery-secret-test'",
+                    [],
+                )?;
+                Ok::<(), tokio_rusqlite::rusqlite::Error>(())
+            })
+            .await
+            .expect("replace private database state");
     }
 
     fn container_entries(path: &Path) -> Vec<Vec<u8>> {
@@ -745,6 +1417,173 @@ mod tests {
         assert!(String::from_utf8_lossy(&entries[2]).contains("RECOVERY_CODEX_SECRET_17002"));
         assert!(String::from_utf8_lossy(&entries[3]).contains("RECOVERY_CLAUDE_SECRET_17003"));
         assert_eq!(service.inspect(&created.path).unwrap(), created.inspection);
+    }
+
+    #[tokio::test]
+    async fn restore_replaces_the_complete_snapshot_and_retains_a_pre_restore_backup() {
+        let (_root, home, _store, service) = fixture().await;
+        install_sensitive_state(&home).await;
+        let selected = service.create().await.expect("selected Recovery Backup");
+        replace_sensitive_state(&home).await;
+
+        let restored = service
+            .restore(&selected.path, Some(claude_context(&home)))
+            .await
+            .expect("restore Recovery Backup");
+
+        assert_eq!(
+            restored.restored_snapshot_id,
+            selected.inspection.snapshot_id
+        );
+        assert_ne!(
+            restored.pre_restore_snapshot_id,
+            selected.inspection.snapshot_id
+        );
+        assert!(restored.pre_restore_backup_path.exists());
+        let restored_entries = container_entries(&service.create().await.unwrap().path);
+        for (entry, original) in restored_entries
+            .iter()
+            .zip(container_entries(&selected.path))
+        {
+            assert_eq!(entry, &original);
+        }
+        let pre_restore_entries = container_entries(&restored.pre_restore_backup_path);
+        for secret in [
+            "RECOVERY_REFRESH_REPLACEMENT_18001",
+            "RECOVERY_CODEX_REPLACEMENT_18002",
+            "RECOVERY_CLAUDE_REPLACEMENT_18003",
+            "RECOVERY_DATABASE_REPLACEMENT_18004",
+        ] {
+            assert!(
+                pre_restore_entries
+                    .iter()
+                    .any(|entry| String::from_utf8_lossy(entry).contains(secret)),
+                "pre-restore snapshot omitted {secret}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_restore_boundary_exactly_recovers_the_prior_snapshot() {
+        for injected_stage in [
+            RecoveryRestoreStage::AfterDatabase,
+            RecoveryRestoreStage::AfterAccounts,
+            RecoveryRestoreStage::AfterCodex,
+            RecoveryRestoreStage::AfterClaude,
+            RecoveryRestoreStage::BeforeRuntimeResume,
+            RecoveryRestoreStage::Verification,
+        ] {
+            let (_root, home, _store, service) = fixture().await;
+            install_sensitive_state(&home).await;
+            let selected = service.create().await.expect("selected Recovery Backup");
+            replace_sensitive_state(&home).await;
+            let service = service.with_restore_hook(Arc::new(move |stage| {
+                if stage == injected_stage {
+                    Err(io::Error::other("injected restore boundary failure"))
+                } else {
+                    Ok(())
+                }
+            }));
+
+            assert!(matches!(
+                service
+                    .restore(&selected.path, Some(claude_context(&home)))
+                    .await,
+                Err(RecoveryBackupError::RestoreFailed { .. })
+            ));
+            let current = container_entries(&service.create().await.unwrap().path);
+            for secret in [
+                "RECOVERY_REFRESH_REPLACEMENT_18001",
+                "RECOVERY_CODEX_REPLACEMENT_18002",
+                "RECOVERY_CLAUDE_REPLACEMENT_18003",
+                "RECOVERY_DATABASE_REPLACEMENT_18004",
+            ] {
+                assert!(
+                    current
+                        .iter()
+                        .any(|entry| String::from_utf8_lossy(entry).contains(secret)),
+                    "{injected_stage:?} rollback omitted {secret}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_failure_enters_recovery_required_and_retains_actionable_backup() {
+        let (_root, home, store, service) = fixture().await;
+        install_sensitive_state(&home).await;
+        let selected = service.create().await.expect("selected Recovery Backup");
+        replace_sensitive_state(&home).await;
+        let service = service.with_restore_hook(Arc::new(|stage| {
+            if matches!(
+                stage,
+                RecoveryRestoreStage::AfterAccounts | RecoveryRestoreStage::BeforeRollback
+            ) {
+                Err(io::Error::other("injected restore and rollback failure"))
+            } else {
+                Ok(())
+            }
+        }));
+
+        let recovery_path = match service
+            .restore(&selected.path, Some(claude_context(&home)))
+            .await
+        {
+            Err(RecoveryBackupError::RecoveryRequired {
+                pre_restore_backup_path,
+                ..
+            }) => pre_restore_backup_path,
+            _ => panic!("rollback failure did not enter Recovery Required"),
+        };
+        assert!(recovery_path.exists());
+        assert!(service.inspect(&recovery_path).is_ok());
+        for target in [
+            crate::control::protocol::Target::Codex,
+            crate::control::protocol::Target::Claude,
+        ] {
+            let view = store.target_view_for(target).await.expect("Recovery View");
+            assert_eq!(view.recovery.state, "recovery-required");
+        }
+        let accounts = SubscriptionAccountStore::open(&home)
+            .expect("Subscription Account store")
+            .read()
+            .expect("Subscription Account file");
+        let account_view = store
+            .subscription_account_catalog(accounts.document)
+            .await
+            .expect("Subscription Account Recovery View");
+        assert_eq!(
+            account_view.recovery.state,
+            crate::control::protocol::SubscriptionAccountRecoveryState::RecoveryRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_preflight_rejects_a_profile_shadow_without_creating_a_recovery_point() {
+        let (_root, home, _store, service) = fixture().await;
+        install_sensitive_state(&home).await;
+        write_private(
+            &home.user_home().join(".codex/config.toml"),
+            b"model = \"backup-model\"\nprofile = \"shadow-profile\"\n",
+        );
+        let selected = service.create().await.expect("selected Recovery Backup");
+        replace_sensitive_state(&home).await;
+
+        assert!(matches!(
+            service
+                .restore(&selected.path, Some(claude_context(&home)))
+                .await,
+            Err(RecoveryBackupError::PreflightFailed)
+        ));
+        let backups = fs::read_dir(home.backups_dir())
+            .expect("backup directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("backup entries");
+        assert_eq!(backups.len(), 1, "preflight created a recovery point");
+        let current = container_entries(&service.create().await.unwrap().path);
+        assert!(current.iter().any(|entry| {
+            String::from_utf8_lossy(entry).contains("RECOVERY_DATABASE_REPLACEMENT_18004")
+        }));
     }
 
     #[tokio::test]

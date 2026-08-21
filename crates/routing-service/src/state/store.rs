@@ -22,6 +22,7 @@ use crate::{
     },
     home::MuxviaHome,
     request_history::PricingCatalog,
+    subscription::SubscriptionAccountDocument,
 };
 
 use super::recovery::RecoveryPayload;
@@ -67,6 +68,11 @@ pub struct StateStore {
     published_view_sequences: [Arc<Mutex<Option<u64>>>; 2],
     universal_provider_views: broadcast::Sender<UniversalProviderCatalogView>,
     published_universal_provider_view_sequence: Arc<Mutex<Option<u64>>>,
+}
+
+pub(crate) struct RecoveryDatabasePreparation {
+    pub(crate) source_schema_version: u32,
+    pub(crate) takeover_ports: Vec<(Target, u16)>,
 }
 
 type ActivationPreparationRow = (
@@ -278,6 +284,142 @@ impl StateStore {
             })
             .await
             .map_err(map_call_error)
+    }
+
+    pub(crate) async fn prepare_recovery_database(
+        path: PathBuf,
+        account_document: SubscriptionAccountDocument,
+    ) -> Result<RecoveryDatabasePreparation, StateError> {
+        let connection = Connection::open(path).await?;
+        connection
+            .call(
+                |connection| -> Result<RecoveryDatabasePreparation, StateError> {
+                    let schema_version = connection.query_row(
+                        "SELECT value FROM metadata WHERE key = 'schema-version'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?;
+                    let schema_version = schema_version
+                        .parse::<u32>()
+                        .map_err(|_| StateError::InvalidRecoveryState)?;
+                    if schema_version == 0 || schema_version > super::SCHEMA_VERSION {
+                        return Err(StateError::InvalidRecoveryState);
+                    }
+                    super::migrations::migrate(connection)?;
+                    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+                    let integrity = connection
+                        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))?;
+                    if integrity != "ok" {
+                        return Err(StateError::InvalidRecoveryState);
+                    }
+                    let mut foreign_key_check = connection.prepare("PRAGMA foreign_key_check")?;
+                    if foreign_key_check.query([])?.next()?.is_some() {
+                        return Err(StateError::InvalidRecoveryState);
+                    }
+                    drop(foreign_key_check);
+                    mark_invalid_managed_configurations(connection, None)?;
+                    install_release_pricing_catalog(connection)?;
+                    for target in [Target::Codex, Target::Claude] {
+                        project_target_view_for(connection, "recovery-preflight", target)?;
+                    }
+                    super::universal_providers::project_universal_provider_catalog(connection)?;
+                    super::subscription_accounts::project_catalog(connection, account_document)?;
+                    let mut takeover_ports = Vec::new();
+                    let mut seen_ports = HashSet::new();
+                    for target in [Target::Codex, Target::Claude] {
+                        let route_port = connection.query_row(
+                            "SELECT route_port FROM target_route_state
+                         WHERE target = ?1 AND takeover_state = 'active'",
+                            [target.as_str()],
+                            |row| row.get::<_, Option<i64>>(0),
+                        );
+                        match route_port {
+                            Ok(Some(route_port)) => {
+                                let route_port = u16::try_from(route_port)
+                                    .ok()
+                                    .filter(|port| *port != 0)
+                                    .ok_or(StateError::InvalidRecoveryState)?;
+                                if !seen_ports.insert(route_port) {
+                                    return Err(StateError::InvalidRecoveryState);
+                                }
+                                takeover_ports.push((target, route_port));
+                            }
+                            Ok(None) => return Err(StateError::InvalidRecoveryState),
+                            Err(tokio_rusqlite::rusqlite::Error::QueryReturnedNoRows) => {}
+                            Err(error) => return Err(StateError::Sqlite(error)),
+                        }
+                    }
+                    Ok(RecoveryDatabasePreparation {
+                        source_schema_version: schema_version,
+                        takeover_ports,
+                    })
+                },
+            )
+            .await
+            .map_err(map_state_call_error)
+    }
+
+    pub(crate) async fn restore_database_from(&self, source: PathBuf) -> Result<(), StateError> {
+        let service_epoch = self.service_epoch.clone();
+        self.connection
+            .call(move |destination| -> Result<(), StateError> {
+                let source = tokio_rusqlite::rusqlite::Connection::open(source)?;
+                let backup = tokio_rusqlite::rusqlite::backup::Backup::new(&source, destination)?;
+                backup.run_to_completion(256, Duration::from_millis(1), None)?;
+                drop(backup);
+                destination.execute_batch("PRAGMA foreign_keys = ON;")?;
+                let integrity = destination
+                    .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))?;
+                if integrity != "ok" {
+                    return Err(StateError::InvalidRecoveryState);
+                }
+                let mut foreign_key_check = destination.prepare("PRAGMA foreign_key_check")?;
+                if foreign_key_check.query([])?.next()?.is_some() {
+                    return Err(StateError::InvalidRecoveryState);
+                }
+                drop(foreign_key_check);
+                for target in [Target::Codex, Target::Claude] {
+                    project_target_view_for(destination, &service_epoch, target)?;
+                }
+                super::universal_providers::project_universal_provider_catalog(destination)?;
+                Ok(())
+            })
+            .await
+            .map_err(map_state_call_error)
+    }
+
+    pub(crate) fn reset_recovery_publication_tracking(&self) {
+        for sequence in &self.published_view_sequences {
+            *sequence.lock().expect("target publication lock poisoned") = None;
+        }
+        *self
+            .published_universal_provider_view_sequence
+            .lock()
+            .expect("universal publication lock poisoned") = None;
+    }
+
+    pub(crate) async fn mark_recovery_restore_required(&self) -> Result<(), StateError> {
+        self.connection
+            .call(|connection| -> Result<(), StateError> {
+                let transaction = connection.transaction()?;
+                transaction.execute(
+                    "UPDATE target_route_state
+                     SET recovery_state = 'recovery-required',
+                         view_sequence = view_sequence + CASE recovery_state WHEN 'clean' THEN 1 ELSE 0 END",
+                    [],
+                )?;
+                transaction.execute(
+                    "UPDATE subscription_account_catalog_state
+                     SET recovery_state = 'recovery-required',
+                         view_sequence = view_sequence + CASE recovery_state WHEN 'clean' THEN 1 ELSE 0 END
+                     WHERE singleton = 1",
+                    [],
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(map_state_call_error)
     }
 
     pub async fn target_view(&self) -> Result<TargetView, StateError> {

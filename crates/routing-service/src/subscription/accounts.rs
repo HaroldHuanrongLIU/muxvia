@@ -172,6 +172,26 @@ impl SubscriptionAccountStore {
             .map_err(|_| SubscriptionAccountStoreError::WriteFailed)
     }
 
+    pub(crate) fn validate_recovery_contents(
+        present: bool,
+        mode: Option<u32>,
+        bytes: &[u8],
+    ) -> Result<SubscriptionAccountDocument, SubscriptionAccountStoreError> {
+        if !present {
+            if mode.is_some() || !bytes.is_empty() {
+                return Err(SubscriptionAccountStoreError::InvalidDocument);
+            }
+            return Ok(SubscriptionAccountDocument::default());
+        }
+        if mode != Some(PRIVATE_FILE_MODE) {
+            return Err(SubscriptionAccountStoreError::InvalidDocument);
+        }
+        let document = serde_json::from_slice(bytes)
+            .map_err(|_| SubscriptionAccountStoreError::InvalidDocument)?;
+        validate_document(&document)?;
+        Ok(document)
+    }
+
     pub(crate) fn replace(
         &self,
         expected: &SubscriptionAccountFileSnapshot,

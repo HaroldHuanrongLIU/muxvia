@@ -492,6 +492,12 @@ const controlOperationSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("create-recovery-backup") }).strict(),
   z.object({ kind: z.literal("inspect-recovery-backup"), path: z.string() }).strict(),
   z.object({
+    kind: z.literal("restore-recovery-backup"),
+    path: z.string(),
+    acknowledgement: z.literal("replace-current-installation"),
+    claudeContext: claudePreflightContextSchema.optional(),
+  }).strict(),
+  z.object({
     kind: z.literal("prepare-handover"),
     candidatePath: z.string(),
     expectedRelease: z.string(),
@@ -1047,6 +1053,15 @@ const controlResultSchema = z.discriminatedUnion("kind", [
     kind: z.literal("recovery-backup-inspection"),
     inspection: recoveryBackupInspectionSchema,
   }).strict(),
+  z.object({
+    kind: z.literal("recovery-backup-restored"),
+    restoredSnapshotId: z.string().uuid(),
+    preRestoreSnapshotId: z.string().uuid(),
+    preRestoreBackupPath: z.string(),
+    resumedTakeovers: z.array(targetSchema).max(2),
+    restartTargetClis: z.literal(true),
+    sensitive: z.literal(true),
+  }).strict(),
 ])
 
 const clientFrameSchema = z.discriminatedUnion("type", [
@@ -1068,6 +1083,7 @@ const serverFrameSchema = z.discriminatedUnion("type", [
     type: z.literal("error"),
     requestId: z.string().nullable(),
     problem: controlProblemSchema,
+    recoveryBackupPath: z.string().optional(),
     authoritativeView: targetViewSchema.optional(),
     authoritativeUniversalProviderView: universalProviderCatalogSchema.optional(),
     authoritativeSubscriptionAccountView: subscriptionAccountCatalogSchema.optional(),

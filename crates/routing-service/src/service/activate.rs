@@ -409,6 +409,21 @@ impl ActivationService {
         Ok(())
     }
 
+    pub(crate) fn preflight_recovery_compatibility(&self, target: Target) -> Result<(), ()> {
+        match target {
+            Target::Codex => self
+                .codex_probe
+                .probe(&self.codex_executable)
+                .map(|_| ())
+                .map_err(|_| ()),
+            Target::Claude => self
+                .claude_probe
+                .probe(&self.claude_executable)
+                .map(|_| ())
+                .map_err(|_| ()),
+        }
+    }
+
     fn subscription_resolver(
         &self,
     ) -> Option<Arc<dyn crate::subscription::resolver::SubscriptionAccountResolver>> {
@@ -1069,6 +1084,13 @@ impl ActivationService {
         target: Target,
     ) -> Result<(), ModelServerError> {
         let _gate = self.gate_for(target).lock().await;
+        self.bootstrap_committed_takeover_for_locked(target).await
+    }
+
+    pub(crate) async fn bootstrap_committed_takeover_for_locked(
+        &self,
+        target: Target,
+    ) -> Result<(), ModelServerError> {
         match self
             .store
             .managed_write_status_for(target)

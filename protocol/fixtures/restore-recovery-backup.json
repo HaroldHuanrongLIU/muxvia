@@ -1,0 +1,15 @@
+{
+  "type": "request",
+  "requestId": "recovery-backup-restore-1",
+  "operation": {
+    "kind": "restore-recovery-backup",
+    "path": "/tmp/00000000-0000-4000-8000-000000000171.muxvia-recovery",
+    "acknowledgement": "replace-current-installation",
+    "claudeContext": {
+      "claudeConfigDir": null,
+      "selectorState": "unset",
+      "hostManagedState": "unmanaged",
+      "cwd": "/tmp/project"
+    }
+  }
+}

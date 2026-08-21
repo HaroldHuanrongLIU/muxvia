@@ -514,7 +514,7 @@ fn subscription_failure(
     })
 }
 
-fn project_catalog(
+pub(super) fn project_catalog(
     connection: &tokio_rusqlite::rusqlite::Connection,
     document: SubscriptionAccountDocument,
 ) -> tokio_rusqlite::rusqlite::Result<SubscriptionAccountCatalogView> {

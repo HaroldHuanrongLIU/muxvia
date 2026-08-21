@@ -272,7 +272,7 @@ impl ManagedFile {
         )
     }
 
-    fn replace_with_mode(
+    pub(crate) fn replace_with_mode(
         &self,
         expected: &FileIdentity,
         bytes: &[u8],

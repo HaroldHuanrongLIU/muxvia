@@ -422,22 +422,24 @@ impl ControlServer {
             Arc::clone(&store),
             Arc::clone(&subscription_accounts),
         ));
-        let recovery_backup = Arc::new(
-            RecoveryBackupService::new(
-                Arc::clone(&store),
-                home.clone(),
-                Arc::clone(&reconciliation),
-                Arc::clone(&subscription_accounts),
-                Arc::clone(&subscription_account_coordinator),
-                release.clone(),
-            )
-            .map_err(|_| ControlServerError::State)?,
-        );
         let device_authorization = Arc::new(DeviceAuthorizationManager::new(
             Arc::clone(&subscription_accounts),
             Arc::clone(&subscription_account_coordinator),
             device_authority,
         ));
+        let recovery_backup = Arc::new(
+            RecoveryBackupService::new(
+                Arc::clone(&store),
+                home.clone(),
+                Arc::clone(&reconciliation),
+                Arc::clone(&activation),
+                Arc::clone(&subscription_accounts),
+                Arc::clone(&subscription_account_coordinator),
+                Arc::clone(&device_authorization),
+                release.clone(),
+            )
+            .map_err(|_| ControlServerError::State)?,
+        );
         let native_usage = Arc::new(
             NativeUsageService::new(home, Arc::clone(&store))
                 .map_err(|_| ControlServerError::State)?,
@@ -1113,6 +1115,7 @@ async fn serve_session(
                     operation,
                     ControlOperation::CreateRecoveryBackup(_)
                         | ControlOperation::InspectRecoveryBackup(_)
+                        | ControlOperation::RestoreRecoveryBackup(_)
                 ) {
                     lifecycle.pending_actions.fetch_add(1, Ordering::AcqRel);
                     let _action_guard = ActionGuard(Arc::clone(&lifecycle));
@@ -1135,6 +1138,33 @@ async fn serve_session(
                                     request_id,
                                     result: ControlResult::RecoveryBackupInspection(
                                         RecoveryBackupInspectionResult { inspection },
+                                    ),
+                                },
+                                Err(error) => recovery_backup_problem(request_id, error),
+                            }
+                        }
+                        ControlOperation::RestoreRecoveryBackup(operation) => {
+                            match recovery_backup
+                                .restore(
+                                    Path::new(&operation.path),
+                                    operation.claude_context,
+                                )
+                                .await
+                            {
+                                Ok(restored) => ServerFrame::Response {
+                                    request_id,
+                                    result: ControlResult::RecoveryBackupRestored(
+                                        crate::control::protocol::RecoveryBackupRestoredResult {
+                                            restored_snapshot_id: restored.restored_snapshot_id,
+                                            pre_restore_snapshot_id: restored.pre_restore_snapshot_id,
+                                            pre_restore_backup_path: restored
+                                                .pre_restore_backup_path
+                                                .to_string_lossy()
+                                                .into_owned(),
+                                            resumed_takeovers: restored.resumed_takeovers,
+                                            restart_target_clis: true,
+                                            sensitive: true,
+                                        },
                                     ),
                                 },
                                 Err(error) => recovery_backup_problem(request_id, error),
@@ -1314,6 +1344,7 @@ async fn serve_session(
                                 Err(failure) => ServerFrame::Error {
                                     request_id: Some(request_id),
                                     problem: failure.problem,
+                                    recovery_backup_path: None,
                                     authoritative_view: None,
                                     authoritative_universal_provider_view: Some(
                                         failure.authoritative_view,
@@ -1495,6 +1526,7 @@ async fn serve_session(
                                     ServerFrame::Error {
                                         request_id: Some(request_id),
                                         problem: failure.problem,
+                                        recovery_backup_path: None,
                                         authoritative_view: None,
                                         authoritative_universal_provider_view: None,
                                         authoritative_subscription_account_view: Some(Box::new(
@@ -1530,6 +1562,7 @@ async fn serve_session(
                                     ServerFrame::Error {
                                         request_id: Some(request_id),
                                         problem: failure.problem,
+                                        recovery_backup_path: None,
                                         authoritative_view: None,
                                         authoritative_universal_provider_view: None,
                                         authoritative_subscription_account_view: Some(Box::new(
@@ -1603,7 +1636,8 @@ async fn serve_session(
                     | ControlOperation::SubscriptionAccountAct { .. }
                     | ControlOperation::UniversalProviderAct { .. }
                     | ControlOperation::CreateRecoveryBackup(_)
-                    | ControlOperation::InspectRecoveryBackup(_) => {
+                    | ControlOperation::InspectRecoveryBackup(_)
+                    | ControlOperation::RestoreRecoveryBackup(_) => {
                         unreachable!("catalog operations are handled before target dispatch")
                     }
                     ControlOperation::PreviewProviderImport(operation) => {
@@ -1904,6 +1938,7 @@ async fn serve_session(
                                 ServerFrame::Error {
                                     request_id: Some(request_id),
                                     problem: failure.problem,
+                                    recovery_backup_path: None,
                                     authoritative_view: Some(failure.authoritative_view),
                                     authoritative_universal_provider_view: None,
                                     authoritative_subscription_account_view: None,
@@ -2139,28 +2174,114 @@ fn provider_transfer_problem(request_id: String, error: ProviderTransferError) -
 }
 
 fn recovery_backup_problem(request_id: String, error: RecoveryBackupError) -> ServerFrame {
-    let (code, message) = match error {
+    let (code, message, recovery_backup_path) = match error {
         RecoveryBackupError::InvalidPath => (
             "recovery-backup-invalid-path",
             "Recovery Backup path is invalid",
+            None,
         ),
         RecoveryBackupError::UnsafePermissions => (
             "recovery-backup-unsafe-permissions",
             "Recovery Backup permissions are unsafe",
+            None,
         ),
-        RecoveryBackupError::InvalidArtifact => {
-            ("recovery-backup-invalid", "Recovery Backup is invalid")
-        }
+        RecoveryBackupError::InvalidArtifact => (
+            "recovery-backup-invalid",
+            "Recovery Backup is invalid",
+            None,
+        ),
         RecoveryBackupError::SnapshotChanged => (
             "recovery-snapshot-changed",
             "Recovery Snapshot changed during creation",
+            None,
         ),
         RecoveryBackupError::CreationFailed => (
             "recovery-backup-creation-failed",
             "Recovery Backup could not be created",
+            None,
+        ),
+        RecoveryBackupError::Incompatible => (
+            "recovery-backup-incompatible",
+            "Recovery Backup is not compatible with this release",
+            None,
+        ),
+        RecoveryBackupError::PreflightFailed => (
+            "recovery-backup-preflight-failed",
+            "Recovery Backup restore preflight failed",
+            None,
+        ),
+        RecoveryBackupError::RestoreStepFailed { stage } => (
+            "recovery-backup-restore-failed",
+            restore_failure_message(stage, false),
+            None,
+        ),
+        RecoveryBackupError::RestoreFailed {
+            pre_restore_backup_path,
+            stage,
+        } => (
+            "recovery-backup-restore-failed",
+            restore_failure_message(stage, false),
+            Some(pre_restore_backup_path.to_string_lossy().into_owned()),
+        ),
+        RecoveryBackupError::RecoveryRequired {
+            pre_restore_backup_path,
+            stage,
+        } => (
+            "recovery-backup-recovery-required",
+            restore_failure_message(stage, true),
+            Some(pre_restore_backup_path.to_string_lossy().into_owned()),
         ),
     };
-    problem_frame(Some(request_id), code, message, None)
+    let mut frame = problem_frame(Some(request_id), code, message, None);
+    if let ServerFrame::Error {
+        recovery_backup_path: path,
+        ..
+    } = &mut frame
+    {
+        *path = recovery_backup_path;
+    }
+    frame
+}
+
+fn restore_failure_message(stage: &str, recovery_required: bool) -> &'static str {
+    match (stage, recovery_required) {
+        ("database", false) => {
+            "Recovery Backup database restore failed; the prior installation was recovered"
+        }
+        ("subscription-accounts", false) => {
+            "Recovery Backup Subscription Account restore failed; the prior installation was recovered"
+        }
+        ("codex-configuration", false) => {
+            "Recovery Backup Codex configuration restore failed; the prior installation was recovered"
+        }
+        ("claude-configuration", false) => {
+            "Recovery Backup Claude configuration restore failed; the prior installation was recovered"
+        }
+        ("runtime", false) => {
+            "Recovery Backup runtime restart failed; the prior installation was recovered"
+        }
+        ("verification", false) => {
+            "Recovery Backup verification failed; the prior installation was recovered"
+        }
+        (_, false) => "Recovery Backup restore failed; the prior installation was recovered",
+        ("database", true) => {
+            "Recovery Backup database rollback failed; manual recovery is required"
+        }
+        ("subscription-accounts", true) => {
+            "Recovery Backup Subscription Account rollback failed; manual recovery is required"
+        }
+        ("codex-configuration", true) => {
+            "Recovery Backup Codex configuration rollback failed; manual recovery is required"
+        }
+        ("claude-configuration", true) => {
+            "Recovery Backup Claude configuration rollback failed; manual recovery is required"
+        }
+        ("runtime", true) => "Recovery Backup runtime rollback failed; manual recovery is required",
+        ("verification", true) => {
+            "Recovery Backup verification rollback failed; manual recovery is required"
+        }
+        (_, true) => "Recovery Backup rollback failed; manual recovery is required",
+    }
 }
 
 fn operation_target(operation: &ControlOperation) -> Option<Target> {
@@ -2175,7 +2296,8 @@ fn operation_target(operation: &ControlOperation) -> Option<Target> {
         | ControlOperation::SubscriptionAccountAct { .. }
         | ControlOperation::UniversalProviderAct { .. }
         | ControlOperation::CreateRecoveryBackup(_)
-        | ControlOperation::InspectRecoveryBackup(_) => None,
+        | ControlOperation::InspectRecoveryBackup(_)
+        | ControlOperation::RestoreRecoveryBackup(_) => None,
         ControlOperation::OpenTarget { target, .. }
         | ControlOperation::Act { target, .. }
         | ControlOperation::DiscoverModels { target, .. }
@@ -2282,6 +2404,7 @@ async fn poll_subscription_account_and_queue(
                     ServerFrame::Error {
                         request_id: Some(request_id.clone()),
                         problem: failure.problem,
+                        recovery_backup_path: None,
                         authoritative_view: None,
                         authoritative_universal_provider_view: None,
                         authoritative_subscription_account_view: Some(Box::new(
@@ -2540,6 +2663,7 @@ async fn inspect_and_queue(
             ServerFrame::Error {
                 request_id: Some(request_id.clone()),
                 problem,
+                recovery_backup_path: None,
                 authoritative_view: None,
                 authoritative_universal_provider_view: None,
                 authoritative_subscription_account_view: None,
@@ -2781,6 +2905,7 @@ fn problem_frame(
             source: None,
             selector: None,
         },
+        recovery_backup_path: None,
         authoritative_view,
         authoritative_universal_provider_view: None,
         authoritative_subscription_account_view: None,
@@ -2843,6 +2968,7 @@ async fn write_problem(
                 source: None,
                 selector: None,
             },
+            recovery_backup_path: None,
             authoritative_view,
             authoritative_universal_provider_view: None,
             authoritative_subscription_account_view: None,

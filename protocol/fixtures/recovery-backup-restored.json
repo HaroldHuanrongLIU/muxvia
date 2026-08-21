@@ -1,0 +1,13 @@
+{
+  "type": "response",
+  "requestId": "recovery-backup-restore-1",
+  "result": {
+    "kind": "recovery-backup-restored",
+    "restoredSnapshotId": "00000000-0000-4000-8000-000000000171",
+    "preRestoreSnapshotId": "00000000-0000-4000-8000-000000000172",
+    "preRestoreBackupPath": "/tmp/00000000-0000-4000-8000-000000000172.muxvia-recovery",
+    "resumedTakeovers": ["codex", "claude"],
+    "restartTargetClis": true,
+    "sensitive": true
+  }
+}

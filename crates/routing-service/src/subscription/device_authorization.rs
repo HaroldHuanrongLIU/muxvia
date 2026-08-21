@@ -509,6 +509,11 @@ impl DeviceAuthorizationManager {
         Ok(account_id)
     }
 
+    pub(crate) async fn reset_for_recovery_restore(&self) {
+        self.pending.lock().await.clear();
+        self.access_tokens.write().await.clear();
+    }
+
     pub(crate) async fn access_token_for_account(
         &self,
         account_id: &str,
@@ -1028,6 +1033,31 @@ mod tests {
             !diagnostic.contains("REMOTE_INTERVAL_SECRET_11742"),
             "public challenge exposed raw upstream polling metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_restore_clears_pending_flows_and_cached_access_tokens() {
+        let temp = TempDir::new().expect("temporary home");
+        let home = MuxviaHome::from_user_home(temp.path());
+        let accounts = Arc::new(SubscriptionAccountStore::open(&home).expect("account store"));
+        let authority = Arc::new(StartAuthority {
+            starts: Mutex::new(0),
+        });
+        let coordinator = account_coordinator(&home, accounts.clone()).await;
+        let manager = DeviceAuthorizationManager::new(accounts, coordinator, authority);
+        manager.start(None).await.expect("pending authorization");
+        manager.access_tokens.write().await.insert(
+            "account-before-restore".to_owned(),
+            super::CachedAccessToken {
+                token: "ACCESS_TOKEN_BEFORE_RESTORE_SECRET_18041".to_owned(),
+                expires_at_seconds: u64::MAX,
+            },
+        );
+
+        manager.reset_for_recovery_restore().await;
+
+        assert!(manager.pending.lock().await.is_empty());
+        assert!(manager.access_tokens.read().await.is_empty());
     }
 
     #[tokio::test]

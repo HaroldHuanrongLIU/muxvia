@@ -80,6 +80,7 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "export-provider-configuration.json",
         "create-recovery-backup.json",
         "inspect-recovery-backup.json",
+        "restore-recovery-backup.json",
         "force-stop.json",
     ] {
         let frame = fixture(name);
@@ -204,11 +205,23 @@ fn recovery_backup_contract_is_closed_sensitive_and_secret_free() {
         !format!("{parsed:?}").contains("00000000-0000-4000-8000-000000000171"),
         "Recovery Backup request Debug exposed the selected path"
     );
+    let restore_request = fixture("restore-recovery-backup.json");
+    assert!(
+        serde_json::from_value::<ClientFrame>(restore_request).is_ok(),
+        "closed restore request fixture must round-trip"
+    );
+    let restored = fixture("recovery-backup-restored.json");
+    assert!(
+        serde_json::from_value::<ServerFrame>(restored).is_ok(),
+        "closed restore result fixture must round-trip"
+    );
     for (name, branch) in [
         ("create-recovery-backup.json", "operation"),
         ("inspect-recovery-backup.json", "operation"),
+        ("restore-recovery-backup.json", "operation"),
         ("recovery-backup-created.json", "result"),
         ("recovery-backup-inspection.json", "result"),
+        ("recovery-backup-restored.json", "result"),
     ] {
         let mut value = fixture(name);
         value[branch]["credential"] = serde_json::json!("RECOVERY_BACKUP_PROTOCOL_SECRET_17001");

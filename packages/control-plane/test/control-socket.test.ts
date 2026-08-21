@@ -133,6 +133,48 @@ test("a generic server frame error rejects pending operations before socket clos
   await expect(client.openTarget("codex")).rejects.toMatchObject({ code: "frame-invalid" })
 })
 
+test("a Recovery Backup failure preserves its dedicated actionable recovery path", async () => {
+  const recoveryBackupPath = "/tmp/pre-restore-recovery-point.muxvia-recovery"
+  const path = await listen((socket) => {
+    const decoder = new FrameDecoder()
+    socket.on("data", (chunk) => {
+      if (typeof chunk === "string") throw new Error("unexpected text chunk")
+      for (const value of decoder.push(chunk)) {
+        const frame = value as { type: string; requestId?: string }
+        if (frame.type === "hello") {
+          socket.write(encodeFrame({
+            type: "hello-ack",
+            rpc: { major: 1, minor: 0 },
+            release: "routing-test",
+            serviceEpoch: "00000000-0000-4000-8000-000000000001",
+            frameLimit: 1_048_576,
+          }))
+        } else {
+          socket.write(encodeFrame({
+            type: "error",
+            requestId: frame.requestId,
+            problem: {
+              code: "recovery-backup-recovery-required",
+              message: "Recovery Backup rollback failed; manual recovery is required",
+            },
+            recoveryBackupPath,
+          }))
+        }
+      }
+    })
+  })
+
+  const client = await RpcClient.connect(path, "control-test")
+  await expect(client.request({
+    kind: "inspect-recovery-backup",
+    path: recoveryBackupPath,
+  })).rejects.toMatchObject({
+    code: "recovery-backup-recovery-required",
+    recoveryBackupPath,
+  })
+  await client.close()
+})
+
 test("a generic server frame error rejects the handshake before socket close", async () => {
   const path = await listen((socket) => {
     socket.once("data", () => socket.end(encodeFrame({

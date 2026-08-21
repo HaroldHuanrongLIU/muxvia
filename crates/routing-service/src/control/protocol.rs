@@ -135,6 +135,8 @@ pub enum ServerFrame {
     Error {
         request_id: Option<String>,
         problem: ControlProblem,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery_backup_path: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         authoritative_view: Option<TargetView>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,6 +222,7 @@ pub enum ControlOperation {
     ExportProviderConfiguration(ExportProviderConfigurationOperation),
     CreateRecoveryBackup(CreateRecoveryBackupOperation),
     InspectRecoveryBackup(InspectRecoveryBackupOperation),
+    RestoreRecoveryBackup(RestoreRecoveryBackupOperation),
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -236,6 +239,27 @@ impl fmt::Debug for InspectRecoveryBackupOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("InspectRecoveryBackup(<redacted-path>)")
     }
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RestoreRecoveryBackupOperation {
+    pub path: String,
+    pub acknowledgement: RecoveryBackupRestoreAcknowledgement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_context: Option<ClaudePreflightContext>,
+}
+
+impl fmt::Debug for RestoreRecoveryBackupOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RestoreRecoveryBackup(<redacted-path>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryBackupRestoreAcknowledgement {
+    ReplaceCurrentInstallation,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -755,6 +779,7 @@ impl fmt::Debug for ControlOperation {
             Self::ExportProviderConfiguration(operation) => operation.fmt(formatter),
             Self::CreateRecoveryBackup(_) => formatter.write_str("CreateRecoveryBackup"),
             Self::InspectRecoveryBackup(operation) => operation.fmt(formatter),
+            Self::RestoreRecoveryBackup(operation) => operation.fmt(formatter),
         }
     }
 }
@@ -1170,6 +1195,7 @@ pub enum ControlResult {
     ProviderConfigurationExport(ProviderConfigurationExportResult),
     RecoveryBackupCreated(RecoveryBackupCreatedResult),
     RecoveryBackupInspection(RecoveryBackupInspectionResult),
+    RecoveryBackupRestored(RecoveryBackupRestoredResult),
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1183,6 +1209,17 @@ pub struct RecoveryBackupCreatedResult {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecoveryBackupInspectionResult {
     pub inspection: RecoveryBackupInspection,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecoveryBackupRestoredResult {
+    pub restored_snapshot_id: Uuid,
+    pub pre_restore_snapshot_id: Uuid,
+    pub pre_restore_backup_path: String,
+    pub resumed_takeovers: Vec<Target>,
+    pub restart_target_clis: bool,
+    pub sensitive: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

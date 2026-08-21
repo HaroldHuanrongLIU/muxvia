@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import { chmod, lstat, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join, resolve } from "node:path"
+import { isAbsolute, join, resolve } from "node:path"
 import { createServer } from "node:net"
 
 import { RpcClient } from "../src/control/rpc-client"
@@ -272,6 +272,7 @@ test("status reads a real private UDS without extending an idle Routing Service 
 
 test("backup create and inspect use one sensitive private artifact without exposing contents", async () => {
   const providerSecret = "RECOVERY_CLI_PROVIDER_SECRET_17021"
+  const replacementSecret = "RECOVERY_CLI_REPLACEMENT_SECRET_18021"
   const refreshSecret = "RECOVERY_CLI_REFRESH_SECRET_17022"
   const root = await mkdtemp(join(tmpdir(), "muxvia-backup-"))
   const userHome = join(root, "operator")
@@ -366,6 +367,74 @@ test("backup create and inspect use one sensitive private artifact without expos
     })
     expect(inspected.stdout).not.toContain(providerSecret)
     expect(inspected.stdout).not.toContain(refreshSecret)
+
+    await session.act({
+      kind: "create-provider",
+      name: "Replacement Recovery CLI",
+      baseUrl: "https://replacement-recovery-cli.invalid/v1",
+      model: "replacement-recovery-cli-model",
+      credential: { kind: "replace", value: replacementSecret },
+      presetKey: null,
+    })
+
+    const unacknowledged = await runCli([
+      "backup",
+      "restore",
+      creation.path,
+      "--json",
+      "--service",
+      service,
+      "--socket",
+      socket,
+    ], { HOME: userHome })
+    expect(unacknowledged).toEqual({
+      exitCode: 64,
+      stdout: "",
+      stderr: `${JSON.stringify({
+        ok: false,
+        problem: {
+          code: "recovery-backup-restore-acknowledgement-required",
+          message: "Recovery Backup restore requires explicit acknowledgement that it replaces the current installation",
+        },
+      })}\n`,
+    })
+
+    const restored = await runCli([
+      "backup",
+      "restore",
+      creation.path,
+      "--acknowledge-replace-current-installation",
+      "--json",
+      "--service",
+      service,
+      "--socket",
+      socket,
+    ], { HOME: userHome })
+    expect(restored.exitCode).toBe(0)
+    expect(restored.stderr).toBe("")
+    const restore = JSON.parse(restored.stdout)
+    expect(restore).toMatchObject({
+      ok: true,
+      command: "backup",
+      operation: "restore",
+      sensitive: true,
+      restoredSnapshotId: creation.inspection.snapshotId,
+      resumedTakeovers: [],
+      restartTargetClis: true,
+    })
+    expect(isAbsolute(restore.preRestoreBackupPath)).toBeTrue()
+    expect((await stat(restore.preRestoreBackupPath)).mode & 0o777).toBe(0o600)
+    expect(restored.stdout).not.toContain(providerSecret)
+    expect(restored.stdout).not.toContain(replacementSecret)
+    expect(restored.stdout).not.toContain(refreshSecret)
+
+    const restoredClient = await RpcClient.connect(socket, "recovery-backup-restored-cli-test")
+    const restoredSession = await restoredClient.openTarget("codex")
+    expect(restoredSession.get().providers.map((provider) => provider.name)).toEqual([
+      "Recovery CLI",
+    ])
+    await restoredSession.close()
+    await restoredClient.close()
 
     const relative = await runCli([
       "backup",

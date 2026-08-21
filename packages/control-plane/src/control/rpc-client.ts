@@ -55,6 +55,7 @@ export class ControlError extends Error {
   readonly authoritativeSubscriptionAccountView?: SubscriptionAccountCatalogView
   readonly source?: string
   readonly selector?: string
+  readonly recoveryBackupPath?: string
 
   constructor(
     code: string,
@@ -64,6 +65,7 @@ export class ControlError extends Error {
     selector?: string,
     authoritativeUniversalProviderView?: UniversalProviderCatalogView,
     authoritativeSubscriptionAccountView?: SubscriptionAccountCatalogView,
+    recoveryBackupPath?: string,
   ) {
     super(message)
     this.name = "ControlError"
@@ -74,6 +76,7 @@ export class ControlError extends Error {
     this.authoritativeSubscriptionAccountView = authoritativeSubscriptionAccountView
     this.source = source
     this.selector = selector
+    this.recoveryBackupPath = recoveryBackupPath
   }
 }
 
@@ -311,6 +314,7 @@ export class RpcClient implements RpcTransport, MuxviaControl {
           frame.problem.source, frame.problem.selector,
           frame.authoritativeUniversalProviderView,
           frame.authoritativeSubscriptionAccountView,
+          frame.recoveryBackupPath,
         ))
       } else {
         handshake.reject(new ControlError("invalid-response", "Expected hello acknowledgement"))
@@ -351,6 +355,7 @@ export class RpcClient implements RpcTransport, MuxviaControl {
         frame.problem.source, frame.problem.selector,
         frame.authoritativeUniversalProviderView,
         frame.authoritativeSubscriptionAccountView,
+        frame.recoveryBackupPath,
       )
       if (frame.requestId === null) {
         this.#socket.destroy()

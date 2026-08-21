@@ -2506,7 +2506,7 @@ async fn generated_activation_advances_catalog_references_and_disable_returns_au
     )
     .await;
     assert_compatibility_wire_is_secret_free(&restored, SECRETS, "generated-reference-restore");
-    assert_eq!(restored["type"], "response");
+    assert_eq!(restored["type"], "response", "{restored:?}");
     let restored_target_push = read_frame(&mut codex).await.unwrap();
     assert_compatibility_wire_is_secret_free(
         &restored_target_push,
@@ -8549,5 +8549,245 @@ async fn recovery_backup_create_and_inspect_are_private_global_and_secret_free_o
     )
     .await;
     assert_eq!(opened["result"]["kind"], "target-view");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn recovery_backup_restore_replaces_the_installation_and_returns_a_safe_recovery_point() {
+    const ORIGINAL_SECRET: &str = "RECOVERY_RESTORE_ORIGINAL_SECRET_18011";
+    const REPLACEMENT_SECRET: &str = "RECOVERY_RESTORE_REPLACEMENT_SECRET_18012";
+    let mut fixture = ControlFixture::start().await;
+    fixture
+        .store
+        .apply_provider_action(
+            Uuid::new_v4(),
+            0,
+            json!({
+                "kind": "create-provider",
+                "name": "Original recovery provider",
+                "baseUrl": "https://original-recovery.example/v1",
+                "model": "original-recovery-model",
+                "credential": { "kind": "replace", "value": ORIGINAL_SECRET },
+                "presetKey": null
+            }),
+        )
+        .await
+        .unwrap();
+    let user_home = fixture.root.join("home");
+    fs::create_dir_all(user_home.join(".codex")).unwrap();
+    fs::write(
+        user_home.join(".codex/config.toml"),
+        "model = \"original-recovery-model\"\n",
+    )
+    .unwrap();
+
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    let created = request(
+        &mut stream,
+        "create-selected-recovery-backup",
+        json!({ "kind": "create-recovery-backup" }),
+    )
+    .await;
+    let selected_path = created["result"]["path"].as_str().unwrap().to_owned();
+
+    fixture
+        .store
+        .apply_provider_action(
+            Uuid::new_v4(),
+            1,
+            json!({
+                "kind": "create-provider",
+                "name": "Replacement recovery provider",
+                "baseUrl": "https://replacement-recovery.example/v1",
+                "model": "replacement-recovery-model",
+                "credential": { "kind": "replace", "value": REPLACEMENT_SECRET },
+                "presetKey": null
+            }),
+        )
+        .await
+        .unwrap();
+    fs::write(
+        user_home.join(".codex/config.toml"),
+        "model = \"replacement-recovery-model\"\n",
+    )
+    .unwrap();
+
+    let restored = request(
+        &mut stream,
+        "restore-selected-recovery-backup",
+        json!({
+            "kind": "restore-recovery-backup",
+            "path": selected_path,
+            "acknowledgement": "replace-current-installation",
+            "claudeContext": {
+                "claudeConfigDir": null,
+                "selectorState": "unset",
+                "hostManagedState": "unmanaged",
+                "cwd": user_home
+            }
+        }),
+    )
+    .await;
+    assert_eq!(restored["type"], "response", "restore frame: {restored:?}");
+    assert_eq!(restored["result"]["kind"], "recovery-backup-restored");
+    assert_eq!(restored["result"]["sensitive"], true);
+    assert_eq!(restored["result"]["restartTargetClis"], true);
+    let recovery_path = PathBuf::from(restored["result"]["preRestoreBackupPath"].as_str().unwrap());
+    assert!(recovery_path.exists());
+    let restored_text = restored.to_string();
+    assert!(!restored_text.contains(ORIGINAL_SECRET));
+    assert!(!restored_text.contains(REPLACEMENT_SECRET));
+    assert!(
+        fs::read(&recovery_path)
+            .unwrap()
+            .windows(REPLACEMENT_SECRET.len())
+            .any(|window| window == REPLACEMENT_SECRET.as_bytes())
+    );
+
+    let opened = request(
+        &mut stream,
+        "open-restored-target",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    let providers = opened["result"]["view"]["providers"].as_array().unwrap();
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0]["name"], "Original recovery provider");
+    assert_eq!(
+        fs::read_to_string(user_home.join(".codex/config.toml")).unwrap(),
+        "model = \"original-recovery-model\"\n"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn recovery_backup_restore_restarts_the_restored_takeover_before_success() {
+    let mut fixture = ControlFixture::start().await;
+    let user_home = fixture.root.join("home");
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    let _ = request(
+        &mut stream,
+        "open-takeover-recovery-target",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    let saved = request(
+        &mut stream,
+        "save-original-takeover-provider",
+        json!({
+            "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
+            "expectedRevision": 0,
+            "action": {
+                "kind": "create-provider", "name": "Original takeover provider",
+                "baseUrl": "https://original-takeover.example/v1", "model": "original-model",
+                "credential": { "kind": "replace", "value": "ORIGINAL_TAKEOVER_SECRET_18031" },
+                "presetKey": null
+            }
+        }),
+    )
+    .await;
+    let original_provider_id = saved["result"]["outcome"]["view"]["providers"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let _ = read_frame(&mut stream).await.unwrap();
+    let activated = request(
+        &mut stream,
+        "activate-original-takeover-provider",
+        json!({
+            "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
+            "expectedRevision": 1,
+            "action": {
+                "kind": "activate-provider", "providerId": original_provider_id,
+                "mode": "takeover"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(activated["result"]["outcome"]["status"], "applied");
+    let _ = read_frame(&mut stream).await.unwrap();
+    let original_port = fixture
+        .store
+        .committed_takeover_for(Target::Codex)
+        .await
+        .unwrap()
+        .unwrap()
+        .route_port;
+
+    let created = request(
+        &mut stream,
+        "create-takeover-recovery-backup",
+        json!({ "kind": "create-recovery-backup" }),
+    )
+    .await;
+    let selected_path = created["result"]["path"].as_str().unwrap();
+
+    let replacement = request(
+        &mut stream,
+        "save-replacement-takeover-provider",
+        json!({
+            "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
+            "expectedRevision": 2,
+            "action": {
+                "kind": "create-provider", "name": "Replacement takeover provider",
+                "baseUrl": "https://replacement-takeover.example/v1", "model": "replacement-model",
+                "credential": { "kind": "replace", "value": "REPLACEMENT_TAKEOVER_SECRET_18032" },
+                "presetKey": null
+            }
+        }),
+    )
+    .await;
+    let replacement_provider_id = replacement["result"]["outcome"]["view"]["providers"][1]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let _ = read_frame(&mut stream).await.unwrap();
+    let replacement = request(
+        &mut stream,
+        "activate-replacement-takeover-provider",
+        json!({
+            "kind": "act", "target": "codex", "actionId": Uuid::new_v4(),
+            "expectedRevision": 3,
+            "action": {
+                "kind": "activate-provider", "providerId": replacement_provider_id,
+                "mode": "takeover"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(replacement["result"]["outcome"]["status"], "applied");
+    let _ = read_frame(&mut stream).await.unwrap();
+
+    let restored = request(
+        &mut stream,
+        "restore-takeover-recovery-backup",
+        json!({
+            "kind": "restore-recovery-backup",
+            "path": selected_path,
+            "acknowledgement": "replace-current-installation",
+            "claudeContext": {
+                "claudeConfigDir": null,
+                "selectorState": "unset",
+                "hostManagedState": "unmanaged",
+                "cwd": user_home
+            }
+        }),
+    )
+    .await;
+    assert_eq!(restored["type"], "response", "restore frame: {restored:?}");
+    assert_eq!(restored["result"]["resumedTakeovers"], json!(["codex"]));
+    let committed = fixture
+        .store
+        .committed_takeover_for(Target::Codex)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.route_port, original_port);
+    tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, original_port))
+        .await
+        .expect("restored takeover is accepting connections");
+    assert!(!restored.to_string().contains("TAKEOVER_SECRET"));
     fixture.shutdown().await;
 }

@@ -98,9 +98,17 @@ test("Provider Transfer contracts are preview-first, closed, and secret-free", a
   }
 
   const exportFrame = await readFixture("provider-configuration-export.json") as any
-  expect(JSON.stringify(parseServerFrame(exportFrame))).not.toMatch(
-    /credential|token|recovery|activatedSnapshot|activatedRoutePlan/i,
+  const parsedExport = parseServerFrame(exportFrame) as any
+  expect(JSON.stringify(parsedExport)).not.toMatch(
+    /token|recovery|activatedSnapshot|activatedRoutePlan/i,
   )
+  expect([
+    ...parsedExport.result.export.universalProviders,
+    ...parsedExport.result.export.targetProviders,
+  ].every((declaration) => declaration.credential === "missing")).toBeTrue()
+  const secretBearing = structuredClone(exportFrame)
+  secretBearing.result.export.targetProviders[0].credential = "present"
+  expect(() => parseServerFrame(secretBearing)).toThrow()
 })
 
 test("Request Record protocol and JSON schema are closed and bounded", async () => {

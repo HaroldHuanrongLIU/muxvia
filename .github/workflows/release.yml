@@ -118,8 +118,8 @@ jobs:
             sh scripts/install.sh
       - name: Pack and smoke the npm installation
         run: |
-          package_root="build/npm/platform"
-          tarballs="build/npm/tarballs"
+          package_root="$(pwd)/build/npm/platform"
+          tarballs="$(pwd)/build/npm/tarballs"
           smoke_root="$(pwd)/build/npm/smoke"
           mkdir -p "$tarballs" "$smoke_root"
           bun run release:npm assemble-platform \
@@ -137,7 +137,7 @@ jobs:
             --root packages/npm-launcher \
             --release "${{ steps.release.outputs.release }}"
           npm pack "$package_root" --pack-destination "$tarballs" --silent
-          npm pack packages/npm-launcher --pack-destination "$tarballs" --silent
+          npm pack ./packages/npm-launcher --pack-destination "$tarballs" --silent
           npm install \
             --prefix "$smoke_root" \
             --offline \
@@ -286,7 +286,7 @@ jobs:
           release="${{ steps.release.outputs.release }}"
           staging_tag="release-${GITHUB_RUN_ID}"
           bun run release:npm inspect-launcher --root packages/npm-launcher --release "$release"
-          launcher_tarball="$(npm pack packages/npm-launcher --pack-destination release --silent)"
+          launcher_tarball="$(npm pack ./packages/npm-launcher --pack-destination release --silent)"
           npm publish "release/$launcher_tarball" --access public --tag "$staging_tag"
           mkdir -p release/npm-verified/launcher/extracted
           verified_tarball="$(npm pack "muxvia@${release}" \

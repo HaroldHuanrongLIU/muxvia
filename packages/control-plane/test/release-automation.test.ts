@@ -54,6 +54,7 @@ test("npm release automation smokes every platform and moves latest only after p
     "node_modules/.bin/muxvia",
     "npm publish",
     "npm pack",
+    "npm pack ./packages/npm-launcher",
     "npm dist-tag add",
   ]) expect(workflow).toContain(gate)
   expect(workflow.indexOf("Publish and verify every npm platform package")).toBeLessThan(

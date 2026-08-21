@@ -11,6 +11,8 @@ import type {
   ReachabilityResult,
   ReconciliationPreview,
   ReconciliationStrategy,
+  RequestRecordDetail,
+  RequestRecordPage,
   TargetAction,
   Target,
   TargetView,
@@ -25,6 +27,11 @@ export interface MuxviaControl {
 export interface CompatibilityResolution {
   version: string
   managementRevision: number
+}
+
+export interface RequestRecordPageRequest {
+  limit: number
+  beforeCursor?: string
 }
 
 export interface TargetSession {
@@ -42,6 +49,11 @@ export interface TargetSession {
   ): Promise<ReconciliationPreview>
   probeCompatibility(signal?: AbortSignal): Promise<CompatibilityProbe>
   resolveCompatibility(input: CompatibilityResolution): Promise<ActionOutcome>
+  listRequestRecords(
+    input: RequestRecordPageRequest,
+    signal?: AbortSignal,
+  ): Promise<RequestRecordPage>
+  inspectRequestRecord(recordId: string, signal?: AbortSignal): Promise<RequestRecordDetail>
   applyReconciliation(input: {
     strategy: ReconciliationStrategy
     observationToken: string
@@ -211,6 +223,53 @@ class TargetSessionImpl implements TargetSession {
       input.managementRevision,
       true,
     )
+  }
+
+  async listRequestRecords(
+    input: RequestRecordPageRequest,
+    signal?: AbortSignal,
+  ): Promise<RequestRecordPage> {
+    if (this.#closed) {
+      throw new ControlError("connection-closed", "Target session is closed")
+    }
+    const limit = input.limit
+    const beforeCursor = input.beforeCursor
+    const response = await this.#rpc.request({
+      kind: "list-request-records",
+      target: this.#target,
+      limit,
+      ...(beforeCursor === undefined ? {} : { beforeCursor }),
+    }, { signal })
+    if (
+      response.kind !== "request-record-page"
+      || response.page.target !== this.#target
+    ) {
+      throw new ControlError("invalid-response", "Request record page did not match Target")
+    }
+    return freezeOwnedValue(structuredClone(response.page))
+  }
+
+  async inspectRequestRecord(
+    recordId: string,
+    signal?: AbortSignal,
+  ): Promise<RequestRecordDetail> {
+    if (this.#closed) {
+      throw new ControlError("connection-closed", "Target session is closed")
+    }
+    const capturedRecordId = recordId
+    const response = await this.#rpc.request({
+      kind: "inspect-request-record",
+      target: this.#target,
+      recordId: capturedRecordId,
+    }, { signal })
+    if (
+      response.kind !== "request-record-detail"
+      || response.detail.target !== this.#target
+      || response.detail.record.id !== capturedRecordId
+    ) {
+      throw new ControlError("invalid-response", "Request record detail did not match request")
+    }
+    return freezeOwnedValue(structuredClone(response.detail))
   }
 
   applyReconciliation(input: {

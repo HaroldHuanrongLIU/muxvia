@@ -198,6 +198,13 @@ struct InspectionOperation {
     opened_claude_context: Option<crate::control::protocol::ClaudePreflightContext>,
 }
 
+#[derive(Clone)]
+struct InspectionServices {
+    inspector: Arc<ProviderInspector>,
+    reconciliation: Arc<ReconciliationService>,
+    store: Arc<StateStore>,
+}
+
 impl ControlServer {
     pub async fn bind(
         home: &MuxviaHome,
@@ -1660,16 +1667,18 @@ async fn serve_session(
                         }
                         lifecycle.pending_inspections.fetch_add(1, Ordering::AcqRel);
                         let guard = InspectionGuard(Arc::clone(&lifecycle));
-                        let inspector = Arc::clone(&inspector);
-                        let reconciliation = Arc::clone(&reconciliation);
+                        let inspection_services = InspectionServices {
+                            inspector: Arc::clone(&inspector),
+                            reconciliation: Arc::clone(&reconciliation),
+                            store: Arc::clone(&store),
+                        };
                         let claude_context = opened_claude_context.clone();
                         let responses = responses.clone();
                         let task_request_id = request_id.clone();
                         let cancellation = CancellationToken::new();
                         let abort = inspections.spawn(inspect_and_queue(
                             task_request_id,
-                            inspector,
-                            reconciliation,
+                            inspection_services,
                             InspectionOperation {
                                 target,
                                 operation,
@@ -1913,14 +1922,18 @@ async fn poll_subscription_account_and_queue(
 
 async fn inspect_and_queue(
     request_id: String,
-    inspector: Arc<ProviderInspector>,
-    reconciliation: Arc<ReconciliationService>,
+    services: InspectionServices,
     work: InspectionOperation,
     responses: mpsc::Sender<QueuedResponse>,
     cancellation: CancellationToken,
     guard: InspectionGuard,
 ) -> InspectionCompletion {
     let _guard = guard;
+    let InspectionServices {
+        inspector,
+        reconciliation,
+        store,
+    } = services;
     let InspectionOperation {
         target,
         operation,
@@ -1993,14 +2006,34 @@ async fn inspect_and_queue(
                         None,
                     )
                 }),
-            ControlOperation::ListRequestRecords(_) | ControlOperation::InspectRequestRecord(_) => {
-                Err(ControlProblem {
-                    code: "request-history-unavailable".into(),
-                    message: "Request history is unavailable".into(),
-                    source: None,
-                    selector: None,
+            ControlOperation::ListRequestRecords(operation) => store
+                .list_request_records(
+                    operation.target,
+                    operation.before_cursor.as_deref(),
+                    operation.limit,
+                )
+                .await
+                .map(|page| {
+                    (
+                        ControlResult::RequestRecordPage(
+                            crate::control::protocol::RequestRecordPageResult { page },
+                        ),
+                        None,
+                    )
                 })
-            }
+                .map_err(request_history_problem),
+            ControlOperation::InspectRequestRecord(operation) => store
+                .inspect_request_record(operation.target, operation.record_id)
+                .await
+                .map(|detail| {
+                    (
+                        ControlResult::RequestRecordDetail(
+                            crate::control::protocol::RequestRecordDetailResult { detail },
+                        ),
+                        None,
+                    )
+                })
+                .map_err(request_history_problem),
             _ => unreachable!(),
         }
     };
@@ -2075,6 +2108,28 @@ async fn inspect_and_queue(
     InspectionCompletion {
         request_id,
         disposition,
+    }
+}
+
+fn request_history_problem(error: crate::request_history::RequestHistoryError) -> ControlProblem {
+    let (code, message) = match error {
+        crate::request_history::RequestHistoryError::Unavailable => (
+            "request-history-unavailable",
+            "Request history is unavailable",
+        ),
+        crate::request_history::RequestHistoryError::InvalidCursor => (
+            "invalid-request-history-cursor",
+            "Request history cursor is invalid",
+        ),
+        crate::request_history::RequestHistoryError::NotFound => {
+            ("request-record-not-found", "Request record was not found")
+        }
+    };
+    ControlProblem {
+        code: code.into(),
+        message: message.into(),
+        source: None,
+        selector: None,
     }
 }
 

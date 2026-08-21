@@ -12,6 +12,8 @@ import type {
   CompatibilityProbe,
   OrdinaryTargetAction,
   ReconciliationPreview,
+  RequestRecordDetail,
+  RequestRecordPage,
   ServerFrame,
   TargetAction,
   TargetView,
@@ -225,6 +227,24 @@ class ScriptedServer {
     })
   }
 
+  replyRequestRecordPage(index: number, page: RequestRecordPage): void {
+    const frame = this.requests()[index]!
+    this.send({
+      type: "response",
+      requestId: frame.requestId,
+      result: { kind: "request-record-page", page },
+    })
+  }
+
+  replyRequestRecordDetail(index: number, detail: RequestRecordDetail): void {
+    const frame = this.requests()[index]!
+    this.send({
+      type: "response",
+      requestId: frame.requestId,
+      result: { kind: "request-record-detail", detail },
+    })
+  }
+
   replyHandoverPrepared(index: number, release: string): void {
     const frame = this.requests()[index]!
     this.send({
@@ -274,6 +294,135 @@ test("RpcClient exposes exact negotiated service metadata", async () => {
   })
 
   await client.close()
+  await server.close()
+})
+
+test("a TargetSession lists and inspects target-bound immutable request history", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  const recordId = "00000000-0000-4000-8000-000000000901"
+  const summary = {
+    id: recordId,
+    planId: "00000000-0000-4000-8000-000000000902",
+    planEpoch: "00000000-0000-4000-8000-000000000903",
+    providerId: "00000000-0000-4000-8000-000000000904",
+    providerName: "Recorded Provider",
+    model: "recorded-model",
+    protocol: "openai-responses" as const,
+    startedAtUnixMs: 100,
+    finishedAtUnixMs: 125,
+    latencyMs: 25,
+    outcome: "upstream-error" as const,
+    httpStatus: 429,
+    usage: null,
+    estimatedCostNanoUsd: null,
+    hasErrorPayload: true,
+    errorPayloadTruncated: false,
+  }
+  const listing = session.listRequestRecords({ limit: 17, beforeCursor: "opaque-before" })
+  await server.waitForRequests(2)
+  expect(server.requests()[1]!.operation).toEqual({
+    kind: "list-request-records",
+    target: "codex",
+    limit: 17,
+    beforeCursor: "opaque-before",
+  })
+  server.replyRequestRecordPage(1, {
+    target: "codex",
+    records: [summary],
+    nextCursor: "opaque-next",
+  })
+  const page = await listing
+  expect(page.records[0]).toEqual(summary)
+  expect(Object.isFrozen(page)).toBe(true)
+  expect(Object.isFrozen(page.records)).toBe(true)
+  expect(Object.isFrozen(page.records[0])).toBe(true)
+
+  const inspecting = session.inspectRequestRecord(recordId)
+  await server.waitForRequests(3)
+  expect(server.requests()[2]!.operation).toEqual({
+    kind: "inspect-request-record",
+    target: "codex",
+    recordId,
+  })
+  server.replyRequestRecordDetail(2, {
+    target: "codex",
+    record: summary,
+    pricingSnapshot: null,
+    errorPayload: "sanitized failure",
+    errorPayloadSensitive: true,
+  })
+  const detail = await inspecting
+  expect(detail.errorPayload).toBe("sanitized failure")
+  expect(Object.isFrozen(detail)).toBe(true)
+  expect(Object.isFrozen(detail.record)).toBe(true)
+
+  await session.close()
+  await server.close()
+})
+
+test("request history is cancellable and rejects mismatched Target or record responses", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  const controller = new AbortController()
+  const cancelled = session.listRequestRecords({ limit: 10 }, controller.signal)
+  await server.waitForRequests(2)
+  const cancelledRequest = server.requests()[1]!
+  controller.abort()
+  await expect(cancelled).rejects.toMatchObject({ code: "cancelled" })
+  await server.waitForFrames(4)
+  expect(server.cancels()).toContainEqual({ type: "cancel", requestId: cancelledRequest.requestId })
+
+  const wrongPage = session.listRequestRecords({ limit: 1 })
+  await server.waitForRequests(3)
+  server.replyRequestRecordPage(2, { target: "claude", records: [], nextCursor: null })
+  await expect(wrongPage).rejects.toMatchObject({
+    code: "invalid-response",
+    message: "Request record page did not match Target",
+  })
+
+  const requestedId = "00000000-0000-4000-8000-000000000911"
+  const wrongDetail = session.inspectRequestRecord(requestedId)
+  await server.waitForRequests(4)
+  server.replyRequestRecordDetail(3, {
+    target: "codex",
+    record: {
+      id: "00000000-0000-4000-8000-000000000912",
+      planId: "00000000-0000-4000-8000-000000000913",
+      planEpoch: "00000000-0000-4000-8000-000000000914",
+      providerId: null,
+      providerName: null,
+      model: "recorded-model",
+      protocol: "openai-responses",
+      startedAtUnixMs: 100,
+      finishedAtUnixMs: 125,
+      latencyMs: 25,
+      outcome: "route-unavailable",
+      httpStatus: null,
+      usage: null,
+      estimatedCostNanoUsd: null,
+      hasErrorPayload: false,
+      errorPayloadTruncated: false,
+    },
+    pricingSnapshot: null,
+    errorPayload: null,
+    errorPayloadSensitive: false,
+  })
+  await expect(wrongDetail).rejects.toMatchObject({
+    code: "invalid-response",
+    message: "Request record detail did not match request",
+  })
+
+  const wrongKind = session.listRequestRecords({ limit: 1 })
+  await server.waitForRequests(5)
+  server.replyWithTargetView(4, viewAtRevision(1))
+  await expect(wrongKind).rejects.toMatchObject({
+    code: "invalid-response",
+    message: "Request record page did not match Target",
+  })
+
+  await session.close()
+  await expect(session.listRequestRecords({ limit: 1 })).rejects.toMatchObject({ code: "connection-closed" })
+  await expect(session.inspectRequestRecord(requestedId)).rejects.toMatchObject({ code: "connection-closed" })
+  expect(server.requests()).toHaveLength(5)
   await server.close()
 })
 

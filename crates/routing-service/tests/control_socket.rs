@@ -37,6 +37,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
+use tokio_rusqlite::rusqlite::params;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -812,6 +813,275 @@ async fn request(stream: &mut UnixStream, request_id: &str, operation: Value) ->
     .await
     .unwrap();
     read_frame(stream).await.unwrap()
+}
+
+fn assert_request_history_frame_secret_free(frame: &Value, credential: &str) {
+    assert!(
+        !frame.to_string().contains(credential) && !format!("{frame:?}").contains(credential),
+        "request-history frame exposed a designated credential"
+    );
+}
+
+#[tokio::test]
+async fn request_history_pages_and_details_are_target_bound_over_real_uds() {
+    const HISTORY_CREDENTIAL: &str = "REQUEST_HISTORY_CREDENTIAL_SECRET_14001";
+    let mut fixture = ControlFixture::start().await;
+    let home = MuxviaHome::from_user_home(&fixture.root.join("home"));
+    let database = tokio_rusqlite::Connection::open(home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
+            connection.execute(
+                "INSERT INTO credentials (id, target, bearer_token) VALUES (?1, 'codex', ?2)",
+                params!["00000000-0000-4000-8000-000000001400", HISTORY_CREDENTIAL],
+            )?;
+            for (id, target, finished, outcome, status, payload) in [
+                (
+                    "00000000-0000-4000-8000-000000001401",
+                    "codex",
+                    110_i64,
+                    "success",
+                    Some(200_i64),
+                    None,
+                ),
+                (
+                    "00000000-0000-4000-8000-000000001402",
+                    "claude",
+                    120,
+                    "upstream-error",
+                    Some(429),
+                    Some(b"claude sanitized failure".as_slice()),
+                ),
+                (
+                    "00000000-0000-4000-8000-000000001403",
+                    "codex",
+                    130,
+                    "upstream-error",
+                    Some(429),
+                    Some(b"codex sanitized failure".as_slice()),
+                ),
+                (
+                    "00000000-0000-4000-8000-000000001404",
+                    "codex",
+                    140,
+                    "success",
+                    Some(200),
+                    None,
+                ),
+            ] {
+                connection.execute(
+                    "INSERT INTO request_records
+                       (id, target, plan_id, plan_epoch, provider_id, provider_name, model,
+                        protocol, started_at_unix_ms, finished_at_unix_ms, latency_ms,
+                        outcome, http_status, usage_observed, input_tokens,
+                        cached_input_tokens, cache_creation_input_tokens, output_tokens,
+                        error_payload, error_payload_truncated)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'History Provider', 'history-model',
+                             ?6, ?7, ?8, 10, ?9, ?10, 0, 0, 0, 0, 0, ?11, ?12)",
+                    params![
+                        id,
+                        target,
+                        Uuid::new_v4().to_string(),
+                        Uuid::new_v4().to_string(),
+                        Uuid::new_v4().to_string(),
+                        if target == "codex" {
+                            "openai-responses"
+                        } else {
+                            "anthropic-messages"
+                        },
+                        finished - 10,
+                        finished,
+                        outcome,
+                        status,
+                        payload,
+                        i64::from(id.ends_with("1403")),
+                    ],
+                )?;
+            }
+            connection.execute(
+                "INSERT INTO pricing_snapshots
+                   (request_record_id, catalog_version, source, source_model,
+                    input_nano_usd_per_million, output_nano_usd_per_million,
+                    cache_read_multiplier_ppm, cache_creation_multiplier_ppm,
+                    priced_at_unix_ms, estimated_cost_nano_usd)
+                 VALUES (?1, 'history-catalog-v1', 'history-test', 'history-model',
+                         1, 2, 3, 4, 130, 5)",
+                ["00000000-0000-4000-8000-000000001403"],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let mut session = fixture.connect().await;
+    hello(&mut session).await;
+    let opened = request(
+        &mut session,
+        "history-open",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    assert_request_history_frame_secret_free(&opened, HISTORY_CREDENTIAL);
+    assert!(
+        opened["type"] == "response",
+        "request history owning Target did not open"
+    );
+    let first = request(
+        &mut session,
+        "history-first",
+        json!({
+            "kind": "list-request-records", "target": "codex",
+            "beforeCursor": null, "limit": 2
+        }),
+    )
+    .await;
+    assert_request_history_frame_secret_free(&first, HISTORY_CREDENTIAL);
+    assert!(
+        !first.to_string().contains("codex sanitized failure"),
+        "request history page exposed retained failed payload bytes"
+    );
+    assert!(
+        first["type"] == "response"
+            && first["result"]["kind"] == "request-record-page"
+            && first["result"]["page"]["target"] == "codex"
+            && first["result"]["page"]["records"]
+                .as_array()
+                .is_some_and(|records| {
+                    records.len() == 2
+                        && records[0]["id"] == "00000000-0000-4000-8000-000000001404"
+                        && records[1]["id"] == "00000000-0000-4000-8000-000000001403"
+                })
+            && first["result"]["page"]["nextCursor"].is_string(),
+        "request history did not return a newest-first bounded Target page"
+    );
+    let cursor = first["result"]["page"]["nextCursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second = request(
+        &mut session,
+        "history-second",
+        json!({
+            "kind": "list-request-records", "target": "codex",
+            "beforeCursor": cursor, "limit": 2
+        }),
+    )
+    .await;
+    assert_request_history_frame_secret_free(&second, HISTORY_CREDENTIAL);
+    assert!(
+        second["result"]["page"]["records"]
+            .as_array()
+            .is_some_and(|records| {
+                records.len() == 1 && records[0]["id"] == "00000000-0000-4000-8000-000000001401"
+            })
+            && second["result"]["page"]["nextCursor"].is_null(),
+        "request history cursor skipped or repeated a Target record"
+    );
+    let detail = request(
+        &mut session,
+        "history-detail",
+        json!({
+            "kind": "inspect-request-record", "target": "codex",
+            "recordId": "00000000-0000-4000-8000-000000001403"
+        }),
+    )
+    .await;
+    assert_request_history_frame_secret_free(&detail, HISTORY_CREDENTIAL);
+    assert!(
+        detail["type"] == "response"
+            && detail["result"]["kind"] == "request-record-detail"
+            && detail["result"]["detail"]["target"] == "codex"
+            && detail["result"]["detail"]["record"]["id"] == "00000000-0000-4000-8000-000000001403"
+            && detail["result"]["detail"]["errorPayload"] == "codex sanitized failure"
+            && detail["result"]["detail"]["errorPayloadSensitive"] == true
+            && detail["result"]["detail"]["record"]["errorPayloadTruncated"] == true
+            && detail["result"]["detail"]["pricingSnapshot"]["catalogVersion"]
+                == "history-catalog-v1"
+            && detail["result"]["detail"]["pricingSnapshot"]["estimatedCostNanoUsd"] == 5,
+        "request history detail did not return the exact Target-bound failed record"
+    );
+    let missing = request(
+        &mut session,
+        "history-missing",
+        json!({
+            "kind": "inspect-request-record", "target": "codex",
+            "recordId": "00000000-0000-4000-8000-000000001499"
+        }),
+    )
+    .await;
+    assert_request_history_frame_secret_free(&missing, HISTORY_CREDENTIAL);
+    assert!(
+        missing["problem"]["code"] == "request-record-not-found",
+        "missing request history detail returned an unstable problem"
+    );
+    let malformed_cursor = request(
+        &mut session,
+        "history-malformed-cursor",
+        json!({
+            "kind": "list-request-records", "target": "codex",
+            "beforeCursor": "not-a-request-history-cursor", "limit": 2
+        }),
+    )
+    .await;
+    assert_request_history_frame_secret_free(&malformed_cursor, HISTORY_CREDENTIAL);
+    assert!(
+        malformed_cursor["problem"]["code"] == "invalid-request-history-cursor",
+        "malformed request history cursor returned an unstable problem"
+    );
+    drop(session);
+    let mut claude = fixture.connect().await;
+    hello(&mut claude).await;
+    let claude_open = request(
+        &mut claude,
+        "history-open-claude",
+        json!({
+            "kind": "open-target", "target": "claude",
+            "claudeContext": {
+                "claudeConfigDir": null,
+                "selectorState": "unset",
+                "hostManagedState": "unmanaged",
+                "cwd": fixture.root.join("home")
+            }
+        }),
+    )
+    .await;
+    assert_request_history_frame_secret_free(&claude_open, HISTORY_CREDENTIAL);
+    assert!(
+        claude_open["type"] == "response",
+        "request history peer Target did not reopen"
+    );
+    let wrong_target = request(
+        &mut claude,
+        "history-wrong-target",
+        json!({
+            "kind": "inspect-request-record", "target": "claude",
+            "recordId": "00000000-0000-4000-8000-000000001403"
+        }),
+    )
+    .await;
+    assert_request_history_frame_secret_free(&wrong_target, HISTORY_CREDENTIAL);
+    assert!(
+        wrong_target["problem"]["code"] == "request-record-not-found",
+        "request history detail crossed its Target boundary"
+    );
+    let cross_target_cursor = request(
+        &mut claude,
+        "history-cross-target-cursor",
+        json!({
+            "kind": "list-request-records", "target": "claude",
+            "beforeCursor": first["result"]["page"]["nextCursor"], "limit": 2
+        }),
+    )
+    .await;
+    assert_request_history_frame_secret_free(&cross_target_cursor, HISTORY_CREDENTIAL);
+    assert!(
+        cross_target_cursor["problem"]["code"] == "invalid-request-history-cursor",
+        "request history cursor crossed its Target boundary"
+    );
+
+    drop(claude);
+    fixture.shutdown().await;
 }
 
 #[tokio::test]

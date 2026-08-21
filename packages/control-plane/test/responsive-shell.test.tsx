@@ -137,6 +137,8 @@ class StaticTargetSession implements TargetSession {
     }
   }
   async resolveCompatibility(): Promise<never> { throw new Error("compatibility resolution not configured in this fixture") }
+  async listRequestRecords(): Promise<never> { throw new Error("request history not configured in this fixture") }
+  async inspectRequestRecord(): Promise<never> { throw new Error("request history not configured in this fixture") }
 
   async act(_action: TargetAction): Promise<ActionOutcome> {
     return { status: "applied", view: this.#view }

@@ -102,6 +102,8 @@ class MemoryTargetSession implements TargetSession {
   async probeCompatibility(): Promise<CompatibilityProbe> { throw new Error("unused") }
   async resolveCompatibility(_input: CompatibilityResolution): Promise<ActionOutcome> { throw new Error("unused") }
   async applyReconciliation(): Promise<never> { throw new Error("unused") }
+  async listRequestRecords(): Promise<never> { throw new Error("unused") }
+  async inspectRequestRecord(): Promise<never> { throw new Error("unused") }
   subscribe(): () => void { return () => {} }
   async whenClosed(): Promise<void> { return await new Promise(() => {}) }
   async close(): Promise<void> {}

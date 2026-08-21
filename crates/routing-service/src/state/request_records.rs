@@ -1,16 +1,21 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use tokio_rusqlite::rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::{
-    control::protocol::{ProviderProtocol, RequestRecordOutcome},
+    control::protocol::{
+        PricingSnapshotView, ProviderProtocol, RequestRecordDetail, RequestRecordOutcome,
+        RequestRecordPage, RequestRecordSummary, RequestUsageView, Target,
+    },
     request_history::{
-        PricingCatalog, PricingError, PricingSnapshot, RequestRecordCompletion,
-        RequestRecordStoreError, RequestUsage,
+        PricingCatalog, PricingError, PricingSnapshot, RequestHistoryError,
+        RequestRecordCompletion, RequestRecordStoreError, RequestUsage,
     },
 };
 
 use super::StateStore;
 
 const MAX_ERROR_PAYLOAD_BYTES: usize = 65_536;
+const REQUEST_HISTORY_CURSOR_VERSION: &str = "request-record-v1";
 
 impl StateStore {
     pub(crate) async fn insert_request_record(
@@ -106,6 +111,332 @@ impl StateStore {
             })
             .await
             .map_err(map_call_error)
+    }
+
+    pub(crate) async fn list_request_records(
+        &self,
+        target: Target,
+        before_cursor: Option<&str>,
+        limit: u16,
+    ) -> Result<RequestRecordPage, RequestHistoryError> {
+        if !(1..=100).contains(&limit) {
+            return Err(RequestHistoryError::InvalidCursor);
+        }
+        let before_sequence = before_cursor
+            .map(|cursor| decode_cursor(target, cursor))
+            .transpose()?;
+        let query_limit = u64::from(limit) + 1;
+        let target_name = target.as_str().to_owned();
+        let rows = self
+            .connection
+            .call(move |connection| {
+                let mut statement = connection.prepare(
+                    "SELECT request.sequence, request.id, request.plan_id, request.plan_epoch,
+                            request.provider_id, request.provider_name, request.model,
+                            request.protocol, request.started_at_unix_ms,
+                            request.finished_at_unix_ms, request.latency_ms, request.outcome,
+                            request.http_status, request.usage_observed, request.input_tokens,
+                            request.cached_input_tokens,
+                            request.cache_creation_input_tokens, request.output_tokens,
+                            request.error_payload IS NOT NULL,
+                            request.error_payload_truncated,
+                            pricing.estimated_cost_nano_usd
+                     FROM request_records request
+                     LEFT JOIN pricing_snapshots pricing
+                       ON pricing.request_record_id = request.id
+                     WHERE request.target = ?1
+                       AND (?2 IS NULL OR request.sequence < ?2)
+                     ORDER BY request.sequence DESC
+                     LIMIT ?3",
+                )?;
+                statement
+                    .query_map(params![target_name, before_sequence, query_limit], |row| {
+                        StoredRequestRecord::from_row(row)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .map_err(|_| RequestHistoryError::Unavailable)?;
+        let mut rows = rows;
+        let has_more = rows.len() > usize::from(limit);
+        if has_more {
+            rows.pop();
+        }
+        let next_cursor = has_more
+            .then(|| rows.last().map(|row| encode_cursor(target, row.sequence)))
+            .flatten();
+        let records = rows
+            .into_iter()
+            .map(StoredRequestRecord::into_summary)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RequestRecordPage {
+            target,
+            records,
+            next_cursor,
+        })
+    }
+
+    pub(crate) async fn inspect_request_record(
+        &self,
+        target: Target,
+        record_id: uuid::Uuid,
+    ) -> Result<RequestRecordDetail, RequestHistoryError> {
+        let target_name = target.as_str().to_owned();
+        let record_id = record_id.to_string();
+        let stored = self
+            .connection
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT request.sequence, request.id, request.plan_id,
+                                request.plan_epoch, request.provider_id,
+                                request.provider_name, request.model, request.protocol,
+                                request.started_at_unix_ms, request.finished_at_unix_ms,
+                                request.latency_ms, request.outcome, request.http_status,
+                                request.usage_observed, request.input_tokens,
+                                request.cached_input_tokens,
+                                request.cache_creation_input_tokens, request.output_tokens,
+                                request.error_payload IS NOT NULL,
+                                request.error_payload_truncated,
+                                pricing.estimated_cost_nano_usd,
+                                pricing.catalog_version, pricing.source, pricing.source_model,
+                                pricing.input_nano_usd_per_million,
+                                pricing.output_nano_usd_per_million,
+                                pricing.cache_read_multiplier_ppm,
+                                pricing.cache_creation_multiplier_ppm,
+                                pricing.priced_at_unix_ms, request.error_payload
+                         FROM request_records request
+                         LEFT JOIN pricing_snapshots pricing
+                           ON pricing.request_record_id = request.id
+                         WHERE request.target = ?1 AND request.id = ?2",
+                        params![target_name, record_id],
+                        |row| {
+                            Ok((
+                                StoredRequestRecord::from_row(row)?,
+                                StoredPricingSnapshot::from_row(row)?,
+                                row.get::<_, Option<Vec<u8>>>(29)?,
+                            ))
+                        },
+                    )
+                    .optional()
+            })
+            .await
+            .map_err(|_| RequestHistoryError::Unavailable)?
+            .ok_or(RequestHistoryError::NotFound)?;
+        let (record, pricing, error_payload) = stored;
+        let pricing_snapshot = pricing.into_view(record.estimated_cost_nano_usd)?;
+        Ok(RequestRecordDetail {
+            target,
+            record: record.into_summary()?,
+            pricing_snapshot,
+            error_payload: error_payload
+                .as_deref()
+                .map(String::from_utf8_lossy)
+                .map(std::borrow::Cow::into_owned),
+            error_payload_sensitive: error_payload.is_some(),
+        })
+    }
+}
+
+struct StoredRequestRecord {
+    sequence: u64,
+    id: String,
+    plan_id: String,
+    plan_epoch: String,
+    provider_id: Option<String>,
+    provider_name: Option<String>,
+    model: String,
+    protocol: String,
+    started_at_unix_ms: u64,
+    finished_at_unix_ms: u64,
+    latency_ms: u64,
+    outcome: String,
+    http_status: Option<u16>,
+    usage_observed: bool,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    output_tokens: u64,
+    has_error_payload: bool,
+    error_payload_truncated: bool,
+    estimated_cost_nano_usd: Option<u64>,
+}
+
+impl StoredRequestRecord {
+    fn from_row(row: &tokio_rusqlite::rusqlite::Row<'_>) -> tokio_rusqlite::rusqlite::Result<Self> {
+        Ok(Self {
+            sequence: row.get(0)?,
+            id: row.get(1)?,
+            plan_id: row.get(2)?,
+            plan_epoch: row.get(3)?,
+            provider_id: row.get(4)?,
+            provider_name: row.get(5)?,
+            model: row.get(6)?,
+            protocol: row.get(7)?,
+            started_at_unix_ms: row.get(8)?,
+            finished_at_unix_ms: row.get(9)?,
+            latency_ms: row.get(10)?,
+            outcome: row.get(11)?,
+            http_status: row.get(12)?,
+            usage_observed: row.get(13)?,
+            input_tokens: row.get(14)?,
+            cached_input_tokens: row.get(15)?,
+            cache_creation_input_tokens: row.get(16)?,
+            output_tokens: row.get(17)?,
+            has_error_payload: row.get(18)?,
+            error_payload_truncated: row.get(19)?,
+            estimated_cost_nano_usd: row.get(20)?,
+        })
+    }
+
+    fn into_summary(self) -> Result<RequestRecordSummary, RequestHistoryError> {
+        Ok(RequestRecordSummary {
+            id: parse_uuid(&self.id)?,
+            plan_id: parse_uuid(&self.plan_id)?,
+            plan_epoch: parse_uuid(&self.plan_epoch)?,
+            provider_id: self.provider_id.as_deref().map(parse_uuid).transpose()?,
+            provider_name: self.provider_name,
+            model: self.model,
+            protocol: parse_protocol(&self.protocol)?,
+            started_at_unix_ms: self.started_at_unix_ms,
+            finished_at_unix_ms: self.finished_at_unix_ms,
+            latency_ms: self.latency_ms,
+            outcome: parse_outcome(&self.outcome)?,
+            http_status: self.http_status,
+            usage: self.usage_observed.then_some(RequestUsageView {
+                input_tokens: self.input_tokens,
+                cached_input_tokens: self.cached_input_tokens,
+                cache_creation_input_tokens: self.cache_creation_input_tokens,
+                output_tokens: self.output_tokens,
+            }),
+            estimated_cost_nano_usd: self.estimated_cost_nano_usd,
+            has_error_payload: self.has_error_payload,
+            error_payload_truncated: self.error_payload_truncated,
+        })
+    }
+}
+
+struct StoredPricingSnapshot {
+    catalog_version: Option<String>,
+    source: Option<String>,
+    source_model: Option<String>,
+    input_nano_usd_per_million: Option<u64>,
+    output_nano_usd_per_million: Option<u64>,
+    cache_read_multiplier_ppm: Option<u64>,
+    cache_creation_multiplier_ppm: Option<u64>,
+    priced_at_unix_ms: Option<u64>,
+}
+
+impl StoredPricingSnapshot {
+    fn from_row(row: &tokio_rusqlite::rusqlite::Row<'_>) -> tokio_rusqlite::rusqlite::Result<Self> {
+        Ok(Self {
+            catalog_version: row.get(21)?,
+            source: row.get(22)?,
+            source_model: row.get(23)?,
+            input_nano_usd_per_million: row.get(24)?,
+            output_nano_usd_per_million: row.get(25)?,
+            cache_read_multiplier_ppm: row.get(26)?,
+            cache_creation_multiplier_ppm: row.get(27)?,
+            priced_at_unix_ms: row.get(28)?,
+        })
+    }
+
+    fn into_view(
+        self,
+        estimated_cost_nano_usd: Option<u64>,
+    ) -> Result<Option<PricingSnapshotView>, RequestHistoryError> {
+        match (
+            self.catalog_version,
+            self.source,
+            self.source_model,
+            self.input_nano_usd_per_million,
+            self.output_nano_usd_per_million,
+            self.cache_read_multiplier_ppm,
+            self.cache_creation_multiplier_ppm,
+            self.priced_at_unix_ms,
+            estimated_cost_nano_usd,
+        ) {
+            (None, None, None, None, None, None, None, None, None) => Ok(None),
+            (
+                Some(catalog_version),
+                Some(source),
+                Some(source_model),
+                Some(input_nano_usd_per_million),
+                Some(output_nano_usd_per_million),
+                Some(cache_read_multiplier_ppm),
+                Some(cache_creation_multiplier_ppm),
+                Some(priced_at_unix_ms),
+                Some(estimated_cost_nano_usd),
+            ) => Ok(Some(PricingSnapshotView {
+                catalog_version,
+                source,
+                source_model,
+                input_nano_usd_per_million,
+                output_nano_usd_per_million,
+                cache_read_multiplier_ppm,
+                cache_creation_multiplier_ppm,
+                priced_at_unix_ms,
+                estimated_cost_nano_usd,
+            })),
+            _ => Err(RequestHistoryError::Unavailable),
+        }
+    }
+}
+
+fn encode_cursor(target: Target, sequence: u64) -> String {
+    URL_SAFE_NO_PAD.encode(format!(
+        "{REQUEST_HISTORY_CURSOR_VERSION}|{}|{sequence}",
+        target.as_str()
+    ))
+}
+
+fn decode_cursor(target: Target, cursor: &str) -> Result<u64, RequestHistoryError> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| RequestHistoryError::InvalidCursor)?;
+    let decoded = std::str::from_utf8(&decoded).map_err(|_| RequestHistoryError::InvalidCursor)?;
+    let mut fields = decoded.split('|');
+    let version = fields.next();
+    let encoded_target = fields.next();
+    let sequence = fields.next();
+    if version != Some(REQUEST_HISTORY_CURSOR_VERSION)
+        || encoded_target != Some(target.as_str())
+        || fields.next().is_some()
+    {
+        return Err(RequestHistoryError::InvalidCursor);
+    }
+    let sequence = sequence
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or(RequestHistoryError::InvalidCursor)?;
+    if encode_cursor(target, sequence) != cursor {
+        return Err(RequestHistoryError::InvalidCursor);
+    }
+    Ok(sequence)
+}
+
+fn parse_uuid(value: &str) -> Result<uuid::Uuid, RequestHistoryError> {
+    uuid::Uuid::parse_str(value).map_err(|_| RequestHistoryError::Unavailable)
+}
+
+fn parse_protocol(value: &str) -> Result<ProviderProtocol, RequestHistoryError> {
+    match value {
+        "openai-responses" => Ok(ProviderProtocol::OpenaiResponses),
+        "anthropic-messages" => Ok(ProviderProtocol::AnthropicMessages),
+        _ => Err(RequestHistoryError::Unavailable),
+    }
+}
+
+fn parse_outcome(value: &str) -> Result<RequestRecordOutcome, RequestHistoryError> {
+    match value {
+        "success" => Ok(RequestRecordOutcome::Success),
+        "upstream-error" => Ok(RequestRecordOutcome::UpstreamError),
+        "semantic-error" => Ok(RequestRecordOutcome::SemanticError),
+        "transport-error" => Ok(RequestRecordOutcome::TransportError),
+        "route-unavailable" => Ok(RequestRecordOutcome::RouteUnavailable),
+        "cancelled" => Ok(RequestRecordOutcome::Cancelled),
+        "stream-error" => Ok(RequestRecordOutcome::StreamError),
+        _ => Err(RequestHistoryError::Unavailable),
     }
 }
 

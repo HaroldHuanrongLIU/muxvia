@@ -183,6 +183,10 @@ fn request_history_contract_is_closed_target_bound_and_payload_bounded() {
         assert!(rejected, "accepted additive request-history credential");
     }
 
+    let mut over_limit = list.clone();
+    over_limit["operation"]["limit"] = serde_json::json!(101);
+    assert!(serde_json::from_value::<ClientFrame>(over_limit).is_err());
+
     let mut zero_limit = list;
     zero_limit["operation"]["limit"] = serde_json::json!(0);
     assert!(serde_json::from_value::<ClientFrame>(zero_limit).is_err());

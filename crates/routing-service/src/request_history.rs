@@ -100,6 +100,16 @@ pub(crate) enum RequestRecordStoreError {
     PricingOverflow,
 }
 
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum RequestHistoryError {
+    #[error("request history is unavailable")]
+    Unavailable,
+    #[error("request history cursor is invalid")]
+    InvalidCursor,
+    #[error("request record was not found")]
+    NotFound,
+}
+
 #[derive(Clone)]
 pub(crate) struct PricingCatalog {
     version: String,

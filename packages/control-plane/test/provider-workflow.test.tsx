@@ -212,6 +212,8 @@ class MemoryTargetSession implements TargetSession {
     }
     return await this.#applyAction({ kind: "resolve-compatibility", version: input.version })
   }
+  async listRequestRecords(): Promise<never> { throw new Error("request history not configured in this fixture") }
+  async inspectRequestRecord(): Promise<never> { throw new Error("request history not configured in this fixture") }
   async applyReconciliation(input: {
     strategy: ReconciliationStrategy
     observationToken: string

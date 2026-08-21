@@ -126,6 +126,8 @@ class MemoryTargetSession implements TargetSession {
   async applyReconciliation(): Promise<never> { throw new Error("reconciliation not configured in this fixture") }
   async probeCompatibility(): Promise<CompatibilityProbe> { throw new Error("compatibility probe not configured in this fixture") }
   async resolveCompatibility(): Promise<ActionOutcome> { throw new Error("compatibility resolution not configured in this fixture") }
+  async listRequestRecords(): Promise<never> { throw new Error("request history not configured in this fixture") }
+  async inspectRequestRecord(): Promise<never> { throw new Error("request history not configured in this fixture") }
 
   async act(action: TargetAction): Promise<ActionOutcome> {
     this.actions.push(projectAction(action))

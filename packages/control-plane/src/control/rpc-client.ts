@@ -33,7 +33,7 @@ type Pending = {
 export type RequestOptions = { signal?: AbortSignal }
 export type InspectionOperation = Extract<
   ControlOperation,
-  { kind: "discover-models" | "check-reachability" | "preview-reconciliation" | "probe-compatibility" | "poll-device-authorization" }
+  { kind: "discover-models" | "check-reachability" | "preview-reconciliation" | "probe-compatibility" | "poll-device-authorization" | "list-request-records" | "inspect-request-record" }
 >
 type NonInspectionOperation = Exclude<ControlOperation, InspectionOperation>
 
@@ -395,6 +395,8 @@ function isInspectionOperation(operation: ControlOperation): operation is Inspec
     || operation.kind === "preview-reconciliation"
     || operation.kind === "probe-compatibility"
     || operation.kind === "poll-device-authorization"
+    || operation.kind === "list-request-records"
+    || operation.kind === "inspect-request-record"
 }
 
 function asControlError(error: unknown): ControlError {

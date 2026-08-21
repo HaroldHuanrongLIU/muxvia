@@ -203,6 +203,8 @@ pub enum ControlOperation {
         claude_context: Option<ClaudePreflightContext>,
     },
     ProbeCompatibility(ProbeCompatibilityOperation),
+    ListRequestRecords(ListRequestRecordsOperation),
+    InspectRequestRecord(InspectRequestRecordOperation),
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -238,6 +240,35 @@ pub struct PreviewDefaultSubscriptionAccountOperation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProbeCompatibilityOperation {
     pub target: Target,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListRequestRecordsOperation {
+    pub target: Target,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_cursor: Option<String>,
+    #[serde(deserialize_with = "deserialize_request_history_limit")]
+    pub limit: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InspectRequestRecordOperation {
+    pub target: Target,
+    pub record_id: Uuid,
+}
+
+fn deserialize_request_history_limit<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let limit = u16::deserialize(deserializer)?;
+    if (1..=100).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err(D::Error::custom("invalid-request-history-limit"))
+    }
 }
 
 /// Secret-free observations supplied while opening the Claude management context.
@@ -526,6 +557,17 @@ impl fmt::Debug for ControlOperation {
             Self::ProbeCompatibility(operation) => formatter
                 .debug_struct("ProbeCompatibility")
                 .field("target", &operation.target)
+                .finish(),
+            Self::ListRequestRecords(operation) => formatter
+                .debug_struct("ListRequestRecords")
+                .field("target", &operation.target)
+                .field("before_cursor", &operation.before_cursor)
+                .field("limit", &operation.limit)
+                .finish(),
+            Self::InspectRequestRecord(operation) => formatter
+                .debug_struct("InspectRequestRecord")
+                .field("target", &operation.target)
+                .field("record_id", &operation.record_id)
                 .finish(),
         }
     }
@@ -929,6 +971,110 @@ pub enum ControlResult {
         preview: ReconciliationPreview,
     },
     CompatibilityProbe(CompatibilityProbeResult),
+    RequestRecordPage(RequestRecordPageResult),
+    RequestRecordDetail(RequestRecordDetailResult),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequestRecordPageResult {
+    pub page: RequestRecordPage,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequestRecordDetailResult {
+    pub detail: RequestRecordDetail,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RequestRecordOutcome {
+    Success,
+    UpstreamError,
+    SemanticError,
+    TransportError,
+    RouteUnavailable,
+    Cancelled,
+    StreamError,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequestUsageView {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequestRecordSummary {
+    pub id: Uuid,
+    pub plan_id: Uuid,
+    pub plan_epoch: Uuid,
+    pub provider_id: Option<Uuid>,
+    pub provider_name: Option<String>,
+    pub model: String,
+    pub protocol: ProviderProtocol,
+    pub started_at_unix_ms: u64,
+    pub finished_at_unix_ms: u64,
+    pub latency_ms: u64,
+    pub outcome: RequestRecordOutcome,
+    pub http_status: Option<u16>,
+    pub usage: Option<RequestUsageView>,
+    pub estimated_cost_nano_usd: Option<u64>,
+    pub has_error_payload: bool,
+    pub error_payload_truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PricingSnapshotView {
+    pub catalog_version: String,
+    pub source: String,
+    pub source_model: String,
+    pub input_nano_usd_per_million: u64,
+    pub output_nano_usd_per_million: u64,
+    pub cache_read_multiplier_ppm: u64,
+    pub cache_creation_multiplier_ppm: u64,
+    pub priced_at_unix_ms: u64,
+    pub estimated_cost_nano_usd: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequestRecordPage {
+    pub target: Target,
+    pub records: Vec<RequestRecordSummary>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequestRecordDetail {
+    pub target: Target,
+    pub record: RequestRecordSummary,
+    pub pricing_snapshot: Option<PricingSnapshotView>,
+    pub error_payload: Option<String>,
+    pub error_payload_sensitive: bool,
+}
+
+impl fmt::Debug for RequestRecordDetail {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestRecordDetail")
+            .field("target", &self.target)
+            .field("record", &self.record)
+            .field("pricing_snapshot", &self.pricing_snapshot)
+            .field(
+                "error_payload",
+                &self.error_payload.as_ref().map(|_| Redacted),
+            )
+            .field("error_payload_sensitive", &self.error_payload_sensitive)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

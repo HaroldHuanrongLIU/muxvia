@@ -1619,7 +1619,9 @@ async fn serve_session(
                     operation @ (ControlOperation::DiscoverModels { .. }
                     | ControlOperation::CheckReachability { .. }
                     | ControlOperation::PreviewReconciliation { .. }
-                    | ControlOperation::ProbeCompatibility(_)) => {
+                    | ControlOperation::ProbeCompatibility(_)
+                    | ControlOperation::ListRequestRecords(_)
+                    | ControlOperation::InspectRequestRecord(_)) => {
                         if let ControlOperation::DiscoverModels {
                             source: DiscoverySource::Draft { authentication, .. },
                             ..
@@ -1779,6 +1781,8 @@ fn operation_target(operation: &ControlOperation) -> Option<Target> {
         | ControlOperation::CheckReachability { target, .. }
         | ControlOperation::PreviewReconciliation { target, .. } => Some(*target),
         ControlOperation::ProbeCompatibility(operation) => Some(operation.target),
+        ControlOperation::ListRequestRecords(operation) => Some(operation.target),
+        ControlOperation::InspectRequestRecord(operation) => Some(operation.target),
     }
 }
 
@@ -1989,6 +1993,14 @@ async fn inspect_and_queue(
                         None,
                     )
                 }),
+            ControlOperation::ListRequestRecords(_) | ControlOperation::InspectRequestRecord(_) => {
+                Err(ControlProblem {
+                    code: "request-history-unavailable".into(),
+                    message: "Request history is unavailable".into(),
+                    source: None,
+                    selector: None,
+                })
+            }
             _ => unreachable!(),
         }
     };

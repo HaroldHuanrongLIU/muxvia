@@ -66,6 +66,81 @@
       },
       "required": ["observationToken", "target", "strategy", "managementRevision", "compatibility", "shadowSources", "changes", "providerEffect", "restartRequired", "unobservableRuntimeBoundary"]
     },
+    "requestRecordOutcome": {
+      "enum": ["success", "upstream-error", "semantic-error", "transport-error", "route-unavailable", "cancelled", "stream-error"]
+    },
+    "requestUsage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "inputTokens": { "type": "integer", "minimum": 0 },
+        "cachedInputTokens": { "type": "integer", "minimum": 0 },
+        "cacheCreationInputTokens": { "type": "integer", "minimum": 0 },
+        "outputTokens": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["inputTokens", "cachedInputTokens", "cacheCreationInputTokens", "outputTokens"]
+    },
+    "requestRecordSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "planId": { "type": "string", "format": "uuid" },
+        "planEpoch": { "type": "string", "format": "uuid" },
+        "providerId": { "oneOf": [{ "type": "string", "format": "uuid" }, { "type": "null" }] },
+        "providerName": { "type": ["string", "null"] },
+        "model": { "type": "string" },
+        "protocol": { "type": "string" },
+        "startedAtUnixMs": { "type": "integer", "minimum": 0 },
+        "finishedAtUnixMs": { "type": "integer", "minimum": 0 },
+        "latencyMs": { "type": "integer", "minimum": 0 },
+        "outcome": { "$ref": "#/$defs/requestRecordOutcome" },
+        "httpStatus": { "oneOf": [{ "type": "integer", "minimum": 100, "maximum": 999 }, { "type": "null" }] },
+        "usage": { "oneOf": [{ "$ref": "#/$defs/requestUsage" }, { "type": "null" }] },
+        "estimatedCostNanoUsd": { "oneOf": [{ "type": "integer", "minimum": 0 }, { "type": "null" }] },
+        "hasErrorPayload": { "type": "boolean" },
+        "errorPayloadTruncated": { "type": "boolean" }
+      },
+      "required": ["id", "planId", "planEpoch", "providerId", "providerName", "model", "protocol", "startedAtUnixMs", "finishedAtUnixMs", "latencyMs", "outcome", "httpStatus", "usage", "estimatedCostNanoUsd", "hasErrorPayload", "errorPayloadTruncated"]
+    },
+    "pricingSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "catalogVersion": { "type": "string" },
+        "source": { "type": "string" },
+        "sourceModel": { "type": "string" },
+        "inputNanoUsdPerMillion": { "type": "integer", "minimum": 0 },
+        "outputNanoUsdPerMillion": { "type": "integer", "minimum": 0 },
+        "cacheReadMultiplierPpm": { "type": "integer", "minimum": 0 },
+        "cacheCreationMultiplierPpm": { "type": "integer", "minimum": 0 },
+        "pricedAtUnixMs": { "type": "integer", "minimum": 0 },
+        "estimatedCostNanoUsd": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["catalogVersion", "source", "sourceModel", "inputNanoUsdPerMillion", "outputNanoUsdPerMillion", "cacheReadMultiplierPpm", "cacheCreationMultiplierPpm", "pricedAtUnixMs", "estimatedCostNanoUsd"]
+    },
+    "requestRecordPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": { "enum": ["codex", "claude"] },
+        "records": { "type": "array", "items": { "$ref": "#/$defs/requestRecordSummary" } },
+        "nextCursor": { "type": ["string", "null"] }
+      },
+      "required": ["target", "records", "nextCursor"]
+    },
+    "requestRecordDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": { "enum": ["codex", "claude"] },
+        "record": { "$ref": "#/$defs/requestRecordSummary" },
+        "pricingSnapshot": { "oneOf": [{ "$ref": "#/$defs/pricingSnapshot" }, { "type": "null" }] },
+        "errorPayload": { "type": ["string", "null"], "maxLength": 65536 },
+        "errorPayloadSensitive": { "type": "boolean" }
+      },
+      "required": ["target", "record", "pricingSnapshot", "errorPayload", "errorPayloadSensitive"]
+    },
     "clientFrame": {
       "oneOf": [
         { "type": "object", "properties": { "type": { "const": "hello" }, "rpc": { "$ref": "#/$defs/rpc" }, "release": { "type": "string" } }, "required": ["type", "rpc", "release"] },
@@ -98,7 +173,9 @@
         { "type": "object", "properties": { "kind": { "const": "discover-models" }, "target": { "enum": ["codex", "claude"] }, "source": { "$ref": "#/$defs/discoverySource" } }, "required": ["kind", "target", "source"] },
         { "type": "object", "properties": { "kind": { "const": "check-reachability" }, "target": { "enum": ["codex", "claude"] }, "providerId": { "type": "string", "format": "uuid" }, "providerRevision": { "type": "integer", "minimum": 1 } }, "required": ["kind", "target", "providerId", "providerRevision"] },
         { "type": "object", "properties": { "kind": { "const": "preview-reconciliation" }, "target": { "enum": ["codex", "claude"] }, "strategy": { "$ref": "#/$defs/reconciliationStrategy" }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind", "target", "strategy"] },
-        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "probe-compatibility" }, "target": { "enum": ["codex", "claude"] } }, "required": ["kind", "target"] }
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "probe-compatibility" }, "target": { "enum": ["codex", "claude"] } }, "required": ["kind", "target"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "list-request-records" }, "target": { "enum": ["codex", "claude"] }, "beforeCursor": { "type": ["string", "null"] }, "limit": { "type": "integer", "minimum": 1, "maximum": 100 } }, "required": ["kind", "target", "limit"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "inspect-request-record" }, "target": { "enum": ["codex", "claude"] }, "recordId": { "type": "string", "format": "uuid" } }, "required": ["kind", "target", "recordId"] }
       ]
     },
     "discoverySource": {
@@ -173,7 +250,9 @@
         { "type": "object", "properties": { "kind": { "const": "model-discovery" }, "result": { "$ref": "#/$defs/modelDiscoveryResult" } }, "required": ["kind", "result"] },
         { "type": "object", "properties": { "kind": { "const": "reachability" }, "result": { "$ref": "#/$defs/reachabilityResult" } }, "required": ["kind", "result"] },
         { "type": "object", "properties": { "kind": { "const": "reconciliation-preview" }, "preview": { "$ref": "#/$defs/reconciliationPreview" } }, "required": ["kind", "preview"] },
-        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "compatibility-probe" }, "probe": { "$ref": "#/$defs/compatibilityProbe" } }, "required": ["kind", "probe"] }
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "compatibility-probe" }, "probe": { "$ref": "#/$defs/compatibilityProbe" } }, "required": ["kind", "probe"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "request-record-page" }, "page": { "$ref": "#/$defs/requestRecordPage" } }, "required": ["kind", "page"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "request-record-detail" }, "detail": { "$ref": "#/$defs/requestRecordDetail" } }, "required": ["kind", "detail"] }
       ]
     },
     "inspectionCategory": {

@@ -14,7 +14,7 @@ use crate::control::protocol::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -51,6 +51,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v9(connection)?;
             migrate_v10(connection)?;
             migrate_v11(connection)?;
+            migrate_v12(connection)?;
         }
         Some(2) => {
             migrate_v2(connection)?;
@@ -63,6 +64,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v9(connection)?;
             migrate_v10(connection)?;
             migrate_v11(connection)?;
+            migrate_v12(connection)?;
         }
         Some(3) => {
             migrate_v3(connection)?;
@@ -74,6 +76,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v9(connection)?;
             migrate_v10(connection)?;
             migrate_v11(connection)?;
+            migrate_v12(connection)?;
         }
         Some(4) => {
             migrate_v4(connection)?;
@@ -84,6 +87,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v9(connection)?;
             migrate_v10(connection)?;
             migrate_v11(connection)?;
+            migrate_v12(connection)?;
         }
         Some(5) => {
             migrate_v5(connection)?;
@@ -93,6 +97,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v9(connection)?;
             migrate_v10(connection)?;
             migrate_v11(connection)?;
+            migrate_v12(connection)?;
         }
         Some(6) => {
             migrate_v6(connection)?;
@@ -101,6 +106,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v9(connection)?;
             migrate_v10(connection)?;
             migrate_v11(connection)?;
+            migrate_v12(connection)?;
         }
         Some(7) => {
             migrate_v7(connection)?;
@@ -108,27 +114,114 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
             migrate_v9(connection)?;
             migrate_v10(connection)?;
             migrate_v11(connection)?;
+            migrate_v12(connection)?;
         }
         Some(8) => {
             migrate_v8(connection)?;
             migrate_v9(connection)?;
             migrate_v10(connection)?;
             migrate_v11(connection)?;
+            migrate_v12(connection)?;
         }
         Some(9) => {
             migrate_v9(connection)?;
             migrate_v10(connection)?;
             migrate_v11(connection)?;
+            migrate_v12(connection)?;
         }
         Some(10) => {
             migrate_v10(connection)?;
             migrate_v11(connection)?;
+            migrate_v12(connection)?;
         }
-        Some(11) => migrate_v11(connection)?,
+        Some(11) => {
+            migrate_v11(connection)?;
+            migrate_v12(connection)?;
+        }
+        Some(12) => migrate_v12(connection)?,
         Some(_) => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v12(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE request_records (
+           sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+           id TEXT NOT NULL UNIQUE,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           plan_id TEXT NOT NULL,
+           plan_epoch TEXT NOT NULL,
+           provider_id TEXT,
+           provider_name TEXT,
+           model TEXT NOT NULL,
+           protocol TEXT NOT NULL CHECK (protocol IN ('openai-responses', 'anthropic-messages')),
+           started_at_unix_ms INTEGER NOT NULL CHECK (started_at_unix_ms >= 0),
+           finished_at_unix_ms INTEGER NOT NULL CHECK (finished_at_unix_ms >= started_at_unix_ms),
+           latency_ms INTEGER NOT NULL CHECK (
+             latency_ms >= 0 AND latency_ms = finished_at_unix_ms - started_at_unix_ms
+           ),
+           outcome TEXT NOT NULL CHECK (outcome IN (
+             'success', 'upstream-error', 'semantic-error', 'transport-error',
+             'route-unavailable', 'cancelled', 'stream-error'
+           )),
+           http_status INTEGER CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 999),
+           usage_observed INTEGER NOT NULL CHECK (usage_observed IN (0, 1)),
+           input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+           cached_input_tokens INTEGER NOT NULL CHECK (cached_input_tokens >= 0),
+           cache_creation_input_tokens INTEGER NOT NULL CHECK (cache_creation_input_tokens >= 0),
+           output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+           error_payload BLOB,
+           error_payload_truncated INTEGER NOT NULL CHECK (error_payload_truncated IN (0, 1)),
+           CHECK ((provider_id IS NULL) = (provider_name IS NULL)),
+           CHECK (
+             usage_observed = 1
+             OR (input_tokens = 0 AND cached_input_tokens = 0
+                 AND cache_creation_input_tokens = 0 AND output_tokens = 0)
+           ),
+           CHECK (error_payload IS NULL OR length(error_payload) <= 65536),
+           CHECK (error_payload IS NULL OR outcome = 'upstream-error'),
+           CHECK (
+             error_payload_truncated = 0
+             OR (outcome = 'upstream-error' AND error_payload IS NOT NULL)
+           ),
+           CHECK (
+             outcome != 'success'
+             OR (error_payload IS NULL AND error_payload_truncated = 0)
+           )
+         );
+         CREATE INDEX request_records_target_sequence
+           ON request_records(target, sequence DESC);
+         CREATE TABLE pricing_snapshots (
+           request_record_id TEXT PRIMARY KEY REFERENCES request_records(id) ON DELETE CASCADE,
+           catalog_version TEXT NOT NULL,
+           source TEXT NOT NULL,
+           source_model TEXT NOT NULL,
+           input_nano_usd_per_million INTEGER NOT NULL CHECK (input_nano_usd_per_million >= 0),
+           output_nano_usd_per_million INTEGER NOT NULL CHECK (output_nano_usd_per_million >= 0),
+           cache_read_multiplier_ppm INTEGER NOT NULL CHECK (cache_read_multiplier_ppm >= 0),
+           cache_creation_multiplier_ppm INTEGER NOT NULL CHECK (cache_creation_multiplier_ppm >= 0),
+           priced_at_unix_ms INTEGER NOT NULL CHECK (priced_at_unix_ms >= 0),
+           estimated_cost_nano_usd INTEGER NOT NULL CHECK (estimated_cost_nano_usd > 0)
+         );
+         CREATE TRIGGER pricing_snapshots_immutable
+         BEFORE UPDATE ON pricing_snapshots
+         BEGIN
+           SELECT RAISE(ABORT, 'immutable-pricing-snapshot');
+         END;",
+    )?;
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.execute(
+        "UPDATE metadata SET value = '13' WHERE key = 'schema-version'",
+        [],
+    )?;
+    transaction.commit()
 }
 
 fn migrate_v11(connection: &mut Connection) -> Result<()> {

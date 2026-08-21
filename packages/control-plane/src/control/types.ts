@@ -395,6 +395,17 @@ const controlOperationSchema = z.discriminatedUnion("kind", [
     kind: z.literal("probe-compatibility"),
     target: targetSchema,
   }).strict(),
+  z.object({
+    kind: z.literal("list-request-records"),
+    target: targetSchema,
+    beforeCursor: z.string().optional(),
+    limit: z.number().int().min(1).max(100),
+  }).strict(),
+  z.object({
+    kind: z.literal("inspect-request-record"),
+    target: targetSchema,
+    recordId: z.string().uuid(),
+  }).strict(),
 ])
 
 const compatibilityProbeSchema = z.object({
@@ -639,6 +650,66 @@ const reachabilityResultSchema = z.discriminatedUnion("status", [
   }),
 ])
 
+const requestUsageSchema = z.object({
+  inputTokens: z.number().int().nonnegative(),
+  cachedInputTokens: z.number().int().nonnegative(),
+  cacheCreationInputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+}).strict()
+
+const requestRecordSummarySchema = z.object({
+  id: z.string().uuid(),
+  planId: z.string().uuid(),
+  planEpoch: z.string().uuid(),
+  providerId: z.string().uuid().nullable(),
+  providerName: z.string().nullable(),
+  model: z.string(),
+  protocol: z.enum(["openai-responses", "anthropic-messages"]),
+  startedAtUnixMs: z.number().int().nonnegative(),
+  finishedAtUnixMs: z.number().int().nonnegative(),
+  latencyMs: z.number().int().nonnegative(),
+  outcome: z.enum([
+    "success",
+    "upstream-error",
+    "semantic-error",
+    "transport-error",
+    "route-unavailable",
+    "cancelled",
+    "stream-error",
+  ]),
+  httpStatus: z.number().int().min(100).max(999).nullable(),
+  usage: requestUsageSchema.nullable(),
+  estimatedCostNanoUsd: z.number().int().nonnegative().nullable(),
+  hasErrorPayload: z.boolean(),
+  errorPayloadTruncated: z.boolean(),
+}).strict()
+
+const pricingSnapshotSchema = z.object({
+  catalogVersion: z.string(),
+  source: z.string(),
+  sourceModel: z.string(),
+  inputNanoUsdPerMillion: z.number().int().nonnegative(),
+  outputNanoUsdPerMillion: z.number().int().nonnegative(),
+  cacheReadMultiplierPpm: z.number().int().nonnegative(),
+  cacheCreationMultiplierPpm: z.number().int().nonnegative(),
+  pricedAtUnixMs: z.number().int().nonnegative(),
+  estimatedCostNanoUsd: z.number().int().nonnegative(),
+}).strict()
+
+const requestRecordPageSchema = z.object({
+  target: targetSchema,
+  records: z.array(requestRecordSummarySchema),
+  nextCursor: z.string().nullable(),
+}).strict()
+
+const requestRecordDetailSchema = z.object({
+  target: targetSchema,
+  record: requestRecordSummarySchema,
+  pricingSnapshot: pricingSnapshotSchema.nullable(),
+  errorPayload: z.string().nullable(),
+  errorPayloadSensitive: z.boolean(),
+}).strict()
+
 const controlResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("handover-prepared"), release: z.string() }).strict(),
   z.object({ kind: z.literal("target-view"), view: targetViewSchema }),
@@ -675,6 +746,8 @@ const controlResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("reachability"), result: reachabilityResultSchema }),
   z.object({ kind: z.literal("reconciliation-preview"), preview: reconciliationPreviewSchema }),
   z.object({ kind: z.literal("compatibility-probe"), probe: compatibilityProbeSchema }).strict(),
+  z.object({ kind: z.literal("request-record-page"), page: requestRecordPageSchema }).strict(),
+  z.object({ kind: z.literal("request-record-detail"), detail: requestRecordDetailSchema }).strict(),
 ])
 
 const clientFrameSchema = z.discriminatedUnion("type", [
@@ -735,6 +808,10 @@ export type ReconciliationStrategy = z.infer<typeof reconciliationStrategySchema
 export type CompatibilityClassification = z.infer<typeof compatibilityClassificationSchema>
 export type CompatibilityProbe = z.infer<typeof compatibilityProbeSchema>
 export type ReconciliationPreview = z.infer<typeof reconciliationPreviewSchema>
+export type RequestRecordSummary = z.infer<typeof requestRecordSummarySchema>
+export type RequestRecordPage = z.infer<typeof requestRecordPageSchema>
+export type RequestRecordDetail = z.infer<typeof requestRecordDetailSchema>
+export type PricingSnapshot = z.infer<typeof pricingSnapshotSchema>
 export type UniversalProviderOutcome = Extract<
   ControlResult,
   { kind: "universal-provider-outcome" }

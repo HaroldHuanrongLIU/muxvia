@@ -1,0 +1,36 @@
+{
+  "type": "response",
+  "requestId": "request-history-list",
+  "result": {
+    "kind": "request-record-page",
+    "page": {
+      "target": "codex",
+      "records": [
+        {
+          "id": "00000000-0000-4000-8000-000000000131",
+          "planId": "00000000-0000-4000-8000-000000000132",
+          "planEpoch": "00000000-0000-4000-8000-000000000133",
+          "providerId": "00000000-0000-4000-8000-000000000134",
+          "providerName": "Primary",
+          "model": "gpt-5.6",
+          "protocol": "openai-responses",
+          "startedAtUnixMs": 1787241600000,
+          "finishedAtUnixMs": 1787241600123,
+          "latencyMs": 123,
+          "outcome": "upstream-error",
+          "httpStatus": 503,
+          "usage": {
+            "inputTokens": 12,
+            "cachedInputTokens": 2,
+            "cacheCreationInputTokens": 0,
+            "outputTokens": 4
+          },
+          "estimatedCostNanoUsd": 42000,
+          "hasErrorPayload": true,
+          "errorPayloadTruncated": false
+        }
+      ],
+      "nextCursor": "rr-v1-42"
+    }
+  }
+}

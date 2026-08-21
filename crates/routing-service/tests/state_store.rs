@@ -16,7 +16,10 @@ use muxvia_routing::{
     },
 };
 use secrecy::SecretString;
+use tokio_rusqlite::rusqlite::{Connection, types::ValueRef};
 use uuid::Uuid;
+
+const V12_SCHEMA: &str = include_str!("fixtures/state-schema-v12.sql");
 
 struct StoreFixture {
     root: PathBuf,
@@ -45,6 +48,66 @@ fn fixed_uuid(last_byte: u8) -> Uuid {
     let mut bytes = [0; 16];
     bytes[15] = last_byte;
     Uuid::from_bytes(bytes)
+}
+
+fn fingerprint_bytes(mut fingerprint: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        fingerprint ^= u64::from(*byte);
+        fingerprint = fingerprint.wrapping_mul(0x100_0000_01b3);
+    }
+    fingerprint
+}
+
+fn v12_state_fingerprint(connection: &Connection) -> Vec<(String, u64)> {
+    let tables = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'table'
+               AND name NOT IN ('metadata', 'request_records', 'pricing_snapshots',
+                                'sqlite_sequence')
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let escaped = table.replace('"', "\"\"");
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM \"{escaped}\" ORDER BY rowid"))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            let mut fingerprint = fingerprint_bytes(0xcbf2_9ce4_8422_2325, table.as_bytes());
+            while let Some(row) = rows.next().unwrap() {
+                for column in 0..columns {
+                    match row.get_ref(column).unwrap() {
+                        ValueRef::Null => fingerprint = fingerprint_bytes(fingerprint, b"n"),
+                        ValueRef::Integer(value) => {
+                            fingerprint = fingerprint_bytes(fingerprint, b"i");
+                            fingerprint = fingerprint_bytes(fingerprint, &value.to_le_bytes());
+                        }
+                        ValueRef::Real(value) => {
+                            fingerprint = fingerprint_bytes(fingerprint, b"r");
+                            fingerprint = fingerprint_bytes(fingerprint, &value.to_le_bytes());
+                        }
+                        ValueRef::Text(value) => {
+                            fingerprint = fingerprint_bytes(fingerprint, b"t");
+                            fingerprint = fingerprint_bytes(fingerprint, value);
+                        }
+                        ValueRef::Blob(value) => {
+                            fingerprint = fingerprint_bytes(fingerprint, b"b");
+                            fingerprint = fingerprint_bytes(fingerprint, value);
+                        }
+                    }
+                }
+            }
+            (table, fingerprint)
+        })
+        .collect()
 }
 
 fn raw_save_provider(
@@ -104,8 +167,241 @@ async fn fresh_schema_reopens_with_codex_and_claude_route_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, "12");
+    assert_eq!(version, "13");
     assert_eq!(targets, ["claude", "codex"]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn request_record_schema_bounds_failed_payload_and_freezes_pricing_snapshot() {
+    let fixture = StoreFixture::new().await;
+    let database = tokio_rusqlite::Connection::open(fixture.home.database_path())
+        .await
+        .unwrap();
+    let oversized = database
+        .call(|connection| {
+            connection.execute(
+                "INSERT INTO request_records
+                   (id, target, plan_id, plan_epoch, provider_id, provider_name, model, protocol,
+                    started_at_unix_ms, finished_at_unix_ms, latency_ms, outcome, http_status,
+                    usage_observed, input_tokens, cached_input_tokens,
+                    cache_creation_input_tokens, output_tokens, error_payload,
+                    error_payload_truncated)
+                 VALUES (?1, 'codex', ?2, ?3, NULL, NULL, 'gpt-5.6', 'openai-responses',
+                         1, 2, 1, 'upstream-error', 503, 0, 0, 0, 0, 0, ?4, 1)",
+                tokio_rusqlite::rusqlite::params![
+                    fixed_uuid(131).to_string(),
+                    fixed_uuid(132).to_string(),
+                    fixed_uuid(133).to_string(),
+                    vec![b'x'; 65_537],
+                ],
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await;
+    assert!(
+        oversized.is_err(),
+        "accepted an error payload larger than 64 KiB"
+    );
+
+    let wrong_outcome = database
+        .call(|connection| {
+            connection.execute(
+                "INSERT INTO request_records
+                   (id, target, plan_id, plan_epoch, provider_id, provider_name, model, protocol,
+                    started_at_unix_ms, finished_at_unix_ms, latency_ms, outcome, http_status,
+                    usage_observed, input_tokens, cached_input_tokens,
+                    cache_creation_input_tokens, output_tokens, error_payload,
+                    error_payload_truncated)
+                 VALUES (?1, 'codex', ?2, ?3, NULL, NULL, 'gpt-5.6', 'openai-responses',
+                         1, 2, 1, 'transport-error', NULL, 0, 0, 0, 0, 0, ?4, 0)",
+                tokio_rusqlite::rusqlite::params![
+                    fixed_uuid(137).to_string(),
+                    fixed_uuid(138).to_string(),
+                    fixed_uuid(139).to_string(),
+                    b"failed transport detail".to_vec(),
+                ],
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await;
+    assert!(
+        wrong_outcome.is_err(),
+        "accepted a failed upstream payload for a non-upstream outcome"
+    );
+
+    database
+        .call(|connection| {
+            connection.execute(
+                "INSERT INTO request_records
+                   (id, target, plan_id, plan_epoch, provider_id, provider_name, model, protocol,
+                    started_at_unix_ms, finished_at_unix_ms, latency_ms, outcome, http_status,
+                    usage_observed, input_tokens, cached_input_tokens,
+                    cache_creation_input_tokens, output_tokens, error_payload,
+                    error_payload_truncated)
+                 VALUES (?1, 'codex', ?2, ?3, NULL, NULL, 'gpt-5.6', 'openai-responses',
+                         1, 2, 1, 'success', 200, 1, 12, 2, 0, 4, NULL, 0)",
+                tokio_rusqlite::rusqlite::params![
+                    fixed_uuid(134).to_string(),
+                    fixed_uuid(135).to_string(),
+                    fixed_uuid(136).to_string(),
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO pricing_snapshots
+                   (request_record_id, catalog_version, source, source_model,
+                    input_nano_usd_per_million, output_nano_usd_per_million,
+                    cache_read_multiplier_ppm, cache_creation_multiplier_ppm,
+                    priced_at_unix_ms, estimated_cost_nano_usd)
+                 VALUES (?1, 'muxvia-0.1.0', 'models.dev', 'gpt-5.6',
+                         2000000000, 10000000000, 100000, 1250000, 2, 42000)",
+                [fixed_uuid(134).to_string()],
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+    let update = database
+        .call(|connection| {
+            connection.execute(
+                "UPDATE pricing_snapshots SET estimated_cost_nano_usd = 1",
+                [],
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await;
+    assert!(update.is_err(), "mutated an immutable Pricing Snapshot");
+}
+
+#[tokio::test]
+async fn schema_v13_migration_preserves_v12_target_state() {
+    let root = std::env::temp_dir().join(format!("muxvia-schema-v12-{}", Uuid::new_v4()));
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    fs::create_dir_all(home.database_path().parent().unwrap()).unwrap();
+    let database = Connection::open(home.database_path()).unwrap();
+    database.execute_batch(V12_SCHEMA).unwrap();
+    database
+        .execute_batch(
+            "INSERT INTO credentials (id, target, bearer_token)
+               VALUES ('00000000-0000-4000-8000-000000000131', 'codex',
+                       'REQUEST_HISTORY_MIGRATION_SECRET_13103');
+             INSERT INTO providers
+               (id, target, position, provider_revision, name, base_url, model, protocol,
+                authentication, credential_id, routing_requirement)
+               VALUES ('00000000-0000-4000-8000-000000000132', 'codex', 0, 3,
+                       'Historical', 'https://history.example/v1', 'history-model',
+                       'openai-responses', 'openai-bearer',
+                       '00000000-0000-4000-8000-000000000131', 'direct-compatible');
+             INSERT INTO universal_credentials (id, bearer_token)
+               VALUES ('00000000-0000-4000-8000-000000000133',
+                       'REQUEST_HISTORY_UNIVERSAL_SECRET_13104');
+             INSERT INTO universal_providers
+               (id, position, provider_revision, name, base_url, credential_id)
+               VALUES ('00000000-0000-4000-8000-000000000134', 0, 2, 'Universal',
+                       'https://universal.example/v1',
+                       '00000000-0000-4000-8000-000000000133');
+             INSERT INTO activation_recovery
+               (id, target, action_id, config_path, file_identity_json, payload_json,
+                state, created_revision)
+               VALUES ('00000000-0000-4000-8000-000000000135', 'codex',
+                       '00000000-0000-4000-8000-000000000136', '/tmp/history.json', '{}',
+                       '{\"credential\":\"REQUEST_HISTORY_RECOVERY_SECRET_13105\"}',
+                       'rolled-back', 0);
+             INSERT INTO action_receipts
+               (target, action_id, action_kind, committed_revision, outcome_json)
+               VALUES ('codex', '00000000-0000-4000-8000-000000000137',
+                       'save-provider', 0, '{\"status\":\"replayed\"}');
+             INSERT INTO subscription_account_recovery_intents
+               (id, action_id, operation, state, before_sha256, desired_sha256,
+                created_revision)
+               VALUES ('00000000-0000-4000-8000-000000000138',
+                       '00000000-0000-4000-8000-000000000139', 'set-default',
+                       'committed', 'before', 'desired', 0);
+             INSERT INTO subscription_account_action_receipts
+               (action_id, action_kind, action_json, committed_revision, outcome_json)
+               VALUES ('00000000-0000-4000-8000-000000000139', 'set-default', '{}', 0,
+                       '{\"status\":\"replayed\"}');",
+        )
+        .unwrap();
+    let before = v12_state_fingerprint(&database);
+    drop(database);
+
+    drop(StateStore::open(&home).await.unwrap());
+    let database = Connection::open(home.database_path()).unwrap();
+    let version: String = database
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'schema-version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let after = v12_state_fingerprint(&database);
+    let tables: u64 = database
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN ('request_records', 'pricing_snapshots')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "13");
+    assert_eq!(
+        after, before,
+        "schema-v13 migration changed existing v12 state"
+    );
+    assert_eq!(tables, 2);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn schema_v13_failed_migration_rolls_back_then_reruns() {
+    let root = std::env::temp_dir().join(format!("muxvia-schema-v13-failure-{}", Uuid::new_v4()));
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    fs::create_dir_all(home.database_path().parent().unwrap()).unwrap();
+    let database = Connection::open(home.database_path()).unwrap();
+    database.execute_batch(V12_SCHEMA).unwrap();
+    database
+        .execute_batch("CREATE TABLE request_records (collision TEXT NOT NULL);")
+        .unwrap();
+    drop(database);
+
+    assert!(StateStore::open(&home).await.is_err());
+    let database = Connection::open(home.database_path()).unwrap();
+    let failed: (String, u64, u64) = database
+        .query_row(
+            "SELECT
+               (SELECT value FROM metadata WHERE key = 'schema-version'),
+               (SELECT COUNT(*) FROM sqlite_schema
+                  WHERE type = 'table' AND name = 'pricing_snapshots'),
+               (SELECT COUNT(*) FROM sqlite_schema
+                  WHERE type = 'trigger' AND name = 'pricing_snapshots_immutable')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(failed, ("12".into(), 0, 0));
+    database.execute("DROP TABLE request_records", []).unwrap();
+    drop(database);
+
+    drop(StateStore::open(&home).await.unwrap());
+    let database = Connection::open(home.database_path()).unwrap();
+    let rerun: (String, u64, u64) = database
+        .query_row(
+            "SELECT
+               (SELECT value FROM metadata WHERE key = 'schema-version'),
+               (SELECT COUNT(*) FROM sqlite_schema
+                  WHERE type = 'table' AND name = 'pricing_snapshots'),
+               (SELECT COUNT(*) FROM sqlite_schema
+                  WHERE type = 'trigger' AND name = 'pricing_snapshots_immutable')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(rerun, ("13".into(), 1, 1));
     let _ = fs::remove_dir_all(root);
 }
 

@@ -1,0 +1,46 @@
+{
+  "type": "response",
+  "requestId": "request-history-detail",
+  "result": {
+    "kind": "request-record-detail",
+    "detail": {
+      "target": "codex",
+      "record": {
+        "id": "00000000-0000-4000-8000-000000000131",
+        "planId": "00000000-0000-4000-8000-000000000132",
+        "planEpoch": "00000000-0000-4000-8000-000000000133",
+        "providerId": "00000000-0000-4000-8000-000000000134",
+        "providerName": "Primary",
+        "model": "gpt-5.6",
+        "protocol": "openai-responses",
+        "startedAtUnixMs": 1787241600000,
+        "finishedAtUnixMs": 1787241600123,
+        "latencyMs": 123,
+        "outcome": "upstream-error",
+        "httpStatus": 503,
+        "usage": {
+          "inputTokens": 12,
+          "cachedInputTokens": 2,
+          "cacheCreationInputTokens": 0,
+          "outputTokens": 4
+        },
+        "estimatedCostNanoUsd": 42000,
+        "hasErrorPayload": true,
+        "errorPayloadTruncated": false
+      },
+      "pricingSnapshot": {
+        "catalogVersion": "muxvia-0.1.0",
+        "source": "models.dev",
+        "sourceModel": "gpt-5.6",
+        "inputNanoUsdPerMillion": 2000000000,
+        "outputNanoUsdPerMillion": 10000000000,
+        "cacheReadMultiplierPpm": 100000,
+        "cacheCreationMultiplierPpm": 1250000,
+        "pricedAtUnixMs": 1787241600123,
+        "estimatedCostNanoUsd": 42000
+      },
+      "errorPayload": "upstream overloaded",
+      "errorPayloadSensitive": true
+    }
+  }
+}

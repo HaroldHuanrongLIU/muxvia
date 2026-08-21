@@ -1,0 +1,10 @@
+{
+  "type": "request",
+  "requestId": "request-history-list",
+  "operation": {
+    "kind": "list-request-records",
+    "target": "codex",
+    "beforeCursor": "rr-v1-43",
+    "limit": 20
+  }
+}

@@ -35,9 +35,13 @@ test.each([
   ["check-reachability.json", parseClientFrame],
   ["cancel-inspection.json", parseClientFrame],
   ["probe-compatibility.json", parseClientFrame],
+  ["list-request-records.json", parseClientFrame],
+  ["inspect-request-record.json", parseClientFrame],
   ["open-universal-providers.json", parseClientFrame],
   ["prepare-handover.json", parseClientFrame],
   ["compatibility-probe.json", parseServerFrame],
+  ["request-record-page.json", parseServerFrame],
+  ["request-record-detail.json", parseServerFrame],
   ["handover-prepared.json", parseServerFrame],
   ["universal-provider-catalog.json", parseServerFrame],
   ["universal-provider-act.json", parseClientFrame],
@@ -65,6 +69,49 @@ test.each([
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)
+})
+
+test("Request Record protocol and JSON schema are closed and bounded", async () => {
+  const list = await readFixture("list-request-records.json") as any
+  const detail = await readFixture("request-record-detail.json") as any
+  for (const [value, parse, surface] of [
+    [list, parseClientFrame, "operation"],
+    [detail, parseServerFrame, "result"],
+  ] as const) {
+    const invalid = structuredClone(value)
+    invalid[surface].credential = "REQUEST_HISTORY_PROTOCOL_SECRET_13101"
+    expect(() => parse(invalid)).toThrow()
+  }
+
+  const zeroLimit = structuredClone(list)
+  zeroLimit.operation.limit = 0
+  expect(() => parseClientFrame(zeroLimit)).toThrow()
+
+  const schema = JSON.parse(await readFile(
+    fileURLToPath(new URL("../../../protocol/control-v1.schema.json", import.meta.url)),
+    "utf8",
+  ))
+  const branch = (definition: string, discriminator: string) => schema.$defs[definition].oneOf.find(
+    (candidate: any) => candidate.properties.kind.const === discriminator,
+  )
+  for (const [definition, discriminator] of [
+    ["controlOperation", "list-request-records"],
+    ["controlOperation", "inspect-request-record"],
+    ["controlResult", "request-record-page"],
+    ["controlResult", "request-record-detail"],
+  ] as const) {
+    expect(branch(definition, discriminator)?.additionalProperties).toBeFalse()
+  }
+  expect(schema.$defs.requestRecordOutcome.enum).toEqual([
+    "success", "upstream-error", "semantic-error", "transport-error",
+    "route-unavailable", "cancelled", "stream-error",
+  ])
+  for (const definition of [
+    "requestUsage", "requestRecordSummary", "pricingSnapshot",
+    "requestRecordPage", "requestRecordDetail",
+  ]) {
+    expect(schema.$defs[definition].additionalProperties).toBeFalse()
+  }
 })
 
 test("Subscription Bridge Target Provider contract is closed and credentialless", async () => {

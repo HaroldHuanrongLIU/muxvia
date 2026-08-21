@@ -64,6 +64,8 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "check-reachability.json",
         "cancel-inspection.json",
         "probe-compatibility.json",
+        "list-request-records.json",
+        "inspect-request-record.json",
         "open-universal-providers.json",
         "prepare-handover.json",
     ] {
@@ -79,6 +81,12 @@ fn fixtures_round_trip_as_their_protocol_types() {
     let handover_prepared = fixture("handover-prepared.json");
     let parsed: ServerFrame = serde_json::from_value(handover_prepared.clone()).unwrap();
     assert_eq!(serde_json::to_value(parsed).unwrap(), handover_prepared);
+
+    for name in ["request-record-page.json", "request-record-detail.json"] {
+        let frame = fixture(name);
+        let parsed: ServerFrame = serde_json::from_value(frame.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), frame);
+    }
 
     let universal_catalog = fixture("universal-provider-catalog.json");
     let parsed: ServerFrame = serde_json::from_value(universal_catalog.clone()).unwrap();
@@ -148,6 +156,90 @@ fn fixtures_round_trip_as_their_protocol_types() {
         let frame = fixture(name);
         let parsed: ServerFrame = serde_json::from_value(frame.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), frame);
+    }
+}
+
+#[test]
+fn request_history_contract_is_closed_target_bound_and_payload_bounded() {
+    let list = fixture("list-request-records.json");
+    let mut detail = fixture("request-record-detail.json");
+    detail["result"]["detail"]["errorPayload"] =
+        serde_json::json!("REQUEST_HISTORY_DEBUG_SECRET_13102");
+    assert!(serde_json::from_value::<ClientFrame>(list.clone()).is_ok());
+    assert!(serde_json::from_value::<ServerFrame>(detail.clone()).is_ok());
+    let parsed: ServerFrame = serde_json::from_value(detail.clone()).unwrap();
+    assert!(
+        !format!("{parsed:?}").contains("REQUEST_HISTORY_DEBUG_SECRET_13102"),
+        "request-history Debug rendered a failed upstream payload"
+    );
+
+    for (mut value, branch) in [(list.clone(), "operation"), (detail.clone(), "result")] {
+        value[branch]["credential"] = serde_json::json!("REQUEST_HISTORY_PROTOCOL_SECRET_13101");
+        let rejected = if branch == "operation" {
+            serde_json::from_value::<ClientFrame>(value).is_err()
+        } else {
+            serde_json::from_value::<ServerFrame>(value).is_err()
+        };
+        assert!(rejected, "accepted additive request-history credential");
+    }
+
+    let mut zero_limit = list;
+    zero_limit["operation"]["limit"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<ClientFrame>(zero_limit).is_err());
+
+    let mut wrong_target = detail;
+    wrong_target["result"]["detail"]["target"] = serde_json::json!("claude");
+    let parsed: ServerFrame = serde_json::from_value(wrong_target).unwrap();
+    assert!(matches!(
+        parsed,
+        ServerFrame::Response {
+            result: ControlResult::RequestRecordDetail(result),
+            ..
+        } if result.detail.target == Target::Claude
+    ));
+
+    let schema = fixture("../control-v1.schema.json");
+    let branch = |definition: &str, discriminator: &str| {
+        schema["$defs"][definition]["oneOf"]
+            .as_array()
+            .and_then(|branches| {
+                branches
+                    .iter()
+                    .find(|branch| branch["properties"]["kind"]["const"] == discriminator)
+            })
+            .expect("missing request-history schema branch")
+    };
+    for (definition, discriminator) in [
+        ("controlOperation", "list-request-records"),
+        ("controlOperation", "inspect-request-record"),
+        ("controlResult", "request-record-page"),
+        ("controlResult", "request-record-detail"),
+    ] {
+        assert_eq!(
+            branch(definition, discriminator)["additionalProperties"],
+            false
+        );
+    }
+    assert_eq!(
+        schema["$defs"]["requestRecordOutcome"]["enum"],
+        serde_json::json!([
+            "success",
+            "upstream-error",
+            "semantic-error",
+            "transport-error",
+            "route-unavailable",
+            "cancelled",
+            "stream-error"
+        ])
+    );
+    for definition in [
+        "requestUsage",
+        "requestRecordSummary",
+        "pricingSnapshot",
+        "requestRecordPage",
+        "requestRecordDetail",
+    ] {
+        assert_eq!(schema["$defs"][definition]["additionalProperties"], false);
     }
 }
 

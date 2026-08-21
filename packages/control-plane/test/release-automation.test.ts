@@ -123,7 +123,8 @@ test("the published GitHub Release updates the official Homebrew tap with its ex
   const publishJob = workflow.slice(workflow.indexOf("  publish:"), workflow.indexOf("  publish-homebrew-tap:"))
   const tapJob = workflow.slice(workflow.indexOf("  publish-homebrew-tap:"))
 
-  expect(publishJob).toContain('gh release create "$GITHUB_REF_NAME" release/*')
+  expect(publishJob).toContain('gh release create "$GITHUB_REF_NAME"')
+  expect(publishJob).toContain("release/muxvia.rb")
   expect(tapJob).toContain("needs: publish")
   expect(tapJob).toContain("repository: HaroldHuanrongLIU/homebrew-muxvia")
   expect(tapJob).toContain("token: ${{ secrets.HOMEBREW_TAP_TOKEN }}")

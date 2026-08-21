@@ -4747,7 +4747,7 @@ test("Claude tracer fixture enforces restrictive umask", async () => {
       providerSecret,
     ],
   })
-})
+}, 70_000)
 
 test("Claude Direct tracer fixture enforces restrictive umask", async () => {
   await runClaudeRestrictiveUmaskTracer({

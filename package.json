@@ -9,6 +9,7 @@
     "test:ts": "bun test packages/control-plane/test",
     "typecheck": "bun run --cwd packages/control-plane typecheck",
     "test:rust": "cargo test --workspace",
+    "release:bundle": "bun scripts/release-bundle.ts",
     "verify": "./scripts/verify-t01.sh"
   },
   "devDependencies": {

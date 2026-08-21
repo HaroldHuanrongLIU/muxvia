@@ -1,6 +1,7 @@
 use std::{env, fs, path::PathBuf};
 
 use clap::Parser;
+use muxvia_routing::release_bundle::validate_embedded_release_bundle;
 use muxvia_routing::service::process::{ProcessOptions, run};
 use serde_json::json;
 
@@ -33,6 +34,10 @@ struct Args {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if validate_embedded_release_bundle().is_err() {
+        eprintln!("release-bundle-invalid: release bundle verification failed");
+        std::process::exit(78);
+    }
     let args = Args::parse();
     if args.lifecycle_metadata {
         println!(

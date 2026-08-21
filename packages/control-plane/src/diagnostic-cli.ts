@@ -6,9 +6,11 @@ import { claudePreflightContext } from "./control/claude-context"
 import { ControlError, RpcClient } from "./control/rpc-client"
 import type { TargetSession } from "./control/target-session"
 import type { TargetView } from "./control/types"
+import { embeddedBundleIdentity } from "./release-bundle"
 
-export const controlPlaneRelease = "muxvia-dev"
-export const routingServiceRelease = "0.1.0"
+const bundleIdentity = embeddedBundleIdentity()
+export const controlPlaneRelease = bundleIdentity?.release ?? "muxvia-dev"
+export const routingServiceRelease = bundleIdentity?.routingRelease ?? "0.1.0"
 
 type Invocation = {
   command?: string
@@ -79,10 +81,13 @@ function valueAfter(args: string[], flag: string): string | undefined {
   return value
 }
 
-export function parseInvocation(args: string[], environment = process.env): Invocation {
-  const controlPlanePath = resolve(Bun.argv[1] ?? "muxvia")
+export function parseInvocation(
+  args: string[],
+  environment = process.env,
+  controlPlanePath = resolve(Bun.argv[1] ?? "muxvia"),
+): Invocation {
   const userHome = environment.HOME
-  const defaultServicePath = join(dirname(controlPlanePath), "muxvia-routing")
+  const defaultServicePath = join(dirname(resolve(controlPlanePath)), "muxvia-routing")
   const defaultSocketPath = userHome
     ? join(userHome, ".muxvia/run/control.sock")
     : join(process.cwd(), ".muxvia/run/control.sock")

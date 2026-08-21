@@ -26,6 +26,7 @@ export interface RunOptions {
   socketPath: string
   release: string
   serviceRelease: string
+  updateRelease?: string
 }
 
 export interface Clock {
@@ -585,6 +586,7 @@ export async function run(options: RunOptions, ports: RunPorts = productionPorts
       subscriptionAccountSession={subscriptionAccountSession}
       subscriptionEffects={ports.subscriptionEffects}
       startupProblem={startupProblem}
+      updateRelease={options.updateRelease}
       locale={locale}
     />, renderer)
     const opened = sessions()

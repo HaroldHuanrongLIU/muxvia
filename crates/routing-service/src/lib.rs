@@ -7,6 +7,7 @@ pub mod home;
 pub mod model;
 mod native_usage;
 mod probe_process;
+pub mod release_bundle;
 mod request_history;
 pub mod service;
 pub mod state;

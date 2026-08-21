@@ -163,6 +163,7 @@ export const zhCN = {
   "home.target.codex.detail": "Provider、配置和路由模型访问",
   "home.target.claude": "Claude Code",
   "home.target.claude.detail": "Provider、配置和路由模型访问",
+  "home.update-available": "Muxvia {release} 已发布。请通过原安装渠道更新；Muxvia 不会自动安装。",
   "target.codex": "Codex CLI",
   "target.claude": "Claude Code",
   "target.claude.unavailable": "此构建中不提供 Claude Code 管理功能。",

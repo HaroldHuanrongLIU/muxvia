@@ -14,7 +14,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        include:
+          - os: macos-latest
+            target: darwin-arm64
+            rust-target: aarch64-apple-darwin
+            bun-target: bun-darwin-arm64
+          - os: ubuntu-latest
+            target: linux-glibc-x64
+            rust-target: x86_64-unknown-linux-gnu
+            bun-target: bun-linux-x64-baseline
     steps:
       # actions/checkout v4.4.0
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -38,3 +46,38 @@ jobs:
             ${{ runner.os }}-deps-
       - run: bun install --frozen-lockfile
       - run: bun run verify
+      - name: Build native release executables
+        env:
+          MUXVIA_BUNDLE_TARGET: ${{ matrix.target }}
+          MUXVIA_BUNDLE_BUILD: ${{ github.sha }}
+        run: |
+          cargo build --release --locked --target "${{ matrix.rust-target }}" -p muxvia-routing
+          mkdir -p build
+          bun build packages/control-plane/src/release-index.ts --compile \
+            --no-compile-autoload-bunfig \
+            --no-compile-autoload-dotenv \
+            --target="${{ matrix.bun-target }}" \
+            --outfile=build/muxvia \
+            --config=packages/control-plane/bunfig.release.toml \
+            --define MUXVIA_BUNDLE_RELEASE='"0.1.0"' \
+            --define MUXVIA_ROUTING_RELEASE='"0.1.0"' \
+            --define MUXVIA_BUNDLE_TARGET='"${{ matrix.target }}"' \
+            --define MUXVIA_BUNDLE_BUILD='"${{ github.sha }}"'
+      - name: Inspect, scan, and smoke the native bundle
+        run: |
+          bun run release:bundle assemble \
+            --release 0.1.0 \
+            --target "${{ matrix.target }}" \
+            --build "${{ github.sha }}" \
+            --control-plane build/muxvia \
+            --routing-service "target/${{ matrix.rust-target }}/release/muxvia-routing" \
+            --output "build/muxvia-0.1.0-${{ matrix.target }}"
+          bun run release:bundle inspect \
+            --root "build/muxvia-0.1.0-${{ matrix.target }}" \
+            --release 0.1.0 \
+            --target "${{ matrix.target }}" \
+            --build "${{ github.sha }}"
+          bun run release:bundle scan --root "build/muxvia-0.1.0-${{ matrix.target }}"
+          bun run release:bundle smoke \
+            --root "build/muxvia-0.1.0-${{ matrix.target }}" \
+            --release 0.1.0

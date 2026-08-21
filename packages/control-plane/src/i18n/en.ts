@@ -161,6 +161,7 @@ export const en = {
   "home.target.codex.detail": "Providers, configuration, and routed model access",
   "home.target.claude": "Claude Code",
   "home.target.claude.detail": "Providers, configuration, and routed model access",
+  "home.update-available": "Muxvia {release} is available. Update through the installation channel; Muxvia will not install it automatically.",
   "target.codex": "Codex CLI",
   "target.claude": "Claude Code",
   "target.claude.unavailable": "Claude Code management is not available in this build.",

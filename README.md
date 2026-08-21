@@ -4,11 +4,9 @@ Muxvia is a terminal-native control plane for managing model access for AI codin
 
 ## Status
 
-Muxvia is pre-release software. The T01 walking skeleton is implemented for development and test use; it is not a production release.
+Muxvia is pre-release software. The repository implements the accepted macOS and glibc Linux product slices, including Codex and Claude provider management, direct and takeover activation, failover, subscription accounts, import/export, private recovery backups, service handover, and auditable release bundles.
 
-T01 proves one Codex Target Takeover path on macOS and Linux: a Provider can be created in the terminal UI, applied to the default Codex configuration, and used through an authenticated local Responses route. The Routing Service runs separately from the Control Plane and keeps an active takeover available after the TUI exits.
-
-## Build and test T01
+## Build and test
 
 Requirements: Rust stable and Bun 1.3.14.
 
@@ -33,9 +31,9 @@ printf 'Temporary demo home: %s\n' "$MUXVIA_DEMO_ROOT"
 
 This command confines Managed Configuration to the printed temporary home. Remove only that printed directory after exiting and confirming it is under the system temporary directory.
 
-## T01 scope
+## Releases
 
-T01 deliberately excludes the complete OpenCode-style shell, Claude Code, Direct Activation, Provider update/delete/reorder, Universal Providers, drift reconciliation UI, failover and circuit breaking, Subscription Accounts and the Subscription Bridge, usage and pricing, import/export, backups, release bundles, service handover, and production-grade detached lifecycle management.
+GitHub Release tags build one complete, integrity-bound archive for macOS arm64, macOS x86-64, Linux glibc arm64, and Linux glibc x86-64. See [release installation, unsigned macOS behavior, and notify-only updates](./docs/releases.md).
 
 ## Design sources
 
@@ -43,6 +41,8 @@ T01 deliberately excludes the complete OpenCode-style shell, Claude Code, Direct
 - [Architecture decision records](./docs/adr/)
 - [Codex Subscription Bridge compatibility and risk notice](./docs/subscription-bridge.md)
 - [Accepted OpenCode-style Control Plane](./docs/adr/0011-build-a-focused-opentui-control-plane.md)
+- [Third-party notices](./THIRD_PARTY_NOTICES.md)
+- [Source extraction manifest](./EXTRACTION_MANIFEST.json)
 
 ## License
 

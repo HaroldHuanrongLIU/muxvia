@@ -49,6 +49,7 @@ export interface AppProps {
   subscriptionAccountSession?: SubscriptionAccountSession | Accessor<SubscriptionAccountSession | undefined>
   subscriptionEffects?: SubscriptionPlatformEffects
   startupProblem?: "handover-failed"
+  updateRelease?: string
   locale?: Locale
 }
 
@@ -293,6 +294,7 @@ function Shell(props: {
   subscriptionAccountSession: Accessor<SubscriptionAccountSession | undefined>
   subscriptionEffects: SubscriptionPlatformEffects
   startupProblem?: "handover-failed"
+  updateRelease?: string
   t: Translator
 }) {
   const renderer = useRenderer()
@@ -325,7 +327,9 @@ function Shell(props: {
   const [notices, setNotices] = createSignal<Partial<Record<Target | "home", Notice>>>(
     props.startupProblem
       ? { home: { kind: "error", text: props.t(messageKeyForProblem(props.startupProblem)) } }
-      : {},
+      : props.updateRelease
+        ? { home: { kind: "success", text: props.t("home.update-available", { release: props.updateRelease }) } }
+        : {},
   )
   const [activitiesByTarget, setActivitiesByTarget] = createSignal<Record<Target, ActivityEntry[]>>({ codex: [], claude: [] })
   const [sidebarOpenByTarget, setSidebarOpenByTarget] = createSignal<Record<Target, boolean>>({ codex: true, claude: true })
@@ -2240,6 +2244,7 @@ export function App(props: AppProps) {
           subscriptionAccountSession={subscriptionAccountSession}
           subscriptionEffects={subscriptionEffects}
           startupProblem={props.startupProblem}
+          updateRelease={props.updateRelease}
           t={t}
         />
       </OverlayProvider>

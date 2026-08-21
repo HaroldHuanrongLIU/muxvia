@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "product": "muxvia",
+  "materials": [
+    {
+      "upstream": "farion1231/cc-switch",
+      "commit": "43eaf07355af145aebfee301801779e824d4c221",
+      "license": "MIT",
+      "kind": "substantially-adapted-behavior",
+      "localPath": "crates/routing-service/src/service/cc_switch_migration.rs",
+      "sourcePaths": [
+        "src-tauri/src/database/schema.rs",
+        "src-tauri/src/database/backup.rs",
+        "src-tauri/src/database/dao/usage_rollup.rs",
+        "src-tauri/src/commands/usage.rs"
+      ]
+    },
+    {
+      "upstream": "farion1231/cc-switch",
+      "commit": "43eaf07355af145aebfee301801779e824d4c221",
+      "license": "MIT",
+      "kind": "substantially-adapted-behavior",
+      "localPath": "crates/routing-service/src/service/provider_inspector.rs",
+      "sourcePaths": [
+        "src-tauri/src/services/model_fetch.rs",
+        "src-tauri/src/services/stream_check.rs"
+      ]
+    },
+    {
+      "upstream": "farion1231/cc-switch",
+      "commit": "43eaf07355af145aebfee301801779e824d4c221",
+      "license": "MIT",
+      "kind": "substantially-adapted-behavior",
+      "localPath": "crates/routing-service/src/subscription/device_authorization.rs",
+      "sourcePaths": [
+        "src-tauri/src/proxy/providers/codex_oauth_auth.rs"
+      ]
+    },
+    {
+      "upstream": "farion1231/cc-switch",
+      "commit": "43eaf07355af145aebfee301801779e824d4c221",
+      "license": "MIT",
+      "kind": "substantially-adapted-behavior",
+      "localPath": "crates/routing-service/src/subscription_bridge/mod.rs",
+      "sourcePaths": [
+        "src-tauri/src/proxy/providers/transform_responses.rs",
+        "src-tauri/src/proxy/providers/claude.rs",
+        "src-tauri/src/proxy/forwarder.rs",
+        "src-tauri/src/proxy/session.rs"
+      ]
+    }
+  ],
+  "referenceOnly": [
+    {
+      "upstream": "anomalyco/opencode",
+      "commit": "0abbcddac233e313bcb67608a527929910df861c",
+      "license": "MIT",
+      "statement": "Interaction and visual grammar were independently implemented; no substantive upstream source block was copied."
+    }
+  ]
+}

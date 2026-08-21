@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: bundle (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-15
+            rust-target: aarch64-apple-darwin
+            bun-target: bun-darwin-arm64
+          - target: darwin-x64
+            runner: macos-15-intel
+            rust-target: x86_64-apple-darwin
+            bun-target: bun-darwin-x64
+          - target: linux-glibc-arm64
+            runner: ubuntu-24.04-arm
+            rust-target: aarch64-unknown-linux-gnu
+            bun-target: bun-linux-arm64
+          - target: linux-glibc-x64
+            runner: ubuntu-24.04
+            rust-target: x86_64-unknown-linux-gnu
+            bun-target: bun-linux-x64-baseline
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # dtolnay/rust-toolchain stable action snapshot (2026-08-05)
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust-target }}
+      # oven-sh/setup-bun v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - name: Match tag to the locked product release
+        id: release
+        shell: bash
+        run: |
+          release="${GITHUB_REF_NAME#v}"
+          test "$release" = "$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/routing-service/Cargo.toml | head -1)"
+          printf 'release=%s\n' "$release" >> "$GITHUB_OUTPUT"
+      - name: Build release executables
+        env:
+          MUXVIA_BUNDLE_TARGET: ${{ matrix.target }}
+          MUXVIA_BUNDLE_BUILD: ${{ github.sha }}
+        run: |
+          cargo build --release --locked --target "${{ matrix.rust-target }}" -p muxvia-routing
+          mkdir -p build
+          bun build packages/control-plane/src/release-index.ts --compile \
+            --no-compile-autoload-bunfig \
+            --no-compile-autoload-dotenv \
+            --target="${{ matrix.bun-target }}" \
+            --outfile=build/muxvia \
+            --config=packages/control-plane/bunfig.release.toml \
+            --define MUXVIA_BUNDLE_RELEASE='"${{ steps.release.outputs.release }}"' \
+            --define MUXVIA_ROUTING_RELEASE='"${{ steps.release.outputs.release }}"' \
+            --define MUXVIA_BUNDLE_TARGET='"${{ matrix.target }}"' \
+            --define MUXVIA_BUNDLE_BUILD='"${{ github.sha }}"'
+      - name: Assemble and verify release archive
+        run: |
+          bundle="build/muxvia-${{ steps.release.outputs.release }}-${{ matrix.target }}"
+          archive="build/muxvia-${{ steps.release.outputs.release }}-${{ matrix.target }}.tar.gz"
+          bun run release:bundle assemble \
+            --release "${{ steps.release.outputs.release }}" \
+            --target "${{ matrix.target }}" \
+            --build "${{ github.sha }}" \
+            --control-plane build/muxvia \
+            --routing-service "target/${{ matrix.rust-target }}/release/muxvia-routing" \
+            --output "$bundle"
+          bun run release:bundle inspect \
+            --root "$bundle" \
+            --release "${{ steps.release.outputs.release }}" \
+            --target "${{ matrix.target }}" \
+            --build "${{ github.sha }}"
+          bun run release:bundle scan --root "$bundle"
+          bun run release:bundle archive --root "$bundle" --output "$archive"
+          mkdir -p build/extracted
+          tar -xzf "$archive" -C build/extracted
+          bun run release:bundle smoke \
+            --root "build/extracted/$(basename "$bundle")" \
+            --release "${{ steps.release.outputs.release }}"
+      # actions/upload-artifact v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: muxvia-${{ steps.release.outputs.release }}-${{ matrix.target }}
+          path: build/muxvia-${{ steps.release.outputs.release }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish GitHub Release
+    needs: bundle
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # oven-sh/setup-bun v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      # actions/download-artifact v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          pattern: muxvia-*
+          path: release
+          merge-multiple: true
+      - name: Build public release manifest
+        id: release
+        shell: bash
+        run: |
+          release="${GITHUB_REF_NAME#v}"
+          bun run release:bundle public-manifest \
+            --release "$release" \
+            --archives release \
+            --output release/muxvia-latest.json
+          printf 'release=%s\n' "$release" >> "$GITHUB_OUTPUT"
+      - name: Publish all verified artifacts together
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --verify-tag \
+            --generate-notes \
+            --title "Muxvia ${{ steps.release.outputs.release }}"

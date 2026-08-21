@@ -15,9 +15,11 @@ import { checkForUpdate } from "./update-notification"
 
 const bundleIdentity = embeddedBundleIdentity()
 let bundledServicePath: string | undefined
+let bundledControlPlanePath: string | undefined
 if (bundleIdentity) {
   try {
     const bundle = await validateReleaseBundle(process.execPath, bundleIdentity)
+    bundledControlPlanePath = resolve(bundle.root, "muxvia")
     bundledServicePath = bundle.routingServicePath
   } catch (error) {
     const code = error instanceof ReleaseBundleError ? error.code : "release-bundle-invalid"
@@ -29,7 +31,7 @@ if (bundleIdentity) {
 const invocation = parseInvocation(
   Bun.argv.slice(2),
   process.env,
-  bundleIdentity ? process.execPath : undefined,
+  bundledControlPlanePath,
 )
 if (bundledServicePath && resolve(invocation.servicePath) !== bundledServicePath) {
   process.stderr.write("release-bundle-invalid: routing service must come from the verified bundle\n")

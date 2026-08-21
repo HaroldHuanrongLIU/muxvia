@@ -20,6 +20,7 @@ type Invocation = {
   force: boolean
   forceAcknowledged: boolean
   backupRestoreAcknowledged: boolean
+  controlPlanePath: string
   servicePath: string
   socketPath: string
   problem?: {
@@ -161,6 +162,7 @@ export function parseInvocation(
     force,
     forceAcknowledged,
     backupRestoreAcknowledged,
+    controlPlanePath: resolve(controlPlanePath),
     servicePath,
     socketPath,
     ...(invalid
@@ -186,7 +188,6 @@ function targetPaths(
 export function effectivePaths(
   invocation: Invocation,
   environment = process.env,
-  controlPlanePath = resolve(Bun.argv[1] ?? "muxvia"),
 ): PathReport {
   const userHome = environment.HOME
   if (!userHome || !isAbsolute(userHome)) throw new Error("HOME must be an absolute path")
@@ -210,7 +211,7 @@ export function effectivePaths(
       claude: targetPaths(join(userHome, ".claude"), "settings.json", environment.CLAUDE_CONFIG_DIR),
     },
     bundle: {
-      controlPlane: controlPlanePath,
+      controlPlane: invocation.controlPlanePath,
       routingService: invocation.servicePath,
     },
   }

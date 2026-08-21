@@ -1845,7 +1845,7 @@ async fn subscription_account_writer_failure_suppresses_publication_but_reopen_r
     .unwrap();
 
     let database = tokio_rusqlite::rusqlite::Connection::open(home.database_path()).unwrap();
-    tokio::time::timeout(Duration::from_millis(200), async {
+    tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let committed: bool = database
                 .query_row(

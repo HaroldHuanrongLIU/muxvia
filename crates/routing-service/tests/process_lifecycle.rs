@@ -1497,7 +1497,10 @@ async fn disconnected_pending_action_commits_before_inactive_exit() {
     let action_started = root.path().join("action-started");
     let action_release = root.path().join("action-release");
     fs::create_dir_all(&user_home).unwrap();
+    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.106.0");
     let child = command(&home, &shutdown_file)
+        .arg("--test-codex-executable")
+        .arg(&codex)
         .env("MUXVIA_TEST_ACTION_STARTED_FILE", &action_started)
         .env("MUXVIA_TEST_ACTION_RELEASE_FILE", &action_release)
         .spawn()

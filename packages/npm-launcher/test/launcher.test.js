@@ -142,7 +142,7 @@ describe("closed platform and Release Bundle identity", () => {
 })
 
 test("missing and invalid optional packages use one repair message and never start Muxvia", async () => {
-  const expected = "muxvia: the required exact-version optional package is missing or invalid. Repair with: npm install --include=optional muxvia@0.1.0 (requires @muxvia/linux-glibc-x64@0.1.0).\n"
+  const expected = "muxvia: the required exact-version optional package is missing or invalid. Repair with: npm install --global --include=optional muxvia@0.1.0 (requires @muxvia/linux-glibc-x64@0.1.0).\n"
   for (const resolvePackageJson of [
     () => { throw new Error("missing") },
     async () => join((await fixture()).bundleRoot, "missing-package.json"),
@@ -201,7 +201,7 @@ test("a platform executable start failure uses the same deterministic repair mes
 
   expect(exitCode).toBe(78)
   expect(stderr).toBe(
-    "muxvia: the required exact-version optional package is missing or invalid. Repair with: npm install --include=optional muxvia@0.1.0 (requires @muxvia/linux-glibc-x64@0.1.0).\n",
+    "muxvia: the required exact-version optional package is missing or invalid. Repair with: npm install --global --include=optional muxvia@0.1.0 (requires @muxvia/linux-glibc-x64@0.1.0).\n",
   )
 })
 
@@ -210,6 +210,7 @@ test("the launcher contains no install, update, or package-tree write path", asy
   expect(source).not.toMatch(/\b(writeFile|rename|copyFile|mkdir|rm)\b/)
   expect(source).not.toMatch(/spawnProcess\(["']npm["']/)
   expect(source.match(/npm install/g)).toHaveLength(1)
+  expect(source).toContain("npm install --global --include=optional")
   const metadata = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"))
   expect(metadata.scripts).toBeUndefined()
 })

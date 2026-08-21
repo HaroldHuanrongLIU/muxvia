@@ -35,7 +35,7 @@ const repairPrefix = "muxvia: the required exact-version optional package is mis
 
 export class LauncherRepairError extends Error {
   constructor(packageName, version) {
-    super(`${repairPrefix} Repair with: npm install --include=optional muxvia@${version} (requires ${packageName}@${version}).`)
+    super(`${repairPrefix} Repair with: npm install --global --include=optional muxvia@${version} (requires ${packageName}@${version}).`)
   }
 }
 

@@ -126,6 +126,15 @@ test("launcher metadata pins every platform package to the exact product release
   for (const version of Object.values(metadata.optionalDependencies)) {
     expect(version).toMatch(/^\d+\.\d+\.\d+$/)
   }
+  expect(await readFile(join(root, "LICENSE"), "utf8")).toBe(await readFile(resolve("LICENSE"), "utf8"))
+
+  const parent = await mkdtemp(join(tmpdir(), "muxvia-npm-launcher-pack-"))
+  roots.push(parent)
+  const packed = JSON.parse(await capture(
+    ["npm", "pack", "--dry-run", "--json", root],
+    { npm_config_cache: join(parent, "npm-cache") },
+  ))[0]
+  expect(packed.files.map((file: { path: string }) => file.path)).toContain("LICENSE")
 })
 
 test("packaged integrity changes fail inspection", async () => {

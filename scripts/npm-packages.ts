@@ -135,7 +135,7 @@ export async function inspectLauncherPackage(root: string, release: string): Pro
   rejectUnless(value.scripts === undefined, "launcher-lifecycle-scripts")
   rejectUnless(
     JSON.stringify(value.bin) === JSON.stringify({ muxvia: "bin/muxvia.js" })
-    && JSON.stringify(value.files) === JSON.stringify(["bin", "lib", "README.md"]),
+    && JSON.stringify(value.files) === JSON.stringify(["bin", "lib", "README.md", "LICENSE"]),
     "launcher-files",
   )
   const expectedDependencies = Object.fromEntries(
@@ -145,10 +145,15 @@ export async function inspectLauncherPackage(root: string, release: string): Pro
     JSON.stringify(value.optionalDependencies) === JSON.stringify(expectedDependencies),
     "launcher-optional-dependencies",
   )
-  for (const relativePath of ["bin/muxvia.js", "lib/launcher.js", "README.md"]) {
+  for (const relativePath of ["bin/muxvia.js", "lib/launcher.js", "README.md", "LICENSE"]) {
     const metadata = await lstat(join(packageRoot, relativePath))
     rejectUnless(metadata.isFile() && !metadata.isSymbolicLink(), `launcher-file-${relativePath}`)
   }
+  rejectUnless(
+    await readFile(join(packageRoot, "LICENSE"), "utf8")
+      === await readFile(new URL("../LICENSE", import.meta.url), "utf8"),
+    "launcher-license",
+  )
 }
 
 function option(args: string[], name: string): string {

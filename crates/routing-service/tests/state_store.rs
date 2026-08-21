@@ -167,7 +167,7 @@ async fn fresh_schema_reopens_with_codex_and_claude_route_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, "13");
+    assert_eq!(version, "14");
     assert_eq!(targets, ["claude", "codex"]);
     let _ = fs::remove_dir_all(root);
 }
@@ -271,6 +271,16 @@ async fn request_record_schema_bounds_failed_payload_and_freezes_pricing_snapsho
         })
         .await;
     assert!(update.is_err(), "mutated an immutable Pricing Snapshot");
+    let direct_delete = database
+        .call(|connection| {
+            connection.execute("DELETE FROM pricing_snapshots", [])?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await;
+    assert!(
+        direct_delete.is_err(),
+        "deleted a Pricing Snapshot without deleting its Request Record"
+    );
     let record_update = database
         .call(|connection| {
             connection.execute("UPDATE request_records SET model = 'rewritten'", [])?;
@@ -281,10 +291,27 @@ async fn request_record_schema_bounds_failed_payload_and_freezes_pricing_snapsho
         record_update.is_err(),
         "mutated an immutable Request Record"
     );
+    database
+        .call(|connection| {
+            connection.execute(
+                "DELETE FROM request_records WHERE id = ?1",
+                [fixed_uuid(134).to_string()],
+            )?;
+            let pricing_rows: u64 =
+                connection.query_row("SELECT COUNT(*) FROM pricing_snapshots", [], |row| {
+                    row.get(0)
+                })?;
+            if pricing_rows != 0 {
+                return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+            }
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .expect("deleting the parent Request Record did not cascade its Pricing Snapshot");
 }
 
 #[tokio::test]
-async fn schema_v13_migration_preserves_v12_target_state() {
+async fn schema_v14_migration_preserves_v12_target_state() {
     let root = std::env::temp_dir().join(format!("muxvia-schema-v12-{}", Uuid::new_v4()));
     let user_home = root.join("home");
     fs::create_dir_all(&user_home).unwrap();
@@ -356,17 +383,97 @@ async fn schema_v13_migration_preserves_v12_target_state() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "13");
+    assert_eq!(version, "14");
     assert_eq!(
         after, before,
-        "schema-v13 migration changed existing v12 state"
+        "schema-v14 migration changed existing v12 state"
     );
     assert_eq!(tables, 2);
     let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
-async fn schema_v13_failed_migration_rolls_back_then_reruns() {
+async fn schema_v14_migrates_v13_to_parent_cascade_only_pricing_deletion() {
+    let root = std::env::temp_dir().join(format!("muxvia-schema-v13-{}", Uuid::new_v4()));
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    drop(StateStore::open(&home).await.unwrap());
+
+    let record_id = fixed_uuid(145).to_string();
+    let database = Connection::open(home.database_path()).unwrap();
+    database
+        .execute_batch(
+            "DROP TRIGGER pricing_snapshots_delete_with_request_record;
+             UPDATE metadata SET value = '13' WHERE key = 'schema-version';",
+        )
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO request_records
+               (id, target, plan_id, plan_epoch, provider_id, provider_name, model, protocol,
+                started_at_unix_ms, finished_at_unix_ms, latency_ms, outcome, http_status,
+                usage_observed, input_tokens, cached_input_tokens,
+                cache_creation_input_tokens, output_tokens, error_payload,
+                error_payload_truncated)
+             VALUES (?1, 'codex', ?2, ?3, NULL, NULL, 'gpt-5.6', 'openai-responses',
+                     1, 2, 1, 'success', 200, 1, 12, 2, 0, 4, NULL, 0)",
+            tokio_rusqlite::rusqlite::params![
+                record_id,
+                fixed_uuid(146).to_string(),
+                fixed_uuid(147).to_string(),
+            ],
+        )
+        .unwrap();
+    let insert_pricing = |connection: &Connection| {
+        connection.execute(
+            "INSERT INTO pricing_snapshots
+               (request_record_id, catalog_version, source, source_model,
+                input_nano_usd_per_million, output_nano_usd_per_million,
+                cache_read_multiplier_ppm, cache_creation_multiplier_ppm,
+                priced_at_unix_ms, estimated_cost_nano_usd)
+             VALUES (?1, 'muxvia-0.1.0', 'models.dev', 'gpt-5.6',
+                     2000000000, 10000000000, 100000, 1250000, 2, 42000)",
+            [&record_id],
+        )
+    };
+    insert_pricing(&database).unwrap();
+    database
+        .execute("DELETE FROM pricing_snapshots", [])
+        .unwrap();
+    insert_pricing(&database).unwrap();
+    drop(database);
+
+    drop(StateStore::open(&home).await.unwrap());
+    let database = Connection::open(home.database_path()).unwrap();
+    let version: String = database
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'schema-version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "14");
+    assert!(
+        database
+            .execute("DELETE FROM pricing_snapshots", [])
+            .is_err(),
+        "schema-v14 migration still allowed direct Pricing Snapshot deletion"
+    );
+    database
+        .execute("DELETE FROM request_records WHERE id = ?1", [&record_id])
+        .unwrap();
+    let pricing_rows: u64 = database
+        .query_row("SELECT COUNT(*) FROM pricing_snapshots", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(pricing_rows, 0);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn schema_v14_failed_migration_rolls_back_then_reruns() {
     let root = std::env::temp_dir().join(format!("muxvia-schema-v13-failure-{}", Uuid::new_v4()));
     let user_home = root.join("home");
     fs::create_dir_all(&user_home).unwrap();
@@ -411,7 +518,7 @@ async fn schema_v13_failed_migration_rolls_back_then_reruns() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(rerun, ("13".into(), 1, 1));
+    assert_eq!(rerun, ("14".into(), 1, 1));
     let _ = fs::remove_dir_all(root);
 }
 

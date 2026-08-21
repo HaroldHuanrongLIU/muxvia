@@ -16,8 +16,7 @@ use super::{
     auth::bearer_routing_credential_matches,
     headers::{forward_claude_request_headers, forward_response_headers},
     request_recorder::{
-        RequestRecordStart, ReservedRequestRecord, ResponseObservation, ResponseUsageFormat,
-        observed_upstream_body, recorded_body, unix_time_ms,
+        RequestRecording, ResponseUsageFormat, observed_upstream_body, recorded_body,
     },
     router::{
         PreparedRouteAttempt, RouteAttemptFailure, RouteResponseKind, pin_route_plan,
@@ -59,33 +58,11 @@ pub(crate) async fn route_messages(
         Some(plan) => plan,
         None => return local_response(StatusCode::SERVICE_UNAVAILABLE),
     };
-    let started_at_unix_ms = unix_time_ms();
-    let mut redactions = vec![expected.expose_secret().as_bytes().to_vec()];
-    redactions.extend(plan.members.iter().filter_map(|member| {
-        member
-            .provider_credential
-            .as_ref()
-            .map(|credential| credential.expose_secret().as_bytes().to_vec())
-    }));
-    let observation = ResponseObservation::new(redactions);
-    let primary = &plan.members[0];
-    let mut record_start = RequestRecordStart {
-        id: uuid::Uuid::new_v4(),
-        target: state.target,
-        plan_id: plan.id,
-        plan_epoch: plan.epoch,
-        provider: Some(crate::request_history::RecordedProvider {
-            id: primary.provider_id,
-            name: primary.name.clone(),
-        }),
-        model: primary.model.clone(),
-        protocol: primary.protocol,
-        started_at_unix_ms,
-        status: None,
-        semantic_failure: false,
-        observation,
-    };
-    let Some(reserved_record) = state.request_recorder.reserve() else {
+    let Some(mut recording) =
+        state
+            .request_recorder
+            .begin(state.target, &plan, expected.expose_secret())
+    else {
         return fixed_failure_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "request-recording-unavailable",
@@ -98,8 +75,7 @@ pub(crate) async fn route_messages(
         .is_some_and(|member| member.authentication == ProviderAuthentication::CodexSubscription);
     if count_tokens && primary_is_bridge {
         return complete_after_plan(
-            reserved_record,
-            record_start,
+            recording,
             StatusCode::NOT_IMPLEMENTED,
             fixed_failure_response(
                 StatusCode::NOT_IMPLEMENTED,
@@ -109,8 +85,7 @@ pub(crate) async fn route_messages(
     }
     let Some(active_request) = ActiveRequestGuard::try_begin(Arc::clone(&state.admission)) else {
         return complete_after_plan(
-            reserved_record,
-            record_start,
+            recording,
             StatusCode::SERVICE_UNAVAILABLE,
             local_response(StatusCode::SERVICE_UNAVAILABLE),
         );
@@ -119,8 +94,7 @@ pub(crate) async fn route_messages(
         Ok(encoding) => encoding,
         Err(()) if primary_is_bridge => {
             return complete_after_plan(
-                reserved_record,
-                record_start,
+                recording,
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 fixed_failure_response(
                     StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -130,8 +104,7 @@ pub(crate) async fn route_messages(
         }
         Err(()) => {
             return complete_after_plan(
-                reserved_record,
-                record_start,
+                recording,
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 body_error(StatusCode::UNSUPPORTED_MEDIA_TYPE),
             );
@@ -152,12 +125,7 @@ pub(crate) async fn route_messages(
         } else {
             body_error(StatusCode::PAYLOAD_TOO_LARGE)
         };
-        return complete_after_plan(
-            reserved_record,
-            record_start,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            response,
-        );
+        return complete_after_plan(recording, StatusCode::PAYLOAD_TOO_LARGE, response);
     }
     let request_path = request.uri().path().to_owned();
     let query = request.uri().query().map(str::to_owned);
@@ -174,12 +142,7 @@ pub(crate) async fn route_messages(
             } else {
                 body_error(StatusCode::BAD_REQUEST)
             };
-            return complete_after_plan(
-                reserved_record,
-                record_start,
-                StatusCode::BAD_REQUEST,
-                response,
-            );
+            return complete_after_plan(recording, StatusCode::BAD_REQUEST, response);
         };
         if bytes.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
             let response = if primary_is_bridge {
@@ -190,12 +153,7 @@ pub(crate) async fn route_messages(
             } else {
                 body_error(StatusCode::PAYLOAD_TOO_LARGE)
             };
-            return complete_after_plan(
-                reserved_record,
-                record_start,
-                StatusCode::PAYLOAD_TOO_LARGE,
-                response,
-            );
+            return complete_after_plan(recording, StatusCode::PAYLOAD_TOO_LARGE, response);
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -203,8 +161,7 @@ pub(crate) async fn route_messages(
         Ok(bytes) => bytes,
         Err(BodyDecodeError::Invalid) if primary_is_bridge => {
             return complete_after_plan(
-                reserved_record,
-                record_start,
+                recording,
                 StatusCode::BAD_REQUEST,
                 fixed_failure_response(
                     StatusCode::BAD_REQUEST,
@@ -214,8 +171,7 @@ pub(crate) async fn route_messages(
         }
         Err(BodyDecodeError::TooLarge) if primary_is_bridge => {
             return complete_after_plan(
-                reserved_record,
-                record_start,
+                recording,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 fixed_failure_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
@@ -225,16 +181,14 @@ pub(crate) async fn route_messages(
         }
         Err(BodyDecodeError::Invalid) => {
             return complete_after_plan(
-                reserved_record,
-                record_start,
+                recording,
                 StatusCode::BAD_REQUEST,
                 body_error(StatusCode::BAD_REQUEST),
             );
         }
         Err(BodyDecodeError::TooLarge) => {
             return complete_after_plan(
-                reserved_record,
-                record_start,
+                recording,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 body_error(StatusCode::PAYLOAD_TOO_LARGE),
             );
@@ -244,8 +198,7 @@ pub(crate) async fn route_messages(
         Ok(Value::Object(object)) => object,
         _ if primary_is_bridge => {
             return complete_after_plan(
-                reserved_record,
-                record_start,
+                recording,
                 StatusCode::BAD_REQUEST,
                 fixed_failure_response(
                     StatusCode::BAD_REQUEST,
@@ -255,14 +208,13 @@ pub(crate) async fn route_messages(
         }
         _ => {
             return complete_after_plan(
-                reserved_record,
-                record_start,
+                recording,
                 StatusCode::BAD_REQUEST,
                 body_error(StatusCode::BAD_REQUEST),
             );
         }
     };
-    let response_observation = record_start.observation.clone();
+    let response_observation = recording.observation();
     let route = route_pinned_plan(
         plan,
         state.target,
@@ -357,21 +309,7 @@ pub(crate) async fn route_messages(
         },
     )
     .await;
-    let outcome_without_response = if route
-        .observations
-        .iter()
-        .any(|observation| observation.outcome == "transport-failure")
-    {
-        crate::control::protocol::RequestRecordOutcome::TransportError
-    } else if route
-        .observations
-        .iter()
-        .any(|observation| observation.outcome == "semantic-failure")
-    {
-        crate::control::protocol::RequestRecordOutcome::SemanticError
-    } else {
-        crate::control::protocol::RequestRecordOutcome::RouteUnavailable
-    };
+    let outcome_without_response = route.request_record_outcome();
     let serving_provider = route
         .routed
         .as_ref()
@@ -388,7 +326,7 @@ pub(crate) async fn route_messages(
                 consecutive_failures: observation.consecutive_failures,
                 total_attempts: observation.total_attempts,
                 failed_attempts: observation.failed_attempts,
-                outcome: observation.outcome.to_owned(),
+                outcome: observation.outcome.as_str().to_owned(),
             })
             .collect();
         let _ = state
@@ -403,13 +341,8 @@ pub(crate) async fn route_messages(
             .await;
     }
     let Some(routed) = route.routed else {
-        if let Some(attempt) = route.last_attempt {
-            record_start.provider = Some(crate::request_history::RecordedProvider {
-                id: attempt.provider_id,
-                name: attempt.provider_name,
-            });
-            record_start.model = attempt.model;
-            record_start.protocol = attempt.protocol;
+        if let Some(attempt) = route.last_attempt.as_ref() {
+            recording.bind_attempt(attempt);
         }
         let status = match route.failure {
             Some(RouteAttemptFailure::SubscriptionBridgeInvalidRequest) => StatusCode::BAD_REQUEST,
@@ -422,18 +355,10 @@ pub(crate) async fn route_messages(
             .failure
             .map(RouteAttemptFailure::code)
             .unwrap_or("model-route-unavailable");
-        record_start.status = Some(status);
-        reserved_record.complete_terminal(record_start, outcome_without_response);
+        recording.complete_terminal(Some(status), outcome_without_response);
         return fixed_failure_response(status, code);
     };
-    record_start.provider = Some(crate::request_history::RecordedProvider {
-        id: routed.provider_id,
-        name: routed.provider_name.clone(),
-    });
-    record_start.model = routed.model.clone();
-    record_start.protocol = routed.protocol;
-    record_start.status = Some(routed.response.status);
-    record_start.semantic_failure = routed.semantic_failure;
+    recording.bind_routed(&routed);
     let observe_forwarded = routed.response_kind == RouteResponseKind::Native;
     let usage_format = match routed.response_kind {
         RouteResponseKind::Native => ResponseUsageFormat::claude(
@@ -451,9 +376,10 @@ pub(crate) async fn route_messages(
                 .and_then(|value| value.to_str().ok()),
         ),
     };
-    record_start.observation.configure(
-        usage_format,
+    recording.configure_response(
         routed.response.status,
+        routed.semantic_failure,
+        usage_format,
         routed
             .response
             .headers
@@ -466,7 +392,7 @@ pub(crate) async fn route_messages(
     let mut upstream = routed.response;
     if routed.response_kind == RouteResponseKind::SubscriptionBridge {
         if upstream.status.is_success() {
-            let observed = observed_upstream_body(upstream.body, record_start.observation.clone());
+            let observed = observed_upstream_body(upstream.body, recording.observation());
             let converted = SubscriptionBridgeAdapter::convert_stream(observed);
             upstream.body = Box::pin(converted.map(Ok));
             upstream.headers = axum::http::HeaderMap::new();
@@ -483,7 +409,7 @@ pub(crate) async fn route_messages(
                     valid = false;
                     break;
                 };
-                record_start.observation.observe(&chunk);
+                recording.observation().observe(&chunk);
                 if error_body.len().saturating_add(chunk.len())
                     > crate::subscription_bridge::MAX_BRIDGE_ERROR_BODY_BYTES
                 {
@@ -512,8 +438,7 @@ pub(crate) async fn route_messages(
         .body(recorded_body(
             upstream.body,
             active_request,
-            reserved_record,
-            record_start,
+            recording,
             observe_forwarded,
         ))
         .expect("valid upstream status");
@@ -591,14 +516,12 @@ fn fixed_failure_response(status: StatusCode, code: &'static str) -> Response<Bo
 }
 
 fn complete_after_plan(
-    reserved: ReservedRequestRecord,
-    mut start: RequestRecordStart,
+    recording: RequestRecording,
     status: StatusCode,
     response: Response<Body>,
 ) -> Response<Body> {
-    start.status = Some(status);
-    reserved.complete_terminal(
-        start,
+    recording.complete_terminal(
+        Some(status),
         crate::control::protocol::RequestRecordOutcome::RouteUnavailable,
     );
     response

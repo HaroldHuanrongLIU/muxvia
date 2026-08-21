@@ -31,10 +31,7 @@ use super::messages::route_messages;
 use super::{
     auth::routing_credential_matches,
     headers::{forward_request_headers, forward_response_headers},
-    request_recorder::{
-        RequestRecordStart, RequestRecorder, ResponseObservation, ResponseUsageFormat,
-        recorded_body, unix_time_ms,
-    },
+    request_recorder::{RequestRecorder, ResponseUsageFormat, recorded_body},
     router::{
         PreparedRouteAttempt, RouteAttemptFailure, RouteHealthRuntime, RouteResponseKind,
         pin_route_plan, route_pinned_plan,
@@ -542,38 +539,19 @@ async fn route_responses(
         Some(plan) => plan,
         None => return local_response(StatusCode::SERVICE_UNAVAILABLE),
     };
-    let started_at_unix_ms = unix_time_ms();
-    let mut redactions = vec![expected.expose_secret().as_bytes().to_vec()];
-    redactions.extend(plan.members.iter().filter_map(|member| {
-        member
-            .provider_credential
-            .as_ref()
-            .map(|credential| credential.expose_secret().as_bytes().to_vec())
-    }));
-    let observation = ResponseObservation::new(redactions);
-    let mut record_start = RequestRecordStart {
-        id: uuid::Uuid::new_v4(),
-        target: state.target,
-        plan_id: plan.id,
-        plan_epoch: plan.epoch,
-        provider: None,
-        model: plan.members[0].model.clone(),
-        protocol: plan.members[0].protocol,
-        started_at_unix_ms,
-        status: None,
-        semantic_failure: false,
-        observation,
-    };
-    let Some(reserved_record) = state.request_recorder.reserve() else {
+    let Some(mut recording) =
+        state
+            .request_recorder
+            .begin(state.target, &plan, expected.expose_secret())
+    else {
         return fixed_local_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "request-recording-unavailable",
         );
     };
     let Some(active_request) = ActiveRequestGuard::try_begin(Arc::clone(&state.admission)) else {
-        record_start.status = Some(StatusCode::SERVICE_UNAVAILABLE);
-        reserved_record.complete_terminal(
-            record_start,
+        recording.complete_terminal(
+            Some(StatusCode::SERVICE_UNAVAILABLE),
             crate::control::protocol::RequestRecordOutcome::RouteUnavailable,
         );
         return local_response(StatusCode::SERVICE_UNAVAILABLE);
@@ -583,17 +561,15 @@ async fn route_responses(
     let mut request_body = Vec::new();
     while let Some(chunk) = incoming.next().await {
         let Ok(chunk) = chunk else {
-            record_start.status = Some(StatusCode::BAD_REQUEST);
-            reserved_record.complete_terminal(
-                record_start,
+            recording.complete_terminal(
+                Some(StatusCode::BAD_REQUEST),
                 crate::control::protocol::RequestRecordOutcome::RouteUnavailable,
             );
             return local_response(StatusCode::BAD_REQUEST);
         };
         if request_body.len().saturating_add(chunk.len()) > MAX_REPLAYABLE_BODY_BYTES {
-            record_start.status = Some(StatusCode::PAYLOAD_TOO_LARGE);
-            reserved_record.complete_terminal(
-                record_start,
+            recording.complete_terminal(
+                Some(StatusCode::PAYLOAD_TOO_LARGE),
                 crate::control::protocol::RequestRecordOutcome::RouteUnavailable,
             );
             return local_response(StatusCode::PAYLOAD_TOO_LARGE);
@@ -629,21 +605,7 @@ async fn route_responses(
         },
     )
     .await;
-    let outcome_without_response = if route
-        .observations
-        .iter()
-        .any(|observation| observation.outcome == "transport-failure")
-    {
-        crate::control::protocol::RequestRecordOutcome::TransportError
-    } else if route
-        .observations
-        .iter()
-        .any(|observation| observation.outcome == "semantic-failure")
-    {
-        crate::control::protocol::RequestRecordOutcome::SemanticError
-    } else {
-        crate::control::protocol::RequestRecordOutcome::RouteUnavailable
-    };
+    let outcome_without_response = route.request_record_outcome();
     let serving_provider = route
         .routed
         .as_ref()
@@ -660,7 +622,7 @@ async fn route_responses(
                 consecutive_failures: observation.consecutive_failures,
                 total_attempts: observation.total_attempts,
                 failed_attempts: observation.failed_attempts,
-                outcome: observation.outcome.to_owned(),
+                outcome: observation.outcome.as_str().to_owned(),
             })
             .collect();
         let _ = state
@@ -675,32 +637,16 @@ async fn route_responses(
             .await;
     }
     let Some(routed) = route.routed else {
-        let (provider, model, protocol) = match route.last_attempt {
-            Some(attempt) => (
-                Some(crate::request_history::RecordedProvider {
-                    id: attempt.provider_id,
-                    name: attempt.provider_name,
-                }),
-                attempt.model,
-                attempt.protocol,
-            ),
-            None => (None, route.model, route.protocol),
-        };
-        record_start.provider = provider;
-        record_start.model = model;
-        record_start.protocol = protocol;
-        reserved_record.complete_terminal(record_start, outcome_without_response);
+        if let Some(attempt) = route.last_attempt.as_ref() {
+            recording.bind_attempt(attempt);
+        }
+        recording.complete_terminal(None, outcome_without_response);
         return local_response(StatusCode::BAD_GATEWAY);
     };
-    record_start.provider = Some(crate::request_history::RecordedProvider {
-        id: routed.provider_id,
-        name: routed.provider_name.clone(),
-    });
-    record_start.model = routed.model.clone();
-    record_start.protocol = routed.protocol;
-    record_start.status = Some(routed.response.status);
-    record_start.semantic_failure = routed.semantic_failure;
-    record_start.observation.configure(
+    recording.bind_routed(&routed);
+    recording.configure_response(
+        routed.response.status,
+        routed.semantic_failure,
         ResponseUsageFormat::codex(
             routed
                 .response
@@ -708,7 +654,6 @@ async fn route_responses(
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok()),
         ),
-        routed.response.status,
         routed
             .response
             .headers
@@ -725,8 +670,7 @@ async fn route_responses(
         .body(recorded_body(
             upstream.body,
             active_request,
-            reserved_record,
-            record_start,
+            recording,
             true,
         ))
         .expect("valid upstream status");

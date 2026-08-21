@@ -26,6 +26,7 @@ const backendSecret = "ACTIVITY_BACKEND_SECRET_15003"
 const settingsSecret = "ACTIVITY_SETTINGS_SECRET_15004"
 const privateSecrets = [credentialSecret, configSecret, backendSecret, settingsSecret] as const
 const retainedPayload = "SANITIZED_FAILURE_PAYLOAD_15005"
+const retainedPayloadAtLimit = retainedPayload + "x".repeat(65_536 - retainedPayload.length)
 
 function targetView(target: Target): TargetView {
   return {
@@ -179,7 +180,7 @@ test("failed detail loads only after selection and renders its sensitivity and t
     target: "codex",
     record: failed,
     pricingSnapshot: null,
-    errorPayload: recordId === failed.id ? retainedPayload : null,
+    errorPayload: recordId === failed.id ? retainedPayloadAtLimit : null,
     errorPayloadSensitive: true,
   })
   const setup = await testRender(() => <App session={session} />, {
@@ -217,6 +218,57 @@ test("failed detail loads only after selection and renders its sensitivity and t
     expect(session.inspectCalls).toEqual([failed.id])
     expect(detail).toContain("sensitive request")
     expect(detail).toContain("truncated at the retention limit")
+    expect(detail).toContain("Display clipped to this terminal")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("a payload-free failed record remains inspectable and is not labelled successful", async () => {
+  const session = new ActivitySession("codex")
+  const failed = requestRecord("codex", {
+    id: "00000000-0000-4000-8000-000000001511",
+    outcome: "route-unavailable",
+    httpStatus: null,
+    usage: null,
+    estimatedCostNanoUsd: null,
+    hasErrorPayload: false,
+  })
+  session.listHandler = async () => ({ target: "codex", records: [failed], nextCursor: null })
+  session.inspectHandler = async () => ({
+    target: "codex",
+    record: failed,
+    pricingSnapshot: null,
+    errorPayload: null,
+    errorPayloadSensitive: false,
+  })
+  const setup = await testRender(() => <App session={session} />, {
+    width: 80,
+    height: 24,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/activity")
+    setup.mockInput.pressEnter()
+    await waitForSecretFreeFrame(
+      setup,
+      (frame) => frame.includes("Route unavailable"),
+      privateSecrets,
+      "activity-payload-free-failure-list",
+    )
+    setup.mockInput.pressEnter()
+    await setup.waitFor(() => session.inspectCalls.length === 1)
+    const detail = await waitForSecretFreeFrame(
+      setup,
+      (frame) => frame.includes("No retained failure payload."),
+      privateSecrets,
+      "activity-payload-free-failure-detail",
+    )
+    expect(detail).not.toContain("Successful records retain no response payload")
+    expect(detail).not.toContain("sensitive request")
   } finally {
     setup.renderer.destroy()
   }

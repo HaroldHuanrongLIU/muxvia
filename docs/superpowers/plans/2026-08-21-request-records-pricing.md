@@ -15,6 +15,7 @@
 - Migrate v12 to v13 atomically without changing existing Target, Provider, account, route, recovery, receipt, or secret state.
 - RED malformed discriminators, wrong-target details, oversized payload rows, mutable snapshots, and failed migration residue.
 - GREEN fresh schema, immutable v12 fixture migration, protocol fixtures, TypeScript parsing, and secret-safe diagnostics.
+- Final-review hardening advances v13 to v14 solely to prevent direct Pricing Snapshot deletion while preserving parent Request Record cascade deletion; a real v13 database fixture proves the atomic migration.
 
 ## Task 2: Deterministic Pricing Snapshot module
 

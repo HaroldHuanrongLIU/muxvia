@@ -859,7 +859,7 @@ function Shell(props: {
   const inspectRequestHistory = async (target: Target, token: OverlayToken) => {
     const current = requestHistoryByTarget()[target]
     const selected = current?.records[current.selectedIndex]
-    if (!current || current.overlayToken !== token || current.pending || !selected?.hasErrorPayload) return
+    if (!current || current.overlayToken !== token || current.pending || !selected || selected.outcome === "success") return
     requestHistoryAborts[target]?.abort()
     const controller = new AbortController()
     requestHistoryAborts[target] = controller

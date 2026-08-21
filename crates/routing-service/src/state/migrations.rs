@@ -14,7 +14,7 @@ use crate::control::protocol::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -38,7 +38,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
         .transpose()?;
 
     match version {
-        None | Some(SCHEMA_VERSION) => {}
+        None | Some(SCHEMA_VERSION) | Some(13) => {}
         Some(1) => {
             migrate_v1(connection)?;
             migrate_v2(connection)?;
@@ -141,8 +141,35 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
         Some(12) => migrate_v12(connection)?,
         Some(_) => return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery),
     }
+    if version.is_some_and(|version| version < SCHEMA_VERSION) {
+        migrate_v13(connection)?;
+    }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v13(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS pricing_snapshots_delete_with_request_record
+         BEFORE DELETE ON pricing_snapshots
+         WHEN EXISTS (
+           SELECT 1 FROM request_records WHERE id = OLD.request_record_id
+         )
+         BEGIN
+           SELECT RAISE(ABORT, 'immutable-pricing-snapshot');
+         END;",
+    )?;
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.execute(
+        "UPDATE metadata SET value = '14' WHERE key = 'schema-version'",
+        [],
+    )?;
+    transaction.commit()
 }
 
 fn migrate_v12(connection: &mut Connection) -> Result<()> {

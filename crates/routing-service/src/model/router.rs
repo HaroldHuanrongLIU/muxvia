@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use uuid::Uuid;
 
 use crate::{
-    control::protocol::Target,
+    control::protocol::{RequestRecordOutcome, Target},
     state::{ActivatedRoutePlanSnapshot, RoutePlanMemberSnapshot, StateStore},
 };
 
@@ -78,10 +78,21 @@ impl RouteAttemptFailure {
         }
     }
 
-    fn observation(self) -> &'static str {
+    fn observation(self) -> RouteHealthOutcome {
         match self {
-            Self::Configuration => "configuration-failure",
-            _ => self.code(),
+            Self::Configuration => RouteHealthOutcome::ConfigurationFailure,
+            Self::SubscriptionAccountUnavailable => {
+                RouteHealthOutcome::SubscriptionAccountUnavailable
+            }
+            Self::SubscriptionAccountNeedsReauthorization => {
+                RouteHealthOutcome::SubscriptionAccountNeedsReauthorization
+            }
+            Self::SubscriptionBridgeInvalidRequest => {
+                RouteHealthOutcome::SubscriptionBridgeInvalidRequest
+            }
+            Self::SubscriptionBridgeCountTokensUnsupported => {
+                RouteHealthOutcome::SubscriptionBridgeCountTokensUnsupported
+            }
         }
     }
 }
@@ -93,8 +104,59 @@ pub(crate) struct PinnedRouteResult {
     pub(crate) observations: Vec<RouteHealthObservation>,
     pub(crate) failure: Option<RouteAttemptFailure>,
     pub(crate) last_attempt: Option<RouteAttemptIdentity>,
-    pub(crate) model: String,
-    pub(crate) protocol: crate::control::protocol::ProviderProtocol,
+}
+
+impl PinnedRouteResult {
+    pub(crate) fn request_record_outcome(&self) -> RequestRecordOutcome {
+        if self
+            .observations
+            .iter()
+            .any(|observation| observation.outcome == RouteHealthOutcome::TransportFailure)
+        {
+            RequestRecordOutcome::TransportError
+        } else if self
+            .observations
+            .iter()
+            .any(|observation| observation.outcome == RouteHealthOutcome::SemanticFailure)
+        {
+            RequestRecordOutcome::SemanticError
+        } else {
+            RequestRecordOutcome::RouteUnavailable
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RouteHealthOutcome {
+    Success,
+    TransportFailure,
+    SemanticFailure,
+    RetryableUpstreamStatus,
+    ConfigurationFailure,
+    SubscriptionAccountUnavailable,
+    SubscriptionAccountNeedsReauthorization,
+    SubscriptionBridgeInvalidRequest,
+    SubscriptionBridgeCountTokensUnsupported,
+}
+
+impl RouteHealthOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::TransportFailure => "transport-failure",
+            Self::SemanticFailure => "semantic-failure",
+            Self::RetryableUpstreamStatus => "retryable-upstream-status",
+            Self::ConfigurationFailure => "configuration-failure",
+            Self::SubscriptionAccountUnavailable => "subscription-account-unavailable",
+            Self::SubscriptionAccountNeedsReauthorization => {
+                "subscription-account-needs-reauthorization"
+            }
+            Self::SubscriptionBridgeInvalidRequest => "subscription-bridge-invalid-request",
+            Self::SubscriptionBridgeCountTokensUnsupported => {
+                "subscription-bridge-count-tokens-unsupported"
+            }
+        }
+    }
 }
 
 pub(crate) struct RouteHealthObservation {
@@ -104,7 +166,7 @@ pub(crate) struct RouteHealthObservation {
     pub(crate) consecutive_failures: u64,
     pub(crate) total_attempts: u64,
     pub(crate) failed_attempts: u64,
-    pub(crate) outcome: &'static str,
+    pub(crate) outcome: RouteHealthOutcome,
 }
 
 pub(crate) struct RouteHealthRuntime {
@@ -211,7 +273,7 @@ impl RouteHealthRuntime {
                 "healthy"
             }
         };
-        observation(provider_id, circuit, state, "success")
+        observation(provider_id, circuit, state, RouteHealthOutcome::Success)
     }
 
     fn failure(
@@ -219,7 +281,7 @@ impl RouteHealthRuntime {
         target: Target,
         provider_id: Uuid,
         now: Instant,
-        outcome: &'static str,
+        outcome: RouteHealthOutcome,
     ) -> RouteHealthObservation {
         let mut circuits = self.target(target).lock().unwrap();
         let circuit = circuits.entry(provider_id).or_default();
@@ -257,7 +319,7 @@ impl RouteAttemptPermit<'_> {
         self.health.success(self.target, self.provider_id)
     }
 
-    fn failure(mut self, now: Instant, outcome: &'static str) -> RouteHealthObservation {
+    fn failure(mut self, now: Instant, outcome: RouteHealthOutcome) -> RouteHealthObservation {
         self.completed = true;
         self.health
             .failure(self.target, self.provider_id, now, outcome)
@@ -284,7 +346,7 @@ fn observation(
     provider_id: Uuid,
     circuit: &Circuit,
     state: &'static str,
-    outcome: &'static str,
+    outcome: RouteHealthOutcome,
 ) -> RouteHealthObservation {
     RouteHealthObservation {
         provider_id,
@@ -318,8 +380,6 @@ where
     let plan_id = plan.id;
     let plan_epoch = plan.epoch;
     let member_count = plan.members.len();
-    let model = plan.members[0].model.clone();
-    let protocol = plan.members[0].protocol;
     let mut last_response = None;
     let mut last_failure = None;
     let mut last_attempt = None;
@@ -347,8 +407,6 @@ where
                         observations,
                         failure: Some(failure),
                         last_attempt,
-                        model,
-                        protocol,
                     };
                 }
                 continue;
@@ -362,7 +420,8 @@ where
         let mut response = match upstream.send(request).await {
             Ok(response) => response,
             Err(_) => {
-                observations.push(attempt.failure(Instant::now(), "transport-failure"));
+                observations
+                    .push(attempt.failure(Instant::now(), RouteHealthOutcome::TransportFailure));
                 continue;
             }
         };
@@ -387,7 +446,8 @@ where
                     response
                 }
                 PrimedResponse::Retry => {
-                    observations.push(attempt.failure(Instant::now(), "semantic-failure"));
+                    observations
+                        .push(attempt.failure(Instant::now(), RouteHealthOutcome::SemanticFailure));
                     continue;
                 }
             };
@@ -402,11 +462,12 @@ where
             response_kind,
         };
         if committed_failure {
-            observations.push(attempt.failure(Instant::now(), "semantic-failure"));
+            observations.push(attempt.failure(Instant::now(), RouteHealthOutcome::SemanticFailure));
         } else if routed.response.status.is_success() {
             observations.push(attempt.success());
         } else if retryable_status(routed.response.status) {
-            observations.push(attempt.failure(Instant::now(), "retryable-upstream-status"));
+            observations
+                .push(attempt.failure(Instant::now(), RouteHealthOutcome::RetryableUpstreamStatus));
         }
         if !retryable_status(routed.response.status) || index + 1 == member_count {
             return PinnedRouteResult {
@@ -416,8 +477,6 @@ where
                 observations,
                 failure: None,
                 last_attempt,
-                model,
-                protocol,
             };
         }
         last_response = Some(routed);
@@ -429,8 +488,6 @@ where
         observations,
         failure: last_failure,
         last_attempt,
-        model,
-        protocol,
     }
 }
 
@@ -460,8 +517,8 @@ mod tests {
     use secrecy::SecretString;
 
     use super::{
-        PreparedRouteAttempt, RouteAttemptFailure, RouteHealthRuntime, RouteResponseKind,
-        retryable_status, route_pinned_plan,
+        PreparedRouteAttempt, RouteAttemptFailure, RouteHealthOutcome, RouteHealthRuntime,
+        RouteResponseKind, retryable_status, route_pinned_plan,
     };
     use crate::{
         control::protocol::{ProviderAuthentication, ProviderProtocol, Target},
@@ -644,7 +701,7 @@ mod tests {
             let _ = health
                 .admit(Target::Claude, primary_id, now)
                 .expect("closed primary circuit")
-                .failure(now, "subscription-account-unavailable");
+                .failure(now, RouteHealthOutcome::SubscriptionAccountUnavailable);
         }
         let builds = Arc::new(AtomicUsize::new(0));
         let upstream: Arc<dyn UpstreamTransport> = Arc::new(SequencedUpstream {
@@ -700,7 +757,10 @@ mod tests {
         .await;
         assert_eq!(routed.routed.as_ref().unwrap().provider_id, fallback_id);
         assert_eq!(*upstream.calls.lock().unwrap(), 2);
-        assert_eq!(routed.observations[0].outcome, "semantic-failure");
+        assert_eq!(
+            routed.observations[0].outcome,
+            RouteHealthOutcome::SemanticFailure
+        );
 
         let committed_plan = plan();
         let primary_id = committed_plan.members[0].provider_id;
@@ -740,7 +800,7 @@ mod tests {
             let observation = health
                 .admit(Target::Codex, provider_id, now)
                 .expect("closed circuit must admit the request")
-                .failure(now, "transport-failure");
+                .failure(now, RouteHealthOutcome::TransportFailure);
             assert_eq!(
                 observation.state,
                 if index == 3 {
@@ -781,7 +841,7 @@ mod tests {
                 .admit(Target::Codex, provider_id, now)
                 .expect("closed circuit must admit the request");
             if matches!(attempt, 0 | 2 | 4 | 6 | 8 | 9) {
-                permit.failure(now, "transport-failure");
+                permit.failure(now, RouteHealthOutcome::TransportFailure);
             } else {
                 permit.success();
             }
@@ -809,7 +869,7 @@ mod tests {
             health
                 .admit(Target::Codex, provider_id, now)
                 .expect("closed circuit must admit the request")
-                .failure(now, "transport-failure");
+                .failure(now, RouteHealthOutcome::TransportFailure);
         }
         let half_open = now + std::time::Duration::from_secs(60);
         let probe = health

@@ -202,6 +202,7 @@ test("Request History estimate, unpriced, sensitivity, truncation, and navigatio
     english("request-history.cost.unpriced"),
     english("request-history.detail.sensitive"),
     english("request-history.detail.truncated"),
+    english("request-history.detail.display-clipped"),
     english("request-history.help", { more: english("request-history.help.more") }),
   ]).toEqual([
     "Request History",
@@ -209,6 +210,7 @@ test("Request History estimate, unpriced, sensitivity, truncation, and navigatio
     "Unpriced",
     "Retained failure payload may contain sensitive request material.",
     "Payload was truncated at the retention limit.",
+    "Display clipped to this terminal; the retained record remains unchanged.",
     "↑/↓ select · Enter inspect failure · M older · Esc close",
   ])
   expect([
@@ -217,6 +219,7 @@ test("Request History estimate, unpriced, sensitivity, truncation, and navigatio
     chinese("request-history.cost.unpriced"),
     chinese("request-history.detail.sensitive"),
     chinese("request-history.detail.truncated"),
+    chinese("request-history.detail.display-clipped"),
     chinese("request-history.help", { more: chinese("request-history.help.more") }),
   ]).toEqual([
     "请求历史",
@@ -224,6 +227,7 @@ test("Request History estimate, unpriced, sensitivity, truncation, and navigatio
     "未定价",
     "保留的失败载荷可能包含敏感请求材料。",
     "载荷已在保留上限处截断。",
+    "显示已按当前终端裁剪；保留记录未被更改。",
     "↑/↓ 选择 · Enter 查看失败 · M 更早 · Esc 关闭",
   ])
 })

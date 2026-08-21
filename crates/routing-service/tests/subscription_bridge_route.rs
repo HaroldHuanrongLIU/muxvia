@@ -666,7 +666,7 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
         rejected_status == StatusCode::BAD_REQUEST
             && rejected_record.outcome == "upstream-error"
             && rejected_record.http_status == Some(StatusCode::BAD_REQUEST.as_u16())
-            && rejected_record.provider_id == bridge_id.to_string()
+            && rejected_record.provider_id.as_deref() == Some(bridge_id.to_string().as_str())
             && rejected_record.protocol == "anthropic-messages"
             && rejected_payload
                 .windows(BRIDGE_ERROR_MARKER.len())
@@ -729,7 +729,7 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
     cancel_bridge_request(endpoint, &routing_token, &upstream).await;
     let cancelled_record = wait_for_latest_request_record(&home, 8).await;
     assert!(
-        cancelled_record.provider_id == bridge_id.to_string()
+        cancelled_record.provider_id.as_deref() == Some(bridge_id.to_string().as_str())
             && cancelled_record.outcome == "cancelled"
             && cancelled_record.http_status == Some(StatusCode::OK.as_u16())
             && cancelled_record.error_payload.is_none(),
@@ -759,7 +759,7 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
     );
     let incomplete_record = wait_for_latest_request_record(&home, 9).await;
     assert!(
-        incomplete_record.provider_id == bridge_id.to_string()
+        incomplete_record.provider_id.as_deref() == Some(bridge_id.to_string().as_str())
             && incomplete_record.outcome == "success"
             && incomplete_record.http_status == Some(StatusCode::OK.as_u16())
             && incomplete_record.error_payload.is_none(),
@@ -793,7 +793,7 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
     );
     let failed_record = wait_for_latest_request_record(&home, 10).await;
     assert!(
-        failed_record.provider_id == bridge_id.to_string()
+        failed_record.provider_id.as_deref() == Some(bridge_id.to_string().as_str())
             && failed_record.outcome == "semantic-error"
             && failed_record.http_status == Some(StatusCode::OK.as_u16())
             && failed_record.error_payload.is_none(),
@@ -884,11 +884,11 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
     );
     let count_record = wait_for_latest_request_record(&home, 23).await;
     assert!(
-        count_record.provider_id == bridge_id.to_string()
+        count_record.provider_id.is_none()
             && count_record.outcome == "route-unavailable"
             && count_record.http_status == Some(StatusCode::NOT_IMPLEMENTED.as_u16())
             && count_record.error_payload.is_none(),
-        "Bridge count_tokens deviation did not produce one fixed Request Record"
+        "Bridge count_tokens deviation did not produce one unattributed fixed Request Record"
     );
 
     let mut replanning = UnixStream::connect(restarted.socket_path()).await.unwrap();
@@ -991,7 +991,7 @@ async fn bridge_resolves_fixed_and_current_default_then_fails_over_without_subst
     );
     let fallback_count_record = wait_for_latest_request_record(&home, 24).await;
     assert!(
-        fallback_count_record.provider_id == bridge_id.to_string()
+        fallback_count_record.provider_id.as_deref() == Some(bridge_id.to_string().as_str())
             && fallback_count_record.outcome == "route-unavailable"
             && fallback_count_record.http_status == Some(StatusCode::NOT_IMPLEMENTED.as_u16()),
         "native-to-Bridge count_tokens exhaustion lost the final Bridge attempt"
@@ -1137,7 +1137,7 @@ async fn wait_for_first_request_record(
 }
 
 struct StoredBridgeRecord {
-    provider_id: String,
+    provider_id: Option<String>,
     protocol: String,
     outcome: String,
     http_status: Option<u16>,

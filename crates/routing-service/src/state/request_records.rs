@@ -208,7 +208,9 @@ impl StateStore {
                          FROM request_records request
                          LEFT JOIN pricing_snapshots pricing
                            ON pricing.request_record_id = request.id
-                         WHERE request.target = ?1 AND request.id = ?2",
+                         WHERE request.target = ?1
+                           AND request.id = ?2
+                           AND request.outcome != 'success'",
                         params![target_name, record_id],
                         |row| {
                             Ok((

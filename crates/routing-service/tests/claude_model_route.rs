@@ -200,6 +200,22 @@ impl StoreFixture {
             .await
             .unwrap()
     }
+
+    async fn request_record_provider_ids(&self) -> Vec<Option<String>> {
+        let database = tokio_rusqlite::Connection::open(self.muxvia_home.database_path())
+            .await
+            .unwrap();
+        database
+            .call(|connection| {
+                let mut statement = connection
+                    .prepare("SELECT provider_id FROM request_records ORDER BY sequence")?;
+                statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap()
+    }
 }
 
 struct CountingUpstream {
@@ -902,6 +918,11 @@ async fn body_policy_returns_fixed_local_errors_without_an_upstream_call() {
     assert!(upstream.requests.lock().await.is_empty());
 
     server.shutdown().await.unwrap();
+    let providers = fixture.request_record_provider_ids().await;
+    assert!(
+        !providers.is_empty() && providers.iter().all(Option::is_none),
+        "a Claude request rejected before routing was attributed to a Provider attempt"
+    );
 }
 
 #[tokio::test]

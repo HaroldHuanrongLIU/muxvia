@@ -374,6 +374,7 @@ export const en = {
   "request-history.detail.loading": "Loading retained failure detail…",
   "request-history.detail.sensitive": "Retained failure payload may contain sensitive request material.",
   "request-history.detail.truncated": "Payload was truncated at the retention limit.",
+  "request-history.detail.display-clipped": "Display clipped to this terminal; the retained record remains unchanged.",
   "request-history.detail.empty": "No retained failure payload.",
   "request-history.detail.success": "Successful records retain no response payload.",
   "request-history.help": "↑/↓ select · Enter inspect failure · {more} · Esc close",

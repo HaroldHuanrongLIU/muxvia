@@ -2,7 +2,8 @@ import type { InputRenderable, KeyEvent } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import { createMemo, createSignal, For, onMount, Show, type Accessor } from "solid-js"
 
-import { useCommandLayer } from "../commands/keymap"
+import { resolveBinding } from "../commands/catalog"
+import { useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
 import type { RequestRecordDetail, RequestRecordSummary, Target } from "../control/types"
 import type { Translator } from "../i18n"
 import { theme } from "../theme"
@@ -55,17 +56,32 @@ function errorKey(code: string) {
 
 export function RequestHistory(props: RequestHistoryProps) {
   const dimensions = useTerminalDimensions()
+  const keymap = useMuxviaKeymap()
   const [keyCapture, setKeyCapture] = createSignal("")
   let input: InputRenderable | undefined
   const selected = () => props.state().records[props.state().selectedIndex]
   const visibleRecords = createMemo(() => {
     const records = props.state().records
-    const capacity = Math.max(1, Math.min(6, Math.floor(Math.max(1, dimensions().height - 8) / 2)))
+    const capacity = props.state().detail
+      ? 1
+      : Math.max(1, Math.min(6, Math.floor(Math.max(1, dimensions().height - 8) / 2)))
     const start = Math.min(
       Math.max(0, records.length - capacity),
       Math.max(0, props.state().selectedIndex - capacity + 1),
     )
     return records.slice(start, start + capacity).map((record, offset) => ({ record, index: start + offset }))
+  })
+  const visibleDetail = createMemo(() => {
+    const payload = props.state().detail?.errorPayload
+    if (payload === null || payload === undefined) return { text: undefined, clipped: false }
+    const capacity = Math.max(
+      1,
+      Math.min(4_096, dimensions().width * Math.max(1, dimensions().height - 12)),
+    )
+    return {
+      text: payload.slice(0, capacity),
+      clipped: payload.length > capacity,
+    }
   })
 
   useCommandLayer({
@@ -84,33 +100,21 @@ export function RequestHistory(props: RequestHistoryProps) {
     if (input && !input.isDestroyed) input.focus()
   }))
 
+  const dispatchBinding = (binding: string) => {
+    const command = resolveBinding("activity", binding)
+    if (!command) return false
+    keymap.dispatchCommand(command)
+    return true
+  }
   const onKeyDown = (event: KeyEvent) => {
-    const handler = event.name === "up" || event.name === "k"
-      ? props.onPrevious
-      : event.name === "down" || event.name === "j"
-        ? props.onNext
-        : event.name === "return" || event.name === "enter" || event.name === "linefeed"
-          ? props.onInspect
-          : event.name === "m"
-            ? props.onMore
-            : event.name === "escape"
-              ? props.onCancel
-              : undefined
-    if (!handler) return
+    const binding = event.name === "enter" || event.name === "linefeed" ? "return" : event.name
+    if (!dispatchBinding(binding)) return
     event.preventDefault()
     event.stopPropagation()
-    handler()
   }
   const captureNavigation = (value: string) => {
-    const handler = value === "up" || value === "k"
-      ? props.onPrevious
-      : value === "down" || value === "j"
-        ? props.onNext
-        : value === "m"
-          ? props.onMore
-          : undefined
-    setKeyCapture("")
-    handler?.()
+    if (dispatchBinding(value)) setKeyCapture("")
+    else setKeyCapture(value)
   }
 
   return <box flexDirection="column" padding={dimensions().width > 3 ? 1 : 0} rowGap={1} backgroundColor={theme.panel}>
@@ -157,13 +161,18 @@ export function RequestHistory(props: RequestHistoryProps) {
       <text fg={theme.warning}>{props.t("request-history.detail.loading")}</text>
     </Show>
     <Show when={props.state().detail}>{(detail: Accessor<RequestRecordDetail>) => <box flexDirection="column">
-      <text fg={theme.warning}>{props.t("request-history.detail.sensitive")}</text>
+      <Show when={detail().errorPayloadSensitive}>
+        <text fg={theme.warning}>{props.t("request-history.detail.sensitive")}</text>
+      </Show>
       <Show when={detail().record.errorPayloadTruncated}>
         <text fg={theme.warning}>{props.t("request-history.detail.truncated")}</text>
       </Show>
-      <text fg={theme.text}>{detail().errorPayload ?? props.t("request-history.detail.empty")}</text>
+      <Show when={visibleDetail().clipped}>
+        <text fg={theme.warning}>{props.t("request-history.detail.display-clipped")}</text>
+      </Show>
+      <text fg={theme.text}>{visibleDetail().text ?? props.t("request-history.detail.empty")}</text>
     </box>}</Show>
-    <Show when={selected() && !selected()!.hasErrorPayload && !props.state().detail}>
+    <Show when={selected()?.outcome === "success" && !props.state().detail}>
       <text fg={theme.muted}>{props.t("request-history.detail.success")}</text>
     </Show>
     <text fg={theme.muted}>{props.t("request-history.help", {

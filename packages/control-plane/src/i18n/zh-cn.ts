@@ -376,6 +376,7 @@ export const zhCN = {
   "request-history.detail.loading": "正在加载保留的失败详情…",
   "request-history.detail.sensitive": "保留的失败载荷可能包含敏感请求材料。",
   "request-history.detail.truncated": "载荷已在保留上限处截断。",
+  "request-history.detail.display-clipped": "显示已按当前终端裁剪；保留记录未被更改。",
   "request-history.detail.empty": "没有保留的失败载荷。",
   "request-history.detail.success": "成功记录不会保留响应载荷。",
   "request-history.help": "↑/↓ 选择 · Enter 查看失败 · {more} · Esc 关闭",

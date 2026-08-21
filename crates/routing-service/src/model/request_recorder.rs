@@ -7,16 +7,21 @@ use std::{
 use axum::{body::Bytes, http::StatusCode};
 use flate2::read::MultiGzDecoder;
 use futures_util::{StreamExt, stream};
+use secrecy::ExposeSecret;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::{
     control::protocol::{ProviderProtocol, RequestRecordOutcome, Target},
     request_history::{PricingCatalog, RecordedProvider, RequestRecordCompletion, RequestUsage},
-    state::StateStore,
+    state::{ActivatedRoutePlanSnapshot, StateStore},
 };
 
-use super::{UpstreamError, server::ActiveRequestGuard};
+use super::{
+    UpstreamError,
+    router::{RouteAttemptIdentity, RoutedUpstream},
+    server::ActiveRequestGuard,
+};
 
 const COMPLETION_QUEUE_CAPACITY: usize = 64;
 const MAX_USAGE_EVENT_BYTES: usize = 256 * 1024;
@@ -35,18 +40,18 @@ pub(crate) struct RequestRecorderActor {
     catalog: PricingCatalog,
 }
 
-pub(crate) struct RequestRecordStart {
-    pub(crate) id: uuid::Uuid,
-    pub(crate) target: Target,
-    pub(crate) plan_id: uuid::Uuid,
-    pub(crate) plan_epoch: uuid::Uuid,
-    pub(crate) provider: Option<RecordedProvider>,
-    pub(crate) model: String,
-    pub(crate) protocol: ProviderProtocol,
-    pub(crate) started_at_unix_ms: u64,
-    pub(crate) status: Option<StatusCode>,
-    pub(crate) semantic_failure: bool,
-    pub(crate) observation: ResponseObservation,
+struct RequestRecordStart {
+    id: uuid::Uuid,
+    target: Target,
+    plan_id: uuid::Uuid,
+    plan_epoch: uuid::Uuid,
+    provider: Option<RecordedProvider>,
+    model: String,
+    protocol: ProviderProtocol,
+    started_at_unix_ms: u64,
+    status: Option<StatusCode>,
+    semantic_failure: bool,
+    observation: ResponseObservation,
 }
 
 #[derive(Clone, Copy)]
@@ -99,6 +104,10 @@ struct ResponseObservationState {
 
 impl ResponseObservation {
     pub(crate) fn new(redactions: Vec<Vec<u8>>) -> Self {
+        let redactions = redactions
+            .into_iter()
+            .flat_map(|secret| redaction_variants(&secret))
+            .collect::<Vec<_>>();
         let error_payload_limit = MAX_ERROR_PAYLOAD_BYTES
             .saturating_add(redactions.iter().map(Vec::len).max().unwrap_or(0));
         Self {
@@ -134,10 +143,12 @@ impl ResponseObservation {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.error_payload_limit = state
-            .error_payload_limit
-            .max(MAX_ERROR_PAYLOAD_BYTES.saturating_add(secret.len()));
-        state.redactions.push(secret.to_vec());
+        for variant in redaction_variants(secret) {
+            state.error_payload_limit = state
+                .error_payload_limit
+                .max(MAX_ERROR_PAYLOAD_BYTES.saturating_add(variant.len()));
+            state.redactions.push(variant);
+        }
     }
 
     pub(crate) fn observe(&self, bytes: &[u8]) {
@@ -178,7 +189,7 @@ impl ResponseObservation {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.gzip && !state.compressed_truncated {
+        if state.gzip {
             let limit = if state.capture_error_payload {
                 state.error_payload_limit
             } else {
@@ -187,19 +198,17 @@ impl ResponseObservation {
             let mut decoder =
                 MultiGzDecoder::new(state.compressed.as_slice()).take((limit + 1) as u64);
             let mut decoded = Vec::new();
-            if decoder.read_to_end(&mut decoded).is_ok() && decoded.len() <= limit {
-                if state.capture_error_payload {
+            let decoded_complete = decoder.read_to_end(&mut decoded).is_ok();
+            if state.capture_error_payload {
+                if !decoded.is_empty() || decoded_complete {
                     state.error_payload = decoded;
-                } else {
-                    state.usage.push(&decoded);
                 }
-            } else if state.capture_error_payload {
-                state.error_payload.clear();
-                state.error_payload_truncated = true;
+                state.error_payload_truncated |= state.compressed_truncated
+                    || !decoded_complete
+                    || state.error_payload.len() > limit;
+            } else if decoded_complete && !state.compressed_truncated && decoded.len() <= limit {
+                state.usage.push(&decoded);
             }
-        } else if state.gzip && state.capture_error_payload {
-            state.error_payload.clear();
-            state.error_payload_truncated = true;
         }
         let usage = state.usage.finish();
         if outcome != RequestRecordOutcome::UpstreamError {
@@ -215,8 +224,13 @@ impl ResponseObservation {
     }
 }
 
-pub(crate) struct ReservedRequestRecord {
+struct ReservedRequestRecord {
     permit: Option<mpsc::OwnedPermit<RequestRecordCompletion>>,
+}
+
+pub(crate) struct RequestRecording {
+    reserved: ReservedRequestRecord,
+    start: RequestRecordStart,
 }
 
 impl RequestRecorder {
@@ -235,7 +249,39 @@ impl RequestRecorder {
         ))
     }
 
-    pub(crate) fn reserve(&self) -> Option<ReservedRequestRecord> {
+    pub(crate) fn begin(
+        &self,
+        target: Target,
+        plan: &ActivatedRoutePlanSnapshot,
+        routing_credential: &str,
+    ) -> Option<RequestRecording> {
+        let reserved = self.reserve()?;
+        let mut redactions = vec![routing_credential.as_bytes().to_vec()];
+        redactions.extend(plan.members.iter().filter_map(|member| {
+            member
+                .provider_credential
+                .as_ref()
+                .map(|credential| credential.expose_secret().as_bytes().to_vec())
+        }));
+        Some(RequestRecording {
+            reserved,
+            start: RequestRecordStart {
+                id: uuid::Uuid::new_v4(),
+                target,
+                plan_id: plan.id,
+                plan_epoch: plan.epoch,
+                provider: None,
+                model: plan.members[0].model.clone(),
+                protocol: plan.members[0].protocol,
+                started_at_unix_ms: unix_time_ms(),
+                status: None,
+                semantic_failure: false,
+                observation: ResponseObservation::new(redactions),
+            },
+        })
+    }
+
+    fn reserve(&self) -> Option<ReservedRequestRecord> {
         self.sender
             .clone()
             .try_reserve_owned()
@@ -289,6 +335,51 @@ impl ReservedRequestRecord {
             error_payload: None,
             error_payload_truncated: false,
         });
+    }
+}
+
+impl RequestRecording {
+    pub(crate) fn observation(&self) -> ResponseObservation {
+        self.start.observation.clone()
+    }
+
+    pub(crate) fn bind_attempt(&mut self, attempt: &RouteAttemptIdentity) {
+        self.start.provider = Some(RecordedProvider {
+            id: attempt.provider_id,
+            name: attempt.provider_name.clone(),
+        });
+        self.start.model = attempt.model.clone();
+        self.start.protocol = attempt.protocol;
+    }
+
+    pub(crate) fn bind_routed(&mut self, routed: &RoutedUpstream) {
+        self.start.provider = Some(RecordedProvider {
+            id: routed.provider_id,
+            name: routed.provider_name.clone(),
+        });
+        self.start.model = routed.model.clone();
+        self.start.protocol = routed.protocol;
+    }
+
+    pub(crate) fn configure_response(
+        &mut self,
+        status: StatusCode,
+        semantic_failure: bool,
+        usage_format: ResponseUsageFormat,
+        gzip: bool,
+    ) {
+        self.start.status = Some(status);
+        self.start.semantic_failure = semantic_failure;
+        self.start.observation.configure(usage_format, status, gzip);
+    }
+
+    pub(crate) fn complete_terminal(
+        mut self,
+        status: Option<StatusCode>,
+        outcome: RequestRecordOutcome,
+    ) {
+        self.start.status = status;
+        self.reserved.complete_terminal(self.start, outcome);
     }
 }
 
@@ -356,14 +447,13 @@ impl Drop for StreamingRecord {
 pub(crate) fn recorded_body(
     body: std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, UpstreamError>> + Send>>,
     active_request: ActiveRequestGuard,
-    reserved: ReservedRequestRecord,
-    start: RequestRecordStart,
+    recording: RequestRecording,
     observe_forwarded: bool,
 ) -> axum::body::Body {
     let recorded = stream::unfold(
         (
             body,
-            StreamingRecord::new(reserved, start),
+            StreamingRecord::new(recording.reserved, recording.start),
             Some(active_request),
         ),
         move |(mut body, mut record, active_request)| async move {
@@ -676,11 +766,86 @@ fn redact(input: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
     redacted
 }
 
+fn redaction_variants(secret: &[u8]) -> Vec<Vec<u8>> {
+    let mut variants = vec![secret.to_vec()];
+    if let Ok(secret) = std::str::from_utf8(secret)
+        && let Ok(encoded) = serde_json::to_vec(secret)
+        && encoded.len() >= 2
+    {
+        let escaped = encoded[1..encoded.len() - 1].to_vec();
+        if escaped != variants[0] {
+            variants.push(escaped);
+        }
+    }
+    variants
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::home::MuxviaHome;
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn failure_payload_redaction_covers_json_escaped_credentials() {
+        let secret = br#"provider\"credential\\segment"#;
+        let observation = ResponseObservation::new(vec![secret.to_vec()]);
+        observation.configure(
+            ResponseUsageFormat::Unsupported,
+            StatusCode::BAD_GATEWAY,
+            false,
+        );
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "error": String::from_utf8_lossy(secret),
+        }))
+        .unwrap();
+        let escaped_secret = serde_json::to_string(&String::from_utf8_lossy(secret))
+            .unwrap()
+            .trim_matches('"')
+            .as_bytes()
+            .to_vec();
+        observation.observe(&payload);
+
+        let (_, stored, _) = observation.finish(RequestRecordOutcome::UpstreamError);
+        let stored = stored.expect("an upstream failure retains a sanitized payload");
+        assert!(
+            !stored
+                .windows(escaped_secret.len())
+                .any(|window| window == escaped_secret),
+            "stored failure payload contains a JSON-escaped credential"
+        );
+    }
+
+    #[test]
+    fn oversized_gzip_failure_retains_the_bounded_decoded_prefix() {
+        let marker = b"retained-gzip-prefix";
+        let mut decoded = marker.to_vec();
+        decoded.resize(MAX_ERROR_PAYLOAD_BYTES + 4_096, b'x');
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&decoded).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let observation = ResponseObservation::new(Vec::new());
+        observation.configure(
+            ResponseUsageFormat::Unsupported,
+            StatusCode::BAD_GATEWAY,
+            true,
+        );
+        observation.observe(&compressed);
+
+        let (_, stored, truncated) = observation.finish(RequestRecordOutcome::UpstreamError);
+        let stored = stored.expect("an upstream failure retains a sanitized payload");
+        assert!(
+            truncated,
+            "oversized decoded payload was not marked truncated"
+        );
+        assert_eq!(stored.len(), MAX_ERROR_PAYLOAD_BYTES);
+        assert!(
+            stored.starts_with(marker),
+            "oversized gzip failure discarded its decoded diagnostic prefix"
+        );
+    }
 
     #[test]
     fn codex_usage_parser_handles_fragmented_sse_and_complete_json() {

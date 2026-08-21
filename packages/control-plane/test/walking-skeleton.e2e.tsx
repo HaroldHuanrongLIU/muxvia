@@ -29,6 +29,7 @@ const wrongRoutingSecret = "routing-secret-must-not-escape"
 const authSentinel = "auth-sentinel-must-not-escape"
 const repoRoot = resolve(import.meta.dir, "../../..")
 const serviceBinary = resolve(repoRoot, "target/debug/muxvia-routing")
+const controlPlaneEntry = resolve(repoRoot, "packages/control-plane/src/index.tsx")
 const fakeCodex = resolve(repoRoot, "tests/e2e/fixtures/fake-codex")
 const fakeClaude = resolve(repoRoot, "tests/e2e/fixtures/fake-claude")
 const deadlineMs = 10_000
@@ -237,6 +238,54 @@ async function claudePost(
   })
 }
 
+async function cancelRoutedPost(
+  target: "codex" | "claude",
+  endpoint: string,
+  credential: string,
+  requestBodySecret: string,
+): Promise<number> {
+  const path = target === "codex" ? "/responses" : "/v1/messages"
+  const url = new URL(`${endpoint}${path}`)
+  return await new Promise<number>((resolveCancelled, reject) => {
+    let settled = false
+    const finish = (status: number) => {
+      if (settled) return
+      settled = true
+      resolveCancelled(status)
+    }
+    const request = httpRequest({
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method: "POST",
+      headers: target === "codex"
+        ? {
+            "content-type": "application/json",
+            "x-muxvia-routing-credential": credential,
+          }
+        : {
+            "content-type": "application/json",
+            authorization: `Bearer ${credential}`,
+            "anthropic-version": "2023-06-01",
+          },
+    }, (response) => {
+      response.once("data", () => {
+        const status = response.statusCode ?? 0
+        response.destroy()
+        request.destroy()
+        finish(status)
+      })
+      response.once("error", () => finish(response.statusCode ?? 0))
+    })
+    request.once("error", (error) => {
+      if (!settled) reject(error)
+    })
+    request.end(JSON.stringify(target === "codex"
+      ? { model: "ignored", input: requestBodySecret }
+      : { model: "ignored", messages: [{ role: "user", content: requestBodySecret }], stream: true }))
+  })
+}
+
 type HeldReconciliationTarget = "codex" | "claude"
 
 type FailoverFixtureBehavior = "success" | "retryable-failure"
@@ -339,6 +388,131 @@ async function startFailoverFixtureUpstream(
     async stop() {
       held?.releaseNow()
       held = undefined
+      server.closeAllConnections()
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
+    },
+  }
+}
+
+type RequestRecordFixtureBehavior =
+  | { kind: "success"; bodySecret: string; headerSecret: string }
+  | { kind: "retryable-failure" }
+  | { kind: "retained-failure"; payload: string }
+  | { kind: "cancelled-stream" }
+
+async function startRequestRecordFixtureUpstream(
+  target: HeldReconciliationTarget,
+  credential: string,
+) {
+  const calls: CapturedRequest[] = []
+  const waiters = new Set<() => void>()
+  let behavior: RequestRecordFixtureBehavior = {
+    kind: "success",
+    bodySecret: "request-record-default-body",
+    headerSecret: "request-record-default-header",
+  }
+  let cancellationStarted = () => {}
+  let cancellationStartedPromise = new Promise<void>((resolveStarted) => {
+    cancellationStarted = resolveStarted
+  })
+  const server = createHttpServer(async (request, response) => {
+    const body: Buffer[] = []
+    for await (const chunk of request) body.push(Buffer.from(chunk))
+    const captured: CapturedRequest = {
+      authorization: typeof request.headers.authorization === "string" ? request.headers.authorization : null,
+      apiKey: typeof request.headers["x-api-key"] === "string" ? request.headers["x-api-key"] : null,
+      headers: Object.fromEntries(Object.entries(request.headers).map(([name, value]) => [name, value ?? null])),
+      contentType: typeof request.headers["content-type"] === "string" ? request.headers["content-type"] : null,
+      method: request.method ?? "",
+      testHeader: typeof request.headers["x-test-preserved"] === "string" ? request.headers["x-test-preserved"] : null,
+      body: Buffer.concat(body).toString("utf8"),
+      path: request.url ?? "",
+    }
+    calls.push(captured)
+    for (const notify of waiters) notify()
+    const expectedPath = target === "codex" ? "/v1/responses" : "/v1/messages"
+    if (
+      captured.path.split("?", 1)[0] !== expectedPath
+      || captured.authorization !== `Bearer ${credential}`
+    ) {
+      response.writeHead(403, { "content-type": "application/json" }).end('{"error":"fixture-rejected"}')
+      return
+    }
+    const selected = behavior
+    if (selected.kind === "retryable-failure") {
+      response.writeHead(503, { "content-type": "application/json" })
+      response.end('{"error":"retryable-fixture-unavailable"}')
+      return
+    }
+    if (selected.kind === "retained-failure") {
+      response.writeHead(429, { "content-type": "application/json" })
+      response.end(selected.payload)
+      return
+    }
+    if (selected.kind === "cancelled-stream") {
+      response.writeHead(200, { "content-type": "text/event-stream" })
+      response.write(target === "codex"
+        ? 'event: response.output_text.delta\ndata: {"delta":"cancel-started"}\n\n'
+        : 'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n')
+      cancellationStarted()
+      await new Promise<void>((resolveClosed) => response.once("close", resolveClosed))
+      return
+    }
+    response.writeHead(target === "codex" ? 201 : 200, {
+      "content-type": "text/event-stream",
+      "x-request-record-success": selected.headerSecret,
+    })
+    const chunks = target === "codex"
+      ? [
+          `event: response.output_text.delta\ndata: {"delta":${JSON.stringify(selected.bodySecret)}}\n\n`,
+          'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":20},"output_tokens":30}}}\n\n',
+        ]
+      : [
+          'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":0,"cache_read_input_tokens":2,"cache_creation_input_tokens":1}}}\n\n',
+          `event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":${JSON.stringify(selected.bodySecret)}}}\n\n`,
+          'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":4}}\n\n',
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+    for (const chunk of chunks) response.write(chunk)
+    response.end()
+  })
+  await new Promise<void>((resolveListen, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolveListen)
+  })
+  const address = server.address()
+  if (!address || typeof address === "string") throw new Error("request-record-upstream-address-missing")
+  return {
+    target,
+    credential,
+    calls,
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    setBehavior(next: RequestRecordFixtureBehavior) {
+      behavior = next
+      if (next.kind === "cancelled-stream") {
+        cancellationStartedPromise = new Promise<void>((resolveStarted) => {
+          cancellationStarted = resolveStarted
+        })
+      }
+    },
+    waitForCancellationStart: () => cancellationStartedPromise,
+    async waitForCallCount(count: number) {
+      if (calls.length >= count) return
+      await new Promise<void>((resolveCount, reject) => {
+        const timeout = setTimeout(() => {
+          waiters.delete(notify)
+          reject(new Error(`request-record-upstream-call-timeout:${target}:${count}`))
+        }, deadlineMs)
+        const notify = () => {
+          if (calls.length < count) return
+          clearTimeout(timeout)
+          waiters.delete(notify)
+          resolveCount()
+        }
+        waiters.add(notify)
+      })
+    },
+    async stop() {
       server.closeAllConnections()
       await new Promise<void>((resolveClose) => server.close(() => resolveClose()))
     },
@@ -937,6 +1111,28 @@ function scanNoSecrets(
 function fixedSurfaceError(error: unknown, scanFailure: string, fallback: string): Error {
   const message = error instanceof Error ? error.message : ""
   return new Error(message === scanFailure ? scanFailure : fallback)
+}
+
+async function waitForSecretSafeText(
+  read: () => string,
+  predicate: (text: string) => boolean,
+  secrets: readonly string[],
+  label: string,
+): Promise<string> {
+  const scanLabel = `${label}-text`
+  const scanFailure = `secret-scan-failed:${scanLabel}`
+  try {
+    await waitFor(() => {
+      const current = read()
+      scanNoSecrets([current], secrets, scanLabel)
+      return predicate(current)
+    }, label)
+    const current = read()
+    scanNoSecrets([current], secrets, scanLabel)
+    return current
+  } catch (error) {
+    throw fixedSurfaceError(error, scanFailure, `text-wait-failed:${label}`)
+  }
 }
 
 async function waitForSecretSafeFrame(
@@ -2022,6 +2218,7 @@ function readStableTargetDatabaseFingerprint(
 ): string {
   const database = new Database(databasePath, { readonly: true })
   try {
+    database.exec("PRAGMA busy_timeout = 5000")
     const route = database.query(`SELECT target, management_revision, current_provider_id, serving_provider_id,
       view_sequence, takeover_state, route_port, routing_credential, activated_snapshot_id, managed_config_path,
       recovery_state FROM target_route_state WHERE target = ?`).get(target) as Record<string, unknown> | null
@@ -2283,6 +2480,25 @@ test("renderer wait diagnostics never retain a secret current frame", async () =
   } finally {
     setup.renderer.destroy()
   }
+})
+
+test("text polling scans every observed frame before semantic predicates", async () => {
+  const secret = "controlled-transient-terminal-secret"
+  const screens = [secret, "Request History Estimated Unpriced"]
+  let index = 0
+  let diagnostic = ""
+  try {
+    await waitForSecretSafeText(
+      () => screens[Math.min(index++, screens.length - 1)]!,
+      (screen) => screen.includes("Request History"),
+      [secret],
+      "controlled-terminal-wait",
+    )
+  } catch (error) {
+    diagnostic = error instanceof Error ? error.message : String(error)
+  }
+  expect(diagnostic).toBe("secret-scan-failed:controlled-terminal-wait-text")
+  expect(diagnostic.includes(secret)).toBeFalse()
 })
 
 test("structured assertion diagnostics never retain additive view secrets", () => {
@@ -2957,7 +3173,7 @@ test("real service keeps child-visible environment traps outside the explicit ta
       claudeConfigDir: requested.CLAUDE_CONFIG_DIR,
       selectorState: "unset",
       hostManagedState: "unmanaged",
-      cwd: root,
+      cwd: repoRoot,
     })
     const saved = await session.act({
       kind: "create-provider",
@@ -8016,5 +8232,708 @@ test("real processes prove Universal Provider synchronization across both Target
     await Promise.all(services.map(({ output }) => Promise.race([output.completed.catch(() => undefined), Bun.sleep(deadlineMs)])))
     await upstream.stop()
     await replacementUpstream.stop()
+  }
+}, 70_000)
+
+test("real processes preserve priced Request History without retaining successful payloads", async () => {
+  const targets = ["codex", "claude"] as const
+  type RecordTarget = typeof targets[number]
+  const root = await mkdtemp(join(tmpdir(), "rr-"))
+  roots.push(root)
+  const userHome = join(root, "home")
+  const muxviaHome = join(userHome, ".muxvia")
+  const socketPath = join(muxviaHome, "run/control.sock")
+  const databasePath = join(muxviaHome, "state/muxvia.db")
+  const codexConfig = join(userHome, ".codex/config.toml")
+  const claudeSettings = join(userHome, ".claude/settings.json")
+  const firstShutdown = join(root, "shutdown-first")
+  const exactModels = {
+    codex: "gpt-5.6",
+    claude: "claude-sonnet-4-5",
+  } as const
+  const unpricedModels = {
+    codex: "request-record-unpriced-codex",
+    claude: "request-record-unpriced-claude",
+  } as const
+  const fixtureSecrets = {
+    codex: {
+      priced: "request-record-codex-priced-provider-secret",
+      fallback: "request-record-codex-fallback-provider-secret",
+      unpriced: "request-record-codex-unpriced-provider-secret",
+    },
+    claude: {
+      priced: "request-record-claude-priced-provider-secret",
+      fallback: "request-record-claude-fallback-provider-secret",
+      unpriced: "request-record-claude-unpriced-provider-secret",
+    },
+  } as const
+  const successBodySecrets = targets.flatMap((target) => [
+    `request-record-${target}-priced-success-body-secret`,
+    `request-record-${target}-fallback-success-body-secret`,
+    `request-record-${target}-unpriced-success-body-secret`,
+  ])
+  const successHeaderSecrets = targets.flatMap((target) => [
+    `request-record-${target}-priced-success-header-secret`,
+    `request-record-${target}-fallback-success-header-secret`,
+    `request-record-${target}-unpriced-success-header-secret`,
+  ])
+  const requestBodySecrets = {
+    codex: "request-record-codex-cancel-request-body-secret",
+    claude: "request-record-claude-cancel-request-body-secret",
+  } as const
+  const retainedMarkers = {
+    codex: "retained-codex-failure-marker",
+    claude: "retained-claude-failure-marker",
+  } as const
+  const fixtures = {
+    codex: {
+      priced: await startRequestRecordFixtureUpstream("codex", fixtureSecrets.codex.priced),
+      fallback: await startRequestRecordFixtureUpstream("codex", fixtureSecrets.codex.fallback),
+      unpriced: await startRequestRecordFixtureUpstream("codex", fixtureSecrets.codex.unpriced),
+    },
+    claude: {
+      priced: await startRequestRecordFixtureUpstream("claude", fixtureSecrets.claude.priced),
+      fallback: await startRequestRecordFixtureUpstream("claude", fixtureSecrets.claude.fallback),
+      unpriced: await startRequestRecordFixtureUpstream("claude", fixtureSecrets.claude.unpriced),
+    },
+  }
+  const allFixtures = targets.flatMap((target) => Object.values(fixtures[target]))
+  const providerSecrets = targets.flatMap((target) => Object.values(fixtureSecrets[target]))
+  const routingSecrets: Record<RecordTarget, Set<string>> = {
+    codex: new Set<string>(),
+    claude: new Set<string>(),
+  }
+  const nonPersistedSecrets = [
+    ...successBodySecrets,
+    ...successHeaderSecrets,
+    ...Object.values(requestBodySecrets),
+  ]
+  const allRoutingSecrets = () => targets.flatMap((target) => [...routingSecrets[target]])
+  const publicSecrets = () => [...providerSecrets, ...allRoutingSecrets(), ...nonPersistedSecrets]
+  const services: Array<{ child: ReturnType<typeof spawn>; output: ReturnType<typeof captureProcessOutput> }> = []
+  const readinessSockets: Array<ReturnType<typeof createConnection>> = []
+  const rpcStreams: Buffer[][] = []
+  const decodedFrames: unknown[] = []
+  const observedViews: TargetView[] = []
+  const renderedFrames: string[] = []
+  const frozenPricingBefore = {} as Record<RecordTarget, { recordId: string; snapshot: string }>
+  const sessions: Partial<Record<RecordTarget, TargetSession>> = {}
+  const clients: Partial<Record<RecordTarget, RpcClient>> = {}
+  const unsubscribes: Array<() => void> = []
+  let setup: Awaited<ReturnType<typeof testRender>> | undefined
+  let recorder: ReturnType<typeof createRendererAudit> | undefined
+
+  await mkdir(dirname(codexConfig), { recursive: true, mode: 0o700 })
+  await mkdir(dirname(claudeSettings), { recursive: true, mode: 0o700 })
+  await writeFile(codexConfig, '# operator comment survives\nunrelated = "keep-me"\n', { mode: 0o600 })
+  await writeFile(claudeSettings, JSON.stringify({
+    operator: { theme: "dark", hooks: ["keep"] },
+    env: { OPERATOR_UNRELATED: "keep-me" },
+  }, null, 2), { mode: 0o640 })
+  await chmod(claudeSettings, 0o640)
+  await chmod(fakeCodex, 0o755)
+  await chmod(fakeClaude, 0o755)
+
+  const startService = async (label: string, shutdownFile?: string) => {
+    const args = [
+      "--home", muxviaHome,
+      "--test-codex-executable", fakeCodex,
+      "--test-claude-executable", fakeClaude,
+    ]
+    if (shutdownFile) args.push("--test-shutdown-file", shutdownFile)
+    const child = spawn(serviceBinary, args, {
+      cwd: root,
+      env: { HOME: userHome, PATH: `${dirname(fakeCodex)}:/usr/bin:/bin`, MUXVIA_INTEGRATION_TEST: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    const output = captureProcessOutput(child)
+    services.push({ child, output })
+    const exitedBeforeReady = output.completed.then(({ code }) => {
+      scanProcessOutputNoSecrets(output.streams, publicSecrets())
+      const stderr = Buffer.concat(output.streams[1]).toString("utf8")
+      const classification = stderr.includes("Routing Service state is unavailable")
+        ? "state"
+        : stderr.includes("another Routing Service owns this Muxvia Home")
+          ? "lock"
+          : stderr.includes("Routing Service control transport failed")
+            ? "control"
+            : "unknown"
+      throw new Error(`request-record-service-exited:${label}:${code}:${classification}`)
+    }) as Promise<never>
+    await waitForEventTurnReadiness(
+      () => probeUnixSocket(socketPath, readinessSockets),
+      exitedBeforeReady,
+      `request-record-${label}-service`,
+    )
+    return { child, output }
+  }
+  const connect = async (target: RecordTarget, release: string) => {
+    const chunks: Buffer[] = []
+    const decoder = new FrameDecoder()
+    rpcStreams.push(chunks)
+    const client = await eventBarrier(RpcClient.connect(socketPath, release, undefined, (path) => {
+      const socket = createConnection({ path })
+      socket.on("data", (chunk) => {
+        const bytes = Buffer.from(chunk)
+        chunks.push(bytes)
+        for (const frame of decoder.push(bytes)) {
+          assertSecretSafeStructured(frame, publicSecrets(), `request-record-${target}-rpc-frame`)
+          decodedFrames.push(frame)
+        }
+      })
+      return socket
+    }), `request-record-${target}-${release}-connect`)
+    readinessSockets.splice(0).forEach((socket) => socket.destroy())
+    return client
+  }
+  const openSessions = async (release: string) => {
+    for (const target of targets) {
+      const client = await connect(target, `${release}-${target}`)
+      clients[target] = client
+      const session = target === "codex"
+        ? await eventBarrier(client.openTarget(target), `request-record-${release}-${target}-open`)
+        : await eventBarrier(client.openTarget(target, {
+            claudeConfigDir: null,
+            selectorState: "unset",
+            hostManagedState: "unmanaged",
+            cwd: root,
+          }), `request-record-${release}-${target}-open`)
+      sessions[target] = session
+      const collect = (view: Readonly<TargetView>) => {
+        assertSecretSafeStructured(view, publicSecrets(), `request-record-${target}-view`)
+        observedViews.push(view as TargetView)
+      }
+      collect(session.get())
+      unsubscribes.push(session.subscribe(collect))
+    }
+  }
+  const closeSessions = async () => {
+    unsubscribes.splice(0).forEach((unsubscribe) => unsubscribe())
+    const ownedSessions = targets.map((target) => sessions[target])
+    const ownedClients = targets.map((target) => clients[target])
+    for (const target of targets) {
+      delete sessions[target]
+      delete clients[target]
+    }
+    await Promise.all(ownedSessions.map((session) => session?.close().catch(() => undefined)))
+    await Promise.all(ownedClients.map((client) => client?.close().catch(() => undefined)))
+  }
+  const sessionFor = (target: RecordTarget) => {
+    const session = sessions[target]
+    if (!session) throw new Error(`request-record-session-missing:${target}`)
+    return session
+  }
+  const providerByName = (target: RecordTarget, name: string) => {
+    const provider = sessionFor(target).get().providers.find((candidate) => candidate.name === name)
+    if (!provider) throw new Error(`request-record-provider-missing:${target}:${name}`)
+    return provider
+  }
+  const safeAct = async (target: RecordTarget, action: OrdinaryTargetAction, label: string) =>
+    await actSecretSafe(sessionFor(target), action, publicSecrets(), `request-record-${target}-${label}`)
+  const applyPlan = async (target: RecordTarget, names: readonly string[]) => {
+    await safeAct(target, {
+      kind: "save-failover-draft",
+      members: names.map((name) => {
+        const provider = providerByName(target, name)
+        return { providerId: provider.id, providerRevision: provider.providerRevision }
+      }),
+    }, "save-plan")
+    const draftRevision = sessionFor(target).get().failover?.draftRevision
+    if (!draftRevision) throw new Error(`request-record-draft-revision-missing:${target}`)
+    await safeAct(target, { kind: "apply-failover-chain", draftRevision }, "apply-plan")
+    const epoch = sessionFor(target).get().failover?.activePlan?.epoch
+    if (!epoch) throw new Error(`request-record-plan-epoch-missing:${target}`)
+    return epoch
+  }
+  const readRoute = async (target: RecordTarget, model: string) => {
+    const route = target === "codex"
+      ? extractManagedConfig(await readFile(codexConfig, "utf8"), model)
+      : extractClaudeManagedSettings(await readFile(claudeSettings, "utf8"), model, providerSecrets)
+    routingSecrets[target].add(route.credential)
+    return route
+  }
+  const post = async (target: RecordTarget, route: { endpoint: string; credential: string }) => target === "codex"
+    ? await chunkedPost(route.endpoint, route.credential)
+    : await claudePost(route.endpoint, route.credential, "/v1/messages", {
+        model: "request-record-request-model",
+        messages: [],
+        max_tokens: 16,
+        stream: true,
+      })
+  const waitForRecordCount = async (target: RecordTarget, count: number) => {
+    let page: Awaited<ReturnType<TargetSession["listRequestRecords"]>> | undefined
+    await waitFor(async () => {
+      page = await sessionFor(target).listRequestRecords({ limit: 100 })
+      assertSecretSafeStructured(page, publicSecrets(), `request-record-${target}-page-wait`)
+      return page.records.length >= count
+    }, `request-record-${target}-count-${count}`)
+    return page!
+  }
+  const collectPages = async (target: RecordTarget) => {
+    const records: Array<Awaited<ReturnType<TargetSession["listRequestRecords"]>>["records"][number]> = []
+    let beforeCursor: string | undefined
+    do {
+      const page = await sessionFor(target).listRequestRecords({
+        limit: 2,
+        ...(beforeCursor === undefined ? {} : { beforeCursor }),
+      })
+      assertSecretSafeStructured(page, publicSecrets(), `request-record-${target}-paged-history`)
+      records.push(...page.records)
+      beforeCursor = page.nextCursor ?? undefined
+    } while (beforeCursor !== undefined)
+    return records
+  }
+  const readFrozenPricingSnapshot = (target: RecordTarget, recordId: string) => {
+    const database = new Database(databasePath, { readonly: true })
+    try {
+      database.exec("PRAGMA busy_timeout = 5000")
+      const snapshot = database.query(`
+        SELECT catalog_version AS catalogVersion,
+               source,
+               source_model AS sourceModel,
+               input_nano_usd_per_million AS inputNanoUsdPerMillion,
+               output_nano_usd_per_million AS outputNanoUsdPerMillion,
+               cache_read_multiplier_ppm AS cacheReadMultiplierPpm,
+               cache_creation_multiplier_ppm AS cacheCreationMultiplierPpm,
+               priced_at_unix_ms AS pricedAtUnixMs,
+               estimated_cost_nano_usd AS estimatedCostNanoUsd
+        FROM pricing_snapshots
+        WHERE request_record_id = ?`).get(recordId) as Record<string, string | number> | null
+      assertSecretSafeStructured(snapshot, publicSecrets(), `request-record-pricing-snapshot-${recordId}`)
+      if (!snapshot) throw new Error("request-record-pricing-snapshot-missing")
+      if (
+        snapshot.catalogVersion !== "models.dev-d2ec701bace7"
+        || snapshot.sourceModel !== exactModels[target]
+        || typeof snapshot.estimatedCostNanoUsd !== "number"
+        || snapshot.estimatedCostNanoUsd <= 0
+      ) throw new Error(`request-record-pricing-snapshot-invalid:${target}`)
+      return canonicalJson(snapshot)
+    } finally {
+      database.close()
+    }
+  }
+  const renderHistory = async () => {
+    setup = await testRender(() => <App sessions={{ codex: sessions.codex!, claude: sessions.claude! }} />, {
+      width: 100,
+      height: 30,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    recorder = createRendererAudit(setup)
+    recorder.start()
+    for (const [index, target] of targets.entries()) {
+      if (index > 0) {
+        setup.mockInput.pressEscape()
+        await waitForSecretSafeFrame(
+          setup,
+          (frame) => frame.includes("Choose a target"),
+          publicSecrets(),
+          `request-record-${target}-home`,
+        )
+      }
+      setup.mockInput.pressKey(index === 0 ? "1" : "2")
+      await waitForSecretSafeFrame(
+        setup,
+        (frame) => frame.includes(target === "codex" ? "Codex CLI" : "Claude Code")
+          && frame.includes("Run a target action"),
+        publicSecrets(),
+        `request-record-${target}-target`,
+      )
+      await setup.mockInput.typeText("/activity")
+      setup.mockInput.pressEnter()
+      const listFrame = await waitForSecretSafeFrame(
+        setup,
+        (frame) => frame.includes("Request History")
+          && frame.includes("Estimated")
+          && frame.includes("Unpriced"),
+        publicSecrets(),
+        `request-record-${target}-activity-list`,
+      )
+      renderedFrames.push(listFrame)
+      setup.mockInput.pressKey("down")
+      await setup.renderOnce()
+      const detailResultsBefore = decodedFrames.filter((frame) => (
+        frame as { result?: { kind?: unknown } }
+      ).result?.kind === "request-record-detail").length
+      setup.mockInput.pressEnter()
+      await waitFor(() => decodedFrames.filter((frame) => (
+        frame as { result?: { kind?: unknown } }
+      ).result?.kind === "request-record-detail").length === detailResultsBefore + 1,
+      `request-record-${target}-activity-detail-response`)
+      for (let pass = 0; pass < 4; pass++) await Promise.resolve()
+      await setup.renderOnce()
+      const detailFrame = captureSecretSafeFrame(
+        setup,
+        renderedFrames,
+        publicSecrets(),
+        `request-record-${target}-activity-detail`,
+      )
+      if (!detailFrame.includes("sensitive request") || !detailFrame.includes("truncated")) {
+        const selectedSuccess = detailFrame.includes("Successful records retain no response payload")
+        const displayClipped = detailFrame.includes("Display clipped to this terminal")
+        const historyOpen = detailFrame.includes("Request History")
+        const detailLoading = detailFrame.includes("Loading retained failure detail")
+        const markerVisible = detailFrame.includes(retainedMarkers[target])
+        throw new Error(`request-record-activity-detail-mismatch:${target}:${selectedSuccess}:${displayClipped}:${historyOpen}:${detailLoading}:${markerVisible}`)
+      }
+      renderedFrames.push(detailFrame)
+      setup.mockInput.pressEscape()
+      await waitForSecretSafeFrame(
+        setup,
+        (frame) => frame.includes("Run a target action") && !frame.includes("Request History"),
+        publicSecrets(),
+        `request-record-${target}-activity-close`,
+      )
+    }
+  }
+  const renderHistoryThroughRealMuxvia = async () => {
+    for (const target of targets) {
+      if (clients[target]?.serviceMetadata.release !== "0.1.0") {
+        throw new Error(`request-record-real-muxvia-service-release-invalid:${target}`)
+      }
+    }
+    const output: Uint8Array[] = []
+    const terminal = new Bun.Terminal({
+      cols: 100,
+      rows: 30,
+      name: "xterm-256color",
+      data: (_terminal, data) => { output.push(Uint8Array.from(data)) },
+    })
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      HOME: userHome,
+      CODEX_HOME: join(userHome, ".codex"),
+      PATH: `${dirname(fakeCodex)}:/usr/bin:/bin`,
+      TERM: "xterm-256color",
+    }
+    delete env.OTUI_NO_NATIVE_RENDER
+    const proc = Bun.spawn([
+      "/usr/bin/env",
+      process.execPath,
+      "run",
+      "--preload=@opentui/solid/preload",
+      "--jsx-import-source=@opentui/solid",
+      controlPlaneEntry,
+      "--service", serviceBinary,
+      "--socket", socketPath,
+    ], {
+      cwd: root,
+      env,
+      terminal,
+    })
+    const rendered = () => new TextDecoder().decode(Buffer.concat(output.map((chunk) => Buffer.from(chunk))))
+    try {
+      try {
+        await waitForSecretSafeText(
+          rendered,
+          (screen) => screen.includes("Choose a target"),
+          publicSecrets(),
+          "request-record-real-muxvia-home",
+        )
+      } catch (error) {
+        if (error instanceof Error
+          && error.message === "secret-scan-failed:request-record-real-muxvia-home-text") {
+          throw error
+        }
+        const screen = rendered()
+        scanNoSecrets([screen], publicSecrets(), "request-record-real-muxvia-startup")
+        const classes = [
+          "service-unavailable", "Connection", "Terminal", "TypeError", "Error", "ENOENT",
+          "unsupported", "failed", "Cannot", "not found", "module", "package", "command",
+          "file", "@opentui", "@opentui/core-darwin", "@opentui/solid", "solid-js",
+          "index.tsx", "hand-over",
+        ].map((marker) => screen.includes(marker)).join(":")
+        throw new Error(`request-record-real-muxvia-startup-invalid:${proc.exitCode}:${screen.includes("Codex CLI")}:${screen.includes("Claude Code")}:${screen.includes("Choose a target")}:${screen.length > 0}:${classes}`)
+      }
+      terminal.write("1")
+      await waitForSecretSafeText(
+        rendered,
+        (screen) => screen.includes("Run a target action"),
+        publicSecrets(),
+        "request-record-real-muxvia-target",
+      )
+      terminal.write("/activity\r")
+      await waitForSecretSafeText(
+        rendered,
+        (screen) => screen.includes("Request History")
+          && screen.includes("Estimated")
+          && screen.includes("Unpriced"),
+        publicSecrets(),
+        "request-record-real-muxvia-activity",
+      )
+      const screen = rendered()
+      scanNoSecrets([screen], publicSecrets(), "request-record-real-muxvia-renderer")
+      renderedFrames.push(screen)
+      proc.kill("SIGINT")
+      const exit = await Promise.race([
+        proc.exited,
+        Bun.sleep(deadlineMs).then(() => undefined),
+      ])
+      if (exit !== 0) throw new Error("request-record-real-muxvia-exit-invalid")
+    } finally {
+      if (proc.exitCode === null) proc.kill("SIGKILL")
+      await proc.exited.catch(() => {})
+      terminal.close()
+    }
+  }
+  const closeRenderer = () => {
+    recorder?.stop()
+    if (recorder) renderedFrames.push(...recorder.frames())
+    if (setup && !setup.renderer.isDestroyed) setup.renderer.destroy()
+    setup = undefined
+    recorder = undefined
+  }
+
+  try {
+    const first = await startService("first", firstShutdown)
+    await openSessions("first")
+    const planEpochs = {} as Record<RecordTarget, { priced: string; unpriced: string }>
+    const routes = {} as Record<RecordTarget, { endpoint: string; credential: string }>
+
+    for (const target of targets) {
+      const label = target === "codex" ? "Codex" : "Claude"
+      const targetFixtures = fixtures[target]
+      const targetSecrets = fixtureSecrets[target]
+      for (const [role, model] of [
+        ["priced", exactModels[target]],
+        ["fallback", exactModels[target]],
+        ["unpriced", unpricedModels[target]],
+      ] as const) {
+        await safeAct(target, {
+          kind: "create-provider",
+          name: `${label} ${role}`,
+          baseUrl: targetFixtures[role].baseUrl,
+          model,
+          credential: { kind: "replace", value: targetSecrets[role] },
+          authentication: target === "codex" ? "openai-bearer" : "anthropic-bearer",
+          presetKey: null,
+        }, `create-${role}`)
+      }
+      const pricedName = `${label} priced`
+      const fallbackName = `${label} fallback`
+      await safeAct(target, {
+        kind: "activate-provider",
+        providerId: providerByName(target, pricedName).id,
+        mode: "takeover",
+      }, "activate-priced")
+      routes[target] = await readRoute(target, exactModels[target])
+      planEpochs[target] = {
+        priced: await applyPlan(target, [pricedName, fallbackName]),
+        unpriced: "",
+      }
+
+      const pricedBody = `request-record-${target}-priced-success-body-secret`
+      const pricedHeader = `request-record-${target}-priced-success-header-secret`
+      targetFixtures.priced.setBehavior({ kind: "success", bodySecret: pricedBody, headerSecret: pricedHeader })
+      const pricedResponse = await post(target, routes[target])
+      if (
+        pricedResponse.status !== (target === "codex" ? 201 : 200)
+        || pricedResponse.headers["x-request-record-success"] !== pricedHeader
+        || !pricedResponse.body.includes(pricedBody)
+      ) throw new Error(`request-record-priced-response-mismatch:${target}`)
+      await waitForRecordCount(target, 1)
+
+      targetFixtures.priced.setBehavior({ kind: "retryable-failure" })
+      const fallbackBody = `request-record-${target}-fallback-success-body-secret`
+      const fallbackHeader = `request-record-${target}-fallback-success-header-secret`
+      targetFixtures.fallback.setBehavior({ kind: "success", bodySecret: fallbackBody, headerSecret: fallbackHeader })
+      const fallbackResponse = await post(target, routes[target])
+      if (
+        fallbackResponse.status !== (target === "codex" ? 201 : 200)
+        || fallbackResponse.headers["x-request-record-success"] !== fallbackHeader
+        || !fallbackResponse.body.includes(fallbackBody)
+      ) throw new Error(`request-record-fallback-response-mismatch:${target}`)
+      const pricedHistory = await waitForRecordCount(target, 2)
+      const pricedRecord = pricedHistory.records.find((record) => record.providerName === pricedName)
+      if (!pricedRecord) throw new Error(`request-record-priced-history-missing:${target}`)
+      frozenPricingBefore[target] = {
+        recordId: pricedRecord.id,
+        snapshot: readFrozenPricingSnapshot(target, pricedRecord.id),
+      }
+
+      const unpricedName = `${label} unpriced`
+      await safeAct(target, {
+        kind: "activate-provider",
+        providerId: providerByName(target, unpricedName).id,
+        mode: "takeover",
+      }, "activate-unpriced")
+      routes[target] = await readRoute(target, unpricedModels[target])
+      planEpochs[target].unpriced = await applyPlan(target, [unpricedName])
+      const unpricedBody = `request-record-${target}-unpriced-success-body-secret`
+      const unpricedHeader = `request-record-${target}-unpriced-success-header-secret`
+      targetFixtures.unpriced.setBehavior({ kind: "success", bodySecret: unpricedBody, headerSecret: unpricedHeader })
+      const unpricedResponse = await post(target, routes[target])
+      if (
+        unpricedResponse.status !== (target === "codex" ? 201 : 200)
+        || unpricedResponse.headers["x-request-record-success"] !== unpricedHeader
+        || !unpricedResponse.body.includes(unpricedBody)
+      ) throw new Error(`request-record-unpriced-response-mismatch:${target}`)
+      await waitForRecordCount(target, 3)
+
+      const retainedPayload = JSON.stringify({
+        marker: retainedMarkers[target],
+        providerCredential: targetSecrets.unpriced,
+        routingCredential: routes[target].credential,
+        payload: "x".repeat(70_000),
+      })
+      targetFixtures.unpriced.setBehavior({ kind: "retained-failure", payload: retainedPayload })
+      const failedResponse = await post(target, routes[target])
+      if (failedResponse.status !== 429 || failedResponse.body.length <= 65_536) {
+        throw new Error(`request-record-failure-response-mismatch:${target}`)
+      }
+      await waitForRecordCount(target, 4)
+
+      const priced = providerByName(target, pricedName)
+      await safeAct(target, {
+        kind: "update-provider",
+        providerId: priced.id,
+        providerRevision: priced.providerRevision,
+        name: `${label} priced edited`,
+        baseUrl: priced.baseUrl,
+        model: `${exactModels[target]}-edited`,
+        credential: { kind: "keep" },
+        authentication: priced.authentication,
+        routingRequirement: priced.routingRequirement,
+      }, "edit-historical-provider")
+
+      targetFixtures.unpriced.setBehavior({ kind: "cancelled-stream" })
+      const cancelled = cancelRoutedPost(
+        target,
+        routes[target].endpoint,
+        routes[target].credential,
+        requestBodySecrets[target],
+      )
+      await eventBarrier(targetFixtures.unpriced.waitForCancellationStart(), `request-record-${target}-cancel-start`)
+      const cancelledStatus = await eventBarrier(cancelled, `request-record-${target}-cancel-client`)
+      if (cancelledStatus !== 200) throw new Error(`request-record-cancel-status-invalid:${target}`)
+    }
+
+    await closeSessions()
+    await writeFile(firstShutdown, "shutdown\n")
+    const firstExit = await eventBarrier(first.output.completed, "request-record-first-exit")
+    if (firstExit.code !== 0 || firstExit.signal !== null) throw new Error("request-record-first-exit-invalid")
+    await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" })
+
+    const second = await startService("restart")
+    await openSessions("restart")
+    for (const target of targets) {
+      const label = target === "codex" ? "Codex" : "Claude"
+      const records = await collectPages(target)
+      if (records.length !== 5) throw new Error(`request-record-history-count-invalid:${target}`)
+      const expected = [
+        ["cancelled", `${label} unpriced`, unpricedModels[target], planEpochs[target].unpriced],
+        ["upstream-error", `${label} unpriced`, unpricedModels[target], planEpochs[target].unpriced],
+        ["success", `${label} unpriced`, unpricedModels[target], planEpochs[target].unpriced],
+        ["success", `${label} fallback`, exactModels[target], planEpochs[target].priced],
+        ["success", `${label} priced`, exactModels[target], planEpochs[target].priced],
+      ] as const
+      for (const [index, record] of records.entries()) {
+        const row = expected[index]!
+        if (
+          record.outcome !== row[0]
+          || record.providerName !== row[1]
+          || record.model !== row[2]
+          || record.planEpoch !== row[3]
+          || "errorPayload" in record
+        ) throw new Error(`request-record-history-row-invalid:${target}:${index}`)
+      }
+      if (
+        records[0]!.hasErrorPayload
+        || !records[1]!.hasErrorPayload
+        || !records[1]!.errorPayloadTruncated
+        || records.slice(2).some((record) => record.hasErrorPayload)
+      ) throw new Error(`request-record-payload-metadata-invalid:${target}`)
+      if (
+        records[0]!.estimatedCostNanoUsd !== null
+        || records[1]!.estimatedCostNanoUsd !== null
+        || records[2]!.estimatedCostNanoUsd !== null
+        || !records[3]!.estimatedCostNanoUsd
+        || !records[4]!.estimatedCostNanoUsd
+      ) throw new Error(`request-record-pricing-projection-invalid:${target}`)
+      const failureDetail = await sessionFor(target).inspectRequestRecord(records[1]!.id)
+      assertSecretSafeStructured(failureDetail, publicSecrets(), `request-record-${target}-failure-detail`)
+      if (
+        failureDetail.errorPayload?.length !== 65_536
+        || !failureDetail.errorPayload.includes(retainedMarkers[target])
+        || failureDetail.record.errorPayloadTruncated !== true
+        || failureDetail.errorPayloadSensitive !== true
+      ) throw new Error(`request-record-failure-detail-invalid:${target}`)
+      if (
+        records[4]!.id !== frozenPricingBefore[target].recordId
+        || readFrozenPricingSnapshot(target, records[4]!.id) !== frozenPricingBefore[target].snapshot
+      ) throw new Error(`request-record-frozen-pricing-invalid:${target}`)
+    }
+
+    await renderHistory()
+    closeRenderer()
+    await renderHistoryThroughRealMuxvia()
+
+    for (const target of targets) {
+      await safeAct(target, { kind: "disable-takeover" }, "disable-takeover")
+    }
+    const finalRoutes = { ...routes }
+    await closeSessions()
+    const naturalExit = await Promise.race([
+      second.output.completed,
+      Bun.sleep(deadlineMs).then(() => undefined),
+    ])
+    if (!naturalExit || naturalExit.code !== 0 || naturalExit.signal !== null) {
+      throw new Error("request-record-natural-exit-failed")
+    }
+    await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" })
+    for (const target of targets) {
+      await expect(post(target, finalRoutes[target])).rejects.toBeDefined()
+    }
+
+    const database = new Database(databasePath, { readonly: true })
+    try {
+      const counts = database.query(`SELECT
+        (SELECT COUNT(*) FROM request_records) AS records,
+        (SELECT COUNT(*) FROM pricing_snapshots) AS pricing,
+        (SELECT COUNT(*) FROM request_records WHERE outcome = 'success' AND error_payload IS NOT NULL) AS successfulPayloads,
+        (SELECT COUNT(*) FROM request_records WHERE outcome = 'upstream-error' AND length(error_payload) = 65536 AND error_payload_truncated = 1) AS cappedFailures`).get() as Record<string, number>
+      if (counts.records !== 10 || counts.pricing !== 4 || counts.successfulPayloads !== 0 || counts.cappedFailures !== 2) {
+        throw new Error("request-record-final-database-counts-invalid")
+      }
+      const definitions = database.query(`SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`).all() as Array<{ name: string }>
+      for (const { name } of definitions) {
+        const quoted = `"${name.replaceAll('"', '""')}"`
+        scanNoSecrets(database.query(`SELECT * FROM ${quoted}`).all(), nonPersistedSecrets, `request-record-database-${name}`)
+      }
+    } finally { database.close() }
+    auditSqliteSecretLocations(databasePath, {
+      providerSecrets: targets.flatMap((target) => {
+        const label = target === "codex" ? "Codex" : "Claude"
+        return [
+          { target, name: `${label} priced edited`, secret: fixtureSecrets[target].priced },
+          { target, name: `${label} fallback`, secret: fixtureSecrets[target].fallback },
+          { target, name: `${label} unpriced`, secret: fixtureSecrets[target].unpriced },
+        ]
+      }),
+      routingSecrets: targets.flatMap((target) => [...routingSecrets[target]].map((secret) => ({ target, secret }))),
+    })
+    scanRawRpcFramesNoSecrets(rpcStreams, publicSecrets())
+    scanNoSecrets([decodedFrames, observedViews, renderedFrames], publicSecrets(), "request-record-public-surfaces")
+    scanProcessOutputNoSecrets(services.flatMap(({ output }) => output.streams), publicSecrets())
+    for (const target of targets) {
+      for (const fixture of Object.values(fixtures[target])) {
+        scanNoSecrets(fixture.calls, allRoutingSecrets(), `request-record-${target}-upstream-routing-secret`)
+        if (fixture.calls.some((call) => call.authorization !== `Bearer ${fixture.credential}`)) {
+          throw new Error(`request-record-upstream-credential-invalid:${target}`)
+        }
+      }
+    }
+  } finally {
+    closeRenderer()
+    readinessSockets.splice(0).forEach((socket) => socket.destroy())
+    await closeSessions()
+    await writeFile(firstShutdown, "shutdown\n").catch(() => {})
+    for (const { child } of services) if (child.exitCode === null) child.kill("SIGKILL")
+    await Promise.all(services.map(({ output }) => Promise.race([
+      output.completed.catch(() => undefined),
+      Bun.sleep(deadlineMs),
+    ])))
+    await Promise.all(allFixtures.map((fixture) => fixture.stop()))
   }
 }, 70_000)

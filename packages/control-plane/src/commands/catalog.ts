@@ -92,6 +92,10 @@ export function commandsForScope(scope: CommandScope): readonly CommandDefinitio
   return commandCatalog.filter((command) => command.scopes.includes(scope))
 }
 
+export function resolveBinding(scope: CommandScope, binding: string): CommandDefinition["id"] | undefined {
+  return commandsForScope(scope).find((command) => command.bindings.includes(binding))?.id
+}
+
 export function resolveSlash(input: string, scope: CommandScope): CommandDefinition["id"] | undefined {
   const match = input.trim().match(/^\/([^\s/]+)$/)
   if (!match) return undefined

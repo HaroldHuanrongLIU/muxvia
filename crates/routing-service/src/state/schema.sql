@@ -276,6 +276,15 @@ BEGIN
   SELECT RAISE(ABORT, 'immutable-pricing-snapshot');
 END;
 
+CREATE TRIGGER IF NOT EXISTS pricing_snapshots_delete_with_request_record
+BEFORE DELETE ON pricing_snapshots
+WHEN EXISTS (
+  SELECT 1 FROM request_records WHERE id = OLD.request_record_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'immutable-pricing-snapshot');
+END;
+
 CREATE TABLE IF NOT EXISTS target_route_state (
   target TEXT PRIMARY KEY CHECK (target IN ('codex', 'claude')),
   management_revision INTEGER NOT NULL,
@@ -376,7 +385,7 @@ INSERT OR IGNORE INTO subscription_account_catalog_state
   (singleton, revision, view_sequence, recovery_state)
 VALUES (1, 0, 0, 'clean');
 
-INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '13');
+INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '14');
 INSERT OR IGNORE INTO universal_provider_catalog_state (
   singleton, revision, view_sequence
 ) VALUES (1, 0, 0);

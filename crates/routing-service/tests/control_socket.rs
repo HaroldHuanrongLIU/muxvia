@@ -838,6 +838,14 @@ async fn request_history_pages_and_details_are_target_bound_over_real_uds() {
             )?;
             for (id, target, finished, outcome, status, payload) in [
                 (
+                    "00000000-0000-4000-8000-000000001400",
+                    "codex",
+                    100_i64,
+                    "route-unavailable",
+                    None,
+                    None,
+                ),
+                (
                     "00000000-0000-4000-8000-000000001401",
                     "codex",
                     110_i64,
@@ -973,7 +981,9 @@ async fn request_history_pages_and_details_are_target_bound_over_real_uds() {
         second["result"]["page"]["records"]
             .as_array()
             .is_some_and(|records| {
-                records.len() == 1 && records[0]["id"] == "00000000-0000-4000-8000-000000001401"
+                records.len() == 2
+                    && records[0]["id"] == "00000000-0000-4000-8000-000000001401"
+                    && records[1]["id"] == "00000000-0000-4000-8000-000000001400"
             })
             && second["result"]["page"]["nextCursor"].is_null(),
         "request history cursor skipped or repeated a Target record"
@@ -1000,6 +1010,38 @@ async fn request_history_pages_and_details_are_target_bound_over_real_uds() {
                 == "history-catalog-v1"
             && detail["result"]["detail"]["pricingSnapshot"]["estimatedCostNanoUsd"] == 5,
         "request history detail did not return the exact Target-bound failed record"
+    );
+    let payload_free_failure = request(
+        &mut session,
+        "history-payload-free-failure",
+        json!({
+            "kind": "inspect-request-record", "target": "codex",
+            "recordId": "00000000-0000-4000-8000-000000001400"
+        }),
+    )
+    .await;
+    assert_request_history_frame_secret_free(&payload_free_failure, HISTORY_CREDENTIAL);
+    assert!(
+        payload_free_failure["type"] == "response"
+            && payload_free_failure["result"]["kind"] == "request-record-detail"
+            && payload_free_failure["result"]["detail"]["record"]["outcome"] == "route-unavailable"
+            && payload_free_failure["result"]["detail"]["errorPayload"].is_null()
+            && payload_free_failure["result"]["detail"]["errorPayloadSensitive"] == false,
+        "payload-free failed Request Record was not inspectable"
+    );
+    let successful_detail = request(
+        &mut session,
+        "history-success-detail",
+        json!({
+            "kind": "inspect-request-record", "target": "codex",
+            "recordId": "00000000-0000-4000-8000-000000001404"
+        }),
+    )
+    .await;
+    assert_request_history_frame_secret_free(&successful_detail, HISTORY_CREDENTIAL);
+    assert!(
+        successful_detail["problem"]["code"] == "request-record-not-found",
+        "successful Request Record exposed an inspection result"
     );
     let missing = request(
         &mut session,

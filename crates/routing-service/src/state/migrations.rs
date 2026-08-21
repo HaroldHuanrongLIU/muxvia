@@ -194,6 +194,11 @@ fn migrate_v12(connection: &mut Connection) -> Result<()> {
          );
          CREATE INDEX request_records_target_sequence
            ON request_records(target, sequence DESC);
+         CREATE TRIGGER request_records_immutable
+         BEFORE UPDATE ON request_records
+         BEGIN
+           SELECT RAISE(ABORT, 'immutable-request-record');
+         END;
          CREATE TABLE pricing_snapshots (
            request_record_id TEXT PRIMARY KEY REFERENCES request_records(id) ON DELETE CASCADE,
            catalog_version TEXT NOT NULL,

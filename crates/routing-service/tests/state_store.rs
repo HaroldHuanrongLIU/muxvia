@@ -271,6 +271,16 @@ async fn request_record_schema_bounds_failed_payload_and_freezes_pricing_snapsho
         })
         .await;
     assert!(update.is_err(), "mutated an immutable Pricing Snapshot");
+    let record_update = database
+        .call(|connection| {
+            connection.execute("UPDATE request_records SET model = 'rewritten'", [])?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await;
+    assert!(
+        record_update.is_err(),
+        "mutated an immutable Request Record"
+    );
 }
 
 #[tokio::test]

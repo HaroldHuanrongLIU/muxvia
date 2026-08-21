@@ -1,0 +1,20 @@
+{
+  "version": "models.dev-d2ec701bace7",
+  "source": "models.dev",
+  "models": [
+    {
+      "model": "gpt-5.6",
+      "inputNanoUsdPerMillion": 5000000000,
+      "outputNanoUsdPerMillion": 30000000000,
+      "cacheReadMultiplierPpm": 100000,
+      "cacheCreationMultiplierPpm": 1250000
+    },
+    {
+      "model": "claude-sonnet-4-5",
+      "inputNanoUsdPerMillion": 3000000000,
+      "outputNanoUsdPerMillion": 15000000000,
+      "cacheReadMultiplierPpm": 100000,
+      "cacheCreationMultiplierPpm": 1250000
+    }
+  ]
+}

@@ -251,6 +251,12 @@ CREATE TABLE IF NOT EXISTS request_records (
 CREATE INDEX IF NOT EXISTS request_records_target_sequence
   ON request_records(target, sequence DESC);
 
+CREATE TRIGGER IF NOT EXISTS request_records_immutable
+BEFORE UPDATE ON request_records
+BEGIN
+  SELECT RAISE(ABORT, 'immutable-request-record');
+END;
+
 CREATE TABLE IF NOT EXISTS pricing_snapshots (
   request_record_id TEXT PRIMARY KEY REFERENCES request_records(id) ON DELETE CASCADE,
   catalog_version TEXT NOT NULL,

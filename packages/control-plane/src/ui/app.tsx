@@ -1366,8 +1366,8 @@ function Shell(props: {
         render: () => <ProviderImportWizard
           target={target}
           t={props.t}
-          onPreview={(source) => originSession.previewProviderImport!(source)}
-          onConfirm={(previewToken, choices) => originSession.confirmProviderImport!(previewToken, choices)}
+          onPreview={(source) => originSession.previewProviderImport(source)}
+          onConfirm={(previewToken, choices) => originSession.confirmProviderImport(previewToken, choices)}
           onClose={() => overlay.close(token)}
         />,
       })
@@ -1390,7 +1390,7 @@ function Shell(props: {
         id: "provider-export",
         render: () => <ProviderExportView
           t={props.t}
-          load={() => originSession.exportProviderConfiguration!()}
+          load={() => originSession.exportProviderConfiguration()}
         />,
       })
     })

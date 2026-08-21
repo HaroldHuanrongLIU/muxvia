@@ -109,6 +109,9 @@ class MemoryTargetSession implements TargetSession {
   async clearUsage(): Promise<never> { throw new Error("unused") }
   async updatePricingCatalog(): Promise<never> { throw new Error("unused") }
   async inspectRequestRecord(): Promise<never> { throw new Error("unused") }
+  async previewProviderImport(): Promise<never> { throw new Error("unused") }
+  async confirmProviderImport(): Promise<never> { throw new Error("unused") }
+  async exportProviderConfiguration(): Promise<never> { throw new Error("unused") }
   subscribe(): () => void { return () => {} }
   async whenClosed(): Promise<void> { return await new Promise(() => {}) }
   async close(): Promise<void> {}

@@ -1305,6 +1305,32 @@ impl<'de> Deserialize<'de> for ProviderConfigurationVersion {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RedactedCredentialPresence;
+
+impl Serialize for RedactedCredentialPresence {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str("missing")
+    }
+}
+
+impl<'de> Deserialize<'de> for RedactedCredentialPresence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "missing" => Ok(Self),
+            _ => Err(D::Error::custom(
+                "provider-export-credential-must-be-missing",
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExportedUniversalProvider {
@@ -1312,6 +1338,7 @@ pub struct ExportedUniversalProvider {
     pub position: u32,
     pub name: String,
     pub base_url: String,
+    pub credential: RedactedCredentialPresence,
     pub targets: Vec<UniversalProviderTargetDraft>,
 }
 
@@ -1324,6 +1351,7 @@ pub struct ExportedTargetProvider {
     pub name: String,
     pub base_url: String,
     pub model: String,
+    pub credential: RedactedCredentialPresence,
     pub protocol: ProviderProtocol,
     pub authentication: ProviderAuthentication,
     pub routing_requirement: ProviderRoutingRequirement,

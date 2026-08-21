@@ -2,9 +2,10 @@ use std::{path::PathBuf, sync::Arc};
 
 use muxvia_routing::{
     control::protocol::{
-        ProviderImportCandidateView, ProviderImportChoice, ProviderImportProduct,
-        ProviderImportRecordResolution, ProviderImportRecordView, ProviderImportResolution,
-        ProviderImportSource, ProviderImportSourceTarget, Target,
+        CredentialPresence, ProviderImportCandidateView, ProviderImportChoice,
+        ProviderImportProduct, ProviderImportRecordResolution, ProviderImportRecordView,
+        ProviderImportResolution, ProviderImportSource, ProviderImportSourceTarget,
+        RedactedCredentialPresence, Target,
     },
     home::MuxviaHome,
     service::provider_transfer::{ProviderTransferError, ProviderTransferService},
@@ -534,6 +535,7 @@ fn muxvia_export_value() -> serde_json::Value {
             "position": 0,
             "name": "Shared Relay",
             "baseUrl": "https://shared.example/v1/",
+            "credential": "missing",
             "targets": [{
                 "target": "codex",
                 "enabled": true,
@@ -555,6 +557,7 @@ fn muxvia_export_value() -> serde_json::Value {
             "name": "Shared Relay",
             "baseUrl": "https://shared.example/v1/",
             "model": "gpt-shared",
+            "credential": "missing",
             "protocol": "openai-responses",
             "authentication": "openai-bearer",
             "routingRequirement": "direct-compatible",
@@ -566,6 +569,7 @@ fn muxvia_export_value() -> serde_json::Value {
             "name": "Claude Relay",
             "baseUrl": "https://claude.example/v1",
             "model": "claude-exported",
+            "credential": "missing",
             "protocol": "anthropic-messages",
             "authentication": "anthropic-bearer",
             "routingRequirement": "direct-compatible",
@@ -604,7 +608,7 @@ async fn muxvia_export_preview_normalizes_redacted_universal_and_target_declarat
     assert!(preview.candidates.iter().all(|candidate| match candidate {
         ProviderImportCandidateView::TargetProvider { credential, .. }
         | ProviderImportCandidateView::UniversalProvider { credential, .. } => {
-            *credential == muxvia_routing::control::protocol::CredentialPresence::Missing
+            *credential == CredentialPresence::Missing
         }
     }));
     assert!(preview.candidates.iter().any(|candidate| matches!(
@@ -726,8 +730,20 @@ async fn muxvia_export_confirmation_round_trips_ordering_models_ownership_failov
         exported.failover_drafts[1].provider_source_ids,
         vec![exported.target_providers[1].source_id]
     );
+    assert!(
+        exported
+            .universal_providers
+            .iter()
+            .all(|provider| provider.credential == RedactedCredentialPresence)
+    );
+    assert!(
+        exported
+            .target_providers
+            .iter()
+            .all(|provider| provider.credential == RedactedCredentialPresence)
+    );
     let serialized = serde_json::to_string(&exported).unwrap();
-    for forbidden in ["credential", "token", "routingCredential", "recovery"] {
+    for forbidden in ["token", "routingCredential", "recovery"] {
         assert!(
             !serialized
                 .to_ascii_lowercase()
@@ -899,12 +915,57 @@ async fn corrupt_oversized_duplicate_and_hostile_previews_fail_atomically_withou
         .preview(
             Target::Codex,
             ProviderImportSource::CcSwitch {
+                payload: format!(
+                    "ccswitch://v1/import?resource=provider&app=codex&name={}",
+                    "x".repeat(256)
+                ),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProviderTransferError::ImportTooLarge));
+
+    let error = transfer
+        .preview(
+            Target::Codex,
+            ProviderImportSource::CcSwitch {
+                payload: format!(
+                    "ccswitch://v1/import?resource=provider&app=codex&name=Relay&apiKey={}",
+                    "x".repeat(16_385)
+                ),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProviderTransferError::ImportTooLarge));
+
+    let error = transfer
+        .preview(
+            Target::Codex,
+            ProviderImportSource::CcSwitch {
                 payload: "ccswitch://v1/import?resource=provider&app=codex&name=Relay&apiKey=first&apiKey=second".to_owned(),
             },
         )
         .await
         .unwrap_err();
     assert!(matches!(error, ProviderTransferError::DuplicateImport));
+
+    for payload in [
+        "ccswitch://operator@v1/import?resource=provider&app=codex&name=Relay",
+        "ccswitch://v1:443/import?resource=provider&app=codex&name=Relay",
+        "ccswitch://v1/import?resource=provider&app=codex&name=Relay#ignored",
+    ] {
+        let error = transfer
+            .preview(
+                Target::Codex,
+                ProviderImportSource::CcSwitch {
+                    payload: payload.to_owned(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderTransferError::HostileImport));
+    }
 
     let mut duplicate_ids = muxvia_export_value();
     duplicate_ids["targetProviders"][1]["sourceId"] =
@@ -932,6 +993,19 @@ async fn corrupt_oversized_duplicate_and_hostile_previews_fail_atomically_withou
         .await
         .unwrap_err();
     assert!(matches!(error, ProviderTransferError::HostileImport));
+
+    let mut credential_claim = muxvia_export_value();
+    credential_claim["universalProviders"][0]["credential"] = "present".into();
+    let error = transfer
+        .preview(
+            Target::Codex,
+            ProviderImportSource::MuxviaExport {
+                payload: serde_json::to_string(&credential_claim).unwrap(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProviderTransferError::InvalidImport));
 
     let after_codex = store.target_view_for(Target::Codex).await.unwrap();
     let after_catalog = store.universal_provider_catalog().await.unwrap();
@@ -1017,6 +1091,7 @@ async fn equal_names_with_distinct_normalized_configurations_coexist_in_preview_
             "name": "Claude Relay",
             "baseUrl": "https://distinct.example/v1/",
             "model": "claude-exported",
+            "credential": "missing",
             "protocol": "anthropic-messages",
             "authentication": "anthropic-bearer",
             "routingRequirement": "direct-compatible",
@@ -1147,7 +1222,6 @@ async fn export_is_an_atomic_always_redacted_snapshot_that_round_trips_through_p
     assert!(!serialized.contains(TARGET_SECRET));
     assert!(!serialized.contains(UNIVERSAL_SECRET));
     for forbidden in [
-        "credential",
         "token",
         "subscription",
         "currentProvider",
@@ -1163,6 +1237,18 @@ async fn export_is_an_atomic_always_redacted_snapshot_that_round_trips_through_p
     }
     assert_eq!(export.universal_providers.len(), 1);
     assert_eq!(export.target_providers.len(), 3);
+    assert!(
+        export
+            .universal_providers
+            .iter()
+            .all(|provider| provider.credential == RedactedCredentialPresence)
+    );
+    assert!(
+        export
+            .target_providers
+            .iter()
+            .all(|provider| provider.credential == RedactedCredentialPresence)
+    );
     assert_eq!(export.failover_drafts[0].provider_source_ids.len(), 2);
     assert_eq!(export.failover_drafts[1].provider_source_ids.len(), 1);
 

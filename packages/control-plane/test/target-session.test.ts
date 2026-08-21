@@ -397,7 +397,7 @@ test("a TargetSession owns the closed preview-confirm-export Provider Transfer w
     kind: "cc-switch",
     payload: "ccswitch://v1/import?resource=provider&app=codex&name=Relay",
   } as const
-  const previewing = session.previewProviderImport!(source)
+  const previewing = session.previewProviderImport(source)
   await server.waitForRequests(2)
   expect(server.requests()[1]!.operation).toEqual({
     kind: "preview-provider-import",
@@ -431,7 +431,7 @@ test("a TargetSession owns the closed preview-confirm-export Provider Transfer w
     candidateId: preview.candidates[0]!.candidateId,
     resolution: { kind: "create" },
   }]
-  const confirming = session.confirmProviderImport!(preview.previewToken, choices)
+  const confirming = session.confirmProviderImport(preview.previewToken, choices)
   await server.waitForRequests(3)
   expect(server.requests()[2]!.operation).toEqual({
     kind: "confirm-provider-import",
@@ -451,7 +451,7 @@ test("a TargetSession owns the closed preview-confirm-export Provider Transfer w
   server.replyProviderImportOutcome(2, outcome)
   expect(await confirming).toEqual(outcome)
 
-  const exporting = session.exportProviderConfiguration!()
+  const exporting = session.exportProviderConfiguration()
   await server.waitForRequests(4)
   expect(server.requests()[3]!.operation).toEqual({
     kind: "export-provider-configuration",
@@ -473,9 +473,9 @@ test("a TargetSession owns the closed preview-confirm-export Provider Transfer w
   expect(Object.isFrozen(receivedExport.failoverDrafts)).toBe(true)
 
   await session.close()
-  await expect(session.previewProviderImport!(source)).rejects.toMatchObject({ code: "connection-closed" })
-  await expect(session.confirmProviderImport!(preview.previewToken, [])).rejects.toMatchObject({ code: "connection-closed" })
-  await expect(session.exportProviderConfiguration!()).rejects.toMatchObject({ code: "connection-closed" })
+  await expect(session.previewProviderImport(source)).rejects.toMatchObject({ code: "connection-closed" })
+  await expect(session.confirmProviderImport(preview.previewToken, [])).rejects.toMatchObject({ code: "connection-closed" })
+  await expect(session.exportProviderConfiguration()).rejects.toMatchObject({ code: "connection-closed" })
   await server.close()
 })
 

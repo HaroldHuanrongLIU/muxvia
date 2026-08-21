@@ -137,6 +137,9 @@ class StaticTargetSession implements TargetSession {
     }
   }
   async resolveCompatibility(): Promise<never> { throw new Error("compatibility resolution not configured in this fixture") }
+  async previewProviderImport(): Promise<never> { throw new Error("provider transfer not configured in this fixture") }
+  async confirmProviderImport(): Promise<never> { throw new Error("provider transfer not configured in this fixture") }
+  async exportProviderConfiguration(): Promise<never> { throw new Error("provider transfer not configured in this fixture") }
   async listRequestRecords(): Promise<RequestRecordPage> {
     return {
       target: this.#view.target,

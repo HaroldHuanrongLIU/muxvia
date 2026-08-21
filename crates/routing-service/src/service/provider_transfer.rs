@@ -21,8 +21,8 @@ use crate::{
         ProviderConfigurationFormat, ProviderConfigurationVersion, ProviderImportCandidateView,
         ProviderImportChoice, ProviderImportOutcome, ProviderImportPreview, ProviderImportProduct,
         ProviderImportResolution, ProviderImportSource, ProviderImportSourceTarget,
-        ProviderImportSourceView, ProviderProtocol, ProviderRoutingRequirement, Target, TargetView,
-        UniversalProviderTargetDraft,
+        ProviderImportSourceView, ProviderProtocol, ProviderRoutingRequirement,
+        RedactedCredentialPresence, Target, TargetView, UniversalProviderTargetDraft,
     },
     domain::provider::normalize_provider_base_url,
     home::MuxviaHome,
@@ -159,7 +159,6 @@ impl ProviderTransferService {
         target: Target,
         source: ProviderImportSource,
     ) -> Result<ProviderImportPreview, ProviderTransferError> {
-        let _supported_home = self.home.user_home();
         let (source, candidates, failover_drafts) = match source {
             ProviderImportSource::CcSwitch { payload } => {
                 let candidate = parse_ccswitch_provider(target, &payload)?;
@@ -394,6 +393,7 @@ impl ProviderTransferService {
                 position: provider.position,
                 name: provider.name,
                 base_url: provider.base_url,
+                credential: RedactedCredentialPresence,
                 targets: provider
                     .targets
                     .into_iter()
@@ -419,6 +419,7 @@ impl ProviderTransferService {
                         name: provider.name.clone(),
                         base_url: provider.base_url.clone(),
                         model: provider.model.clone(),
+                        credential: RedactedCredentialPresence,
                         protocol: provider.protocol,
                         authentication: provider.authentication,
                         routing_requirement: provider.routing_requirement.clone(),
@@ -1056,6 +1057,13 @@ fn parse_ccswitch_provider(
     if url.scheme() != "ccswitch" || url.host_str() != Some("v1") || url.path() != "/import" {
         return Err(ProviderTransferError::InvalidImport);
     }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ProviderTransferError::HostileImport);
+    }
     let allowed = [
         "resource",
         "app",
@@ -1105,7 +1113,10 @@ fn parse_ccswitch_provider(
     };
     let credential = match fields.get("apiKey") {
         None => None,
-        Some(value) if value.trim().is_empty() || value.len() > MAX_CREDENTIAL_BYTES => {
+        Some(value) if value.len() > MAX_CREDENTIAL_BYTES => {
+            return Err(ProviderTransferError::ImportTooLarge);
+        }
+        Some(value) if value.trim().is_empty() => {
             return Err(ProviderTransferError::InvalidImport);
         }
         Some(value) => Some(SecretString::from(value.clone())),
@@ -1121,6 +1132,9 @@ fn parse_ccswitch_provider(
         ),
     };
     let source_identifier = format!("provider:{}:{name}", target.as_str());
+    if source_identifier.len() > MAX_NAME_BYTES {
+        return Err(ProviderTransferError::ImportTooLarge);
+    }
     let configuration_fingerprint = target_configuration_fingerprint(
         target,
         &base_url,

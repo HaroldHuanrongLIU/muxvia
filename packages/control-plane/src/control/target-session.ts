@@ -69,12 +69,12 @@ export interface TargetSession {
   setUsageRetention(detailedRetentionDays: number, signal?: AbortSignal): Promise<UsageRetentionOutcome>
   clearUsage(signal?: AbortSignal): Promise<UsageClearOutcome>
   updatePricingCatalog(signal?: AbortSignal): Promise<PricingCatalogUpdateOutcome>
-  previewProviderImport?(source: ProviderImportSource): Promise<ProviderImportPreview>
-  confirmProviderImport?(
+  previewProviderImport(source: ProviderImportSource): Promise<ProviderImportPreview>
+  confirmProviderImport(
     previewToken: string,
     choices: ProviderImportChoice[],
   ): Promise<ProviderImportOutcome>
-  exportProviderConfiguration?(): Promise<ProviderConfigurationExport>
+  exportProviderConfiguration(): Promise<ProviderConfigurationExport>
   applyReconciliation(input: {
     strategy: ReconciliationStrategy
     observationToken: string

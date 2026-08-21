@@ -191,6 +191,9 @@ class InspectionTargetSession implements TargetSession {
   async clearUsage(): Promise<never> { throw new Error("usage activity not configured in this fixture") }
   async updatePricingCatalog(): Promise<never> { throw new Error("usage activity not configured in this fixture") }
   async inspectRequestRecord(): Promise<never> { throw new Error("request history not configured in this fixture") }
+  async previewProviderImport(): Promise<never> { throw new Error("provider transfer not configured in this fixture") }
+  async confirmProviderImport(): Promise<never> { throw new Error("provider transfer not configured in this fixture") }
+  async exportProviderConfiguration(): Promise<never> { throw new Error("provider transfer not configured in this fixture") }
   subscribe(listener: (next: TargetView) => void): () => void {
     this.#listeners.add(listener)
     return () => this.#listeners.delete(listener)

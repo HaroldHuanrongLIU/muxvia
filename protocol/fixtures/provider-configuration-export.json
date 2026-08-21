@@ -12,6 +12,7 @@
           "position": 0,
           "name": "Shared Relay",
           "baseUrl": "https://relay.example/v1",
+          "credential": "missing",
           "targets": [
             {
               "target": "codex",
@@ -38,6 +39,7 @@
           "name": "Shared Relay",
           "baseUrl": "https://relay.example/v1",
           "model": "gpt-5",
+          "credential": "missing",
           "protocol": "openai-responses",
           "authentication": "openai-bearer",
           "routingRequirement": "direct-compatible",

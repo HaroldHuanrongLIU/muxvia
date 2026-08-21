@@ -79,6 +79,10 @@ impl ProcessFixture {
         self.home.join("state/muxvia.db")
     }
 
+    fn user_home(&self) -> &Path {
+        self.home.parent().expect("Muxvia Home has a user home")
+    }
+
     async fn connect(&self) -> UnixStream {
         UnixStream::connect(self.socket()).await.unwrap()
     }
@@ -496,6 +500,221 @@ async fn disable_process_takeover(socket: &Path, target: Target, user_home: &Pat
 
 fn fingerprint(path: &Path) -> Vec<u8> {
     fs::read(path).unwrap()
+}
+
+#[tokio::test]
+async fn provider_transfer_process_tracer_proves_identity_provenance_redaction_and_atomic_rejection()
+ {
+    const SECRET: &str = "process-provider-import-secret-must-not-escape";
+    let fixture = ProcessFixture::start().await;
+    let configuration_home = fixture.user_home().join(".codex");
+    fs::create_dir(&configuration_home).unwrap();
+    let configuration_path = configuration_home.join("config.toml");
+    let configuration = format!(
+        r#"model = "gpt-process-live"
+model_provider = "operator-process-live"
+
+[model_providers.operator-process-live]
+name = "Operator Process Live"
+base_url = "https://process-live.example/v1/"
+wire_api = "responses"
+http_headers = {{ Authorization = "Bearer {SECRET}" }}
+supports_websockets = false
+"#
+    );
+    fs::write(&configuration_path, configuration.as_bytes()).unwrap();
+
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    let before = request(
+        &mut stream,
+        "provider-process-open-before",
+        json!({"kind":"open-target","target":"codex"}),
+    )
+    .await;
+    let before_view = before["result"]["view"].clone();
+
+    let preview = request(
+        &mut stream,
+        "provider-process-preview-live",
+        json!({
+            "kind":"preview-provider-import","target":"codex",
+            "source":{"kind":"live-target"}
+        }),
+    )
+    .await;
+    assert_eq!(preview["type"], "response");
+    assert_eq!(
+        preview["result"]["preview"]["candidates"][0]["importedCurrent"],
+        true
+    );
+    assert!(!preview.to_string().contains(SECRET));
+    let preview_token = preview["result"]["preview"]["previewToken"]
+        .as_str()
+        .unwrap();
+    let candidate_id = preview["result"]["preview"]["candidates"][0]["candidateId"]
+        .as_str()
+        .unwrap();
+    let confirmed = request(
+        &mut stream,
+        "provider-process-confirm-live",
+        json!({
+            "kind":"confirm-provider-import","target":"codex",
+            "previewToken":preview_token,
+            "choices":[{"candidateId":candidate_id,"resolution":{"kind":"create"}}]
+        }),
+    )
+    .await;
+    let provider_id = confirmed["result"]["outcome"]["records"][0]["providerId"]
+        .as_str()
+        .unwrap();
+    assert_ne!(provider_id, candidate_id);
+    let imported_push = read_frame(&mut stream).await.unwrap();
+    let imported = imported_push["view"]["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == provider_id)
+        .unwrap();
+    assert_eq!(imported["completeness"], "complete");
+    assert_eq!(imported["importedCurrent"], true);
+    let provenance = &imported["importProvenance"];
+    assert_eq!(provenance["sourceProduct"], "target-cli");
+    assert_eq!(provenance["sourceTarget"], "codex");
+    assert!(!provenance["sourceIdentifier"].as_str().unwrap().is_empty());
+    assert_eq!(
+        provenance["configurationFingerprint"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(
+        imported_push["view"]["currentProviderId"],
+        before_view["currentProviderId"]
+    );
+    assert_eq!(
+        fs::read(&configuration_path).unwrap(),
+        configuration.as_bytes()
+    );
+    assert!(!confirmed.to_string().contains(SECRET));
+    assert!(!imported_push.to_string().contains(SECRET));
+
+    let exported = request(
+        &mut stream,
+        "provider-process-export",
+        json!({"kind":"export-provider-configuration","target":"codex"}),
+    )
+    .await;
+    let export = exported["result"]["export"].clone();
+    assert!(
+        export["targetProviders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|provider| provider["credential"] == "missing")
+    );
+    let export_text = export.to_string();
+    assert!(!export_text.contains(SECRET));
+    for forbidden in [
+        "currentProvider",
+        "servingProvider",
+        "activatedSnapshot",
+        "recovery",
+    ] {
+        assert!(!export_text.contains(forbidden));
+    }
+
+    let round_trip_preview = request(
+        &mut stream,
+        "provider-process-preview-export",
+        json!({
+            "kind":"preview-provider-import","target":"codex",
+            "source":{"kind":"muxvia-export","payload":export_text}
+        }),
+    )
+    .await;
+    let round_trip_token = round_trip_preview["result"]["preview"]["previewToken"]
+        .as_str()
+        .unwrap();
+    let round_trip_candidate =
+        round_trip_preview["result"]["preview"]["candidates"][0]["candidateId"]
+            .as_str()
+            .unwrap();
+    let round_trip = request(
+        &mut stream,
+        "provider-process-confirm-export",
+        json!({
+            "kind":"confirm-provider-import","target":"codex",
+            "previewToken":round_trip_token,
+            "choices":[{"candidateId":round_trip_candidate,"resolution":{"kind":"create"}}]
+        }),
+    )
+    .await;
+    let round_trip_id = round_trip["result"]["outcome"]["records"][0]["providerId"]
+        .as_str()
+        .unwrap();
+    assert_ne!(round_trip_id, provider_id);
+    assert_ne!(round_trip_id, round_trip_candidate);
+    let round_trip_push = read_frame(&mut stream).await.unwrap();
+    let round_trip_provider = round_trip_push["view"]["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == round_trip_id)
+        .unwrap();
+    assert_eq!(
+        round_trip_provider["importProvenance"]["sourceProduct"],
+        "muxvia"
+    );
+    assert_eq!(
+        round_trip_provider["importProvenance"]["sourceTarget"],
+        "universal"
+    );
+    assert_eq!(
+        round_trip_provider["importProvenance"]["configurationFingerprint"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+
+    let stable = request(
+        &mut stream,
+        "provider-process-open-stable",
+        json!({"kind":"open-target","target":"codex"}),
+    )
+    .await;
+    let rejected = request(
+        &mut stream,
+        "provider-process-reject-duplicate",
+        json!({
+            "kind":"preview-provider-import","target":"codex",
+            "source":{
+                "kind":"cc-switch",
+                "payload":format!(
+                    "ccswitch://v1/import?resource=provider&app=codex&name=Rejected&apiKey={SECRET}&apiKey=duplicate"
+                )
+            }
+        }),
+    )
+    .await;
+    assert_eq!(rejected["type"], "error");
+    assert_eq!(rejected["problem"]["code"], "duplicate-provider-import");
+    assert!(!rejected.to_string().contains(SECRET));
+    let after_rejection = request(
+        &mut stream,
+        "provider-process-open-after-rejection",
+        json!({"kind":"open-target","target":"codex"}),
+    )
+    .await;
+    assert_eq!(after_rejection["result"]["view"], stable["result"]["view"]);
+    assert_eq!(
+        fs::read(&configuration_path).unwrap(),
+        configuration.as_bytes()
+    );
+
+    fixture.shutdown().await;
 }
 
 #[tokio::test]

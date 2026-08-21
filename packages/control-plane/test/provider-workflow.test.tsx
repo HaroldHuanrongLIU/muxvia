@@ -720,6 +720,45 @@ test("/import-providers previews pasted data before confirmation and /export-pro
   }
 })
 
+test("a failed pasted Provider preview clears the secret before rendering its stable problem", async () => {
+  const transferSecret = "failed-provider-transfer-secret-must-not-render"
+  const session = new MemoryTargetSession(view())
+  session.providerImportPreviewHandler = async () => {
+    throw { code: "invalid-provider-import" }
+  }
+  const setup = await testRender(() => <App session={session} />, {
+    width: 100,
+    height: 24,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    await setup.mockInput.typeText("/import-providers")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    setup.mockInput.pressKey("down")
+    await setup.renderOnce()
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    const payload = `ccswitch://v1/import?resource=provider&app=codex&name=Relay&apiKey=${transferSecret}`
+    await setup.mockInput.typeText(payload)
+    setup.mockInput.pressEnter()
+    await Bun.sleep(1)
+    await setup.renderOnce()
+
+    expect(session.providerImportSources).toEqual([{ kind: "cc-switch", payload }])
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain("Provider transfer failed (invalid-provider-import).")
+    expect(frame).not.toContain(transferSecret)
+    expect(frame).not.toContain("provider-transfer-secret-must-not-render")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
 test("a distinct live Target preview labels Imported Current and leaves it unselected", async () => {
   const session = new MemoryTargetSession(view())
   session.providerImportPreviewHandler = async () => ({

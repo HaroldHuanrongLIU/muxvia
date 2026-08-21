@@ -428,6 +428,7 @@ const providerConfigurationExportSchema = z.object({
     position: z.number().int().nonnegative(),
     name: z.string(),
     baseUrl: z.string(),
+    credential: z.literal("missing"),
     targets: z.array(providerImportTargetOverlaySchema),
   }).strict()).max(256),
   targetProviders: z.array(z.object({
@@ -437,6 +438,7 @@ const providerConfigurationExportSchema = z.object({
     name: z.string(),
     baseUrl: z.string(),
     model: z.string(),
+    credential: z.literal("missing"),
     protocol: z.enum(["openai-responses", "anthropic-messages"]),
     authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"]),
     routingRequirement: z.enum(["direct-compatible", "takeover-required"]),

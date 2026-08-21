@@ -8230,8 +8230,12 @@ async fn provider_transfer_preview_and_export_are_target_scoped_and_secret_free_
     .await;
     assert_eq!(export["type"], "response");
     assert_eq!(export["result"]["kind"], "provider-configuration-export");
+    assert_eq!(
+        export["result"]["export"]["targetProviders"][0]["credential"],
+        "missing"
+    );
     let export_text = export.to_string().to_ascii_lowercase();
-    for forbidden in ["credential", "token", "recovery", "activatedsnapshot"] {
+    for forbidden in ["token", "recovery", "activatedsnapshot"] {
         assert!(!export_text.contains(forbidden));
     }
 

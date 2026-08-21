@@ -330,9 +330,10 @@
         "position": { "type": "integer", "minimum": 0 },
         "name": { "type": "string" },
         "baseUrl": { "type": "string" },
+        "credential": { "const": "missing" },
         "targets": { "type": "array", "items": { "$ref": "#/$defs/universalProviderPresetTarget" } }
       },
-      "required": ["sourceId", "position", "name", "baseUrl", "targets"]
+      "required": ["sourceId", "position", "name", "baseUrl", "credential", "targets"]
     },
     "exportedTargetProvider": {
       "type": "object",
@@ -344,12 +345,13 @@
         "name": { "type": "string" },
         "baseUrl": { "type": "string" },
         "model": { "type": "string" },
+        "credential": { "const": "missing" },
         "protocol": { "enum": ["openai-responses", "anthropic-messages"] },
         "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"] },
         "routingRequirement": { "enum": ["direct-compatible", "takeover-required"] },
         "universalProviderSourceId": { "oneOf": [{ "type": "string", "format": "uuid" }, { "type": "null" }] }
       },
-      "required": ["sourceId", "target", "position", "name", "baseUrl", "model", "protocol", "authentication", "routingRequirement", "universalProviderSourceId"]
+      "required": ["sourceId", "target", "position", "name", "baseUrl", "model", "credential", "protocol", "authentication", "routingRequirement", "universalProviderSourceId"]
     },
     "exportedFailoverDraft": {
       "type": "object",

@@ -24,10 +24,6 @@ function safeProblemCode(error: unknown): string {
     : "internal-failure"
 }
 
-function candidateName(candidate: ProviderImportCandidateView): string {
-  return candidate.name
-}
-
 export function ProviderImportWizard(props: {
   target: Target
   t: Translator
@@ -102,6 +98,7 @@ export function ProviderImportWizard(props: {
     } catch (error) {
       setErrorCode(safeProblemCode(error))
     } finally {
+      if (kind !== "live-target") setPayload("")
       setPending(false)
     }
   }
@@ -253,7 +250,7 @@ export function ProviderImportWizard(props: {
         })}</text>
         <For each={candidates()}>{(candidate, index) => <box flexDirection="column">
           <text fg={selectedIndex() === index() ? theme.primary : theme.text}>
-            {`${selected().has(candidate.candidateId) ? "[x]" : "[ ]"} ${candidate.kind === "target-provider" && candidate.importedCurrent ? props.t("provider-transfer.preview.imported-current") + " · " : ""}${candidateName(candidate)} · ${candidate.baseUrl || props.t("value.none")}`}
+            {`${selected().has(candidate.candidateId) ? "[x]" : "[ ]"} ${candidate.kind === "target-provider" && candidate.importedCurrent ? props.t("provider-transfer.preview.imported-current") + " · " : ""}${candidate.name} · ${candidate.baseUrl || props.t("value.none")}`}
           </text>
           <text fg={theme.muted}>{`${candidate.kind === "target-provider" ? candidate.model : candidate.targets.filter((target) => target.enabled).map((target) => target.model).join(", ")} · ${resolutionLabel(candidate)} · ${props.t("provider-transfer.preview.credential-redacted", { state: candidate.credential })}`}</text>
         </box>}</For>

@@ -146,6 +146,9 @@ class ActivitySession implements TargetSession {
   async applyReconciliation(): Promise<never> { throw new Error("not used") }
   async probeCompatibility(): Promise<CompatibilityProbe> { throw new Error("not used") }
   async resolveCompatibility(): Promise<ActionOutcome> { throw new Error("not used") }
+  async previewProviderImport(): Promise<never> { throw new Error("not used") }
+  async confirmProviderImport(): Promise<never> { throw new Error("not used") }
+  async exportProviderConfiguration(): Promise<never> { throw new Error("not used") }
   subscribe(): () => void { return () => {} }
   async close(): Promise<void> {}
   async whenClosed(): Promise<void> { return await new Promise(() => {}) }

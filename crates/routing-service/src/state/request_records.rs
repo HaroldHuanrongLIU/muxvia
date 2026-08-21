@@ -18,6 +18,40 @@ const MAX_ERROR_PAYLOAD_BYTES: usize = 65_536;
 const REQUEST_HISTORY_CURSOR_VERSION: &str = "request-record-v1";
 
 impl StateStore {
+    pub(crate) async fn record_request_completion(
+        &self,
+        completion: RequestRecordCompletion,
+    ) -> Result<(), RequestRecordStoreError> {
+        validate_completion(&completion)?;
+        self.connection
+            .call(move |connection| -> Result<(), RequestRecordStoreError> {
+                let transaction =
+                    connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let catalog_json = transaction.query_row(
+                    "SELECT catalog_json FROM pricing_catalog_state WHERE singleton = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let catalog =
+                    PricingCatalog::from_json(&catalog_json).map_err(map_pricing_error)?;
+                let pricing = match completion.usage {
+                    Some(usage) => catalog
+                        .price(&completion.model, usage, completion.finished_at_unix_ms)
+                        .map_err(map_pricing_error)?,
+                    None => None,
+                };
+                insert_completion(&transaction, &completion)?;
+                if let Some(snapshot) = pricing.as_ref() {
+                    insert_pricing_snapshot(&transaction, completion.id, snapshot)?;
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .map_err(map_call_error)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn insert_request_record(
         &self,
         completion: RequestRecordCompletion,
@@ -240,8 +274,8 @@ impl StateStore {
     }
 }
 
-struct StoredRequestRecord {
-    sequence: u64,
+pub(super) struct StoredRequestRecord {
+    pub(super) sequence: u64,
     id: String,
     plan_id: String,
     plan_epoch: String,
@@ -265,7 +299,9 @@ struct StoredRequestRecord {
 }
 
 impl StoredRequestRecord {
-    fn from_row(row: &tokio_rusqlite::rusqlite::Row<'_>) -> tokio_rusqlite::rusqlite::Result<Self> {
+    pub(super) fn from_row(
+        row: &tokio_rusqlite::rusqlite::Row<'_>,
+    ) -> tokio_rusqlite::rusqlite::Result<Self> {
         Ok(Self {
             sequence: row.get(0)?,
             id: row.get(1)?,
@@ -291,7 +327,7 @@ impl StoredRequestRecord {
         })
     }
 
-    fn into_summary(self) -> Result<RequestRecordSummary, RequestHistoryError> {
+    pub(super) fn into_summary(self) -> Result<RequestRecordSummary, RequestHistoryError> {
         Ok(RequestRecordSummary {
             id: parse_uuid(&self.id)?,
             plan_id: parse_uuid(&self.plan_id)?,
@@ -531,7 +567,7 @@ fn insert_completion(
     Ok(())
 }
 
-fn insert_pricing_snapshot(
+pub(super) fn insert_pricing_snapshot(
     transaction: &Transaction<'_>,
     request_record_id: uuid::Uuid,
     snapshot: &PricingSnapshot,

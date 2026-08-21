@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::control::protocol::{ProviderProtocol, RequestRecordOutcome, Target};
@@ -117,7 +117,7 @@ pub(crate) struct PricingCatalog {
     models: BTreeMap<String, CatalogPrice>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CatalogPrice {
     model: String,
@@ -127,7 +127,7 @@ struct CatalogPrice {
     cache_creation_multiplier_ppm: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CatalogDocument {
     version: String,
@@ -168,6 +168,23 @@ impl PricingCatalog {
             source: document.source,
             models,
         })
+    }
+
+    pub(crate) fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub(crate) fn to_json(&self) -> Result<String, PricingError> {
+        serde_json::to_string(&CatalogDocument {
+            version: self.version.clone(),
+            source: self.source.clone(),
+            models: self.models.values().cloned().collect(),
+        })
+        .map_err(|_| PricingError::InvalidCatalog)
     }
 
     pub(crate) fn price(

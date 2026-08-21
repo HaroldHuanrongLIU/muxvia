@@ -5,6 +5,7 @@ pub mod control;
 pub mod domain;
 pub mod home;
 pub mod model;
+mod native_usage;
 mod probe_process;
 mod request_history;
 pub mod service;

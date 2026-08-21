@@ -91,6 +91,8 @@ export const zhCN = {
   "command.activity.inspect.description": "加载选中失败请求记录的保留载荷",
   "command.activity.more": "加载更早请求",
   "command.activity.more.description": "加载下一页请求历史",
+  "command.activity.refresh": "刷新原生用量",
+  "command.activity.refresh.description": "导入新的 Target 原生用量并重新加载活动",
   "command.activity.cancel": "关闭请求历史",
   "command.activity.cancel.description": "关闭请求历史浮层",
   "command.route.open": "编辑故障转移路由",

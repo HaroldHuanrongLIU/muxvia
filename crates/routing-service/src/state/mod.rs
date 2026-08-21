@@ -6,6 +6,7 @@ mod request_records;
 mod store;
 mod subscription_accounts;
 mod universal_providers;
+mod usage;
 
 pub use crate::control::protocol::CompatibilityClassification;
 pub use migrations::SCHEMA_VERSION;

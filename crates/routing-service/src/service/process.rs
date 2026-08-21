@@ -57,6 +57,7 @@ pub struct ProcessOptions {
     pub test_device_authority_origin: Option<String>,
     pub test_refresh_subscription_account: Option<String>,
     pub test_subscription_bridge_origin: Option<String>,
+    pub test_native_usage_scan_interval: Option<Duration>,
 }
 
 struct ServiceLock {
@@ -172,15 +173,27 @@ pub async fn run(options: ProcessOptions) -> Result<(), ProcessError> {
                 )
                 .await?
             }
-            None => {
-                ControlServer::bind_process(
-                    &home,
-                    Arc::clone(&store),
-                    options.release.clone(),
-                    Arc::clone(&activation),
-                )
-                .await?
-            }
+            None => match options.test_native_usage_scan_interval {
+                Some(interval) => {
+                    ControlServer::bind_process_with_native_usage_scan_interval(
+                        &home,
+                        Arc::clone(&store),
+                        options.release.clone(),
+                        Arc::clone(&activation),
+                        interval,
+                    )
+                    .await?
+                }
+                None => {
+                    ControlServer::bind_process(
+                        &home,
+                        Arc::clone(&store),
+                        options.release.clone(),
+                        Arc::clone(&activation),
+                    )
+                    .await?
+                }
+            },
         };
         let outcome = if let Some(path) = &options.test_shutdown_file {
             tokio::select! {
@@ -239,6 +252,11 @@ fn exec_candidate(
         }
         if let Some(origin) = &options.test_subscription_bridge_origin {
             command.arg("--test-subscription-bridge-origin").arg(origin);
+        }
+        if let Some(interval) = options.test_native_usage_scan_interval {
+            command
+                .arg("--test-native-usage-scan-interval-ms")
+                .arg(interval.as_millis().to_string());
         }
     }
     command.exec()

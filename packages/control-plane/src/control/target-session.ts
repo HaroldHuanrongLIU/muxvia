@@ -13,9 +13,14 @@ import type {
   ReconciliationStrategy,
   RequestRecordDetail,
   RequestRecordPage,
+  NativeUsageRefresh,
+  PricingCatalogUpdateOutcome,
   TargetAction,
   Target,
   TargetView,
+  UsageActivityPage,
+  UsageClearOutcome,
+  UsageRetentionOutcome,
 } from "./types"
 import type { UniversalProviderSession } from "./universal-provider-session"
 
@@ -54,6 +59,11 @@ export interface TargetSession {
     signal?: AbortSignal,
   ): Promise<RequestRecordPage>
   inspectRequestRecord(recordId: string, signal?: AbortSignal): Promise<RequestRecordDetail>
+  listUsageActivity(input: RequestRecordPageRequest, signal?: AbortSignal): Promise<UsageActivityPage>
+  refreshNativeUsage(signal?: AbortSignal): Promise<NativeUsageRefresh>
+  setUsageRetention(detailedRetentionDays: number, signal?: AbortSignal): Promise<UsageRetentionOutcome>
+  clearUsage(signal?: AbortSignal): Promise<UsageClearOutcome>
+  updatePricingCatalog(signal?: AbortSignal): Promise<PricingCatalogUpdateOutcome>
   applyReconciliation(input: {
     strategy: ReconciliationStrategy
     observationToken: string
@@ -270,6 +280,70 @@ class TargetSessionImpl implements TargetSession {
       throw new ControlError("invalid-response", "Request record detail did not match request")
     }
     return freezeOwnedValue(structuredClone(response.detail))
+  }
+
+  async listUsageActivity(
+    input: RequestRecordPageRequest,
+    signal?: AbortSignal,
+  ): Promise<UsageActivityPage> {
+    if (this.#closed) throw new ControlError("connection-closed", "Target session is closed")
+    const response = await this.#rpc.request({
+      kind: "list-usage-activity",
+      target: this.#target,
+      limit: input.limit,
+      ...(input.beforeCursor === undefined ? {} : { beforeCursor: input.beforeCursor }),
+    }, { signal })
+    if (response.kind !== "usage-activity-page" || response.page.target !== this.#target) {
+      throw new ControlError("invalid-response", "Usage activity page did not match Target")
+    }
+    return freezeOwnedValue(structuredClone(response.page))
+  }
+
+  async refreshNativeUsage(signal?: AbortSignal): Promise<NativeUsageRefresh> {
+    if (this.#closed) throw new ControlError("connection-closed", "Target session is closed")
+    const response = await this.#rpc.request({ kind: "refresh-native-usage", target: this.#target }, { signal })
+    if (response.kind !== "native-usage-refresh" || response.refresh.target !== this.#target) {
+      throw new ControlError("invalid-response", "Native usage refresh did not match Target")
+    }
+    return freezeOwnedValue(structuredClone(response.refresh))
+  }
+
+  async setUsageRetention(
+    detailedRetentionDays: number,
+    signal?: AbortSignal,
+  ): Promise<UsageRetentionOutcome> {
+    if (this.#closed) throw new ControlError("connection-closed", "Target session is closed")
+    const response = await this.#rpc.request({
+      kind: "set-usage-retention",
+      target: this.#target,
+      detailedRetentionDays,
+    }, { signal })
+    if (
+      response.kind !== "usage-retention-outcome"
+      || response.outcome.target !== this.#target
+      || response.outcome.detailedRetentionDays !== detailedRetentionDays
+    ) {
+      throw new ControlError("invalid-response", "Usage retention outcome did not match request")
+    }
+    return freezeOwnedValue(structuredClone(response.outcome))
+  }
+
+  async clearUsage(signal?: AbortSignal): Promise<UsageClearOutcome> {
+    if (this.#closed) throw new ControlError("connection-closed", "Target session is closed")
+    const response = await this.#rpc.request({ kind: "clear-usage", target: this.#target }, { signal })
+    if (response.kind !== "usage-clear-outcome" || response.outcome.target !== this.#target) {
+      throw new ControlError("invalid-response", "Usage clear outcome did not match Target")
+    }
+    return freezeOwnedValue(structuredClone(response.outcome))
+  }
+
+  async updatePricingCatalog(signal?: AbortSignal): Promise<PricingCatalogUpdateOutcome> {
+    if (this.#closed) throw new ControlError("connection-closed", "Target session is closed")
+    const response = await this.#rpc.request({ kind: "update-pricing-catalog", target: this.#target }, { signal })
+    if (response.kind !== "pricing-catalog-update-outcome" || response.outcome.target !== this.#target) {
+      throw new ControlError("invalid-response", "Pricing catalog update did not match Target")
+    }
+    return freezeOwnedValue(structuredClone(response.outcome))
   }
 
   applyReconciliation(input: {

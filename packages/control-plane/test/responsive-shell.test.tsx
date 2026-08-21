@@ -162,6 +162,20 @@ class StaticTargetSession implements TargetSession {
     }
   }
   async inspectRequestRecord(): Promise<never> { throw new Error("request history not configured in this fixture") }
+  async listUsageActivity() {
+    const page = await this.listRequestRecords()
+    return {
+      target: page.target,
+      entries: page.records.map((record) => ({ kind: "request-record" as const, record })),
+      nextCursor: page.nextCursor,
+      detailedRetentionDays: 30,
+      catalogVersion: "fixture",
+    }
+  }
+  async refreshNativeUsage(): Promise<never> { throw new Error("usage activity not configured in this fixture") }
+  async setUsageRetention(): Promise<never> { throw new Error("usage activity not configured in this fixture") }
+  async clearUsage(): Promise<never> { throw new Error("usage activity not configured in this fixture") }
+  async updatePricingCatalog(): Promise<never> { throw new Error("usage activity not configured in this fixture") }
 
   async act(_action: TargetAction): Promise<ActionOutcome> {
     return { status: "applied", view: this.#view }

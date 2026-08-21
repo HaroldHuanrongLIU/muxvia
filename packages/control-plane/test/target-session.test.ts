@@ -426,6 +426,82 @@ test("request history is cancellable and rejects mismatched Target or record res
   await server.close()
 })
 
+test("a TargetSession exposes target-bound native usage lifecycle operations", async () => {
+  const { session, server } = await openScriptedSession(viewAtRevision(1))
+  const listing = session.listUsageActivity({ limit: 7, beforeCursor: "usage-before" })
+  await server.waitForRequests(2)
+  expect(server.requests()[1]!.operation).toEqual({
+    kind: "list-usage-activity",
+    target: "codex",
+    limit: 7,
+    beforeCursor: "usage-before",
+  })
+  server.send({
+    type: "response",
+    requestId: server.requests()[1]!.requestId,
+    result: {
+      kind: "usage-activity-page",
+      page: {
+        target: "codex",
+        entries: [],
+        nextCursor: null,
+        detailedRetentionDays: 30,
+        catalogVersion: "release-pinned",
+      },
+    },
+  })
+  expect(Object.isFrozen(await listing)).toBe(true)
+
+  const refreshing = session.refreshNativeUsage()
+  await server.waitForRequests(3)
+  server.send({
+    type: "response",
+    requestId: server.requests()[2]!.requestId,
+    result: { kind: "native-usage-refresh", refresh: { target: "codex", importedRecords: 2, scannedFiles: 1 } },
+  })
+  await expect(refreshing).resolves.toMatchObject({ importedRecords: 2 })
+
+  const retaining = session.setUsageRetention(14)
+  await server.waitForRequests(4)
+  expect(server.requests()[3]!.operation).toEqual({ kind: "set-usage-retention", target: "codex", detailedRetentionDays: 14 })
+  server.send({
+    type: "response",
+    requestId: server.requests()[3]!.requestId,
+    result: {
+      kind: "usage-retention-outcome",
+      outcome: { target: "codex", detailedRetentionDays: 14, rolledUpDays: 1, prunedRequestRecords: 1, prunedNativeUsageRecords: 1 },
+    },
+  })
+  await expect(retaining).resolves.toMatchObject({ detailedRetentionDays: 14 })
+
+  const clearing = session.clearUsage()
+  await server.waitForRequests(5)
+  server.send({
+    type: "response",
+    requestId: server.requests()[4]!.requestId,
+    result: {
+      kind: "usage-clear-outcome",
+      outcome: { target: "codex", clearedRequestRecords: 1, clearedNativeUsageRecords: 2, clearedDailyRollups: 3, clearedImportCursors: 4 },
+    },
+  })
+  await expect(clearing).resolves.toMatchObject({ clearedImportCursors: 4 })
+
+  const updating = session.updatePricingCatalog()
+  await server.waitForRequests(6)
+  server.send({
+    type: "response",
+    requestId: server.requests()[5]!.requestId,
+    result: {
+      kind: "pricing-catalog-update-outcome",
+      outcome: { target: "codex", catalogVersion: "models.dev-sha256:abc", source: "models.dev", backfilledRequestRecords: 1, backfilledNativeUsageRecords: 2 },
+    },
+  })
+  await expect(updating).resolves.toMatchObject({ backfilledNativeUsageRecords: 2 })
+
+  await session.close()
+  await server.close()
+})
+
 test("RpcClient prepares one closed compatible handover request", async () => {
   const { server, path } = await ScriptedServer.start()
   const client = await RpcClient.connect(path, "control-test")

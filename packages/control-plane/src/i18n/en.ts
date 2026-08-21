@@ -89,6 +89,8 @@ export const en = {
   "command.activity.inspect.description": "Load the selected failed Request Record payload",
   "command.activity.more": "Load older requests",
   "command.activity.more.description": "Load the next Request History page",
+  "command.activity.refresh": "Refresh native usage",
+  "command.activity.refresh.description": "Import new native Target usage and reload activity",
   "command.activity.cancel": "Close Request History",
   "command.activity.cancel.description": "Close the Request History overlay",
   "command.route.open": "Edit failover route",

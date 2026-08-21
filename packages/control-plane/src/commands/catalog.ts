@@ -56,6 +56,7 @@ export const commandCatalog = [
   command("activity.select-next", "command.activity.select-next", null, ["down", "j"], ["activity"], false),
   command("activity.inspect", "command.activity.inspect", null, ["return"], ["activity"], false),
   command("activity.more", "command.activity.more", null, ["m"], ["activity"], false),
+  command("activity.refresh", "command.activity.refresh", null, ["r"], ["activity"], false),
   command("activity.cancel", "command.activity.cancel", null, ["escape"], ["activity"], false),
   command("route.open", "command.route.open", "route", ["<leader>f"], ["codex", "claude"], true),
   command("route.move-up", "command.route.move-up", null, ["u"], ["route-editor"], false),

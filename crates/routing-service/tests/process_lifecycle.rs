@@ -1617,6 +1617,74 @@ async fn disabling_each_takeover_is_target_local_and_the_final_disable_exits_nat
 }
 
 #[tokio::test]
+async fn takeover_only_native_scan_imports_without_extending_final_idle_exit() {
+    let root = TempDir::new().unwrap();
+    let user_home = root.path().join("home");
+    let home = user_home.join(".muxvia");
+    let shutdown_file = root.path().join("unused-shutdown");
+    fs::create_dir_all(user_home.join(".codex")).unwrap();
+    fs::write(
+        user_home.join(".codex/config.toml"),
+        b"# operator-owned\nunrelated = \"keep\"\n",
+    )
+    .unwrap();
+    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.106.0");
+    let mut child = command(&home, &shutdown_file)
+        .arg("--test-codex-executable")
+        .arg(codex)
+        .arg("--test-native-usage-scan-interval-ms")
+        .arg("25")
+        .spawn()
+        .unwrap();
+    let socket = home.join("run/control.sock");
+    wait_for_socket(&socket).await;
+    let _endpoint = activate_process_takeover(&socket, Target::Codex, &user_home).await;
+
+    let sessions = user_home.join(".codex/sessions/2026/08/21");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("periodic.jsonl"),
+        concat!(
+            "{\"timestamp\":\"2026-08-21T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"periodic-secret-session\"}}\n",
+            "{\"timestamp\":\"2026-08-21T10:00:01Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.6\"}}\n",
+            "{\"timestamp\":\"2026-08-21T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":12,\"cached_input_tokens\":2,\"output_tokens\":4}}}}\n",
+        ),
+    )
+    .unwrap();
+    timeout(PROCESS_TIMEOUT, async {
+        loop {
+            let database =
+                tokio_rusqlite::rusqlite::Connection::open(home.join("state/muxvia.db")).unwrap();
+            let count = database
+                .query_row("SELECT COUNT(*) FROM native_usage_records", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap();
+            if count == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("periodic native usage scan did not import during Takeover");
+    assert!(
+        timeout(Duration::from_millis(100), child.wait())
+            .await
+            .is_err(),
+        "an active Takeover did not keep the process alive"
+    );
+
+    disable_process_takeover(&socket, Target::Codex, &user_home).await;
+    let status = timeout(PROCESS_TIMEOUT, child.wait())
+        .await
+        .expect("periodic scan extended final idle exit")
+        .unwrap();
+    assert!(status.success());
+    assert!(!socket.exists());
+}
+
+#[tokio::test]
 async fn clean_dual_takeover_restart_resumes_exact_claude_route_snapshot_and_credential() {
     let root = TempDir::new().unwrap();
     let user_home = root.path().join("home");

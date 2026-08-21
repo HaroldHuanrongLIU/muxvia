@@ -34,6 +34,7 @@ use crate::{
     domain::provider::has_valid_provider_authentication,
     home::MuxviaHome,
     model::ReqwestUpstream,
+    native_usage::{NativeUsageError, NativeUsageService},
     service::{
         activate::ActivationService,
         handover::{PreparedHandover, probe_candidate},
@@ -189,6 +190,7 @@ struct SessionServices {
     provider_synchronization: Arc<ProviderSynchronizationService>,
     device_authorization: Arc<DeviceAuthorizationManager>,
     subscription_account_coordinator: Arc<SubscriptionAccountCoordinator>,
+    native_usage: Arc<NativeUsageService>,
     handover: Option<mpsc::Sender<PreparedHandover>>,
 }
 
@@ -203,6 +205,7 @@ struct InspectionServices {
     inspector: Arc<ProviderInspector>,
     reconciliation: Arc<ReconciliationService>,
     store: Arc<StateStore>,
+    native_usage: Arc<NativeUsageService>,
 }
 
 impl ControlServer {
@@ -223,7 +226,17 @@ impl ControlServer {
             )
             .with_configuration_home_override(std::env::var_os("CODEX_HOME").map(PathBuf::from)),
         );
-        Self::bind_configured(home, store, release, activation, false, None, None).await
+        Self::bind_configured(
+            home,
+            store,
+            release,
+            activation,
+            false,
+            None,
+            None,
+            Duration::from_secs(60),
+        )
+        .await
     }
 
     pub async fn bind_with_activation(
@@ -232,7 +245,17 @@ impl ControlServer {
         release: impl Into<String>,
         activation: Arc<ActivationService>,
     ) -> Result<ControlServerHandle, ControlServerError> {
-        Self::bind_configured(home, store, release, activation, false, None, None).await
+        Self::bind_configured(
+            home,
+            store,
+            release,
+            activation,
+            false,
+            None,
+            None,
+            Duration::from_secs(60),
+        )
+        .await
     }
 
     #[doc(hidden)]
@@ -255,6 +278,7 @@ impl ControlServer {
             false,
             Some(authority),
             None,
+            Duration::from_secs(60),
         )
         .await
     }
@@ -265,7 +289,38 @@ impl ControlServer {
         release: impl Into<String>,
         activation: Arc<ActivationService>,
     ) -> Result<ControlServerHandle, ControlServerError> {
-        Self::bind_configured(home, store, release, activation, true, None, None).await
+        Self::bind_configured(
+            home,
+            store,
+            release,
+            activation,
+            true,
+            None,
+            None,
+            Duration::from_secs(60),
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn bind_process_with_native_usage_scan_interval(
+        home: &MuxviaHome,
+        store: Arc<StateStore>,
+        release: impl Into<String>,
+        activation: Arc<ActivationService>,
+        scan_interval: Duration,
+    ) -> Result<ControlServerHandle, ControlServerError> {
+        Self::bind_configured(
+            home,
+            store,
+            release,
+            activation,
+            true,
+            None,
+            None,
+            scan_interval,
+        )
+        .await
     }
 
     #[doc(hidden)]
@@ -289,6 +344,7 @@ impl ControlServer {
             true,
             Some(authority),
             refresh_account_id,
+            Duration::from_secs(60),
         )
         .await
     }
@@ -303,6 +359,7 @@ impl ControlServer {
             Arc<dyn crate::subscription::device_authorization::DeviceAuthorizationAuthority>,
         >,
         startup_refresh_account_id: Option<String>,
+        native_usage_scan_interval: Duration,
     ) -> Result<ControlServerHandle, ControlServerError> {
         let reconciliation_runtime = activation.reconciliation_runtime();
         if reconciliation_runtime.home.root() != home.root() {
@@ -341,6 +398,10 @@ impl ControlServer {
             Arc::clone(&subscription_account_coordinator),
             device_authority,
         ));
+        let native_usage = Arc::new(
+            NativeUsageService::new(home, Arc::clone(&store))
+                .map_err(|_| ControlServerError::State)?,
+        );
         activation
             .install_subscription_resolver(device_authorization.clone())
             .map_err(|_| ControlServerError::State)?;
@@ -437,6 +498,32 @@ impl ControlServer {
         let handle_lifecycle = Arc::clone(&lifecycle);
         let task_path = socket_path.clone();
         let handle_reconciliation = Arc::clone(&reconciliation);
+        let periodic_usage = Arc::clone(&native_usage);
+        let periodic_store = Arc::clone(&store);
+        let mut periodic_shutdown = session_shutdown_rx.clone();
+        let periodic_usage_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(native_usage_scan_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    changed = periodic_shutdown.changed() => {
+                        if changed.is_err() || *periodic_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        for target in [Target::Codex, Target::Claude] {
+                            if matches!(periodic_store.committed_takeover_for(target).await, Ok(Some(_)))
+                                && periodic_usage.scan(target).await.is_err()
+                            {
+                                eprintln!("native-usage-scan-failed");
+                            }
+                        }
+                    }
+                }
+            }
+        });
         let task = tokio::spawn(async move {
             let mut sessions = JoinSet::new();
             loop {
@@ -465,6 +552,7 @@ impl ControlServer {
                         let device_authorization = Arc::clone(&device_authorization);
                         let subscription_account_coordinator =
                             Arc::clone(&subscription_account_coordinator);
+                        let native_usage = Arc::clone(&native_usage);
                         let handover = handover.clone();
                         let release = release.clone();
                         let lifecycle = Arc::clone(&lifecycle);
@@ -478,6 +566,7 @@ impl ControlServer {
                             provider_synchronization,
                             device_authorization,
                             subscription_account_coordinator,
+                            native_usage,
                             handover,
                         };
                         sessions.spawn(async move {
@@ -494,6 +583,8 @@ impl ControlServer {
                 }
             }
             drop(listener);
+            periodic_usage_task.abort();
+            let _ = periodic_usage_task.await;
             while sessions.join_next().await.is_some() {}
             remove_socket_if_present(&task_path);
             let _ = completed_tx.send(true);
@@ -691,6 +782,7 @@ async fn serve_session(
         provider_synchronization,
         device_authorization,
         subscription_account_coordinator,
+        native_usage,
         handover,
     } = services;
     let first = match read_frame(&mut stream).await {
@@ -1368,6 +1460,9 @@ async fn serve_session(
                         unreachable!("catalog operations are handled before target dispatch")
                     }
                     ControlOperation::OpenTarget { target, claude_context } => {
+                        if native_usage.scan(target).await.is_err() {
+                            eprintln!("native-usage-scan-failed");
+                        }
                         let Ok(view) = store.target_view_for(target).await else {
                             if !enqueue_response(&responses, problem_frame(Some(request_id), "state-store-error", "State store unavailable", None)) {
                                 break 'session;
@@ -1676,6 +1771,7 @@ async fn serve_session(
                             inspector: Arc::clone(&inspector),
                             reconciliation: Arc::clone(&reconciliation),
                             store: Arc::clone(&store),
+                            native_usage: Arc::clone(&native_usage),
                         };
                         let claude_context = opened_claude_context.clone();
                         let responses = responses.clone();
@@ -1943,6 +2039,7 @@ async fn inspect_and_queue(
         inspector,
         reconciliation,
         store,
+        native_usage,
     } = services;
     let InspectionOperation {
         target,
@@ -2044,16 +2141,70 @@ async fn inspect_and_queue(
                     )
                 })
                 .map_err(request_history_problem),
-            ControlOperation::ListUsageActivity(_)
-            | ControlOperation::RefreshNativeUsage(_)
-            | ControlOperation::SetUsageRetention(_)
-            | ControlOperation::ClearUsage(_)
-            | ControlOperation::UpdatePricingCatalog(_) => Err(ControlProblem {
-                code: "native-usage-unavailable".into(),
-                message: "Native usage is unavailable".into(),
-                source: None,
-                selector: None,
-            }),
+            ControlOperation::ListUsageActivity(operation) => native_usage
+                .list(
+                    operation.target,
+                    operation.before_cursor.as_deref(),
+                    operation.limit,
+                )
+                .await
+                .map(|page| {
+                    (
+                        ControlResult::UsageActivityPage(
+                            crate::control::protocol::UsageActivityPageResult { page },
+                        ),
+                        None,
+                    )
+                })
+                .map_err(native_usage_problem),
+            ControlOperation::RefreshNativeUsage(operation) => native_usage
+                .scan(operation.target)
+                .await
+                .map(|refresh| {
+                    (
+                        ControlResult::NativeUsageRefresh(
+                            crate::control::protocol::NativeUsageRefreshResult { refresh },
+                        ),
+                        None,
+                    )
+                })
+                .map_err(native_usage_problem),
+            ControlOperation::SetUsageRetention(operation) => native_usage
+                .set_retention(operation.target, operation.detailed_retention_days)
+                .await
+                .map(|outcome| {
+                    (
+                        ControlResult::UsageRetentionOutcome(
+                            crate::control::protocol::UsageRetentionOutcomeResult { outcome },
+                        ),
+                        None,
+                    )
+                })
+                .map_err(native_usage_problem),
+            ControlOperation::ClearUsage(operation) => native_usage
+                .clear(operation.target)
+                .await
+                .map(|outcome| {
+                    (
+                        ControlResult::UsageClearOutcome(
+                            crate::control::protocol::UsageClearOutcomeResult { outcome },
+                        ),
+                        None,
+                    )
+                })
+                .map_err(native_usage_problem),
+            ControlOperation::UpdatePricingCatalog(operation) => native_usage
+                .update_catalog(operation.target)
+                .await
+                .map(|outcome| {
+                    (
+                        ControlResult::PricingCatalogUpdateOutcome(
+                            crate::control::protocol::PricingCatalogUpdateOutcomeResult { outcome },
+                        ),
+                        None,
+                    )
+                })
+                .map_err(native_usage_problem),
             _ => unreachable!(),
         }
     };
@@ -2144,6 +2295,25 @@ fn request_history_problem(error: crate::request_history::RequestHistoryError) -
         crate::request_history::RequestHistoryError::NotFound => {
             ("request-record-not-found", "Request record was not found")
         }
+    };
+    ControlProblem {
+        code: code.into(),
+        message: message.into(),
+        source: None,
+        selector: None,
+    }
+}
+
+fn native_usage_problem(error: NativeUsageError) -> ControlProblem {
+    let (code, message) = match error {
+        NativeUsageError::Unavailable => {
+            ("native-usage-unavailable", "Native usage is unavailable")
+        }
+        NativeUsageError::InvalidRequest => ("invalid-usage-request", "Usage request is invalid"),
+        NativeUsageError::InvalidCatalog => (
+            "invalid-pricing-catalog",
+            "Pricing catalog candidate is invalid",
+        ),
     };
     ControlProblem {
         code: code.into(),

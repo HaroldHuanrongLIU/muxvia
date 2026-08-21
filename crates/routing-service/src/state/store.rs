@@ -19,6 +19,7 @@ use crate::{
         view::project_target_view_for,
     },
     home::MuxviaHome,
+    request_history::PricingCatalog,
 };
 
 use super::recovery::RecoveryPayload;
@@ -228,6 +229,7 @@ impl StateStore {
                 }
                 drop(foreign_key_check);
                 mark_invalid_managed_configurations(connection, None)?;
+                install_release_pricing_catalog(connection)?;
                 Ok(())
             })
             .await
@@ -2578,6 +2580,23 @@ impl StateStore {
             authoritative_view,
         }
     }
+}
+
+fn install_release_pricing_catalog(
+    connection: &mut tokio_rusqlite::rusqlite::Connection,
+) -> tokio_rusqlite::rusqlite::Result<()> {
+    let catalog = PricingCatalog::release_pinned()
+        .map_err(|_| tokio_rusqlite::rusqlite::Error::InvalidQuery)?;
+    let catalog_json = catalog
+        .to_json()
+        .map_err(|_| tokio_rusqlite::rusqlite::Error::InvalidQuery)?;
+    connection.execute(
+        "INSERT OR IGNORE INTO pricing_catalog_state
+           (singleton, catalog_version, source, catalog_json, updated_at_unix_ms)
+         VALUES (1, ?1, ?2, ?3, 0)",
+        params![catalog.version(), catalog.source(), catalog_json],
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

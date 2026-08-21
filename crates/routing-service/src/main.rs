@@ -27,6 +27,8 @@ struct Args {
     test_refresh_subscription_account: Option<String>,
     #[arg(long, hide = true)]
     test_subscription_bridge_origin: Option<String>,
+    #[arg(long, hide = true)]
+    test_native_usage_scan_interval_ms: Option<u64>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -51,7 +53,8 @@ async fn main() {
             || args.test_release.is_some()
             || args.test_device_authority_origin.is_some()
             || args.test_refresh_subscription_account.is_some()
-            || args.test_subscription_bridge_origin.is_some())
+            || args.test_subscription_bridge_origin.is_some()
+            || args.test_native_usage_scan_interval_ms.is_some())
     {
         eprintln!("test-only Routing Service options require integration invocation");
         std::process::exit(64);
@@ -90,6 +93,10 @@ async fn main() {
         test_device_authority_origin: args.test_device_authority_origin,
         test_refresh_subscription_account: args.test_refresh_subscription_account,
         test_subscription_bridge_origin: args.test_subscription_bridge_origin,
+        test_native_usage_scan_interval: args
+            .test_native_usage_scan_interval_ms
+            .filter(|milliseconds| *milliseconds > 0)
+            .map(std::time::Duration::from_millis),
     };
     if let Err(error) = run(options).await {
         eprintln!("{error}");

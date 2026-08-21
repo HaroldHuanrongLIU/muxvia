@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     control::protocol::{ProviderProtocol, RequestRecordOutcome, Target},
-    request_history::{PricingCatalog, RecordedProvider, RequestRecordCompletion, RequestUsage},
+    request_history::{RecordedProvider, RequestRecordCompletion, RequestUsage},
     state::{ActivatedRoutePlanSnapshot, StateStore},
 };
 
@@ -37,7 +37,6 @@ pub(crate) struct RequestRecorder {
 pub(crate) struct RequestRecorderActor {
     receiver: mpsc::Receiver<RequestRecordCompletion>,
     store: Arc<StateStore>,
-    catalog: PricingCatalog,
 }
 
 struct RequestRecordStart {
@@ -237,16 +236,8 @@ impl RequestRecorder {
     pub(crate) fn new(
         store: Arc<StateStore>,
     ) -> Result<(Self, RequestRecorderActor), crate::request_history::PricingError> {
-        let catalog = PricingCatalog::release_pinned()?;
         let (sender, receiver) = mpsc::channel(COMPLETION_QUEUE_CAPACITY);
-        Ok((
-            Self { sender },
-            RequestRecorderActor {
-                receiver,
-                store,
-                catalog,
-            },
-        ))
+        Ok((Self { sender }, RequestRecorderActor { receiver, store }))
     }
 
     pub(crate) fn begin(
@@ -297,7 +288,7 @@ impl RequestRecorderActor {
         while let Some(completion) = self.receiver.recv().await {
             if self
                 .store
-                .insert_request_record(completion, &self.catalog)
+                .record_request_completion(completion)
                 .await
                 .is_err()
             {

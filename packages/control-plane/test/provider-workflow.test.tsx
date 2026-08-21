@@ -213,6 +213,11 @@ class MemoryTargetSession implements TargetSession {
     return await this.#applyAction({ kind: "resolve-compatibility", version: input.version })
   }
   async listRequestRecords(): Promise<never> { throw new Error("request history not configured in this fixture") }
+  async listUsageActivity(): Promise<never> { throw new Error("usage activity not configured in this fixture") }
+  async refreshNativeUsage(): Promise<never> { throw new Error("usage activity not configured in this fixture") }
+  async setUsageRetention(): Promise<never> { throw new Error("usage activity not configured in this fixture") }
+  async clearUsage(): Promise<never> { throw new Error("usage activity not configured in this fixture") }
+  async updatePricingCatalog(): Promise<never> { throw new Error("usage activity not configured in this fixture") }
   async inspectRequestRecord(): Promise<never> { throw new Error("request history not configured in this fixture") }
   async applyReconciliation(input: {
     strategy: ReconciliationStrategy

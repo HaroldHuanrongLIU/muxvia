@@ -812,7 +812,7 @@ function Shell(props: {
       detail: append ? state.detail : undefined,
     }))
     try {
-      const page = await originSession.listRequestRecords({
+      const page = await originSession.listUsageActivity({
         limit: 20,
         ...(beforeCursor === undefined ? {} : { beforeCursor }),
       }, controller.signal)
@@ -829,7 +829,7 @@ function Shell(props: {
       ) return
       updateRequestHistory(target, token, (state) => ({
         ...state,
-        records: append ? [...state.records, ...page.records] : page.records,
+        entries: append ? [...state.entries, ...page.entries] : page.entries,
         nextCursor: page.nextCursor,
         selectedIndex: append ? state.selectedIndex : 0,
         pending: undefined,
@@ -858,8 +858,15 @@ function Shell(props: {
 
   const inspectRequestHistory = async (target: Target, token: OverlayToken) => {
     const current = requestHistoryByTarget()[target]
-    const selected = current?.records[current.selectedIndex]
-    if (!current || current.overlayToken !== token || current.pending || !selected || selected.outcome === "success") return
+    const selected = current?.entries[current.selectedIndex]
+    if (
+      !current
+      || current.overlayToken !== token
+      || current.pending
+      || !selected
+      || selected.kind !== "request-record"
+      || selected.record.outcome === "success"
+    ) return
     requestHistoryAborts[target]?.abort()
     const controller = new AbortController()
     requestHistoryAborts[target] = controller
@@ -873,8 +880,9 @@ function Shell(props: {
       errorCode: undefined,
     }))
     try {
-      const detail = await originSession.inspectRequestRecord(selected.id, controller.signal)
+      const detail = await originSession.inspectRequestRecord(selected.record.id, controller.signal)
       const latest = requestHistoryByTarget()[target]
+      const latestSelected = latest?.entries[latest.selectedIndex]
       if (
         disposed
         || exiting
@@ -884,7 +892,8 @@ function Shell(props: {
         || latest.overlayToken !== token
         || latest.originSession !== originSession
         || latest.generation !== generation
-        || latest.records[latest.selectedIndex]?.id !== selected.id
+        || latestSelected?.kind !== "request-record"
+        || latestSelected.record.id !== selected.record.id
       ) return
       updateRequestHistory(target, token, (state) => ({ ...state, detail, pending: undefined }))
     } catch (error) {
@@ -911,8 +920,8 @@ function Shell(props: {
 
   const selectRequestHistory = (target: Target, token: OverlayToken, delta: -1 | 1) => {
     updateRequestHistory(target, token, (state) => {
-      if (state.pending || state.records.length === 0) return state
-      const selectedIndex = Math.max(0, Math.min(state.records.length - 1, state.selectedIndex + delta))
+      if (state.pending || state.entries.length === 0) return state
+      const selectedIndex = Math.max(0, Math.min(state.entries.length - 1, state.selectedIndex + delta))
       return selectedIndex === state.selectedIndex
         ? state
         : { ...state, selectedIndex, detail: undefined, errorCode: undefined }
@@ -943,7 +952,7 @@ function Shell(props: {
       const token = Symbol(`request-history-${target}`)
       const initial: RequestHistoryWorkflowState = {
         target,
-        records: [],
+        entries: [],
         nextCursor: null,
         selectedIndex: 0,
         overlayToken: token,
@@ -961,6 +970,15 @@ function Shell(props: {
           onNext={() => selectRequestHistory(target, token, 1)}
           onInspect={() => { void inspectRequestHistory(target, token) }}
           onMore={() => { void loadRequestHistory(target, token, true) }}
+          onRefresh={() => {
+            void originSession.refreshNativeUsage().then(
+              () => loadRequestHistory(target, token, false),
+              (error) => updateRequestHistory(target, token, (state) => ({
+                ...state,
+                errorCode: safeRequestHistoryProblem(error),
+              })),
+            )
+          }}
           onCancel={() => closeRequestHistory(target, token)}
         />,
         onClose: () => {

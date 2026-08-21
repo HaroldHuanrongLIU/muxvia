@@ -43,6 +43,7 @@ export type CommandId =
   | "activity.select-next"
   | "activity.inspect"
   | "activity.more"
+  | "activity.refresh"
   | "activity.cancel"
   | "route.open"
   | "route.move-up"

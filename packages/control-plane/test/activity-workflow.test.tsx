@@ -110,6 +110,31 @@ class ActivitySession implements TargetSession {
     this.listCalls.push(structuredClone(input))
     return await this.listHandler(input, signal)
   }
+  async listUsageActivity(
+    input: { limit: number; beforeCursor?: string },
+    signal?: AbortSignal,
+  ) {
+    const page = await this.listRequestRecords(input, signal)
+    return {
+      target: page.target,
+      entries: page.records.map((record) => ({ kind: "request-record" as const, record })),
+      nextCursor: page.nextCursor,
+      detailedRetentionDays: 30,
+      catalogVersion: "fixture",
+    }
+  }
+  async refreshNativeUsage() {
+    return { target: this.#view.target, importedRecords: 0, scannedFiles: 0 }
+  }
+  async setUsageRetention(detailedRetentionDays: number) {
+    return { target: this.#view.target, detailedRetentionDays, rolledUpDays: 0, prunedRequestRecords: 0, prunedNativeUsageRecords: 0 }
+  }
+  async clearUsage() {
+    return { target: this.#view.target, clearedRequestRecords: 0, clearedNativeUsageRecords: 0, clearedDailyRollups: 0, clearedImportCursors: 0 }
+  }
+  async updatePricingCatalog() {
+    return { target: this.#view.target, catalogVersion: "fixture", source: "models.dev", backfilledRequestRecords: 0, backfilledNativeUsageRecords: 0 }
+  }
   async inspectRequestRecord(recordId: string, signal?: AbortSignal): Promise<RequestRecordDetail> {
     this.inspectCalls.push(recordId)
     return await this.inspectHandler(recordId, signal)

@@ -823,6 +823,78 @@ fn assert_request_history_frame_secret_free(frame: &Value, credential: &str) {
 }
 
 #[tokio::test]
+async fn native_usage_lifecycle_is_target_bound_over_real_uds() {
+    const SESSION_MARKER: &str = "NATIVE_USAGE_SESSION_SECRET_15001";
+    let mut fixture = ControlFixture::start().await;
+    let session_dir = fixture.root.join("home/.codex/sessions/2026/08/21");
+    fs::create_dir_all(&session_dir).unwrap();
+    let session_file = session_dir.join("source-path-secret.jsonl");
+    let first = format!(
+        concat!(
+            "{{\"timestamp\":\"2026-08-21T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\"}}}}\n",
+            "{{\"timestamp\":\"2026-08-21T10:00:01Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-5.6\"}}}}\n",
+            "{{\"timestamp\":\"2026-08-21T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"input_tokens\":12,\"cached_input_tokens\":2,\"output_tokens\":4}}}}}}}}\n",
+        ),
+        SESSION_MARKER
+    );
+    fs::write(&session_file, &first).unwrap();
+
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    let opened = request(
+        &mut stream,
+        "open-native",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    assert_eq!(opened["result"]["kind"], "target-view");
+    let listed = request(
+        &mut stream,
+        "list-native",
+        json!({ "kind": "list-usage-activity", "target": "codex", "limit": 10 }),
+    )
+    .await;
+    assert_eq!(listed["result"]["kind"], "usage-activity-page");
+    assert_eq!(
+        listed["result"]["page"]["entries"][0]["kind"],
+        "native-usage-record"
+    );
+    assert!(!listed.to_string().contains(SESSION_MARKER));
+    assert!(!listed.to_string().contains("source-path-secret"));
+
+    fs::write(
+        &session_file,
+        format!(
+            "{first}{{\"timestamp\":\"2026-08-21T10:00:03Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"input_tokens\":6,\"cached_input_tokens\":1,\"output_tokens\":2}}}}}}}}\n"
+        ),
+    )
+    .unwrap();
+    let refreshed = request(
+        &mut stream,
+        "refresh-native",
+        json!({ "kind": "refresh-native-usage", "target": "codex" }),
+    )
+    .await;
+    assert_eq!(refreshed["result"]["refresh"]["importedRecords"], 1);
+    let retained = request(
+        &mut stream,
+        "retain-native",
+        json!({ "kind": "set-usage-retention", "target": "codex", "detailedRetentionDays": 14 }),
+    )
+    .await;
+    assert_eq!(retained["result"]["outcome"]["detailedRetentionDays"], 14);
+    let cleared = request(
+        &mut stream,
+        "clear-native",
+        json!({ "kind": "clear-usage", "target": "codex" }),
+    )
+    .await;
+    assert_eq!(cleared["result"]["outcome"]["clearedNativeUsageRecords"], 2);
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn request_history_pages_and_details_are_target_bound_over_real_uds() {
     const HISTORY_CREDENTIAL: &str = "REQUEST_HISTORY_CREDENTIAL_SECRET_14001";
     let mut fixture = ControlFixture::start().await;

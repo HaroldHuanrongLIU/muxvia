@@ -4,13 +4,13 @@ import { createMemo, createSignal, For, onMount, Show, type Accessor } from "sol
 
 import { resolveBinding } from "../commands/catalog"
 import { useCommandLayer, useMuxviaKeymap } from "../commands/keymap"
-import type { RequestRecordDetail, RequestRecordSummary, Target } from "../control/types"
+import type { RequestRecordDetail, RequestRecordSummary, Target, UsageActivityEntry } from "../control/types"
 import type { Translator } from "../i18n"
 import { theme } from "../theme"
 
 export interface RequestHistoryUiState {
   target: Target
-  records: readonly RequestRecordSummary[]
+  entries: readonly UsageActivityEntry[]
   nextCursor: string | null
   selectedIndex: number
   detail?: RequestRecordDetail
@@ -25,6 +25,7 @@ export interface RequestHistoryProps {
   onNext: () => void
   onInspect: () => void
   onMore: () => void
+  onRefresh: () => void
   onCancel: () => void
 }
 
@@ -59,9 +60,13 @@ export function RequestHistory(props: RequestHistoryProps) {
   const keymap = useMuxviaKeymap()
   const [keyCapture, setKeyCapture] = createSignal("")
   let input: InputRenderable | undefined
-  const selected = () => props.state().records[props.state().selectedIndex]
+  const selected = () => props.state().entries[props.state().selectedIndex]
+  const selectedRequest = () => {
+    const entry = selected()
+    return entry?.kind === "request-record" ? entry.record : undefined
+  }
   const visibleRecords = createMemo(() => {
-    const records = props.state().records
+    const records = props.state().entries
     const capacity = props.state().detail
       ? 1
       : Math.max(1, Math.min(6, Math.floor(Math.max(1, dimensions().height - 8) / 2)))
@@ -92,6 +97,7 @@ export function RequestHistory(props: RequestHistoryProps) {
       "activity.select-next": props.onNext,
       "activity.inspect": props.onInspect,
       "activity.more": props.onMore,
+      "activity.refresh": props.onRefresh,
       "activity.cancel": props.onCancel,
     },
   })
@@ -136,26 +142,51 @@ export function RequestHistory(props: RequestHistoryProps) {
         width="100%"
       />
     </box>
-    <Show when={props.state().pending === "list" && props.state().records.length === 0}>
+    <Show when={props.state().pending === "list" && props.state().entries.length === 0}>
       <text fg={theme.warning}>{props.t("request-history.loading")}</text>
     </Show>
     <Show when={props.state().errorCode}>
       <text fg={theme.error}>{props.t(errorKey(props.state().errorCode!))}</text>
     </Show>
-    <Show when={!props.state().pending && props.state().records.length === 0 && !props.state().errorCode}>
+    <Show when={!props.state().pending && props.state().entries.length === 0 && !props.state().errorCode}>
       <text fg={theme.muted}>{props.t("request-history.empty")}</text>
     </Show>
-    <For each={visibleRecords()}>{({ record, index }) => <box flexDirection="column">
-      <text fg={index === props.state().selectedIndex ? theme.primary : theme.text}>
-        {`${index === props.state().selectedIndex ? ">" : " "} ${formatCompletion(record.finishedAtUnixMs)} · ${record.providerName ?? props.t("request-history.provider.unknown")} · ${record.model}`}
-      </text>
-      <text fg={record.outcome === "success" ? theme.muted : theme.warning}>
-        {`${record.usage
-          ? props.t("request-history.usage", { input: record.usage.inputTokens, output: record.usage.outputTokens })
-          : props.t("request-history.usage.unavailable")} · ${props.t("request-history.latency", { latency: record.latencyMs })} · ${props.t(outcomeKey(record.outcome))} · ${record.estimatedCostNanoUsd === null
-          ? props.t("request-history.cost.unpriced")
-          : props.t("request-history.cost.estimated", { cost: formatNanoUsd(record.estimatedCostNanoUsd) })}`}
-      </text>
+    <For each={visibleRecords()}>{({ record: entry, index }) => <box flexDirection="column">
+      <Show when={entry.kind === "request-record"}>{() => {
+        const record = (entry as Extract<UsageActivityEntry, { kind: "request-record" }>).record
+        return <>
+          <text fg={index === props.state().selectedIndex ? theme.primary : theme.text}>
+            {`${index === props.state().selectedIndex ? ">" : " "} Request · ${record.providerName ?? props.t("request-history.provider.unknown")} · ${record.model}`}
+          </text>
+          <text fg={record.outcome === "success" ? theme.muted : theme.warning}>
+            {`${formatCompletion(record.finishedAtUnixMs)} · ${record.usage
+              ? props.t("request-history.usage", { input: record.usage.inputTokens, output: record.usage.outputTokens })
+              : props.t("request-history.usage.unavailable")} · ${props.t("request-history.latency", { latency: record.latencyMs })} · ${props.t(outcomeKey(record.outcome))} · ${record.estimatedCostNanoUsd === null
+              ? props.t("request-history.cost.unpriced")
+              : props.t("request-history.cost.estimated", { cost: formatNanoUsd(record.estimatedCostNanoUsd) })}`}
+          </text>
+        </>
+      }}</Show>
+      <Show when={entry.kind === "native-usage-record"}>{() => {
+        const record = (entry as Extract<UsageActivityEntry, { kind: "native-usage-record" }>).record
+        return <>
+          <text fg={index === props.state().selectedIndex ? theme.primary : theme.text}>
+            {`${index === props.state().selectedIndex ? ">" : " "} Native · ${formatCompletion(record.observedAtUnixMs)} · ${record.model}`}
+          </text>
+          <text fg={theme.muted}>{`${props.t("request-history.usage", { input: record.usage.inputTokens, output: record.usage.outputTokens })} · ${record.estimatedCostNanoUsd === null
+            ? props.t("request-history.cost.unpriced")
+            : props.t("request-history.cost.estimated", { cost: formatNanoUsd(record.estimatedCostNanoUsd) })}`}</text>
+        </>
+      }}</Show>
+      <Show when={entry.kind === "daily-usage-rollup"}>{() => {
+        const rollup = (entry as Extract<UsageActivityEntry, { kind: "daily-usage-rollup" }>).rollup
+        return <>
+          <text fg={index === props.state().selectedIndex ? theme.primary : theme.text}>
+            {`${index === props.state().selectedIndex ? ">" : " "} Daily rollup · ${rollup.localDate} · ${rollup.requestRecordCount} Request / ${rollup.nativeUsageRecordCount} Native`}
+          </text>
+          <text fg={theme.muted}>{`${props.t("request-history.usage", { input: rollup.usage.inputTokens, output: rollup.usage.outputTokens })} · ${props.t("request-history.cost.estimated", { cost: formatNanoUsd(rollup.estimatedCostNanoUsd) })}`}</text>
+        </>
+      }}</Show>
     </box>}</For>
     <Show when={props.state().pending === "detail"}>
       <text fg={theme.warning}>{props.t("request-history.detail.loading")}</text>
@@ -172,7 +203,7 @@ export function RequestHistory(props: RequestHistoryProps) {
       </Show>
       <text fg={theme.text}>{visibleDetail().text ?? props.t("request-history.detail.empty")}</text>
     </box>}</Show>
-    <Show when={selected()?.outcome === "success" && !props.state().detail}>
+    <Show when={selectedRequest()?.outcome === "success" && !props.state().detail}>
       <text fg={theme.muted}>{props.t("request-history.detail.success")}</text>
     </Show>
     <text fg={theme.muted}>{props.t("request-history.help", {

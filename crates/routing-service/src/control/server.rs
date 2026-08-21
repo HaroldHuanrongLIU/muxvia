@@ -27,9 +27,10 @@ use crate::{
         protocol::{
             ActionStatus, ClaudePreflightContext, ClientFrame, CompatibilityProbeResult,
             ControlOperation, ControlProblem, ControlResult, DiscoverySource, FrameLimit,
-            HandoverPreparedResult, ProviderConfigurationExportResult, ProviderImportOutcomeResult,
-            ProviderImportPreviewResult, ReconciliationStrategy, RpcVersion, ServerFrame, Target,
-            TargetAction, TargetView, UniversalProviderAction, UniversalProviderCatalogView,
+            ForceStopAcceptedResult, HandoverPreparedResult, ProviderConfigurationExportResult,
+            ProviderImportOutcomeResult, ProviderImportPreviewResult, ReconciliationStrategy,
+            RpcVersion, ServerFrame, Target, TargetAction, TargetView, UniversalProviderAction,
+            UniversalProviderCatalogView,
         },
     },
     domain::provider::has_valid_provider_authentication,
@@ -80,6 +81,7 @@ pub struct ControlServerHandle {
     lifecycle: Arc<ServerLifecycle>,
     reconciliation: Arc<ReconciliationService>,
     handover: Option<mpsc::Receiver<PreparedHandover>>,
+    force_stop: Option<mpsc::Receiver<()>>,
 }
 
 pub(crate) enum ControlLifecycleOutcome {
@@ -195,6 +197,7 @@ struct SessionServices {
     subscription_account_coordinator: Arc<SubscriptionAccountCoordinator>,
     native_usage: Arc<NativeUsageService>,
     handover: Option<mpsc::Sender<PreparedHandover>>,
+    force_stop: Option<mpsc::Sender<()>>,
 }
 
 struct InspectionOperation {
@@ -516,6 +519,8 @@ impl ControlServer {
         let (completed_tx, completed) = watch::channel(false);
         let (handover_tx, handover_rx) = mpsc::channel(1);
         let handover = runtime.exit_when_idle.then_some(handover_tx);
+        let (force_stop_tx, force_stop_rx) = mpsc::channel(1);
+        let force_stop = runtime.exit_when_idle.then_some(force_stop_tx);
         let lifecycle = Arc::new(ServerLifecycle::default());
         let handle_lifecycle = Arc::clone(&lifecycle);
         let task_path = socket_path.clone();
@@ -577,6 +582,7 @@ impl ControlServer {
                             Arc::clone(&subscription_account_coordinator);
                         let native_usage = Arc::clone(&native_usage);
                         let handover = handover.clone();
+                        let force_stop = force_stop.clone();
                         let release = release.clone();
                         let lifecycle = Arc::clone(&lifecycle);
                         let session_shutdown = session_shutdown_rx.clone();
@@ -592,6 +598,7 @@ impl ControlServer {
                             subscription_account_coordinator,
                             native_usage,
                             handover,
+                            force_stop,
                         };
                         sessions.spawn(async move {
                             let _guard = SessionGuard(Arc::clone(&lifecycle));
@@ -622,6 +629,7 @@ impl ControlServer {
             lifecycle: handle_lifecycle,
             reconciliation: handle_reconciliation,
             handover: runtime.exit_when_idle.then_some(handover_rx),
+            force_stop: runtime.exit_when_idle.then_some(force_stop_rx),
         })
     }
 }
@@ -703,7 +711,8 @@ impl ControlServerHandle {
     pub(crate) async fn wait_for_lifecycle(
         &mut self,
     ) -> Result<ControlLifecycleOutcome, ControlServerError> {
-        let Some(handover) = self.handover.as_mut() else {
+        let (Some(handover), Some(force_stop)) = (self.handover.as_mut(), self.force_stop.as_mut())
+        else {
             self.wait_for_exit().await?;
             return Ok(ControlLifecycleOutcome::Idle);
         };
@@ -713,6 +722,13 @@ impl ControlServerHandle {
                 prepared = handover.recv() => {
                     if let Some(prepared) = prepared {
                         return Ok(ControlLifecycleOutcome::Handover(prepared));
+                    }
+                    self.wait_for_exit().await?;
+                    return Ok(ControlLifecycleOutcome::Idle);
+                }
+                requested = force_stop.recv() => {
+                    if requested.is_some() {
+                        return Ok(ControlLifecycleOutcome::ExplicitShutdown);
                     }
                     self.wait_for_exit().await?;
                     return Ok(ControlLifecycleOutcome::Idle);
@@ -809,6 +825,7 @@ async fn serve_session(
         subscription_account_coordinator,
         native_usage,
         handover,
+        force_stop,
     } = services;
     let first = match read_frame(&mut stream).await {
         Ok(first) => first,
@@ -1026,6 +1043,52 @@ async fn serve_session(
                         break 'session;
                     }
                     permit.send(prepared);
+                    break 'session;
+                }
+
+                if let ControlOperation::ForceStop(operation) = operation {
+                    let Some(sender) = force_stop.as_ref() else {
+                        if !enqueue_response(
+                            &responses,
+                            problem_frame(
+                                Some(request_id),
+                                "unsupported-operation",
+                                "Force stop requires process mode",
+                                None,
+                            ),
+                        ) {
+                            break 'session;
+                        }
+                        continue;
+                    };
+                    let Ok(permit) = sender.clone().try_reserve_owned() else {
+                        if !enqueue_response(
+                            &responses,
+                            problem_frame(
+                                Some(request_id),
+                                "force-stop-in-progress",
+                                "Routing Service force stop is already in progress",
+                                None,
+                            ),
+                        ) {
+                            break 'session;
+                        }
+                        continue;
+                    };
+                    if !enqueue_written_response(
+                        &responses,
+                        ServerFrame::Response {
+                            request_id,
+                            result: ControlResult::ForceStopAccepted(ForceStopAcceptedResult {
+                                warning: operation.acknowledgement,
+                            }),
+                        },
+                    )
+                    .await
+                    {
+                        break 'session;
+                    }
+                    permit.send(());
                     break 'session;
                 }
 
@@ -1475,6 +1538,7 @@ async fn serve_session(
 
                 match operation {
                     ControlOperation::PrepareHandover(_)
+                    | ControlOperation::ForceStop(_)
                     | ControlOperation::OpenUniversalProviders { .. }
                     | ControlOperation::OpenSubscriptionAccounts(_)
                     | ControlOperation::StartDeviceAuthorization(_)
@@ -2006,6 +2070,7 @@ fn provider_transfer_problem(request_id: String, error: ProviderTransferError) -
 fn operation_target(operation: &ControlOperation) -> Option<Target> {
     match operation {
         ControlOperation::PrepareHandover(_)
+        | ControlOperation::ForceStop(_)
         | ControlOperation::OpenUniversalProviders { .. }
         | ControlOperation::OpenSubscriptionAccounts(_)
         | ControlOperation::StartDeviceAuthorization(_)

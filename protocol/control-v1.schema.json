@@ -394,6 +394,7 @@
     "controlOperation": {
       "oneOf": [
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "prepare-handover" }, "candidatePath": { "type": "string" }, "expectedRelease": { "type": "string" } }, "required": ["kind", "candidatePath", "expectedRelease"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "force-stop" }, "acknowledgement": { "const": "managed-target-files-may-remain-pointed-at-dead-endpoint" } }, "required": ["kind", "acknowledgement"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "open-universal-providers" }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "open-subscription-accounts" } }, "required": ["kind"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "start-device-authorization" }, "reauthorizeAccountId": { "type": ["string", "null"] } }, "required": ["kind", "reauthorizeAccountId"] },
@@ -479,6 +480,7 @@
     "controlResult": {
       "oneOf": [
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "handover-prepared" }, "release": { "type": "string" } }, "required": ["kind", "release"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "force-stop-accepted" }, "warning": { "const": "managed-target-files-may-remain-pointed-at-dead-endpoint" } }, "required": ["kind", "warning"] },
         { "type": "object", "properties": { "kind": { "const": "target-view" }, "view": { "$ref": "#/$defs/targetView" } }, "required": ["kind", "view"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "universal-provider-catalog" }, "view": { "$ref": "#/$defs/universalProviderCatalog" } }, "required": ["kind", "view"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "subscription-account-catalog" }, "view": { "$ref": "#/$defs/subscriptionAccountCatalog" } }, "required": ["kind", "view"] },

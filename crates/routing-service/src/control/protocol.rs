@@ -157,6 +157,7 @@ pub enum ServerFrame {
 )]
 pub enum ControlOperation {
     PrepareHandover(PrepareHandoverOperation),
+    ForceStop(ForceStopOperation),
     OpenUniversalProviders {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_context: Option<ClaudePreflightContext>,
@@ -288,6 +289,18 @@ pub enum ProviderImportResolution {
 pub struct PrepareHandoverOperation {
     pub candidate_path: String,
     pub expected_release: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForceStopOperation {
+    pub acknowledgement: ForceStopAcknowledgement,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ForceStopAcknowledgement {
+    ManagedTargetFilesMayRemainPointedAtDeadEndpoint,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -593,6 +606,10 @@ impl fmt::Debug for ControlOperation {
                 .debug_struct("PrepareHandover")
                 .field("candidate_path", &Redacted)
                 .field("expected_release", &operation.expected_release)
+                .finish(),
+            Self::ForceStop(operation) => formatter
+                .debug_struct("ForceStop")
+                .field("acknowledgement", &operation.acknowledgement)
                 .finish(),
             Self::OpenUniversalProviders { .. } => formatter.write_str("OpenUniversalProviders"),
             Self::OpenSubscriptionAccounts(_) => formatter.write_str("OpenSubscriptionAccounts"),
@@ -1075,6 +1092,7 @@ pub enum ActivationMode {
 )]
 pub enum ControlResult {
     HandoverPrepared(HandoverPreparedResult),
+    ForceStopAccepted(ForceStopAcceptedResult),
     TargetView {
         view: TargetView,
     },
@@ -1721,6 +1739,12 @@ pub enum SubscriptionAccountRecoveryState {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HandoverPreparedResult {
     pub release: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForceStopAcceptedResult {
+    pub warning: ForceStopAcknowledgement,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

@@ -457,6 +457,10 @@ const controlOperationSchema = z.discriminatedUnion("kind", [
     expectedRelease: z.string(),
   }).strict(),
   z.object({
+    kind: z.literal("force-stop"),
+    acknowledgement: z.literal("managed-target-files-may-remain-pointed-at-dead-endpoint"),
+  }).strict(),
+  z.object({
     kind: z.literal("open-universal-providers"),
     claudeContext: claudePreflightContextSchema.optional(),
   }).strict(),
@@ -931,6 +935,10 @@ const pricingCatalogUpdateOutcomeSchema = z.object({
 
 const controlResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("handover-prepared"), release: z.string() }).strict(),
+  z.object({
+    kind: z.literal("force-stop-accepted"),
+    warning: z.literal("managed-target-files-may-remain-pointed-at-dead-endpoint"),
+  }).strict(),
   z.object({ kind: z.literal("target-view"), view: targetViewSchema }),
   z.object({ kind: z.literal("universal-provider-catalog"), view: universalProviderCatalogSchema }).strict(),
   z.object({ kind: z.literal("subscription-account-catalog"), view: subscriptionAccountCatalogSchema }).strict(),

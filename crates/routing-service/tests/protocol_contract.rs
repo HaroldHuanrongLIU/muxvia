@@ -76,6 +76,7 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "preview-provider-import.json",
         "confirm-provider-import.json",
         "export-provider-configuration.json",
+        "force-stop.json",
     ] {
         let frame = fixture(name);
         let parsed: ClientFrame = serde_json::from_value(frame.clone()).unwrap();
@@ -89,6 +90,10 @@ fn fixtures_round_trip_as_their_protocol_types() {
     let handover_prepared = fixture("handover-prepared.json");
     let parsed: ServerFrame = serde_json::from_value(handover_prepared.clone()).unwrap();
     assert_eq!(serde_json::to_value(parsed).unwrap(), handover_prepared);
+
+    let force_stop_accepted = fixture("force-stop-accepted.json");
+    let parsed: ServerFrame = serde_json::from_value(force_stop_accepted.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), force_stop_accepted);
 
     for name in ["request-record-page.json", "request-record-detail.json"] {
         let frame = fixture(name);
@@ -460,19 +465,31 @@ fn lifecycle_contracts_are_closed_and_secret_free() {
     let disabled = fixture("disable-takeover.json");
     let prepared = fixture("prepare-handover.json");
     let accepted = fixture("handover-prepared.json");
+    let forced = fixture("force-stop.json");
+    let force_accepted = fixture("force-stop-accepted.json");
 
     assert!(serde_json::from_value::<TargetAction>(disabled.clone()).is_ok());
     assert!(serde_json::from_value::<ClientFrame>(prepared.clone()).is_ok());
     assert!(serde_json::from_value::<ServerFrame>(accepted.clone()).is_ok());
+    assert!(serde_json::from_value::<ClientFrame>(forced.clone()).is_ok());
+    assert!(serde_json::from_value::<ServerFrame>(force_accepted.clone()).is_ok());
+    let mut wrong_acknowledgement = forced.clone();
+    wrong_acknowledgement["operation"]["acknowledgement"] = serde_json::json!("yes");
+    assert!(serde_json::from_value::<ClientFrame>(wrong_acknowledgement).is_err());
+    let mut wrong_warning = force_accepted.clone();
+    wrong_warning["result"]["warning"] = serde_json::json!("yes");
+    assert!(serde_json::from_value::<ServerFrame>(wrong_warning).is_err());
 
     for (mut value, label) in [
         (disabled, "disable"),
         (prepared, "prepare"),
         (accepted, "accepted"),
+        (forced, "forced"),
+        (force_accepted, "force-accepted"),
     ] {
         let object = if label == "disable" {
             value.as_object_mut().unwrap()
-        } else if label == "prepare" {
+        } else if label == "prepare" || label == "forced" {
             value["operation"].as_object_mut().unwrap()
         } else {
             value["result"].as_object_mut().unwrap()
@@ -483,7 +500,7 @@ fn lifecycle_contracts_are_closed_and_secret_free() {
         );
         let rejected = match label {
             "disable" => serde_json::from_value::<TargetAction>(value).is_err(),
-            "prepare" => serde_json::from_value::<ClientFrame>(value).is_err(),
+            "prepare" | "forced" => serde_json::from_value::<ClientFrame>(value).is_err(),
             _ => serde_json::from_value::<ServerFrame>(value).is_err(),
         };
         assert!(rejected, "accepted additive lifecycle field");

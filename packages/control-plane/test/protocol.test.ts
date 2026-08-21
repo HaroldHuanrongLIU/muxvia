@@ -39,10 +39,12 @@ test.each([
   ["inspect-request-record.json", parseClientFrame],
   ["open-universal-providers.json", parseClientFrame],
   ["prepare-handover.json", parseClientFrame],
+  ["force-stop.json", parseClientFrame],
   ["compatibility-probe.json", parseServerFrame],
   ["request-record-page.json", parseServerFrame],
   ["request-record-detail.json", parseServerFrame],
   ["handover-prepared.json", parseServerFrame],
+  ["force-stop-accepted.json", parseServerFrame],
   ["universal-provider-catalog.json", parseServerFrame],
   ["universal-provider-act.json", parseClientFrame],
   ["universal-provider-outcome.json", parseServerFrame],
@@ -244,20 +246,34 @@ test("lifecycle contracts are closed and secret-free", async () => {
   const disabled = await readFixture("disable-takeover.json") as any
   const prepared = await readFixture("prepare-handover.json") as any
   const accepted = await readFixture("handover-prepared.json") as any
+  const forced = await readFixture("force-stop.json") as any
+  const forceAccepted = await readFixture("force-stop-accepted.json") as any
 
   expect(parseTargetAction(disabled)).toEqual(disabled)
   expect(parseClientFrame(prepared)).toEqual(prepared)
   expect(parseServerFrame(accepted)).toEqual(accepted)
+  expect(parseClientFrame(forced)).toEqual(forced)
+  expect(parseServerFrame(forceAccepted)).toEqual(forceAccepted)
+  expect(() => parseClientFrame({
+    ...forced,
+    operation: { ...forced.operation, acknowledgement: "yes" },
+  })).toThrow()
+  expect(() => parseServerFrame({
+    ...forceAccepted,
+    result: { ...forceAccepted.result, warning: "yes" },
+  })).toThrow()
 
   for (const [value, branch, parse] of [
     [disabled, disabled, parseTargetAction],
     [prepared, prepared.operation, parseClientFrame],
     [accepted, accepted.result, parseServerFrame],
+    [forced, forced.operation, parseClientFrame],
+    [forceAccepted, forceAccepted.result, parseServerFrame],
   ] as const) {
     const invalid = structuredClone(value)
     const invalidBranch = branch === disabled
       ? invalid
-      : branch === prepared.operation
+      : "operation" in invalid
         ? invalid.operation
         : invalid.result
     invalidBranch.additiveSecret = "LIFECYCLE_PROTOCOL_SECRET_40391"

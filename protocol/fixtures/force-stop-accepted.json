@@ -1,0 +1,8 @@
+{
+  "type": "response",
+  "requestId": "force-stop-1",
+  "result": {
+    "kind": "force-stop-accepted",
+    "warning": "managed-target-files-may-remain-pointed-at-dead-endpoint"
+  }
+}

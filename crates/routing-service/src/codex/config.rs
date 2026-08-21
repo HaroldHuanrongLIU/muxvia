@@ -454,6 +454,29 @@ impl CodexConfigCodec {
             .map(ManagedCodexState::into_snapshot)
     }
 
+    pub(crate) fn provider_for_import(
+        &self,
+    ) -> Result<(String, String, String, String, SecretString), CodexProblem> {
+        let contents = self
+            .file
+            .read()
+            .map_err(|error| map_file_error(error, Some(self.config_path())))?;
+        let source = String::from_utf8(contents.bytes)
+            .map_err(|_| CodexProblem::new("invalid-configuration", Some(self.config_path())))?;
+        let document = source
+            .parse::<DocumentMut>()
+            .map_err(|_| CodexProblem::new("invalid-configuration", Some(self.config_path())))?;
+        let provider_key = selected_provider_key(&document)
+            .filter(|key| !key.trim().is_empty())
+            .ok_or_else(|| CodexProblem::new("invalid-configuration", Some(self.config_path())))?;
+        let snapshot = snapshot_from_document(contents.identity, &document, &provider_key)?;
+        let (name, model, base_url, credential) = snapshot
+            .as_adopted_direct()
+            .reconciliation_provider()
+            .ok_or_else(|| CodexProblem::new("invalid-configuration", Some(self.config_path())))?;
+        Ok((provider_key, name, model, base_url, credential))
+    }
+
     #[allow(dead_code)]
     pub(crate) fn reconciliation_snapshot(&self) -> Result<(ConfigSnapshot, bool), CodexProblem> {
         let (snapshot, document) = self.read_snapshot()?;

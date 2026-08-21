@@ -1,0 +1,18 @@
+{
+  "type": "response",
+  "requestId": "provider-import-confirm-1",
+  "result": {
+    "kind": "provider-import-outcome",
+    "outcome": {
+      "records": [
+        {
+          "candidateId": "20000000-0000-4000-8000-000000000001",
+          "resolution": "created",
+          "kind": "target-provider",
+          "target": "codex",
+          "providerId": "30000000-0000-4000-8000-000000000001"
+        }
+      ]
+    }
+  }
+}

@@ -221,6 +221,157 @@
       "properties": { "target": { "enum": ["codex", "claude"] }, "catalogVersion": { "type": "string" }, "source": { "type": "string" }, "backfilledRequestRecords": { "type": "integer", "minimum": 0 }, "backfilledNativeUsageRecords": { "type": "integer", "minimum": 0 } },
       "required": ["target", "catalogVersion", "source", "backfilledRequestRecords", "backfilledNativeUsageRecords"]
     },
+    "providerImportSource": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "live-target" } }, "required": ["kind"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "cc-switch" }, "payload": { "type": "string", "maxLength": 524288 } }, "required": ["kind", "payload"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "muxvia-export" }, "payload": { "type": "string", "maxLength": 524288 } }, "required": ["kind", "payload"] }
+      ]
+    },
+    "providerImportResolution": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "create" } }, "required": ["kind"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "use-existing" }, "providerId": { "type": "string", "format": "uuid" } }, "required": ["kind", "providerId"] }
+      ]
+    },
+    "providerImportChoice": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "candidateId": { "type": "string", "format": "uuid" },
+        "resolution": { "$ref": "#/$defs/providerImportResolution" }
+      },
+      "required": ["candidateId", "resolution"]
+    },
+    "providerImportSourceView": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "product": { "enum": ["target-cli", "cc-switch", "muxvia"] },
+        "target": { "enum": ["codex", "claude", "universal"] }
+      },
+      "required": ["product", "target"]
+    },
+    "providerImportMatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "providerId": { "type": "string", "format": "uuid" },
+        "name": { "type": "string" }
+      },
+      "required": ["providerId", "name"]
+    },
+    "providerImportTargetCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "target-provider" },
+        "candidateId": { "type": "string", "format": "uuid" },
+        "target": { "enum": ["codex", "claude"] },
+        "name": { "type": "string" },
+        "baseUrl": { "type": "string" },
+        "model": { "type": "string" },
+        "protocol": { "enum": ["openai-responses", "anthropic-messages"] },
+        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"] },
+        "routingRequirement": { "enum": ["direct-compatible", "takeover-required"] },
+        "credential": { "enum": ["present", "missing"] },
+        "importedCurrent": { "type": "boolean" },
+        "exactMatches": { "type": "array", "items": { "$ref": "#/$defs/providerImportMatch" } }
+      },
+      "required": ["kind", "candidateId", "target", "name", "baseUrl", "model", "protocol", "authentication", "routingRequirement", "credential", "importedCurrent", "exactMatches"]
+    },
+    "providerImportUniversalCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "universal-provider" },
+        "candidateId": { "type": "string", "format": "uuid" },
+        "name": { "type": "string" },
+        "baseUrl": { "type": "string" },
+        "credential": { "enum": ["present", "missing"] },
+        "targets": { "type": "array", "items": { "$ref": "#/$defs/universalProviderPresetTarget" } },
+        "exactMatches": { "type": "array", "items": { "$ref": "#/$defs/providerImportMatch" } }
+      },
+      "required": ["kind", "candidateId", "name", "baseUrl", "credential", "targets", "exactMatches"]
+    },
+    "providerImportCandidate": {
+      "oneOf": [
+        { "$ref": "#/$defs/providerImportTargetCandidate" },
+        { "$ref": "#/$defs/providerImportUniversalCandidate" }
+      ]
+    },
+    "providerImportPreview": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "previewToken": { "type": "string", "format": "uuid" },
+        "source": { "$ref": "#/$defs/providerImportSourceView" },
+        "candidates": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "$ref": "#/$defs/providerImportCandidate" } }
+      },
+      "required": ["previewToken", "source", "candidates"]
+    },
+    "providerImportRecord": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "target-provider" }, "candidateId": { "type": "string", "format": "uuid" }, "resolution": { "enum": ["created", "existing"] }, "target": { "enum": ["codex", "claude"] }, "providerId": { "type": "string", "format": "uuid" } }, "required": ["kind", "candidateId", "resolution", "target", "providerId"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "universal-provider" }, "candidateId": { "type": "string", "format": "uuid" }, "resolution": { "enum": ["created", "existing"] }, "providerId": { "type": "string", "format": "uuid" } }, "required": ["kind", "candidateId", "resolution", "providerId"] }
+      ]
+    },
+    "providerImportOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "records": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "$ref": "#/$defs/providerImportRecord" } } },
+      "required": ["records"]
+    },
+    "exportedUniversalProvider": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sourceId": { "type": "string", "format": "uuid" },
+        "position": { "type": "integer", "minimum": 0 },
+        "name": { "type": "string" },
+        "baseUrl": { "type": "string" },
+        "targets": { "type": "array", "items": { "$ref": "#/$defs/universalProviderPresetTarget" } }
+      },
+      "required": ["sourceId", "position", "name", "baseUrl", "targets"]
+    },
+    "exportedTargetProvider": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sourceId": { "type": "string", "format": "uuid" },
+        "target": { "enum": ["codex", "claude"] },
+        "position": { "type": "integer", "minimum": 0 },
+        "name": { "type": "string" },
+        "baseUrl": { "type": "string" },
+        "model": { "type": "string" },
+        "protocol": { "enum": ["openai-responses", "anthropic-messages"] },
+        "authentication": { "enum": ["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"] },
+        "routingRequirement": { "enum": ["direct-compatible", "takeover-required"] },
+        "universalProviderSourceId": { "oneOf": [{ "type": "string", "format": "uuid" }, { "type": "null" }] }
+      },
+      "required": ["sourceId", "target", "position", "name", "baseUrl", "model", "protocol", "authentication", "routingRequirement", "universalProviderSourceId"]
+    },
+    "exportedFailoverDraft": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "target": { "enum": ["codex", "claude"] },
+        "providerSourceIds": { "type": "array", "items": { "type": "string", "format": "uuid" } }
+      },
+      "required": ["target", "providerSourceIds"]
+    },
+    "providerConfigurationExport": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "format": { "const": "muxvia-provider-configuration" },
+        "version": { "const": 1 },
+        "universalProviders": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/exportedUniversalProvider" } },
+        "targetProviders": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/exportedTargetProvider" } },
+        "failoverDrafts": { "type": "array", "maxItems": 2, "items": { "$ref": "#/$defs/exportedFailoverDraft" } }
+      },
+      "required": ["format", "version", "universalProviders", "targetProviders", "failoverDrafts"]
+    },
     "clientFrame": {
       "oneOf": [
         { "type": "object", "properties": { "type": { "const": "hello" }, "rpc": { "$ref": "#/$defs/rpc" }, "release": { "type": "string" } }, "required": ["type", "rpc", "release"] },
@@ -260,7 +411,10 @@
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "refresh-native-usage" }, "target": { "enum": ["codex", "claude"] } }, "required": ["kind", "target"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "set-usage-retention" }, "target": { "enum": ["codex", "claude"] }, "detailedRetentionDays": { "type": "integer", "minimum": 1, "maximum": 3650 } }, "required": ["kind", "target", "detailedRetentionDays"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "clear-usage" }, "target": { "enum": ["codex", "claude"] } }, "required": ["kind", "target"] },
-        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "update-pricing-catalog" }, "target": { "enum": ["codex", "claude"] } }, "required": ["kind", "target"] }
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "update-pricing-catalog" }, "target": { "enum": ["codex", "claude"] } }, "required": ["kind", "target"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "preview-provider-import" }, "target": { "enum": ["codex", "claude"] }, "source": { "$ref": "#/$defs/providerImportSource" } }, "required": ["kind", "target", "source"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "confirm-provider-import" }, "target": { "enum": ["codex", "claude"] }, "previewToken": { "type": "string", "format": "uuid" }, "choices": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "$ref": "#/$defs/providerImportChoice" } } }, "required": ["kind", "target", "previewToken", "choices"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "export-provider-configuration" }, "target": { "enum": ["codex", "claude"] } }, "required": ["kind", "target"] }
       ]
     },
     "discoverySource": {
@@ -342,7 +496,10 @@
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "native-usage-refresh" }, "refresh": { "$ref": "#/$defs/nativeUsageRefresh" } }, "required": ["kind", "refresh"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "usage-retention-outcome" }, "outcome": { "$ref": "#/$defs/usageRetentionOutcome" } }, "required": ["kind", "outcome"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "usage-clear-outcome" }, "outcome": { "$ref": "#/$defs/usageClearOutcome" } }, "required": ["kind", "outcome"] },
-        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "pricing-catalog-update-outcome" }, "outcome": { "$ref": "#/$defs/pricingCatalogUpdateOutcome" } }, "required": ["kind", "outcome"] }
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "pricing-catalog-update-outcome" }, "outcome": { "$ref": "#/$defs/pricingCatalogUpdateOutcome" } }, "required": ["kind", "outcome"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "provider-import-preview" }, "preview": { "$ref": "#/$defs/providerImportPreview" } }, "required": ["kind", "preview"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "provider-import-outcome" }, "outcome": { "$ref": "#/$defs/providerImportOutcome" } }, "required": ["kind", "outcome"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "provider-configuration-export" }, "export": { "$ref": "#/$defs/providerConfigurationExport" } }, "required": ["kind", "export"] }
       ]
     },
     "inspectionCategory": {

@@ -3,6 +3,7 @@ pub(crate) mod handover;
 pub mod process;
 pub mod provider_inspector;
 pub(crate) mod provider_synchronization;
+pub mod provider_transfer;
 pub(crate) mod reconcile;
 // Task 4 consumes the prepared target-native values exposed by this seam.
 #[allow(dead_code)]

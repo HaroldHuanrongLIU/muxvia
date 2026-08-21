@@ -6,9 +6,9 @@ use muxvia_routing::{
         protocol::{
             ActivationMode, ClientFrame, ControlResult, CredentialEdit, DiscoverySource,
             DraftCredentialSource, DuplicateCredential, ProviderAuthentication,
-            ProviderCompleteness, ProviderProtocol, ProviderRequirement,
-            ProviderRoutingRequirement, ServerFrame, SubscriptionAccountAction, Target,
-            TargetAction, TargetView, UniversalProviderAction,
+            ProviderCompleteness, ProviderConfigurationExport, ProviderImportPreview,
+            ProviderProtocol, ProviderRequirement, ProviderRoutingRequirement, ServerFrame,
+            SubscriptionAccountAction, Target, TargetAction, TargetView, UniversalProviderAction,
         },
     },
     domain::provider::has_valid_provider_declaration,
@@ -73,6 +73,9 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "update-pricing-catalog.json",
         "open-universal-providers.json",
         "prepare-handover.json",
+        "preview-provider-import.json",
+        "confirm-provider-import.json",
+        "export-provider-configuration.json",
     ] {
         let frame = fixture(name);
         let parsed: ClientFrame = serde_json::from_value(frame.clone()).unwrap();
@@ -99,6 +102,9 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "usage-retention-outcome.json",
         "usage-clear-outcome.json",
         "pricing-catalog-update-outcome.json",
+        "provider-import-preview.json",
+        "provider-import-outcome.json",
+        "provider-configuration-export.json",
     ] {
         let frame = fixture(name);
         let parsed: ServerFrame = serde_json::from_value(frame.clone()).unwrap();
@@ -220,6 +226,106 @@ fn usage_lifecycle_contract_is_closed_target_bound_and_secret_free() {
         "usageRetentionOutcome",
         "usageClearOutcome",
         "pricingCatalogUpdateOutcome",
+    ] {
+        assert_eq!(schema["$defs"][definition]["additionalProperties"], false);
+    }
+}
+
+#[test]
+fn provider_transfer_contract_is_preview_first_closed_and_secret_free() {
+    let request = fixture("preview-provider-import.json");
+    let parsed: ClientFrame = serde_json::from_value(request.clone()).unwrap();
+    assert!(
+        !format!("{parsed:?}").contains("provider-import-secret-must-not-escape"),
+        "preview request Debug rendered pasted Provider credentials"
+    );
+
+    let preview = fixture("provider-import-preview.json");
+    let parsed: ServerFrame = serde_json::from_value(preview.clone()).unwrap();
+    let serialized = serde_json::to_string(&parsed).unwrap();
+    assert!(!serialized.contains("provider-import-secret-must-not-escape"));
+    assert!(!format!("{parsed:?}").contains("provider-import-secret-must-not-escape"));
+
+    let export = fixture("provider-configuration-export.json");
+    let parsed: ServerFrame = serde_json::from_value(export.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), export);
+
+    for (name, branch) in [
+        ("preview-provider-import.json", "operation"),
+        ("confirm-provider-import.json", "operation"),
+        ("export-provider-configuration.json", "operation"),
+        ("provider-import-preview.json", "result"),
+        ("provider-import-outcome.json", "result"),
+        ("provider-configuration-export.json", "result"),
+    ] {
+        let mut value = fixture(name);
+        value[branch]["additiveSecret"] =
+            serde_json::json!("PROVIDER_TRANSFER_ADDITIVE_SECRET_16001");
+        let rejected = if branch == "operation" {
+            serde_json::from_value::<ClientFrame>(value).is_err()
+        } else {
+            serde_json::from_value::<ServerFrame>(value).is_err()
+        };
+        assert!(rejected, "accepted additive field in {name}");
+    }
+
+    let result =
+        match serde_json::from_value::<ServerFrame>(fixture("provider-import-preview.json"))
+            .unwrap()
+        {
+            ServerFrame::Response {
+                result: ControlResult::ProviderImportPreview(result),
+                ..
+            } => result.preview,
+            _ => panic!("unexpected preview fixture"),
+        };
+    let _: ProviderImportPreview = result;
+
+    let exported =
+        match serde_json::from_value::<ServerFrame>(fixture("provider-configuration-export.json"))
+            .unwrap()
+        {
+            ServerFrame::Response {
+                result: ControlResult::ProviderConfigurationExport(result),
+                ..
+            } => result.export,
+            _ => panic!("unexpected export fixture"),
+        };
+    let _: ProviderConfigurationExport = exported;
+
+    let schema = fixture("../control-v1.schema.json");
+    let branch = |definition: &str, discriminator: &str| {
+        schema["$defs"][definition]["oneOf"]
+            .as_array()
+            .and_then(|branches| {
+                branches
+                    .iter()
+                    .find(|branch| branch["properties"]["kind"]["const"] == discriminator)
+            })
+            .expect("missing Provider Transfer schema branch")
+    };
+    for (definition, discriminator) in [
+        ("controlOperation", "preview-provider-import"),
+        ("controlOperation", "confirm-provider-import"),
+        ("controlOperation", "export-provider-configuration"),
+        ("controlResult", "provider-import-preview"),
+        ("controlResult", "provider-import-outcome"),
+        ("controlResult", "provider-configuration-export"),
+    ] {
+        assert_eq!(
+            branch(definition, discriminator)["additionalProperties"],
+            false
+        );
+    }
+    for definition in [
+        "providerImportPreview",
+        "providerImportTargetCandidate",
+        "providerImportUniversalCandidate",
+        "providerImportChoice",
+        "providerConfigurationExport",
+        "exportedTargetProvider",
+        "exportedUniversalProvider",
+        "exportedFailoverDraft",
     ] {
         assert_eq!(schema["$defs"][definition]["additionalProperties"], false);
     }

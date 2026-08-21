@@ -1,0 +1,12 @@
+{
+  "type": "request",
+  "requestId": "provider-import-preview-1",
+  "operation": {
+    "kind": "preview-provider-import",
+    "target": "codex",
+    "source": {
+      "kind": "cc-switch",
+      "payload": "ccswitch://v1/import?resource=provider&app=codex&name=Relay&endpoint=https%3A%2F%2Frelay.example%2Fv1&apiKey=provider-import-secret-must-not-escape&model=gpt-5"
+    }
+  }
+}

@@ -363,6 +363,15 @@ impl ClaudeConfigCodec {
         self.inspect_with_ownership(ClaudeConfigOwnership::FourField)
     }
 
+    pub(crate) fn provider_for_import(
+        &self,
+    ) -> Result<(String, String, ProviderAuthentication, SecretString), ClaudeProblem> {
+        self.inspect()?
+            .as_adopted_direct()
+            .reconciliation_provider()
+            .ok_or_else(|| ClaudeProblem::new("invalid-configuration", Some(self.settings_path())))
+    }
+
     #[allow(dead_code)]
     pub(crate) fn reconciliation_snapshot(
         &self,

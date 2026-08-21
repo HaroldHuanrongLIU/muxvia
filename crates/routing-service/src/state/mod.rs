@@ -1,4 +1,5 @@
 mod migrations;
+mod provider_transfer;
 pub(crate) mod providers;
 mod reconciliation;
 mod recovery;

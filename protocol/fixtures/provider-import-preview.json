@@ -1,0 +1,30 @@
+{
+  "type": "response",
+  "requestId": "provider-import-preview-1",
+  "result": {
+    "kind": "provider-import-preview",
+    "preview": {
+      "previewToken": "10000000-0000-4000-8000-000000000001",
+      "source": {
+        "product": "cc-switch",
+        "target": "codex"
+      },
+      "candidates": [
+        {
+          "kind": "target-provider",
+          "candidateId": "20000000-0000-4000-8000-000000000001",
+          "target": "codex",
+          "name": "Relay",
+          "baseUrl": "https://relay.example/v1",
+          "model": "gpt-5",
+          "protocol": "openai-responses",
+          "authentication": "openai-bearer",
+          "routingRequirement": "direct-compatible",
+          "credential": "present",
+          "importedCurrent": false,
+          "exactMatches": []
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "type": "request",
+  "requestId": "provider-export-1",
+  "operation": {
+    "kind": "export-provider-configuration",
+    "target": "codex"
+  }
+}

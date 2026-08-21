@@ -1,0 +1,54 @@
+{
+  "type": "response",
+  "requestId": "provider-export-1",
+  "result": {
+    "kind": "provider-configuration-export",
+    "export": {
+      "format": "muxvia-provider-configuration",
+      "version": 1,
+      "universalProviders": [
+        {
+          "sourceId": "40000000-0000-4000-8000-000000000001",
+          "position": 0,
+          "name": "Shared Relay",
+          "baseUrl": "https://relay.example/v1",
+          "targets": [
+            {
+              "target": "codex",
+              "enabled": true,
+              "model": "gpt-5",
+              "authentication": "openai-bearer",
+              "routingRequirement": "direct-compatible"
+            }
+          ]
+        }
+      ],
+      "targetProviders": [
+        {
+          "sourceId": "50000000-0000-4000-8000-000000000001",
+          "target": "codex",
+          "position": 0,
+          "name": "Shared Relay",
+          "baseUrl": "https://relay.example/v1",
+          "model": "gpt-5",
+          "protocol": "openai-responses",
+          "authentication": "openai-bearer",
+          "routingRequirement": "direct-compatible",
+          "universalProviderSourceId": "40000000-0000-4000-8000-000000000001"
+        }
+      ],
+      "failoverDrafts": [
+        {
+          "target": "codex",
+          "providerSourceIds": [
+            "50000000-0000-4000-8000-000000000001"
+          ]
+        },
+        {
+          "target": "claude",
+          "providerSourceIds": []
+        }
+      ]
+    }
+  }
+}

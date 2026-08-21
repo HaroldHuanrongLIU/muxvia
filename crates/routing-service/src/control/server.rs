@@ -1474,6 +1474,21 @@ async fn serve_session(
                     | ControlOperation::UniversalProviderAct { .. } => {
                         unreachable!("catalog operations are handled before target dispatch")
                     }
+                    ControlOperation::PreviewProviderImport(_)
+                    | ControlOperation::ConfirmProviderImport(_)
+                    | ControlOperation::ExportProviderConfiguration(_) => {
+                        if !enqueue_response(
+                            &responses,
+                            problem_frame(
+                                Some(request_id),
+                                "unsupported-operation",
+                                "Provider transfer is not available",
+                                None,
+                            ),
+                        ) {
+                            break 'session;
+                        }
+                    }
                     ControlOperation::OpenTarget { target, claude_context } => {
                         if native_usage.scan(target).await.is_err() {
                             eprintln!("native-usage-scan-failed");
@@ -1905,6 +1920,9 @@ fn operation_target(operation: &ControlOperation) -> Option<Target> {
         | ControlOperation::DiscoverModels { target, .. }
         | ControlOperation::CheckReachability { target, .. }
         | ControlOperation::PreviewReconciliation { target, .. } => Some(*target),
+        ControlOperation::PreviewProviderImport(operation) => Some(operation.target),
+        ControlOperation::ConfirmProviderImport(operation) => Some(operation.target),
+        ControlOperation::ExportProviderConfiguration(operation) => Some(operation.target),
         ControlOperation::ProbeCompatibility(operation) => Some(operation.target),
         ControlOperation::ListRequestRecords(operation) => Some(operation.target),
         ControlOperation::InspectRequestRecord(operation) => Some(operation.target),

@@ -1,0 +1,17 @@
+{
+  "type": "request",
+  "requestId": "provider-import-confirm-1",
+  "operation": {
+    "kind": "confirm-provider-import",
+    "target": "codex",
+    "previewToken": "10000000-0000-4000-8000-000000000001",
+    "choices": [
+      {
+        "candidateId": "20000000-0000-4000-8000-000000000001",
+        "resolution": {
+          "kind": "create"
+        }
+      }
+    ]
+  }
+}

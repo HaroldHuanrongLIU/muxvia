@@ -327,6 +327,118 @@ const targetActionSchema = z.discriminatedUnion("kind", [
   }).strict(),
 ])
 
+const providerImportSourceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("live-target") }).strict(),
+  z.object({ kind: z.literal("cc-switch"), payload: z.string().max(524_288) }).strict(),
+  z.object({ kind: z.literal("muxvia-export"), payload: z.string().max(524_288) }).strict(),
+])
+
+const providerImportResolutionSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("create") }).strict(),
+  z.object({ kind: z.literal("use-existing"), providerId: z.string().uuid() }).strict(),
+])
+
+const providerImportChoiceSchema = z.object({
+  candidateId: z.string().uuid(),
+  resolution: providerImportResolutionSchema,
+}).strict()
+
+const providerImportTargetOverlaySchema = z.object({
+  target: targetSchema,
+  enabled: z.boolean(),
+  model: z.string(),
+  authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer"]),
+  routingRequirement: z.enum(["direct-compatible", "takeover-required"]),
+}).strict()
+
+const providerImportMatchSchema = z.object({
+  providerId: z.string().uuid(),
+  name: z.string(),
+}).strict()
+
+const providerImportCandidateSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("target-provider"),
+    candidateId: z.string().uuid(),
+    target: targetSchema,
+    name: z.string(),
+    baseUrl: z.string(),
+    model: z.string(),
+    protocol: z.enum(["openai-responses", "anthropic-messages"]),
+    authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"]),
+    routingRequirement: z.enum(["direct-compatible", "takeover-required"]),
+    credential: z.enum(["present", "missing"]),
+    importedCurrent: z.boolean(),
+    exactMatches: z.array(providerImportMatchSchema),
+  }).strict(),
+  z.object({
+    kind: z.literal("universal-provider"),
+    candidateId: z.string().uuid(),
+    name: z.string(),
+    baseUrl: z.string(),
+    credential: z.enum(["present", "missing"]),
+    targets: z.array(providerImportTargetOverlaySchema),
+    exactMatches: z.array(providerImportMatchSchema),
+  }).strict(),
+])
+
+const providerImportPreviewSchema = z.object({
+  previewToken: z.string().uuid(),
+  source: z.object({
+    product: z.enum(["target-cli", "cc-switch", "muxvia"]),
+    target: z.enum(["codex", "claude", "universal"]),
+  }).strict(),
+  candidates: z.array(providerImportCandidateSchema).min(1).max(256),
+}).strict()
+
+const providerImportRecordSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("target-provider"),
+    candidateId: z.string().uuid(),
+    resolution: z.enum(["created", "existing"]),
+    target: targetSchema,
+    providerId: z.string().uuid(),
+  }).strict(),
+  z.object({
+    kind: z.literal("universal-provider"),
+    candidateId: z.string().uuid(),
+    resolution: z.enum(["created", "existing"]),
+    providerId: z.string().uuid(),
+  }).strict(),
+])
+
+const providerImportOutcomeSchema = z.object({
+  records: z.array(providerImportRecordSchema).min(1).max(256),
+}).strict()
+
+const providerConfigurationExportSchema = z.object({
+  format: z.literal("muxvia-provider-configuration"),
+  version: z.literal(1),
+  universalProviders: z.array(z.object({
+    sourceId: z.string().uuid(),
+    position: z.number().int().nonnegative(),
+    name: z.string(),
+    baseUrl: z.string(),
+    targets: z.array(providerImportTargetOverlaySchema),
+  }).strict()).max(256),
+  targetProviders: z.array(z.object({
+    sourceId: z.string().uuid(),
+    target: targetSchema,
+    position: z.number().int().nonnegative(),
+    name: z.string(),
+    baseUrl: z.string(),
+    model: z.string(),
+    protocol: z.enum(["openai-responses", "anthropic-messages"]),
+    authentication: z.enum(["openai-bearer", "anthropic-api-key", "anthropic-bearer", "codex-subscription"]),
+    routingRequirement: z.enum(["direct-compatible", "takeover-required"]),
+    universalProviderSourceId: z.string().uuid().nullable(),
+  }).strict()).max(256),
+  failoverDrafts: z.array(z.object({
+    target: targetSchema,
+    providerSourceIds: z.array(z.string().uuid()),
+  }).strict()).max(2),
+}).strict()
+
 const controlOperationSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("prepare-handover"),
@@ -420,6 +532,21 @@ const controlOperationSchema = z.discriminatedUnion("kind", [
   }).strict(),
   z.object({ kind: z.literal("clear-usage"), target: targetSchema }).strict(),
   z.object({ kind: z.literal("update-pricing-catalog"), target: targetSchema }).strict(),
+  z.object({
+    kind: z.literal("preview-provider-import"),
+    target: targetSchema,
+    source: providerImportSourceSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("confirm-provider-import"),
+    target: targetSchema,
+    previewToken: z.string().uuid(),
+    choices: z.array(providerImportChoiceSchema).min(1).max(256),
+  }).strict(),
+  z.object({
+    kind: z.literal("export-provider-configuration"),
+    target: targetSchema,
+  }).strict(),
 ])
 
 const compatibilityProbeSchema = z.object({
@@ -833,6 +960,9 @@ const controlResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("usage-retention-outcome"), outcome: usageRetentionOutcomeSchema }).strict(),
   z.object({ kind: z.literal("usage-clear-outcome"), outcome: usageClearOutcomeSchema }).strict(),
   z.object({ kind: z.literal("pricing-catalog-update-outcome"), outcome: pricingCatalogUpdateOutcomeSchema }).strict(),
+  z.object({ kind: z.literal("provider-import-preview"), preview: providerImportPreviewSchema }).strict(),
+  z.object({ kind: z.literal("provider-import-outcome"), outcome: providerImportOutcomeSchema }).strict(),
+  z.object({ kind: z.literal("provider-configuration-export"), export: providerConfigurationExportSchema }).strict(),
 ])
 
 const clientFrameSchema = z.discriminatedUnion("type", [
@@ -905,6 +1035,11 @@ export type NativeUsageRefresh = z.infer<typeof nativeUsageRefreshSchema>
 export type UsageRetentionOutcome = z.infer<typeof usageRetentionOutcomeSchema>
 export type UsageClearOutcome = z.infer<typeof usageClearOutcomeSchema>
 export type PricingCatalogUpdateOutcome = z.infer<typeof pricingCatalogUpdateOutcomeSchema>
+export type ProviderImportSource = z.infer<typeof providerImportSourceSchema>
+export type ProviderImportChoice = z.infer<typeof providerImportChoiceSchema>
+export type ProviderImportPreview = z.infer<typeof providerImportPreviewSchema>
+export type ProviderImportOutcome = z.infer<typeof providerImportOutcomeSchema>
+export type ProviderConfigurationExport = z.infer<typeof providerConfigurationExportSchema>
 export type UniversalProviderOutcome = Extract<
   ControlResult,
   { kind: "universal-provider-outcome" }

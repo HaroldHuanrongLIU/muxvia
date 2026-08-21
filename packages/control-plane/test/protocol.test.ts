@@ -66,9 +66,39 @@ test.each([
   ["subscription-default-preview.json", parseServerFrame],
   ["subscription-account-act.json", parseClientFrame],
   ["subscription-account-outcome.json", parseServerFrame],
+  ["preview-provider-import.json", parseClientFrame],
+  ["confirm-provider-import.json", parseClientFrame],
+  ["export-provider-configuration.json", parseClientFrame],
+  ["provider-import-preview.json", parseServerFrame],
+  ["provider-import-outcome.json", parseServerFrame],
+  ["provider-configuration-export.json", parseServerFrame],
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)
+})
+
+test("Provider Transfer contracts are preview-first, closed, and secret-free", async () => {
+  for (const [name, parse, surface] of [
+    ["preview-provider-import.json", parseClientFrame, "operation"],
+    ["confirm-provider-import.json", parseClientFrame, "operation"],
+    ["export-provider-configuration.json", parseClientFrame, "operation"],
+    ["provider-import-preview.json", parseServerFrame, "result"],
+    ["provider-import-outcome.json", parseServerFrame, "result"],
+    ["provider-configuration-export.json", parseServerFrame, "result"],
+  ] as const) {
+    const value = await readFixture(name) as any
+    const invalid = structuredClone(value)
+    invalid[surface].additiveSecret = "PROVIDER_TRANSFER_ADDITIVE_SECRET_16001"
+    expect(() => parse(invalid)).toThrow()
+    if (surface === "result") {
+      expect(JSON.stringify(parse(value))).not.toContain("provider-import-secret-must-not-escape")
+    }
+  }
+
+  const exportFrame = await readFixture("provider-configuration-export.json") as any
+  expect(JSON.stringify(parseServerFrame(exportFrame))).not.toMatch(
+    /credential|token|recovery|activatedSnapshot|activatedRoutePlan/i,
+  )
 })
 
 test("Request Record protocol and JSON schema are closed and bounded", async () => {

@@ -75,7 +75,7 @@ impl<'de> Deserialize<'de> for FrameLimit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Target {
     Codex,
@@ -210,6 +210,77 @@ pub enum ControlOperation {
     SetUsageRetention(SetUsageRetentionOperation),
     ClearUsage(TargetUsageOperation),
     UpdatePricingCatalog(TargetUsageOperation),
+    PreviewProviderImport(PreviewProviderImportOperation),
+    ConfirmProviderImport(ConfirmProviderImportOperation),
+    ExportProviderConfiguration(ExportProviderConfigurationOperation),
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewProviderImportOperation {
+    pub target: Target,
+    pub source: ProviderImportSource,
+}
+
+impl fmt::Debug for PreviewProviderImportOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreviewProviderImportOperation")
+            .field("target", &self.target)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConfirmProviderImportOperation {
+    pub target: Target,
+    pub preview_token: Uuid,
+    pub choices: Vec<ProviderImportChoice>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExportProviderConfigurationOperation {
+    pub target: Target,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ProviderImportSource {
+    LiveTarget,
+    CcSwitch { payload: String },
+    MuxviaExport { payload: String },
+}
+
+impl fmt::Debug for ProviderImportSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LiveTarget => formatter.write_str("LiveTarget"),
+            Self::CcSwitch { .. } => formatter.write_str("CcSwitch(<redacted>)"),
+            Self::MuxviaExport { .. } => formatter.write_str("MuxviaExport(<redacted>)"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderImportChoice {
+    pub candidate_id: Uuid,
+    pub resolution: ProviderImportResolution,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ProviderImportResolution {
+    Create,
+    UseExisting { provider_id: Uuid },
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -636,6 +707,9 @@ impl fmt::Debug for ControlOperation {
                 .debug_struct("UpdatePricingCatalog")
                 .field("target", &operation.target)
                 .finish(),
+            Self::PreviewProviderImport(operation) => operation.fmt(formatter),
+            Self::ConfirmProviderImport(operation) => operation.fmt(formatter),
+            Self::ExportProviderConfiguration(operation) => operation.fmt(formatter),
         }
     }
 }
@@ -1045,6 +1119,222 @@ pub enum ControlResult {
     UsageRetentionOutcome(UsageRetentionOutcomeResult),
     UsageClearOutcome(UsageClearOutcomeResult),
     PricingCatalogUpdateOutcome(PricingCatalogUpdateOutcomeResult),
+    ProviderImportPreview(ProviderImportPreviewResult),
+    ProviderImportOutcome(ProviderImportOutcomeResult),
+    ProviderConfigurationExport(ProviderConfigurationExportResult),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderImportPreviewResult {
+    pub preview: ProviderImportPreview,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderImportOutcomeResult {
+    pub outcome: ProviderImportOutcome,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderConfigurationExportResult {
+    pub export: ProviderConfigurationExport,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderImportProduct {
+    TargetCli,
+    CcSwitch,
+    Muxvia,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderImportSourceTarget {
+    Codex,
+    Claude,
+    Universal,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderImportSourceView {
+    pub product: ProviderImportProduct,
+    pub target: ProviderImportSourceTarget,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderImportPreview {
+    pub preview_token: Uuid,
+    pub source: ProviderImportSourceView,
+    pub candidates: Vec<ProviderImportCandidateView>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ProviderImportCandidateView {
+    TargetProvider {
+        candidate_id: Uuid,
+        target: Target,
+        name: String,
+        base_url: String,
+        model: String,
+        protocol: ProviderProtocol,
+        authentication: ProviderAuthentication,
+        routing_requirement: ProviderRoutingRequirement,
+        credential: CredentialPresence,
+        imported_current: bool,
+        exact_matches: Vec<ProviderImportMatchView>,
+    },
+    UniversalProvider {
+        candidate_id: Uuid,
+        name: String,
+        base_url: String,
+        credential: CredentialPresence,
+        targets: Vec<UniversalProviderTargetDraft>,
+        exact_matches: Vec<ProviderImportMatchView>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderImportMatchView {
+    pub provider_id: Uuid,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderImportOutcome {
+    pub records: Vec<ProviderImportRecordView>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderImportRecordResolution {
+    Created,
+    Existing,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ProviderImportRecordView {
+    TargetProvider {
+        candidate_id: Uuid,
+        resolution: ProviderImportRecordResolution,
+        target: Target,
+        provider_id: Uuid,
+    },
+    UniversalProvider {
+        candidate_id: Uuid,
+        resolution: ProviderImportRecordResolution,
+        provider_id: Uuid,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderConfigurationExport {
+    pub format: ProviderConfigurationFormat,
+    pub version: ProviderConfigurationVersion,
+    pub universal_providers: Vec<ExportedUniversalProvider>,
+    pub target_providers: Vec<ExportedTargetProvider>,
+    pub failover_drafts: Vec<ExportedFailoverDraft>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProviderConfigurationFormat;
+
+impl Serialize for ProviderConfigurationFormat {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str("muxvia-provider-configuration")
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderConfigurationFormat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "muxvia-provider-configuration" => Ok(Self),
+            _ => Err(D::Error::custom("invalid-provider-configuration-format")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProviderConfigurationVersion;
+
+impl Serialize for ProviderConfigurationVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u8(1)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderConfigurationVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match u8::deserialize(deserializer)? {
+            1 => Ok(Self),
+            _ => Err(D::Error::custom(
+                "unsupported-provider-configuration-version",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExportedUniversalProvider {
+    pub source_id: Uuid,
+    pub position: u32,
+    pub name: String,
+    pub base_url: String,
+    pub targets: Vec<UniversalProviderTargetDraft>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExportedTargetProvider {
+    pub source_id: Uuid,
+    pub target: Target,
+    pub position: u32,
+    pub name: String,
+    pub base_url: String,
+    pub model: String,
+    pub protocol: ProviderProtocol,
+    pub authentication: ProviderAuthentication,
+    pub routing_requirement: ProviderRoutingRequirement,
+    pub universal_provider_source_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExportedFailoverDraft {
+    pub target: Target,
+    pub provider_source_ids: Vec<Uuid>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

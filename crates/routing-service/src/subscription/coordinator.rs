@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::{Mutex, OwnedMutexGuard, broadcast};
+use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, broadcast};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -80,6 +80,10 @@ impl SubscriptionAccountCoordinator {
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<SubscriptionAccountCatalogView> {
         self.views.subscribe()
+    }
+
+    pub(crate) async fn lock_recovery_snapshot(&self) -> MutexGuard<'_, ()> {
+        self.gate.lock().await
     }
 
     pub(crate) async fn publish(&self, view: SubscriptionAccountCatalogView) {

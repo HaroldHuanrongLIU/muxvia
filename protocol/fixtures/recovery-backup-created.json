@@ -1,0 +1,25 @@
+{
+  "type": "response",
+  "requestId": "recovery-backup-create-1",
+  "result": {
+    "kind": "recovery-backup-created",
+    "path": "/tmp/00000000-0000-4000-8000-000000000171.muxvia-recovery",
+    "inspection": {
+      "snapshotId": "00000000-0000-4000-8000-000000000171",
+      "createdAtUnixSeconds": 1787300000,
+      "createdByRelease": "0.1.0",
+      "formatVersion": 1,
+      "databaseSchemaVersion": 17,
+      "artifactSizeBytes": 49152,
+      "artifactSha256": "1717171717171717171717171717171717171717171717171717171717171717",
+      "sensitive": true,
+      "compatibility": "compatible",
+      "entries": [
+        { "kind": "sqlite-state", "present": true, "mode": 384, "byteLength": 45056 },
+        { "kind": "subscription-accounts", "present": true, "mode": 384, "byteLength": 512 },
+        { "kind": "codex-managed-configuration", "present": true, "mode": 420, "byteLength": 256 },
+        { "kind": "claude-managed-configuration", "present": false, "byteLength": 0 }
+      ]
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "type": "request",
+  "requestId": "recovery-backup-create-1",
+  "operation": {
+    "kind": "create-recovery-backup"
+  }
+}

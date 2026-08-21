@@ -1,0 +1,8 @@
+{
+  "type": "request",
+  "requestId": "recovery-backup-inspect-1",
+  "operation": {
+    "kind": "inspect-recovery-backup",
+    "path": "/tmp/00000000-0000-4000-8000-000000000171.muxvia-recovery"
+  }
+}

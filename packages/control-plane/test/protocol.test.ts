@@ -79,9 +79,30 @@ test.each([
   ["cc-switch-sql-import-outcome.json", parseServerFrame],
   ["migrated-usage-activity-page.json", parseServerFrame],
   ["provider-configuration-export.json", parseServerFrame],
+  ["create-recovery-backup.json", parseClientFrame],
+  ["inspect-recovery-backup.json", parseClientFrame],
+  ["recovery-backup-created.json", parseServerFrame],
+  ["recovery-backup-inspection.json", parseServerFrame],
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
   expect(JSON.parse(JSON.stringify(parse(value)))).toEqual(value)
+})
+
+test("Recovery Backup contracts stay closed, sensitive, and content-free", async () => {
+  for (const [name, parse, surface] of [
+    ["create-recovery-backup.json", parseClientFrame, "operation"],
+    ["inspect-recovery-backup.json", parseClientFrame, "operation"],
+    ["recovery-backup-created.json", parseServerFrame, "result"],
+    ["recovery-backup-inspection.json", parseServerFrame, "result"],
+  ] as const) {
+    const value = await readFixture(name) as any
+    value[surface].credential = "RECOVERY_BACKUP_PROTOCOL_SECRET_17002"
+    expect(() => parse(value)).toThrow()
+  }
+  const created = parseServerFrame(await readFixture("recovery-backup-created.json"))
+  expect(JSON.stringify(created)).not.toContain("credential")
+  expect(JSON.stringify(created)).not.toContain("refreshToken")
+  expect(JSON.stringify(created)).toContain('"sensitive":true')
 })
 
 test("Provider Transfer contracts are preview-first, closed, and secret-free", async () => {

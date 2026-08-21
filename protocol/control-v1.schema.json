@@ -405,6 +405,34 @@
       },
       "required": ["format", "version", "universalProviders", "targetProviders", "failoverDrafts"]
     },
+    "recoveryBackupEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["sqlite-state", "subscription-accounts", "codex-managed-configuration", "claude-managed-configuration"] },
+        "present": { "type": "boolean" },
+        "mode": { "type": "integer", "minimum": 0, "maximum": 511 },
+        "byteLength": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["kind", "present", "byteLength"]
+    },
+    "recoveryBackupInspection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "snapshotId": { "type": "string", "format": "uuid" },
+        "createdAtUnixSeconds": { "type": "integer", "minimum": 1 },
+        "createdByRelease": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "formatVersion": { "const": 1 },
+        "databaseSchemaVersion": { "type": "integer", "minimum": 1 },
+        "artifactSizeBytes": { "type": "integer", "minimum": 1 },
+        "artifactSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "sensitive": { "const": true },
+        "compatibility": { "enum": ["compatible", "migration-required", "unsupported-database-schema"] },
+        "entries": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "#/$defs/recoveryBackupEntry" } }
+      },
+      "required": ["snapshotId", "createdAtUnixSeconds", "createdByRelease", "formatVersion", "databaseSchemaVersion", "artifactSizeBytes", "artifactSha256", "sensitive", "compatibility", "entries"]
+    },
     "clientFrame": {
       "oneOf": [
         { "type": "object", "properties": { "type": { "const": "hello" }, "rpc": { "$ref": "#/$defs/rpc" }, "release": { "type": "string" } }, "required": ["type", "rpc", "release"] },
@@ -424,6 +452,8 @@
     },
     "controlOperation": {
       "oneOf": [
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "create-recovery-backup" } }, "required": ["kind"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "inspect-recovery-backup" }, "path": { "type": "string" } }, "required": ["kind", "path"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "prepare-handover" }, "candidatePath": { "type": "string" }, "expectedRelease": { "type": "string" } }, "required": ["kind", "candidatePath", "expectedRelease"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "force-stop" }, "acknowledgement": { "const": "managed-target-files-may-remain-pointed-at-dead-endpoint" } }, "required": ["kind", "acknowledgement"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "open-universal-providers" }, "claudeContext": { "$ref": "#/$defs/claudePreflightContext" } }, "required": ["kind"] },
@@ -534,7 +564,9 @@
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "pricing-catalog-update-outcome" }, "outcome": { "$ref": "#/$defs/pricingCatalogUpdateOutcome" } }, "required": ["kind", "outcome"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "provider-import-preview" }, "preview": { "$ref": "#/$defs/providerImportPreview" } }, "required": ["kind", "preview"] },
         { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "provider-import-outcome" }, "outcome": { "$ref": "#/$defs/providerImportOutcome" } }, "required": ["kind", "outcome"] },
-        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "provider-configuration-export" }, "export": { "$ref": "#/$defs/providerConfigurationExport" } }, "required": ["kind", "export"] }
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "provider-configuration-export" }, "export": { "$ref": "#/$defs/providerConfigurationExport" } }, "required": ["kind", "export"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "recovery-backup-created" }, "path": { "type": "string" }, "inspection": { "$ref": "#/$defs/recoveryBackupInspection" } }, "required": ["kind", "path", "inspection"] },
+        { "type": "object", "additionalProperties": false, "properties": { "kind": { "const": "recovery-backup-inspection" }, "inspection": { "$ref": "#/$defs/recoveryBackupInspection" } }, "required": ["kind", "inspection"] }
       ]
     },
     "inspectionCategory": {

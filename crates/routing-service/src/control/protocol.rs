@@ -218,6 +218,24 @@ pub enum ControlOperation {
     PreviewProviderImport(PreviewProviderImportOperation),
     ConfirmProviderImport(ConfirmProviderImportOperation),
     ExportProviderConfiguration(ExportProviderConfigurationOperation),
+    CreateRecoveryBackup(CreateRecoveryBackupOperation),
+    InspectRecoveryBackup(InspectRecoveryBackupOperation),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateRecoveryBackupOperation {}
+
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InspectRecoveryBackupOperation {
+    pub path: String,
+}
+
+impl fmt::Debug for InspectRecoveryBackupOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("InspectRecoveryBackup(<redacted-path>)")
+    }
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -735,6 +753,8 @@ impl fmt::Debug for ControlOperation {
             Self::PreviewProviderImport(operation) => operation.fmt(formatter),
             Self::ConfirmProviderImport(operation) => operation.fmt(formatter),
             Self::ExportProviderConfiguration(operation) => operation.fmt(formatter),
+            Self::CreateRecoveryBackup(_) => formatter.write_str("CreateRecoveryBackup"),
+            Self::InspectRecoveryBackup(operation) => operation.fmt(formatter),
         }
     }
 }
@@ -1148,6 +1168,63 @@ pub enum ControlResult {
     ProviderImportPreview(ProviderImportPreviewResult),
     ProviderImportOutcome(ProviderImportOutcomeResult),
     ProviderConfigurationExport(ProviderConfigurationExportResult),
+    RecoveryBackupCreated(RecoveryBackupCreatedResult),
+    RecoveryBackupInspection(RecoveryBackupInspectionResult),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecoveryBackupCreatedResult {
+    pub path: String,
+    pub inspection: RecoveryBackupInspection,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecoveryBackupInspectionResult {
+    pub inspection: RecoveryBackupInspection,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecoveryBackupInspection {
+    pub snapshot_id: Uuid,
+    pub created_at_unix_seconds: u64,
+    pub created_by_release: String,
+    pub format_version: u32,
+    pub database_schema_version: u32,
+    pub artifact_size_bytes: u64,
+    pub artifact_sha256: String,
+    pub sensitive: bool,
+    pub compatibility: RecoveryBackupCompatibility,
+    pub entries: Vec<RecoveryBackupEntrySummary>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryBackupCompatibility {
+    Compatible,
+    MigrationRequired,
+    UnsupportedDatabaseSchema,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryBackupEntryKind {
+    SqliteState,
+    SubscriptionAccounts,
+    CodexManagedConfiguration,
+    ClaudeManagedConfiguration,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecoveryBackupEntrySummary {
+    pub kind: RecoveryBackupEntryKind,
+    pub present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    pub byte_length: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

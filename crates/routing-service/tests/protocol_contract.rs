@@ -78,6 +78,8 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "confirm-provider-import.json",
         "confirm-cc-switch-sql-import.json",
         "export-provider-configuration.json",
+        "create-recovery-backup.json",
+        "inspect-recovery-backup.json",
         "force-stop.json",
     ] {
         let frame = fixture(name);
@@ -115,6 +117,8 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "provider-import-outcome.json",
         "cc-switch-sql-import-outcome.json",
         "provider-configuration-export.json",
+        "recovery-backup-created.json",
+        "recovery-backup-inspection.json",
     ] {
         let frame = fixture(name);
         let parsed: ServerFrame = serde_json::from_value(frame.clone()).unwrap();
@@ -190,6 +194,40 @@ fn fixtures_round_trip_as_their_protocol_types() {
         let parsed: ServerFrame = serde_json::from_value(frame.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), frame);
     }
+}
+
+#[test]
+fn recovery_backup_contract_is_closed_sensitive_and_secret_free() {
+    let inspection_request = fixture("inspect-recovery-backup.json");
+    let parsed: ClientFrame = serde_json::from_value(inspection_request.clone()).unwrap();
+    assert!(
+        !format!("{parsed:?}").contains("00000000-0000-4000-8000-000000000171"),
+        "Recovery Backup request Debug exposed the selected path"
+    );
+    for (name, branch) in [
+        ("create-recovery-backup.json", "operation"),
+        ("inspect-recovery-backup.json", "operation"),
+        ("recovery-backup-created.json", "result"),
+        ("recovery-backup-inspection.json", "result"),
+    ] {
+        let mut value = fixture(name);
+        value[branch]["credential"] = serde_json::json!("RECOVERY_BACKUP_PROTOCOL_SECRET_17001");
+        let rejected = if branch == "operation" {
+            serde_json::from_value::<ClientFrame>(value).is_err()
+        } else {
+            serde_json::from_value::<ServerFrame>(value).is_err()
+        };
+        assert!(rejected, "accepted additive secret field in {name}");
+    }
+    let schema = fixture("../control-v1.schema.json");
+    assert_eq!(
+        schema["$defs"]["recoveryBackupInspection"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        schema["$defs"]["recoveryBackupEntry"]["additionalProperties"],
+        false
+    );
 }
 
 #[test]

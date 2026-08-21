@@ -8430,3 +8430,124 @@ async fn cc_switch_sql_provider_and_usage_migrate_clear_and_fail_closed_over_the
     );
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn recovery_backup_create_and_inspect_are_private_global_and_secret_free_over_real_uds() {
+    const PROVIDER_SECRET: &str = "RECOVERY_SOCKET_PROVIDER_SECRET_17011";
+    const REFRESH_SECRET: &str = "RECOVERY_SOCKET_REFRESH_SECRET_17012";
+    let mut fixture = ControlFixture::start().await;
+    fixture
+        .store
+        .apply_provider_action(
+            Uuid::new_v4(),
+            0,
+            json!({
+                "kind": "create-provider",
+                "name": "Recovery socket provider",
+                "baseUrl": "https://recovery.example/v1",
+                "model": "recovery-model",
+                "credential": { "kind": "replace", "value": PROVIDER_SECRET },
+                "presetKey": null
+            }),
+        )
+        .await
+        .unwrap();
+    let user_home = fixture.root.join("home");
+    let account_path = user_home.join(".muxvia/state/subscription-accounts.json");
+    fs::write(
+        &account_path,
+        format!(
+            r#"{{"version":1,"accounts":{{"account":{{"account_id":"account","refresh_token":"{REFRESH_SECRET}","authenticated_at":1700000000,"state":"authorized"}}}},"default_account_id":"account"}}"#
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&account_path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::create_dir_all(user_home.join(".codex")).unwrap();
+    fs::write(
+        user_home.join(".codex/config.toml"),
+        "model = \"recovery-socket\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(user_home.join(".claude")).unwrap();
+    fs::write(user_home.join(".claude/settings.json"), "{\"env\":{}}\n").unwrap();
+
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    let created = request(
+        &mut stream,
+        "create-recovery-backup",
+        json!({ "kind": "create-recovery-backup" }),
+    )
+    .await;
+    assert_eq!(created["type"], "response");
+    assert_eq!(created["result"]["kind"], "recovery-backup-created");
+    assert_eq!(created["result"]["inspection"]["sensitive"], true);
+    assert_eq!(
+        created["result"]["inspection"]["compatibility"],
+        "compatible"
+    );
+    assert_eq!(
+        created["result"]["inspection"]["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    let created_text = created.to_string();
+    assert!(!created_text.contains(PROVIDER_SECRET));
+    assert!(!created_text.contains(REFRESH_SECRET));
+    let backup_path = PathBuf::from(created["result"]["path"].as_str().unwrap());
+    assert_eq!(
+        backup_path.parent(),
+        Some(user_home.join(".muxvia/backups").as_path())
+    );
+    assert_eq!(
+        fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let artifact = fs::read(&backup_path).unwrap();
+    assert!(
+        artifact
+            .windows(PROVIDER_SECRET.len())
+            .any(|window| window == PROVIDER_SECRET.as_bytes())
+    );
+    assert!(
+        artifact
+            .windows(REFRESH_SECRET.len())
+            .any(|window| window == REFRESH_SECRET.as_bytes())
+    );
+
+    let inspected = request(
+        &mut stream,
+        "inspect-recovery-backup",
+        json!({
+            "kind": "inspect-recovery-backup",
+            "path": backup_path.to_string_lossy()
+        }),
+    )
+    .await;
+    assert_eq!(inspected["result"]["kind"], "recovery-backup-inspection");
+    assert_eq!(
+        inspected["result"]["inspection"],
+        created["result"]["inspection"]
+    );
+    assert!(!inspected.to_string().contains(PROVIDER_SECRET));
+    assert!(!inspected.to_string().contains(REFRESH_SECRET));
+
+    let rejected = request(
+        &mut stream,
+        "inspect-relative-recovery-backup",
+        json!({ "kind": "inspect-recovery-backup", "path": "relative.backup" }),
+    )
+    .await;
+    assert_eq!(rejected["problem"]["code"], "recovery-backup-invalid-path");
+    assert!(!rejected.to_string().contains("relative.backup"));
+    let opened = request(
+        &mut stream,
+        "open-after-recovery-backup",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    assert_eq!(opened["result"]["kind"], "target-view");
+    fixture.shutdown().await;
+}

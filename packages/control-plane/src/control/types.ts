@@ -459,7 +459,38 @@ const providerConfigurationExportSchema = z.object({
   }).strict()).max(2),
 }).strict()
 
+const recoveryBackupEntrySchema = z.object({
+  kind: z.enum([
+    "sqlite-state",
+    "subscription-accounts",
+    "codex-managed-configuration",
+    "claude-managed-configuration",
+  ]),
+  present: z.boolean(),
+  mode: z.number().int().min(0).max(0o777).optional(),
+  byteLength: z.number().int().nonnegative(),
+}).strict()
+
+const recoveryBackupInspectionSchema = z.object({
+  snapshotId: z.string().uuid(),
+  createdAtUnixSeconds: z.number().int().positive(),
+  createdByRelease: z.string().min(1).max(256),
+  formatVersion: z.literal(1),
+  databaseSchemaVersion: z.number().int().positive(),
+  artifactSizeBytes: z.number().int().positive(),
+  artifactSha256: z.string().regex(/^[0-9a-f]{64}$/),
+  sensitive: z.literal(true),
+  compatibility: z.enum([
+    "compatible",
+    "migration-required",
+    "unsupported-database-schema",
+  ]),
+  entries: z.array(recoveryBackupEntrySchema).length(4),
+}).strict()
+
 const controlOperationSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("create-recovery-backup") }).strict(),
+  z.object({ kind: z.literal("inspect-recovery-backup"), path: z.string() }).strict(),
   z.object({
     kind: z.literal("prepare-handover"),
     candidatePath: z.string(),
@@ -1007,6 +1038,15 @@ const controlResultSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("provider-import-preview"), preview: providerImportPreviewSchema }).strict(),
   z.object({ kind: z.literal("provider-import-outcome"), outcome: providerImportOutcomeSchema }).strict(),
   z.object({ kind: z.literal("provider-configuration-export"), export: providerConfigurationExportSchema }).strict(),
+  z.object({
+    kind: z.literal("recovery-backup-created"),
+    path: z.string(),
+    inspection: recoveryBackupInspectionSchema,
+  }).strict(),
+  z.object({
+    kind: z.literal("recovery-backup-inspection"),
+    inspection: recoveryBackupInspectionSchema,
+  }).strict(),
 ])
 
 const clientFrameSchema = z.discriminatedUnion("type", [
@@ -1085,6 +1125,7 @@ export type ProviderImportPreview = z.infer<typeof providerImportPreviewSchema>
 export type ProviderImportCandidateView = ProviderImportPreview["candidates"][number]
 export type ProviderImportOutcome = z.infer<typeof providerImportOutcomeSchema>
 export type ProviderConfigurationExport = z.infer<typeof providerConfigurationExportSchema>
+export type RecoveryBackupInspection = z.infer<typeof recoveryBackupInspectionSchema>
 export type UniversalProviderOutcome = Extract<
   ControlResult,
   { kind: "universal-provider-outcome" }

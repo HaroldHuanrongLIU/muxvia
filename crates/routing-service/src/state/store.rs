@@ -1,6 +1,8 @@
 use std::{
     collections::HashSet,
+    path::PathBuf,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use secrecy::{ExposeSecret, SecretString};
@@ -245,6 +247,37 @@ impl StateStore {
             universal_provider_views,
             published_universal_provider_view_sequence: Arc::new(Mutex::new(None)),
         })
+    }
+
+    pub(crate) async fn create_online_backup(
+        &self,
+        destination: PathBuf,
+    ) -> Result<u32, StateError> {
+        self.connection
+            .call(move |source| {
+                let schema_version = source.query_row(
+                    "SELECT value FROM metadata WHERE key = 'schema-version'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let schema_version = schema_version
+                    .parse::<u32>()
+                    .map_err(|_| tokio_rusqlite::rusqlite::Error::InvalidQuery)?;
+                let mut destination = tokio_rusqlite::rusqlite::Connection::open(destination)?;
+                let backup =
+                    tokio_rusqlite::rusqlite::backup::Backup::new(source, &mut destination)?;
+                backup.run_to_completion(256, Duration::from_millis(1), None)?;
+                drop(backup);
+                destination.execute_batch("PRAGMA foreign_keys = ON;")?;
+                let integrity = destination
+                    .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))?;
+                if integrity != "ok" {
+                    return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+                }
+                Ok(schema_version)
+            })
+            .await
+            .map_err(map_call_error)
     }
 
     pub async fn target_view(&self) -> Result<TargetView, StateError> {

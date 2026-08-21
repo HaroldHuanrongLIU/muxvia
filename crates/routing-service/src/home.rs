@@ -73,6 +73,31 @@ impl MuxviaHome {
         self.state.join("subscription-accounts.json")
     }
 
+    pub fn backups_dir(&self) -> PathBuf {
+        self.root.join("backups")
+    }
+
+    pub(crate) fn prepare_backups_dir(&self) -> io::Result<PathBuf> {
+        self.prepare_root()?;
+        let backups = self.backups_dir();
+        match fs::symlink_metadata(&backups) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Muxvia backups path must be a directory",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&backups)?;
+            }
+            Err(error) => return Err(error),
+        }
+        #[cfg(unix)]
+        fs::set_permissions(&backups, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))?;
+        Ok(backups)
+    }
+
     pub(crate) fn prepare_database(&self) -> io::Result<()> {
         create_private_dir(&self.root)?;
         create_private_dir(&self.state)?;

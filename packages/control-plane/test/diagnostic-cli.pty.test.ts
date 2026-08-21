@@ -270,6 +270,133 @@ test("status reads a real private UDS without extending an idle Routing Service 
   })
 }, 20_000)
 
+test("backup create and inspect use one sensitive private artifact without exposing contents", async () => {
+  const providerSecret = "RECOVERY_CLI_PROVIDER_SECRET_17021"
+  const refreshSecret = "RECOVERY_CLI_REFRESH_SECRET_17022"
+  const root = await mkdtemp(join(tmpdir(), "muxvia-backup-"))
+  const userHome = join(root, "operator")
+  const muxviaHome = join(userHome, ".muxvia")
+  const socket = join(muxviaHome, "run/control.sock")
+  await mkdir(join(muxviaHome, "state"), { recursive: true })
+  await writeFile(
+    join(muxviaHome, "state/subscription-accounts.json"),
+    JSON.stringify({
+      version: 1,
+      accounts: {
+        account: {
+          account_id: "account",
+          refresh_token: refreshSecret,
+          authenticated_at: 1_700_000_000,
+          state: "authorized",
+        },
+      },
+      default_account_id: "account",
+    }),
+    { mode: 0o600 },
+  )
+  const routing = Bun.spawn([service, "--home", muxviaHome], {
+    env: { ...process.env, HOME: userHome },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  let keeper: RpcClient | undefined
+  try {
+    await waitForSocket(socket)
+    keeper = await RpcClient.connect(socket, "recovery-backup-cli-test")
+    const session = await keeper.openTarget("codex")
+    await session.act({
+      kind: "create-provider",
+      name: "Recovery CLI",
+      baseUrl: "https://recovery-cli.invalid/v1",
+      model: "recovery-cli-model",
+      credential: { kind: "replace", value: providerSecret },
+      presetKey: null,
+    })
+
+    const created = await runCli([
+      "backup",
+      "create",
+      "--json",
+      "--service",
+      service,
+      "--socket",
+      socket,
+    ], { HOME: userHome })
+    expect(created.exitCode).toBe(0)
+    expect(created.stderr).toBe("")
+    const creation = JSON.parse(created.stdout)
+    expect(creation).toMatchObject({
+      ok: true,
+      command: "backup",
+      operation: "create",
+      sensitive: true,
+      inspection: {
+        formatVersion: 1,
+        databaseSchemaVersion: 17,
+        sensitive: true,
+        compatibility: "compatible",
+      },
+    })
+    expect(creation.path).toStartWith(join(muxviaHome, "backups"))
+    expect(creation.inspection.entries).toHaveLength(4)
+    expect((await stat(creation.path)).mode & 0o777).toBe(0o600)
+    expect(created.stdout).not.toContain(providerSecret)
+    expect(created.stdout).not.toContain(refreshSecret)
+
+    const inspected = await runCli([
+      "backup",
+      "inspect",
+      creation.path,
+      "--json",
+      "--service",
+      service,
+      "--socket",
+      socket,
+    ], { HOME: userHome })
+    expect(inspected.exitCode).toBe(0)
+    expect(inspected.stderr).toBe("")
+    expect(JSON.parse(inspected.stdout)).toEqual({
+      ok: true,
+      command: "backup",
+      operation: "inspect",
+      sensitive: true,
+      path: creation.path,
+      inspection: creation.inspection,
+    })
+    expect(inspected.stdout).not.toContain(providerSecret)
+    expect(inspected.stdout).not.toContain(refreshSecret)
+
+    const relative = await runCli([
+      "backup",
+      "inspect",
+      "relative.muxvia-recovery",
+      "--json",
+      "--service",
+      service,
+      "--socket",
+      socket,
+    ], { HOME: userHome })
+    expect(relative).toEqual({
+      exitCode: 64,
+      stdout: "",
+      stderr: `${JSON.stringify({
+        ok: false,
+        problem: { code: "invalid-invocation", message: "CLI invocation is invalid" },
+      })}\n`,
+    })
+    await session.close()
+    expect(await Promise.race([
+      routing.exited,
+      Bun.sleep(exitDeadlineMs).then(() => { throw new Error("idle service did not exit") }),
+    ])).toBe(0)
+  } finally {
+    await keeper?.close().catch(() => {})
+    if (routing.exitCode === null) routing.kill("SIGKILL")
+    await routing.exited.catch(() => {})
+  }
+}, 20_000)
+
 test("doctor is read-only across bundle, permissions, homes, symlinks, shadows, and Target compatibility", async () => {
   const root = await mkdtemp(join(tmpdir(), "muxvia-doctor-"))
   const userHome = join(root, "operator")

@@ -29,8 +29,9 @@ use crate::{
             ControlOperation, ControlProblem, ControlResult, DiscoverySource,
             ForceStopAcceptedResult, FrameLimit, HandoverPreparedResult,
             ProviderConfigurationExportResult, ProviderImportOutcomeResult,
-            ProviderImportPreviewResult, ReconciliationStrategy, RpcVersion, ServerFrame, Target,
-            TargetAction, TargetView, UniversalProviderAction, UniversalProviderCatalogView,
+            ProviderImportPreviewResult, ReconciliationStrategy, RecoveryBackupCreatedResult,
+            RecoveryBackupInspectionResult, RpcVersion, ServerFrame, Target, TargetAction,
+            TargetView, UniversalProviderAction, UniversalProviderCatalogView,
         },
     },
     domain::provider::has_valid_provider_authentication,
@@ -45,6 +46,7 @@ use crate::{
         provider_transfer::{ProviderTransferError, ProviderTransferService},
         reconcile::ReconciliationService,
         reconciliation_adapter::ReconciliationContext,
+        recovery_backup::{RecoveryBackupError, RecoveryBackupService},
         route_plan::RoutePlanCoordinator,
     },
     state::{ManagedWriteStatus, StateStore},
@@ -193,6 +195,7 @@ struct SessionServices {
     route_plans: Arc<RoutePlanCoordinator>,
     provider_synchronization: Arc<ProviderSynchronizationService>,
     provider_transfer: Arc<ProviderTransferService>,
+    recovery_backup: Arc<RecoveryBackupService>,
     device_authorization: Arc<DeviceAuthorizationManager>,
     subscription_account_coordinator: Arc<SubscriptionAccountCoordinator>,
     native_usage: Arc<NativeUsageService>,
@@ -382,6 +385,7 @@ impl ControlServer {
         startup_refresh_account_id: Option<String>,
         runtime: ServerRuntime,
     ) -> Result<ControlServerHandle, ControlServerError> {
+        let release = release.into();
         let reconciliation_runtime = activation.reconciliation_runtime();
         if reconciliation_runtime.home.root() != home.root() {
             return Err(ControlServerError::State);
@@ -418,6 +422,17 @@ impl ControlServer {
             Arc::clone(&store),
             Arc::clone(&subscription_accounts),
         ));
+        let recovery_backup = Arc::new(
+            RecoveryBackupService::new(
+                Arc::clone(&store),
+                home.clone(),
+                Arc::clone(&reconciliation),
+                Arc::clone(&subscription_accounts),
+                Arc::clone(&subscription_account_coordinator),
+                release.clone(),
+            )
+            .map_err(|_| ControlServerError::State)?,
+        );
         let device_authorization = Arc::new(DeviceAuthorizationManager::new(
             Arc::clone(&subscription_accounts),
             Arc::clone(&subscription_account_coordinator),
@@ -513,7 +528,6 @@ impl ControlServer {
         let listener = UnixListener::bind(&socket_path)?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
 
-        let release = release.into();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let (session_shutdown_tx, session_shutdown_rx) = watch::channel(false);
         let (completed_tx, completed) = watch::channel(false);
@@ -577,6 +591,7 @@ impl ControlServer {
                         let route_plans = Arc::clone(&route_plans);
                         let provider_synchronization = Arc::clone(&provider_synchronization);
                         let provider_transfer = Arc::clone(&provider_transfer);
+                        let recovery_backup = Arc::clone(&recovery_backup);
                         let device_authorization = Arc::clone(&device_authorization);
                         let subscription_account_coordinator =
                             Arc::clone(&subscription_account_coordinator);
@@ -594,6 +609,7 @@ impl ControlServer {
                             route_plans,
                             provider_synchronization,
                             provider_transfer,
+                            recovery_backup,
                             device_authorization,
                             subscription_account_coordinator,
                             native_usage,
@@ -821,6 +837,7 @@ async fn serve_session(
         route_plans,
         provider_synchronization,
         provider_transfer,
+        recovery_backup,
         device_authorization,
         subscription_account_coordinator,
         native_usage,
@@ -1090,6 +1107,45 @@ async fn serve_session(
                     }
                     permit.send(());
                     break 'session;
+                }
+
+                if matches!(
+                    operation,
+                    ControlOperation::CreateRecoveryBackup(_)
+                        | ControlOperation::InspectRecoveryBackup(_)
+                ) {
+                    lifecycle.pending_actions.fetch_add(1, Ordering::AcqRel);
+                    let _action_guard = ActionGuard(Arc::clone(&lifecycle));
+                    let frame = match operation {
+                        ControlOperation::CreateRecoveryBackup(_) => match recovery_backup.create().await {
+                            Ok(created) => ServerFrame::Response {
+                                request_id,
+                                result: ControlResult::RecoveryBackupCreated(
+                                    RecoveryBackupCreatedResult {
+                                        path: created.path.to_string_lossy().into_owned(),
+                                        inspection: created.inspection,
+                                    },
+                                ),
+                            },
+                            Err(error) => recovery_backup_problem(request_id, error),
+                        },
+                        ControlOperation::InspectRecoveryBackup(operation) => {
+                            match recovery_backup.inspect(Path::new(&operation.path)) {
+                                Ok(inspection) => ServerFrame::Response {
+                                    request_id,
+                                    result: ControlResult::RecoveryBackupInspection(
+                                        RecoveryBackupInspectionResult { inspection },
+                                    ),
+                                },
+                                Err(error) => recovery_backup_problem(request_id, error),
+                            }
+                        }
+                        _ => unreachable!("Recovery Backup operation was matched above"),
+                    };
+                    if !enqueue_response(&responses, frame) {
+                        break 'session;
+                    }
+                    continue;
                 }
 
                 if matches!(
@@ -1545,7 +1601,9 @@ async fn serve_session(
                     | ControlOperation::PollDeviceAuthorization(_)
                     | ControlOperation::PreviewDefaultSubscriptionAccount(_)
                     | ControlOperation::SubscriptionAccountAct { .. }
-                    | ControlOperation::UniversalProviderAct { .. } => {
+                    | ControlOperation::UniversalProviderAct { .. }
+                    | ControlOperation::CreateRecoveryBackup(_)
+                    | ControlOperation::InspectRecoveryBackup(_) => {
                         unreachable!("catalog operations are handled before target dispatch")
                     }
                     ControlOperation::PreviewProviderImport(operation) => {
@@ -2080,6 +2138,31 @@ fn provider_transfer_problem(request_id: String, error: ProviderTransferError) -
     problem_frame(Some(request_id), code, message, None)
 }
 
+fn recovery_backup_problem(request_id: String, error: RecoveryBackupError) -> ServerFrame {
+    let (code, message) = match error {
+        RecoveryBackupError::InvalidPath => (
+            "recovery-backup-invalid-path",
+            "Recovery Backup path is invalid",
+        ),
+        RecoveryBackupError::UnsafePermissions => (
+            "recovery-backup-unsafe-permissions",
+            "Recovery Backup permissions are unsafe",
+        ),
+        RecoveryBackupError::InvalidArtifact => {
+            ("recovery-backup-invalid", "Recovery Backup is invalid")
+        }
+        RecoveryBackupError::SnapshotChanged => (
+            "recovery-snapshot-changed",
+            "Recovery Snapshot changed during creation",
+        ),
+        RecoveryBackupError::CreationFailed => (
+            "recovery-backup-creation-failed",
+            "Recovery Backup could not be created",
+        ),
+    };
+    problem_frame(Some(request_id), code, message, None)
+}
+
 fn operation_target(operation: &ControlOperation) -> Option<Target> {
     match operation {
         ControlOperation::PrepareHandover(_)
@@ -2090,7 +2173,9 @@ fn operation_target(operation: &ControlOperation) -> Option<Target> {
         | ControlOperation::PollDeviceAuthorization(_)
         | ControlOperation::PreviewDefaultSubscriptionAccount(_)
         | ControlOperation::SubscriptionAccountAct { .. }
-        | ControlOperation::UniversalProviderAct { .. } => None,
+        | ControlOperation::UniversalProviderAct { .. }
+        | ControlOperation::CreateRecoveryBackup(_)
+        | ControlOperation::InspectRecoveryBackup(_) => None,
         ControlOperation::OpenTarget { target, .. }
         | ControlOperation::Act { target, .. }
         | ControlOperation::DiscoverModels { target, .. }

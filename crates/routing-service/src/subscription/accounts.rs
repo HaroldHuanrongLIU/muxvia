@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    config::managed_file::{FileIdentity, ManagedFile},
+    config::managed_file::{FileIdentity, ManagedFile, ManagedFileContents},
     home::MuxviaHome,
 };
 
@@ -161,6 +161,15 @@ impl SubscriptionAccountStore {
             document,
             identity: contents.identity,
         })
+    }
+
+    pub(crate) fn recovery_file_contents(
+        &self,
+    ) -> Result<ManagedFileContents, SubscriptionAccountStoreError> {
+        self.read()?;
+        self.file
+            .read()
+            .map_err(|_| SubscriptionAccountStoreError::WriteFailed)
     }
 
     pub(crate) fn replace(

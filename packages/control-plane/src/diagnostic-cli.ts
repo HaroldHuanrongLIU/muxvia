@@ -13,6 +13,7 @@ export const routingServiceRelease = "0.1.0"
 type Invocation = {
   command?: string
   subcommand?: string
+  backupPath?: string
   json: boolean
   force: boolean
   forceAcknowledged: boolean
@@ -117,6 +118,7 @@ export function parseInvocation(args: string[], environment = process.env): Invo
   ].includes(argument) && !optionValues.has(index))
   const command = positional[0]
   const subcommand = positional[1]
+  const backupPath = positional[2]
   const force = args.includes("--force")
   const forceAcknowledged = args.includes(
     "--acknowledge-managed-target-files-may-remain-pointed-at-dead-endpoint",
@@ -124,8 +126,13 @@ export function parseInvocation(args: string[], environment = process.env): Invo
   if (!isAbsolute(servicePath) || !isAbsolute(socketPath)) invalid = true
   if (
     (command === "service" && !["start", "stop"].includes(subcommand ?? ""))
+    || (command === "backup" && !["create", "inspect"].includes(subcommand ?? ""))
     || (["paths", "version", "status", "doctor"].includes(command ?? "") && positional.length !== 1)
     || (command === "service" && positional.length !== 2)
+    || (command === "backup" && subcommand === "create" && positional.length !== 2)
+    || (command === "backup" && subcommand === "inspect" && (
+      positional.length !== 3 || !backupPath || !isAbsolute(backupPath)
+    ))
     || (force && (command !== "service" || subcommand !== "stop"))
     || (forceAcknowledged && !force)
   ) {
@@ -134,6 +141,7 @@ export function parseInvocation(args: string[], environment = process.env): Invo
   return {
     command,
     subcommand,
+    backupPath,
     json: args.includes("--json"),
     force,
     forceAcknowledged,
@@ -250,6 +258,38 @@ export async function dispatchDiagnostic(invocation: Invocation): Promise<boolea
     }
     return true
   }
+  if (invocation.command === "backup" && invocation.subcommand === "create") {
+    try {
+      const result = await createRecoveryBackup(invocation)
+      process.stdout.write(invocation.json
+        ? `${JSON.stringify(result)}\n`
+        : formatRecoveryBackup(result.path, result.inspection, "created"))
+    } catch {
+      writeFailure(
+        invocation,
+        "recovery-backup-creation-failed",
+        "Sensitive Recovery Backup could not be created",
+        70,
+      )
+    }
+    return true
+  }
+  if (invocation.command === "backup" && invocation.subcommand === "inspect") {
+    try {
+      const result = await inspectRecoveryBackup(invocation)
+      process.stdout.write(invocation.json
+        ? `${JSON.stringify(result)}\n`
+        : formatRecoveryBackup(result.path, result.inspection, "inspected"))
+    } catch {
+      writeFailure(
+        invocation,
+        "recovery-backup-inspection-failed",
+        "Sensitive Recovery Backup could not be inspected",
+        70,
+      )
+    }
+    return true
+  }
   if (invocation.command === "service" && invocation.subcommand === "start") {
     try {
       const result = await startService(invocation)
@@ -300,6 +340,83 @@ export async function dispatchDiagnostic(invocation: Invocation): Promise<boolea
   }
   writeFailure(invocation, "unsupported-command", "Unsupported noninteractive command", 64)
   return true
+}
+
+async function createRecoveryBackup(invocation: Invocation) {
+  const client = await connectForBackup(invocation)
+  try {
+    const result = await client.request({ kind: "create-recovery-backup" })
+    if (result.kind !== "recovery-backup-created" || !isAbsolute(result.path)) {
+      throw new Error("unexpected-recovery-backup-response")
+    }
+    return {
+      ok: true,
+      command: "backup",
+      operation: "create",
+      sensitive: true,
+      path: result.path,
+      inspection: result.inspection,
+    } as const
+  } finally {
+    await client.close().catch(() => {})
+  }
+}
+
+async function inspectRecoveryBackup(invocation: Invocation) {
+  const path = invocation.backupPath
+  if (!path || !isAbsolute(path)) throw new Error("invalid-recovery-backup-path")
+  const client = await connectForBackup(invocation)
+  try {
+    const result = await client.request({ kind: "inspect-recovery-backup", path })
+    if (result.kind !== "recovery-backup-inspection") {
+      throw new Error("unexpected-recovery-backup-response")
+    }
+    return {
+      ok: true,
+      command: "backup",
+      operation: "inspect",
+      sensitive: true,
+      path,
+      inspection: result.inspection,
+    } as const
+  } finally {
+    await client.close().catch(() => {})
+  }
+}
+
+async function connectForBackup(invocation: Invocation): Promise<RpcClient> {
+  const cancellation = new AbortController()
+  const deadline = setTimeout(() => cancellation.abort(), probeTimeoutMs)
+  try {
+    return await RpcClient.connect(
+      invocation.socketPath,
+      controlPlaneRelease,
+      cancellation.signal,
+    )
+  } finally {
+    clearTimeout(deadline)
+  }
+}
+
+function formatRecoveryBackup(
+  path: string,
+  inspection: Awaited<ReturnType<typeof createRecoveryBackup>>["inspection"],
+  operation: "created" | "inspected",
+): string {
+  const entries = inspection.entries
+    .map((entry) => `  ${entry.kind}: ${entry.present ? `${entry.byteLength} bytes` : "absent"}`)
+    .join("\n")
+  return [
+    "SENSITIVE RECOVERY BACKUP — contains credentials and private installation state",
+    `Recovery Backup ${operation}: ${path}`,
+    `Snapshot: ${inspection.snapshotId}`,
+    `Compatibility: ${inspection.compatibility}`,
+    `Format: ${inspection.formatVersion}; database schema: ${inspection.databaseSchemaVersion}`,
+    `Artifact: ${inspection.artifactSizeBytes} bytes; SHA-256 ${inspection.artifactSha256}`,
+    "Entries:",
+    entries,
+    "",
+  ].join("\n")
 }
 
 function writeFailure(

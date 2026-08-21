@@ -2,6 +2,7 @@ pub mod auth;
 mod commitment;
 pub mod headers;
 mod messages;
+mod request_recorder;
 mod router;
 mod server;
 mod upstream;

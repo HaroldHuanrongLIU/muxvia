@@ -16,6 +16,7 @@ use axum::{
 };
 use futures_util::{StreamExt, stream};
 use reqwest::Body as ReqwestBody;
+use secrecy::ExposeSecret;
 use tokio::{
     net::TcpListener,
     sync::{Notify, oneshot},
@@ -30,6 +31,9 @@ use super::messages::route_messages;
 use super::{
     auth::routing_credential_matches,
     headers::{forward_request_headers, forward_response_headers},
+    request_recorder::{
+        CodexUsageFormat, RequestRecordStart, RequestRecorder, recorded_codex_body, unix_time_ms,
+    },
     router::{
         PreparedRouteAttempt, RouteAttemptFailure, RouteHealthRuntime, RouteResponseKind,
         pin_route_plan, route_pinned_plan,
@@ -225,6 +229,7 @@ pub(crate) struct RouteState {
     pub(crate) admission: Arc<ModelAdmission>,
     pub(crate) route_health: Arc<RouteHealthRuntime>,
     pub(crate) subscription_resolver: Option<Arc<dyn SubscriptionAccountResolver>>,
+    pub(crate) request_recorder: RequestRecorder,
 }
 
 impl Clone for RouteState {
@@ -236,6 +241,7 @@ impl Clone for RouteState {
             admission: Arc::clone(&self.admission),
             route_health: Arc::clone(&self.route_health),
             subscription_resolver: self.subscription_resolver.clone(),
+            request_recorder: self.request_recorder.clone(),
         }
     }
 }
@@ -314,6 +320,8 @@ impl ModelServer {
         subscription_resolver: Option<Arc<dyn SubscriptionAccountResolver>>,
     ) -> Result<ModelServerHandle, ModelServerError> {
         let endpoint = reserved.endpoint;
+        let (request_recorder, request_recorder_actor) =
+            RequestRecorder::new(Arc::clone(&store)).map_err(|_| ModelServerError::State)?;
         let state = RouteState {
             target,
             store,
@@ -321,6 +329,7 @@ impl ModelServer {
             admission: Arc::new(ModelAdmission::new()),
             route_health,
             subscription_resolver,
+            request_recorder,
         };
         let admission = Arc::clone(&state.admission);
         let router = match target {
@@ -356,6 +365,7 @@ impl ModelServer {
                     let _ = shutdown_rx.await;
                 })
                 .await;
+            request_recorder_actor.run().await;
             let final_status = if result.is_ok() && task_shutdown_requested.load(Ordering::Acquire)
             {
                 ModelServerStatus::Stopped
@@ -527,7 +537,40 @@ async fn route_responses(
         Some(plan) => plan,
         None => return local_response(StatusCode::SERVICE_UNAVAILABLE),
     };
+    let started_at_unix_ms = unix_time_ms();
+    let mut redactions = vec![expected.expose_secret().as_bytes().to_vec()];
+    redactions.extend(plan.members.iter().filter_map(|member| {
+        member
+            .provider_credential
+            .as_ref()
+            .map(|credential| credential.expose_secret().as_bytes().to_vec())
+    }));
+    let mut record_start = RequestRecordStart {
+        id: uuid::Uuid::new_v4(),
+        target: state.target,
+        plan_id: plan.id,
+        plan_epoch: plan.epoch,
+        provider: None,
+        model: plan.members[0].model.clone(),
+        protocol: plan.members[0].protocol,
+        started_at_unix_ms,
+        status: None,
+        semantic_failure: false,
+        redactions,
+        usage_format: CodexUsageFormat::Unsupported,
+    };
+    let Some(reserved_record) = state.request_recorder.reserve() else {
+        return fixed_local_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "request-recording-unavailable",
+        );
+    };
     let Some(active_request) = ActiveRequestGuard::try_begin(Arc::clone(&state.admission)) else {
+        record_start.status = Some(StatusCode::SERVICE_UNAVAILABLE);
+        reserved_record.complete_terminal(
+            record_start,
+            crate::control::protocol::RequestRecordOutcome::RouteUnavailable,
+        );
         return local_response(StatusCode::SERVICE_UNAVAILABLE);
     };
     let request_headers = request.headers().clone();
@@ -535,9 +578,19 @@ async fn route_responses(
     let mut request_body = Vec::new();
     while let Some(chunk) = incoming.next().await {
         let Ok(chunk) = chunk else {
+            record_start.status = Some(StatusCode::BAD_REQUEST);
+            reserved_record.complete_terminal(
+                record_start,
+                crate::control::protocol::RequestRecordOutcome::RouteUnavailable,
+            );
             return local_response(StatusCode::BAD_REQUEST);
         };
         if request_body.len().saturating_add(chunk.len()) > MAX_REPLAYABLE_BODY_BYTES {
+            record_start.status = Some(StatusCode::PAYLOAD_TOO_LARGE);
+            reserved_record.complete_terminal(
+                record_start,
+                crate::control::protocol::RequestRecordOutcome::RouteUnavailable,
+            );
             return local_response(StatusCode::PAYLOAD_TOO_LARGE);
         }
         request_body.extend_from_slice(&chunk);
@@ -571,6 +624,21 @@ async fn route_responses(
         },
     )
     .await;
+    let outcome_without_response = if route
+        .observations
+        .iter()
+        .any(|observation| observation.outcome == "transport-failure")
+    {
+        crate::control::protocol::RequestRecordOutcome::TransportError
+    } else if route
+        .observations
+        .iter()
+        .any(|observation| observation.outcome == "semantic-failure")
+    {
+        crate::control::protocol::RequestRecordOutcome::SemanticError
+    } else {
+        crate::control::protocol::RequestRecordOutcome::RouteUnavailable
+    };
     let serving_provider = route
         .routed
         .as_ref()
@@ -602,13 +670,48 @@ async fn route_responses(
             .await;
     }
     let Some(routed) = route.routed else {
+        let (provider, model, protocol) = match route.last_attempt {
+            Some(attempt) => (
+                Some(crate::request_history::RecordedProvider {
+                    id: attempt.provider_id,
+                    name: attempt.provider_name,
+                }),
+                attempt.model,
+                attempt.protocol,
+            ),
+            None => (None, route.model, route.protocol),
+        };
+        record_start.provider = provider;
+        record_start.model = model;
+        record_start.protocol = protocol;
+        reserved_record.complete_terminal(record_start, outcome_without_response);
         return local_response(StatusCode::BAD_GATEWAY);
     };
+    record_start.provider = Some(crate::request_history::RecordedProvider {
+        id: routed.provider_id,
+        name: routed.provider_name.clone(),
+    });
+    record_start.model = routed.model.clone();
+    record_start.protocol = routed.protocol;
+    record_start.status = Some(routed.response.status);
+    record_start.semantic_failure = routed.semantic_failure;
+    record_start.usage_format = CodexUsageFormat::from_content_type(
+        routed
+            .response
+            .headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+    );
     let upstream = routed.response;
 
     let mut response = Response::builder()
         .status(upstream.status)
-        .body(body_with_active_guard(upstream.body, active_request))
+        .body(recorded_codex_body(
+            upstream.body,
+            active_request,
+            reserved_record,
+            record_start,
+        ))
         .expect("valid upstream status");
     *response.headers_mut() = forward_response_headers(&upstream.headers);
     response
@@ -670,4 +773,11 @@ fn local_response(status: StatusCode) -> Response<Body> {
         .status(status)
         .body(Body::from("request rejected"))
         .expect("valid local response")
+}
+
+fn fixed_local_response(status: StatusCode, problem: &'static str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .body(Body::from(problem))
+        .expect("valid fixed local response")
 }

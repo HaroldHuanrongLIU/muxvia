@@ -161,6 +161,7 @@ pub(crate) struct ActivatedRoutePlanSnapshot {
 #[derive(Clone)]
 pub(crate) struct RoutePlanMemberSnapshot {
     pub(crate) provider_id: Uuid,
+    pub(crate) name: String,
     pub(crate) base_url: String,
     pub(crate) model: String,
     pub(crate) provider_credential: Option<SecretString>,
@@ -1388,7 +1389,7 @@ impl StateStore {
                     )?;
                     let members = connection
                         .prepare(
-                            "SELECT member.provider_id, member.base_url, member.model,
+                            "SELECT member.provider_id, member.name, member.base_url, member.model,
                                 credential.bearer_token, member.protocol, member.authentication,
                                 member.routing_requirement, binding.binding_kind, binding.account_id
                          FROM activated_route_plan_members member
@@ -1406,12 +1407,13 @@ impl StateStore {
                                 row.get::<_, String>(0)?,
                                 row.get::<_, String>(1)?,
                                 row.get::<_, String>(2)?,
-                                row.get::<_, Option<String>>(3)?,
-                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, Option<String>>(4)?,
                                 row.get::<_, String>(5)?,
                                 row.get::<_, String>(6)?,
-                                row.get::<_, Option<String>>(7)?,
+                                row.get::<_, String>(7)?,
                                 row.get::<_, Option<String>>(8)?,
+                                row.get::<_, Option<String>>(9)?,
                             ))
                         })?
                         .collect::<Result<Vec<_>, _>>()?
@@ -1419,6 +1421,7 @@ impl StateStore {
                         .map(
                             |(
                                 provider_id,
+                                name,
                                 base_url,
                                 model,
                                 credential,
@@ -1471,6 +1474,7 @@ impl StateStore {
                                 Ok(RoutePlanMemberSnapshot {
                                     provider_id: Uuid::parse_str(&provider_id)
                                         .map_err(|_| StateError::InvalidActivatedSnapshot)?,
+                                    name,
                                     base_url,
                                     model,
                                     provider_credential: credential.map(SecretString::from),

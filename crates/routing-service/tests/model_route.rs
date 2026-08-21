@@ -144,6 +144,17 @@ struct StoreFixture {
     store: Arc<StateStore>,
 }
 
+struct StoredRequestRecord {
+    outcome: String,
+    http_status: Option<u16>,
+    provider_id: Option<String>,
+    provider_name: Option<String>,
+    model: String,
+    error_payload: Option<Vec<u8>>,
+    error_payload_truncated: bool,
+    usage: Option<(u64, u64, u64, u64)>,
+}
+
 impl StoreFixture {
     async fn new() -> Self {
         let home = TempDir::new().unwrap();
@@ -173,6 +184,11 @@ impl StoreFixture {
     }
 
     async fn seed_snapshot(&self, upstream_base_url: &str) -> (Uuid, Uuid) {
+        self.seed_snapshot_for_model(upstream_base_url, "gpt-test")
+            .await
+    }
+
+    async fn seed_snapshot_for_model(&self, upstream_base_url: &str, model: &str) -> (Uuid, Uuid) {
         self.set_routing_credential().await;
         let snapshot_id = Uuid::new_v4();
         let provider_id = Uuid::new_v4();
@@ -182,6 +198,7 @@ impl StoreFixture {
             .await
             .unwrap();
         let upstream_base_url = upstream_base_url.to_owned();
+        let model = model.to_owned();
         database
             .call(move |connection| -> tokio_rusqlite::rusqlite::Result<()> {
                 let transaction = connection.transaction()?;
@@ -195,21 +212,26 @@ impl StoreFixture {
                      (id, target, position, provider_revision, name, base_url, model, protocol,
                       authentication, routing_requirement, credential_id, provenance_kind,
                       provenance_key, generated_owner_id)
-                     VALUES (?1, 'codex', 0, 1, 'Fake upstream', ?2, 'gpt-test',
+                     VALUES (?1, 'codex', 0, 1, 'Fake upstream', ?2, ?3,
                              'openai-responses', 'openai-bearer', 'direct-compatible',
                              ?1, NULL, NULL, NULL)",
-                    (provider_id.to_string(), upstream_base_url.clone()),
+                    (
+                        provider_id.to_string(),
+                        upstream_base_url.clone(),
+                        model.clone(),
+                    ),
                 )?;
                 transaction.execute(
                     "INSERT INTO activated_snapshots
                      (id, target, provider_id, base_url, model, protocol, authentication,
                       provider_bearer_token, epoch)
-                     VALUES (?1, 'codex', ?2, ?3, 'gpt-test', 'openai-responses',
-                             'openai-bearer', ?4, ?5)",
+                     VALUES (?1, 'codex', ?2, ?3, ?4, 'openai-responses',
+                             'openai-bearer', ?5, ?6)",
                     (
                         snapshot_id.to_string(),
                         provider_id.to_string(),
                         upstream_base_url.clone(),
+                        model.clone(),
                         PROVIDER_SECRET,
                         Uuid::new_v4().to_string(),
                     ),
@@ -229,12 +251,13 @@ impl StoreFixture {
                     "INSERT INTO activated_route_plan_members
                      (plan_id, position, provider_id, provider_revision, name, base_url, model,
                       protocol, authentication, credential_id, routing_requirement)
-                     VALUES (?1, 0, ?2, 1, 'Fake upstream', ?3, 'gpt-test',
-                             'openai-responses', 'openai-bearer', ?4, 'direct-compatible')",
+                     VALUES (?1, 0, ?2, 1, 'Fake upstream', ?3, ?4,
+                             'openai-responses', 'openai-bearer', ?5, 'direct-compatible')",
                     (
                         plan_id.to_string(),
                         provider_id.to_string(),
                         upstream_base_url,
+                        model,
                         provider_id.to_string(),
                     ),
                 )?;
@@ -270,6 +293,48 @@ impl StoreFixture {
             })
             .await
             .unwrap();
+    }
+
+    async fn request_records(&self) -> Vec<StoredRequestRecord> {
+        let database = tokio_rusqlite::Connection::open(self.muxvia_home.database_path())
+            .await
+            .unwrap();
+        database
+            .call(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT outcome, http_status, provider_id, provider_name, model,
+                            error_payload, error_payload_truncated, usage_observed,
+                            input_tokens, cached_input_tokens, cache_creation_input_tokens,
+                            output_tokens
+                     FROM request_records ORDER BY sequence",
+                )?;
+                statement
+                    .query_map([], |row| {
+                        let usage_observed = row.get::<_, bool>(7)?;
+                        Ok(StoredRequestRecord {
+                            outcome: row.get(0)?,
+                            http_status: row.get(1)?,
+                            provider_id: row.get(2)?,
+                            provider_name: row.get(3)?,
+                            model: row.get(4)?,
+                            error_payload: row.get(5)?,
+                            error_payload_truncated: row.get(6)?,
+                            usage: usage_observed
+                                .then(|| {
+                                    Ok::<_, tokio_rusqlite::rusqlite::Error>((
+                                        row.get(8)?,
+                                        row.get(9)?,
+                                        row.get(10)?,
+                                        row.get(11)?,
+                                    ))
+                                })
+                                .transpose()?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .unwrap()
     }
 }
 
@@ -485,6 +550,7 @@ struct FakeState {
     status: StatusCode,
     body_dropped: Arc<AtomicBool>,
     first_body_chunk_gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    error_body: Arc<Vec<u8>>,
 }
 
 type SharedCapture = Arc<Mutex<Option<(String, HeaderMap, Vec<u8>)>>>;
@@ -525,7 +591,7 @@ async fn fake_responses(State(state): State<FakeState>, request: Request<Body>) 
             .status(state.status)
             .header("content-type", "application/json")
             .header("x-upstream-error", "rate-limited")
-            .body(Body::from("{\"error\":\"slow down\"}"))
+            .body(Body::from(state.error_body.as_ref().clone()))
             .unwrap();
     }
 
@@ -541,7 +607,8 @@ async fn fake_responses(State(state): State<FakeState>, request: Request<Body>) 
             let chunk: &'static [u8] = match index {
                 0 => b"data: {\"type\":\"response.created\"}\n\n",
                 1 => b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
-                2 => b"data: [DONE]\n\n",
+                2 => b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":20},\"output_tokens\":30}}}\n\n",
+                3 => b"data: [DONE]\n\n",
                 _ => return None,
             };
             sleep(if index == 0 {
@@ -602,6 +669,10 @@ impl FakeUpstream {
         Self::start_with_body_gate(status, None).await
     }
 
+    async fn start_with_error_body(error_body: Vec<u8>) -> Self {
+        Self::start_with_body_gate_and_error(StatusCode::TOO_MANY_REQUESTS, None, error_body).await
+    }
+
     async fn start_with_blocked_body(status: StatusCode) -> (Self, oneshot::Sender<()>) {
         let (release, gate) = oneshot::channel();
         (
@@ -614,6 +685,19 @@ impl FakeUpstream {
         status: StatusCode,
         first_body_chunk_gate: Option<oneshot::Receiver<()>>,
     ) -> Self {
+        Self::start_with_body_gate_and_error(
+            status,
+            first_body_chunk_gate,
+            b"{\"error\":\"slow down\"}".to_vec(),
+        )
+        .await
+    }
+
+    async fn start_with_body_gate_and_error(
+        status: StatusCode,
+        first_body_chunk_gate: Option<oneshot::Receiver<()>>,
+        error_body: Vec<u8>,
+    ) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let endpoint = listener.local_addr().unwrap();
         let state = FakeState {
@@ -622,6 +706,7 @@ impl FakeUpstream {
             status,
             body_dropped: Arc::new(AtomicBool::new(false)),
             first_body_chunk_gate: Arc::new(Mutex::new(first_body_chunk_gate)),
+            error_body: Arc::new(error_body),
         };
         let router = Router::new()
             .route("/api/v1/responses", post(fake_responses))
@@ -746,6 +831,95 @@ async fn upstream_429_status_headers_and_body_pass_through_without_serving_updat
 }
 
 #[tokio::test]
+async fn final_upstream_error_payload_is_bounded_redacted_and_marked_truncated() {
+    let error_body = format!(
+        "provider={PROVIDER_SECRET};routing={ROUTING_CREDENTIAL};{}",
+        "x".repeat(70_000)
+    )
+    .into_bytes();
+    let upstream = FakeUpstream::start_with_error_body(error_body.clone()).await;
+    let fixture = StoreFixture::new().await;
+    let (_snapshot_id, provider_id) = fixture.seed_snapshot(&upstream.base_url()).await;
+    let server = start_model(&fixture).await;
+
+    let response = post_route(
+        server.endpoint(),
+        Some(HeaderValue::from_static(ROUTING_CREDENTIAL)),
+    )
+    .await;
+    let status = response.status();
+    let forwarded = response.bytes().await.unwrap();
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        forwarded.as_ref() == error_body.as_slice(),
+        "upstream error payload changed in transit"
+    );
+    server.shutdown().await.unwrap();
+
+    let records = fixture.request_records().await;
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    let stored = record.error_payload.as_deref().unwrap_or_default();
+    assert!(
+        !stored
+            .windows(PROVIDER_SECRET.len())
+            .any(|window| window == PROVIDER_SECRET.as_bytes()),
+        "stored failure payload contains a provider credential"
+    );
+    assert!(
+        !stored
+            .windows(ROUTING_CREDENTIAL.len())
+            .any(|window| window == ROUTING_CREDENTIAL.as_bytes()),
+        "stored failure payload contains a routing credential"
+    );
+    assert_eq!(record.outcome, "upstream-error");
+    assert_eq!(record.http_status, Some(429));
+    assert_eq!(
+        record.provider_id.as_deref(),
+        Some(provider_id.to_string().as_str())
+    );
+    assert_eq!(record.provider_name.as_deref(), Some("Fake upstream"));
+    assert_eq!(record.model, "gpt-test");
+    assert_eq!(stored.len(), 65_536);
+    assert!(record.error_payload_truncated);
+
+    upstream.shutdown().await;
+}
+
+#[tokio::test]
+async fn exhausted_transport_failure_persists_the_final_attempt_without_a_payload() {
+    let fixture = StoreFixture::new().await;
+    let closed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let (_snapshot_id, provider_id) = fixture
+        .seed_snapshot(&format!("http://127.0.0.1:{port}/api/v1/"))
+        .await;
+    let server = start_model(&fixture).await;
+
+    let response = post_route(
+        server.endpoint(),
+        Some(HeaderValue::from_static(ROUTING_CREDENTIAL)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    server.shutdown().await.unwrap();
+
+    let records = fixture.request_records().await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].outcome, "transport-error");
+    assert_eq!(
+        records[0].provider_id.as_deref(),
+        Some(provider_id.to_string().as_str())
+    );
+    assert_eq!(records[0].provider_name.as_deref(), Some("Fake upstream"));
+    assert_eq!(records[0].model, "gpt-test");
+    assert_eq!(records[0].http_status, None);
+    assert!(records[0].error_payload.is_none());
+    assert!(!records[0].error_payload_truncated);
+}
+
+#[tokio::test]
 async fn successful_route_appends_path_forwards_bytes_and_streams_sse_in_order() {
     let (upstream, release_upstream_body) =
         FakeUpstream::start_with_blocked_body(StatusCode::OK).await;
@@ -806,6 +980,7 @@ async fn successful_route_appends_path_forwards_bytes_and_streams_sse_in_order()
         concat!(
             "data: {\"type\":\"response.created\"}\n\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":20},\"output_tokens\":30}}}\n\n",
             "data: [DONE]\n\n"
         )
     );
@@ -844,6 +1019,79 @@ async fn successful_route_appends_path_forwards_bytes_and_streams_sse_in_order()
     repeated.bytes().await.unwrap();
 
     server.shutdown().await.unwrap();
+    upstream.shutdown().await;
+}
+
+#[tokio::test]
+async fn successful_codex_stream_persists_one_priced_request_record_after_body_completion() {
+    let upstream = FakeUpstream::start(StatusCode::OK).await;
+    let fixture = StoreFixture::new().await;
+    let (_snapshot_id, provider_id) = fixture
+        .seed_snapshot_for_model(&upstream.base_url(), "gpt-5.6")
+        .await;
+    let server = start_model(&fixture).await;
+
+    let response = post_route(
+        server.endpoint(),
+        Some(HeaderValue::from_static(ROUTING_CREDENTIAL)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    server.shutdown().await.unwrap();
+
+    let database = tokio_rusqlite::Connection::open(fixture.muxvia_home.database_path())
+        .await
+        .unwrap();
+    let observed = database
+        .call(|connection| {
+            connection.query_row(
+                "SELECT request.target, request.provider_id, request.provider_name,
+                        request.model, request.protocol, request.outcome, request.http_status,
+                        request.input_tokens, request.cached_input_tokens,
+                        request.cache_creation_input_tokens, request.output_tokens,
+                        request.error_payload IS NULL, pricing.source_model,
+                        pricing.estimated_cost_nano_usd
+                 FROM request_records request
+                 JOIN pricing_snapshots pricing ON pricing.request_record_id = request.id",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, u16>(6)?,
+                        row.get::<_, u64>(7)?,
+                        row.get::<_, u64>(8)?,
+                        row.get::<_, u64>(9)?,
+                        row.get::<_, u64>(10)?,
+                        row.get::<_, bool>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, u64>(13)?,
+                    ))
+                },
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(observed.0, "codex");
+    assert_eq!(observed.1, provider_id.to_string());
+    assert_eq!(observed.2, "Fake upstream");
+    assert_eq!(observed.3, "gpt-5.6");
+    assert_eq!(observed.4, "openai-responses");
+    assert_eq!(observed.5, "success");
+    assert_eq!(observed.6, 200);
+    assert_eq!(
+        (observed.7, observed.8, observed.9, observed.10),
+        (100, 20, 0, 30)
+    );
+    assert!(observed.11, "successful response payload was persisted");
+    assert_eq!(observed.12, "gpt-5.6");
+    assert!(observed.13 > 0, "priced usage produced a zero estimate");
+
     upstream.shutdown().await;
 }
 
@@ -891,6 +1139,57 @@ async fn draining_rejects_new_requests_and_waits_for_an_accepted_response_body()
 
 struct InvalidatingObservationUpstream {
     database_path: std::path::PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum DeterministicFailureKind {
+    Semantic,
+    Stream,
+    JsonSuccess,
+}
+
+struct DeterministicFailureUpstream {
+    kind: DeterministicFailureKind,
+}
+
+#[async_trait]
+impl UpstreamTransport for DeterministicFailureUpstream {
+    async fn send(&self, _: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static(match self.kind {
+                DeterministicFailureKind::JsonSuccess => "application/json",
+                _ => "text/event-stream",
+            }),
+        );
+        let body = match self.kind {
+            DeterministicFailureKind::Semantic => Box::pin(stream::iter([Ok(
+                axum::body::Bytes::from_static(b"data: {\"type\":\"response.failed\"}\n\n"),
+            )])) as _,
+            DeterministicFailureKind::Stream => Box::pin(
+                stream::once(async {
+                    Ok(axum::body::Bytes::from_static(
+                    b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                    ))
+                })
+                .chain(stream::once(async {
+                    sleep(Duration::from_millis(100)).await;
+                    Err(UpstreamError)
+                })),
+            ) as _,
+            DeterministicFailureKind::JsonSuccess => Box::pin(stream::once(async {
+                Ok(axum::body::Bytes::from_static(
+                    br#"{"id":"response","usage":{"input_tokens":17,"input_tokens_details":{"cached_tokens":2},"output_tokens":6}}"#,
+                ))
+            })) as _,
+        };
+        Ok(UpstreamResponse {
+            status: StatusCode::OK,
+            headers,
+            body,
+        })
+    }
 }
 
 #[async_trait]
@@ -967,6 +1266,104 @@ async fn successful_upstream_response_survives_serving_observation_failure() {
 }
 
 #[tokio::test]
+async fn semantic_exhaustion_and_committed_stream_failure_persist_distinct_terminal_outcomes() {
+    for (kind, expected_status, expected_outcome) in [
+        (
+            DeterministicFailureKind::Semantic,
+            StatusCode::BAD_GATEWAY,
+            "semantic-error",
+        ),
+        (
+            DeterministicFailureKind::Stream,
+            StatusCode::OK,
+            "stream-error",
+        ),
+        (
+            DeterministicFailureKind::JsonSuccess,
+            StatusCode::OK,
+            "success",
+        ),
+    ] {
+        let fixture = StoreFixture::new().await;
+        let (_snapshot_id, provider_id) = fixture
+            .seed_snapshot("https://unused.example/api/v1/")
+            .await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server = ModelServer::bind_reserved(
+            ReservedListener::new(listener).unwrap(),
+            Arc::clone(&fixture.store),
+            Arc::new(DeterministicFailureUpstream { kind }),
+        )
+        .await
+        .unwrap();
+
+        let response = post_route(
+            server.endpoint(),
+            Some(HeaderValue::from_static(ROUTING_CREDENTIAL)),
+        )
+        .await;
+        assert_eq!(response.status(), expected_status);
+        let body_result = response.bytes().await;
+        match kind {
+            DeterministicFailureKind::Semantic => assert!(body_result.is_ok()),
+            DeterministicFailureKind::Stream => assert!(body_result.is_err()),
+            DeterministicFailureKind::JsonSuccess => assert!(body_result.is_ok()),
+        }
+        server.shutdown().await.unwrap();
+
+        let records = fixture.request_records().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, expected_outcome);
+        assert_eq!(
+            records[0].provider_id.as_deref(),
+            Some(provider_id.to_string().as_str())
+        );
+        assert_eq!(records[0].provider_name.as_deref(), Some("Fake upstream"));
+        assert!(records[0].error_payload.is_none());
+        assert_eq!(
+            records[0].usage,
+            matches!(kind, DeterministicFailureKind::JsonSuccess).then_some((15, 2, 0, 6))
+        );
+    }
+}
+
+#[tokio::test]
+async fn request_record_storage_failure_does_not_change_the_committed_response() {
+    let upstream = FakeUpstream::start(StatusCode::OK).await;
+    let fixture = StoreFixture::new().await;
+    fixture.seed_snapshot(&upstream.base_url()).await;
+    let database = tokio_rusqlite::Connection::open(fixture.muxvia_home.database_path())
+        .await
+        .unwrap();
+    database
+        .call(|connection| -> tokio_rusqlite::rusqlite::Result<()> {
+            connection.execute_batch(
+                "CREATE TRIGGER reject_request_record_insert
+                 BEFORE INSERT ON request_records
+                 BEGIN
+                   SELECT RAISE(ABORT, 'controlled-request-record-failure');
+                 END;",
+            )
+        })
+        .await
+        .unwrap();
+    let server = start_model(&fixture).await;
+
+    let response = post_route(
+        server.endpoint(),
+        Some(HeaderValue::from_static(ROUTING_CREDENTIAL)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.bytes().await.unwrap();
+    assert!(body.ends_with(b"data: [DONE]\n\n"));
+    server.shutdown().await.unwrap();
+    assert!(fixture.request_records().await.is_empty());
+
+    upstream.shutdown().await;
+}
+
+#[tokio::test]
 async fn dropping_downstream_connection_drops_upstream_body_stream() {
     let upstream = FakeUpstream::start(StatusCode::OK).await;
     let fixture = StoreFixture::new().await;
@@ -997,5 +1394,10 @@ async fn dropping_downstream_connection_drops_upstream_body_stream() {
     .expect("downstream cancellation must drop the upstream response stream");
 
     server.shutdown().await.unwrap();
+    let records = fixture.request_records().await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].outcome, "cancelled");
+    assert_eq!(records[0].http_status, Some(200));
+    assert!(records[0].error_payload.is_none());
     upstream.shutdown().await;
 }

@@ -40,6 +40,8 @@ impl StateStore {
             .map_err(map_call_error)
     }
 
+    // T14 catalog replacement consumes this one-time backfill seam.
+    #[allow(dead_code)]
     pub(crate) async fn backfill_request_pricing(
         &self,
         catalog: &PricingCatalog,

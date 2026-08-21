@@ -21,7 +21,19 @@ use super::{
 pub(crate) struct RoutedUpstream {
     pub(crate) response: UpstreamResponse,
     pub(crate) provider_id: Uuid,
+    pub(crate) provider_name: String,
+    pub(crate) model: String,
+    pub(crate) protocol: crate::control::protocol::ProviderProtocol,
+    pub(crate) semantic_failure: bool,
     pub(crate) response_kind: RouteResponseKind,
+}
+
+#[derive(Clone)]
+pub(crate) struct RouteAttemptIdentity {
+    pub(crate) provider_id: Uuid,
+    pub(crate) provider_name: String,
+    pub(crate) model: String,
+    pub(crate) protocol: crate::control::protocol::ProviderProtocol,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +92,9 @@ pub(crate) struct PinnedRouteResult {
     pub(crate) routed: Option<RoutedUpstream>,
     pub(crate) observations: Vec<RouteHealthObservation>,
     pub(crate) failure: Option<RouteAttemptFailure>,
+    pub(crate) last_attempt: Option<RouteAttemptIdentity>,
+    pub(crate) model: String,
+    pub(crate) protocol: crate::control::protocol::ProviderProtocol,
 }
 
 pub(crate) struct RouteHealthObservation {
@@ -303,13 +318,22 @@ where
     let plan_id = plan.id;
     let plan_epoch = plan.epoch;
     let member_count = plan.members.len();
+    let model = plan.members[0].model.clone();
+    let protocol = plan.members[0].protocol;
     let mut last_response = None;
     let mut last_failure = None;
+    let mut last_attempt = None;
     let mut observations = Vec::new();
     for (index, member) in plan.members.iter().enumerate() {
         let Some(attempt) = health.admit(target, member.provider_id, Instant::now()) else {
             continue;
         };
+        last_attempt = Some(RouteAttemptIdentity {
+            provider_id: member.provider_id,
+            provider_name: member.name.clone(),
+            model: member.model.clone(),
+            protocol: member.protocol,
+        });
         let prepared = match build(member).await {
             Ok(prepared) => prepared,
             Err(failure) => {
@@ -322,6 +346,9 @@ where
                         routed: None,
                         observations,
                         failure: Some(failure),
+                        last_attempt,
+                        model,
+                        protocol,
                     };
                 }
                 continue;
@@ -368,6 +395,10 @@ where
         let routed = RoutedUpstream {
             response,
             provider_id: member.provider_id,
+            provider_name: member.name.clone(),
+            model: member.model.clone(),
+            protocol: member.protocol,
+            semantic_failure: committed_failure,
             response_kind,
         };
         if committed_failure {
@@ -384,6 +415,9 @@ where
                 routed: Some(routed),
                 observations,
                 failure: None,
+                last_attempt,
+                model,
+                protocol,
             };
         }
         last_response = Some(routed);
@@ -394,6 +428,9 @@ where
         routed: last_response,
         observations,
         failure: last_failure,
+        last_attempt,
+        model,
+        protocol,
     }
 }
 
@@ -510,6 +547,7 @@ mod tests {
                 .into_iter()
                 .map(|name| RoutePlanMemberSnapshot {
                     provider_id: Uuid::new_v4(),
+                    name: name.to_owned(),
                     base_url: format!("https://{name}.test/v1"),
                     model: format!("{name}-model"),
                     provider_credential: Some(SecretString::from(format!("{name}-secret"))),

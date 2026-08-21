@@ -2,8 +2,6 @@ mod migrations;
 pub(crate) mod providers;
 mod reconciliation;
 mod recovery;
-// Task 3 consumes this crate-internal seam from the routed response recorder.
-#[allow(dead_code)]
 mod request_records;
 mod store;
 mod subscription_accounts;

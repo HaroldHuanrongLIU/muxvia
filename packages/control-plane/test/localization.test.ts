@@ -193,6 +193,41 @@ test("Reconciliation stable problems map to fixed localized diagnostics", () => 
   expect(messageKeyForProblem("target-busy")).toBe("error.target-busy")
 })
 
+test("Request History estimate, unpriced, sensitivity, truncation, and navigation copy is exact", () => {
+  const english = createTranslator("en")
+  const chinese = createTranslator("zh-CN")
+  expect([
+    english("command.activity.open"),
+    english("request-history.cost.estimated", { cost: "$0.000000042" }),
+    english("request-history.cost.unpriced"),
+    english("request-history.detail.sensitive"),
+    english("request-history.detail.truncated"),
+    english("request-history.help", { more: english("request-history.help.more") }),
+  ]).toEqual([
+    "Request History",
+    "Estimated $0.000000042",
+    "Unpriced",
+    "Retained failure payload may contain sensitive request material.",
+    "Payload was truncated at the retention limit.",
+    "↑/↓ select · Enter inspect failure · M older · Esc close",
+  ])
+  expect([
+    chinese("command.activity.open"),
+    chinese("request-history.cost.estimated", { cost: "$0.000000042" }),
+    chinese("request-history.cost.unpriced"),
+    chinese("request-history.detail.sensitive"),
+    chinese("request-history.detail.truncated"),
+    chinese("request-history.help", { more: chinese("request-history.help.more") }),
+  ]).toEqual([
+    "请求历史",
+    "预估 $0.000000042",
+    "未定价",
+    "保留的失败载荷可能包含敏感请求材料。",
+    "载荷已在保留上限处截断。",
+    "↑/↓ 选择 · Enter 查看失败 · M 更早 · Esc 关闭",
+  ])
+})
+
 test("Failover route commands, health, and editor copy have exact locale parity", () => {
   const english = createTranslator("en")
   const chinese = createTranslator("zh-CN")

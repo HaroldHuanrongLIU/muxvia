@@ -24,6 +24,7 @@ import { ProviderForm, type ProviderDraft, type ProviderFormRef, type ProviderFo
 import { ProviderPicker } from "./provider-picker"
 import { ProviderSourcePicker, type ProviderSource } from "./provider-source-picker"
 import { Reconciliation, type ReconciliationUiState } from "./reconciliation"
+import { RequestHistory, type RequestHistoryUiState } from "./request-history"
 import { RouteEditor } from "./route-editor"
 import { SubscriptionAccountPicker, type SubscriptionAuthorizationState } from "./subscription-account-picker"
 import { TargetSidebar } from "./target-sidebar"
@@ -61,6 +62,11 @@ type Editor = {
   dirty?: boolean
 }
 type ReconciliationWorkflowState = ReconciliationUiState & {
+  overlayToken: OverlayToken
+  originSession: TargetSession
+  generation: number
+}
+type RequestHistoryWorkflowState = RequestHistoryUiState & {
   overlayToken: OverlayToken
   originSession: TargetSession
   generation: number
@@ -103,6 +109,20 @@ function safeReconciliationProblem(error: unknown): string {
     case "stale-revision":
     case "target-busy":
     case "untested-target-cli":
+      return code
+    default:
+      return "internal-failure"
+  }
+}
+
+function safeRequestHistoryProblem(error: unknown): string {
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String(error.code)
+    : "internal-failure"
+  switch (code) {
+    case "invalid-request-history-cursor":
+    case "request-record-not-found":
+    case "request-history-unavailable":
       return code
     default:
       return "internal-failure"
@@ -298,6 +318,7 @@ function Shell(props: {
   const [applyingByTarget, setApplyingByTarget] = createSignal<Record<Target, "direct" | "takeover" | undefined>>({ codex: undefined, claude: undefined })
   const [disablingByTarget, setDisablingByTarget] = createSignal<Record<Target, boolean>>({ codex: false, claude: false })
   const [reconciliationByTarget, setReconciliationByTarget] = createSignal<Partial<Record<Target, ReconciliationWorkflowState>>>({})
+  const [requestHistoryByTarget, setRequestHistoryByTarget] = createSignal<Partial<Record<Target, RequestHistoryWorkflowState>>>({})
   const [routeWorkflowByTarget, setRouteWorkflowByTarget] = createSignal<Partial<Record<Target, RouteWorkflowState>>>({})
   const showCommandPalette = useCommandPaletteOpener(props.t, () => applying() === undefined)
   const [notices, setNotices] = createSignal<Partial<Record<Target | "home", Notice>>>(
@@ -345,9 +366,12 @@ function Shell(props: {
   const providerSourcePickerScheduled: Record<Target, boolean> = { codex: false, claude: false }
   const reconciliationScheduled: Record<Target, boolean> = { codex: false, claude: false }
   const reconciliationGenerations: Record<Target, number> = { codex: 0, claude: 0 }
+  const requestHistoryScheduled: Record<Target, boolean> = { codex: false, claude: false }
+  const requestHistoryGenerations: Record<Target, number> = { codex: 0, claude: 0 }
   const routeWorkflowScheduled: Record<Target, boolean> = { codex: false, claude: false }
   const routeWorkflowGenerations: Record<Target, number> = { codex: 0, claude: 0 }
   const reconciliationAborts: Partial<Record<Target, AbortController>> = {}
+  const requestHistoryAborts: Partial<Record<Target, AbortController>> = {}
   const reachabilityAborts: Partial<Record<Target, AbortController>> = {}
   const reachabilityGenerations: Record<Target, number> = { codex: 0, claude: 0 }
   let subscriptionAuthorizationGeneration = 0
@@ -359,6 +383,8 @@ function Shell(props: {
     disposed = true
     reconciliationAborts.codex?.abort()
     reconciliationAborts.claude?.abort()
+    requestHistoryAborts.codex?.abort()
+    requestHistoryAborts.claude?.abort()
     subscriptionAuthorizationAbort?.abort()
   })
 
@@ -749,6 +775,204 @@ function Shell(props: {
         },
       })
       if (compatibilityOnly) void probeCompatibility(target, token)
+    })
+  }
+
+  const updateRequestHistory = (
+    target: Target,
+    token: OverlayToken,
+    update: (current: RequestHistoryWorkflowState) => RequestHistoryWorkflowState,
+  ) => {
+    setRequestHistoryByTarget((states) => {
+      const current = states[target]
+      if (!current || current.overlayToken !== token) return states
+      return { ...states, [target]: update(current) }
+    })
+  }
+
+  const loadRequestHistory = async (
+    target: Target,
+    token: OverlayToken,
+    append: boolean,
+  ) => {
+    const current = requestHistoryByTarget()[target]
+    if (!current || current.overlayToken !== token || current.pending) return
+    const beforeCursor = append ? current.nextCursor ?? undefined : undefined
+    if (append && !beforeCursor) return
+    requestHistoryAborts[target]?.abort()
+    const controller = new AbortController()
+    requestHistoryAborts[target] = controller
+    const generation = ++requestHistoryGenerations[target]
+    const originSession = current.originSession
+    updateRequestHistory(target, token, (state) => ({
+      ...state,
+      generation,
+      pending: "list",
+      errorCode: undefined,
+      detail: append ? state.detail : undefined,
+    }))
+    try {
+      const page = await originSession.listRequestRecords({
+        limit: 20,
+        ...(beforeCursor === undefined ? {} : { beforeCursor }),
+      }, controller.signal)
+      const latest = requestHistoryByTarget()[target]
+      if (
+        disposed
+        || exiting
+        || controller.signal.aborted
+        || props.sessions()[target] !== originSession
+        || !latest
+        || latest.overlayToken !== token
+        || latest.originSession !== originSession
+        || latest.generation !== generation
+      ) return
+      updateRequestHistory(target, token, (state) => ({
+        ...state,
+        records: append ? [...state.records, ...page.records] : page.records,
+        nextCursor: page.nextCursor,
+        selectedIndex: append ? state.selectedIndex : 0,
+        pending: undefined,
+      }))
+    } catch (error) {
+      const latest = requestHistoryByTarget()[target]
+      if (
+        disposed
+        || exiting
+        || controller.signal.aborted
+        || props.sessions()[target] !== originSession
+        || !latest
+        || latest.overlayToken !== token
+        || latest.originSession !== originSession
+        || latest.generation !== generation
+      ) return
+      updateRequestHistory(target, token, (state) => ({
+        ...state,
+        pending: undefined,
+        errorCode: safeRequestHistoryProblem(error),
+      }))
+    } finally {
+      if (requestHistoryAborts[target] === controller) delete requestHistoryAborts[target]
+    }
+  }
+
+  const inspectRequestHistory = async (target: Target, token: OverlayToken) => {
+    const current = requestHistoryByTarget()[target]
+    const selected = current?.records[current.selectedIndex]
+    if (!current || current.overlayToken !== token || current.pending || !selected?.hasErrorPayload) return
+    requestHistoryAborts[target]?.abort()
+    const controller = new AbortController()
+    requestHistoryAborts[target] = controller
+    const generation = ++requestHistoryGenerations[target]
+    const originSession = current.originSession
+    updateRequestHistory(target, token, (state) => ({
+      ...state,
+      generation,
+      pending: "detail",
+      detail: undefined,
+      errorCode: undefined,
+    }))
+    try {
+      const detail = await originSession.inspectRequestRecord(selected.id, controller.signal)
+      const latest = requestHistoryByTarget()[target]
+      if (
+        disposed
+        || exiting
+        || controller.signal.aborted
+        || props.sessions()[target] !== originSession
+        || !latest
+        || latest.overlayToken !== token
+        || latest.originSession !== originSession
+        || latest.generation !== generation
+        || latest.records[latest.selectedIndex]?.id !== selected.id
+      ) return
+      updateRequestHistory(target, token, (state) => ({ ...state, detail, pending: undefined }))
+    } catch (error) {
+      const latest = requestHistoryByTarget()[target]
+      if (
+        disposed
+        || exiting
+        || controller.signal.aborted
+        || props.sessions()[target] !== originSession
+        || !latest
+        || latest.overlayToken !== token
+        || latest.originSession !== originSession
+        || latest.generation !== generation
+      ) return
+      updateRequestHistory(target, token, (state) => ({
+        ...state,
+        pending: undefined,
+        errorCode: safeRequestHistoryProblem(error),
+      }))
+    } finally {
+      if (requestHistoryAborts[target] === controller) delete requestHistoryAborts[target]
+    }
+  }
+
+  const selectRequestHistory = (target: Target, token: OverlayToken, delta: -1 | 1) => {
+    updateRequestHistory(target, token, (state) => {
+      if (state.pending || state.records.length === 0) return state
+      const selectedIndex = Math.max(0, Math.min(state.records.length - 1, state.selectedIndex + delta))
+      return selectedIndex === state.selectedIndex
+        ? state
+        : { ...state, selectedIndex, detail: undefined, errorCode: undefined }
+    })
+  }
+
+  const closeRequestHistory = (target: Target, token: OverlayToken) => {
+    const current = requestHistoryByTarget()[target]
+    if (!current || current.overlayToken !== token) return
+    requestHistoryAborts[target]?.abort()
+    overlay.close(token)
+  }
+
+  const openRequestHistory = () => {
+    const target = activeTarget()
+    const originSession = session(target)
+    if (!target || !originSession || requestHistoryScheduled[target] || overlay.depth > 0) return
+    requestHistoryScheduled[target] = true
+    queueMicrotask(() => {
+      requestHistoryScheduled[target] = false
+      if (
+        disposed
+        || exiting
+        || activeTarget() !== target
+        || props.sessions()[target] !== originSession
+        || overlay.depth > 0
+      ) return
+      const token = Symbol(`request-history-${target}`)
+      const initial: RequestHistoryWorkflowState = {
+        target,
+        records: [],
+        nextCursor: null,
+        selectedIndex: 0,
+        overlayToken: token,
+        originSession,
+        generation: requestHistoryGenerations[target],
+      }
+      setRequestHistoryByTarget((states) => ({ ...states, [target]: initial }))
+      overlay.replace({
+        id: "request-history",
+        token,
+        render: () => <RequestHistory
+          state={() => requestHistoryByTarget()[target] ?? initial}
+          t={props.t}
+          onPrevious={() => selectRequestHistory(target, token, -1)}
+          onNext={() => selectRequestHistory(target, token, 1)}
+          onInspect={() => { void inspectRequestHistory(target, token) }}
+          onMore={() => { void loadRequestHistory(target, token, true) }}
+          onCancel={() => closeRequestHistory(target, token)}
+        />,
+        onClose: () => {
+          requestHistoryAborts[target]?.abort()
+          delete requestHistoryAborts[target]
+          requestHistoryGenerations[target]++
+          setRequestHistoryByTarget((states) => states[target]?.overlayToken === token
+            ? { ...states, [target]: undefined }
+            : states)
+        },
+      })
+      void loadRequestHistory(target, token, false)
     })
   }
 
@@ -1772,6 +1996,7 @@ function Shell(props: {
       "target.takeover.apply": () => applyDefaultProvider("takeover"),
       "target.takeover.disable": openDisableTakeoverConfirmation,
       "target.reconciliation.open": openReconciliation,
+      "activity.open": openRequestHistory,
       "route.open": openRouteEditor,
     },
   })
@@ -1790,6 +2015,7 @@ function Shell(props: {
       "target.takeover.apply": () => applyDefaultProvider("takeover"),
       "target.takeover.disable": openDisableTakeoverConfirmation,
       "target.reconciliation.open": openReconciliation,
+      "activity.open": openRequestHistory,
       "route.open": openRouteEditor,
     },
   })

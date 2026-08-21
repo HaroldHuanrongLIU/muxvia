@@ -3,7 +3,7 @@ import { testRender } from "@opentui/solid"
 
 import { MuxviaKeymapProvider } from "../src/commands/keymap"
 import type { TargetSession } from "../src/control/target-session"
-import type { ActionOutcome, CompatibilityProbe, ReconciliationPreview, ReconciliationStrategy, TargetAction, TargetView } from "../src/control/types"
+import type { ActionOutcome, CompatibilityProbe, ReconciliationPreview, ReconciliationStrategy, RequestRecordPage, TargetAction, TargetView } from "../src/control/types"
 import { createTranslator } from "../src/i18n"
 import { App } from "../src/ui/app"
 import { OverlayProvider } from "../src/ui/overlay-stack"
@@ -137,7 +137,30 @@ class StaticTargetSession implements TargetSession {
     }
   }
   async resolveCompatibility(): Promise<never> { throw new Error("compatibility resolution not configured in this fixture") }
-  async listRequestRecords(): Promise<never> { throw new Error("request history not configured in this fixture") }
+  async listRequestRecords(): Promise<RequestRecordPage> {
+    return {
+      target: this.#view.target,
+      records: [{
+        id: "00000000-0000-4000-8000-000000000095",
+        planId: "00000000-0000-4000-8000-000000000096",
+        planEpoch: "00000000-0000-4000-8000-000000000097",
+        providerId: null,
+        providerName: "Responsive History",
+        model: "responsive-history-model",
+        protocol: this.#view.target === "codex" ? "openai-responses" : "anthropic-messages",
+        startedAtUnixMs: 1_700_000_000_000,
+        finishedAtUnixMs: 1_700_000_000_010,
+        latencyMs: 10,
+        outcome: "success",
+        httpStatus: 200,
+        usage: null,
+        estimatedCostNanoUsd: null,
+        hasErrorPayload: false,
+        errorPayloadTruncated: false,
+      }],
+      nextCursor: null,
+    }
+  }
   async inspectRequestRecord(): Promise<never> { throw new Error("request history not configured in this fixture") }
 
   async act(_action: TargetAction): Promise<ActionOutcome> {
@@ -397,6 +420,39 @@ test.each(["codex", "claude"] as const)(
       const regular = setup.captureCharFrame()
       expect(regular).toContain("Command-line flags and resumed sessions may still")
       expect(regular).toContain("Y resolve tested version")
+    } finally {
+      setup.renderer.destroy()
+    }
+  },
+)
+
+test.each([
+  ["codex", "en"],
+  ["claude", "en"],
+  ["codex", "zh-CN"],
+  ["claude", "zh-CN"],
+] as const)(
+  "Request History remains renderable for %s in %s at every required terminal size",
+  async (target, locale) => {
+    const session = new StaticTargetSession(target)
+    const setup = await testRender(() => <App sessions={{ [target]: session }} locale={locale} />, {
+      width: 80,
+      height: 24,
+      useThread: false,
+      kittyKeyboard: true,
+    })
+    try {
+      await setup.renderOnce()
+      setup.mockInput.pressKey(target === "codex" ? "1" : "2")
+      await setup.mockInput.typeText("/activity")
+      setup.mockInput.pressEnter()
+      await setup.waitForFrame((frame) => frame.includes("Responsive History"))
+      for (const [width, height] of [[1, 1], [2, 2], [20, 5], [40, 10], [80, 24], [121, 30]] as const) {
+        setup.resize(width, height)
+        await setup.renderOnce()
+        expect(() => setup.captureCharFrame()).not.toThrow()
+        expectExcludedChrome(setup.captureCharFrame())
+      }
     } finally {
       setup.renderer.destroy()
     }

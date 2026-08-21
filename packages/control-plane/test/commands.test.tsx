@@ -384,6 +384,14 @@ test.each(["codex", "claude"] as const)(
 )
 
 test.each(["codex", "claude"] as const)(
+  "Request History uses one shared slash and palette command for %s",
+  (scope) => {
+    expect(resolveSlash("/activity", scope)).toBe("activity.open")
+    expect(commandsForScope(scope).find((command) => command.id === "activity.open")?.palette).toBeTrue()
+  },
+)
+
+test.each(["codex", "claude"] as const)(
   "Failover routing uses one exact shared command family through the real %s keymap",
   async (scope) => {
     const executed: string[] = []

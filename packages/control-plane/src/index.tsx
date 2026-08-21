@@ -1,23 +1,17 @@
-import { isAbsolute } from "node:path"
+import {
+  controlPlaneRelease,
+  dispatchDiagnostic,
+  parseInvocation,
+  routingServiceRelease,
+} from "./diagnostic-cli"
 
-import { run } from "./app"
+const invocation = parseInvocation(Bun.argv.slice(2))
+if (await dispatchDiagnostic(invocation)) process.exit(process.exitCode ?? 0)
 
-function valueAfter(flag: string): string {
-  const index = Bun.argv.indexOf(flag)
-  const value = index >= 0 ? Bun.argv[index + 1] : undefined
-  if (!value) throw new Error(`Missing ${flag}`)
-  return value
-}
-
-const servicePath = valueAfter("--service")
-const socketPath = valueAfter("--socket")
-if (!isAbsolute(servicePath) || !isAbsolute(socketPath)) {
-  throw new Error("--service and --socket must be absolute paths")
-}
-
+const { run } = await import("./app")
 await run({
-  servicePath,
-  socketPath,
-  release: "muxvia-dev",
-  serviceRelease: "0.1.0",
+  servicePath: invocation.servicePath,
+  socketPath: invocation.socketPath,
+  release: controlPlaneRelease,
+  serviceRelease: routingServiceRelease,
 })

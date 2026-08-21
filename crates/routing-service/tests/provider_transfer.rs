@@ -499,6 +499,29 @@ async fn corrupt_oversized_duplicate_and_hostile_previews_fail_atomically_withou
 }
 
 #[tokio::test]
+async fn oversized_live_target_configuration_is_rejected_before_parsing_without_mutation() {
+    let (_root, user_home, store, transfer) = fixture().await;
+    let configuration_home = user_home.join(".codex");
+    std::fs::create_dir(&configuration_home).unwrap();
+    std::fs::write(
+        configuration_home.join("config.toml"),
+        format!("#{}", "x".repeat(524_288)),
+    )
+    .unwrap();
+    let before = store.target_view_for(Target::Codex).await.unwrap();
+
+    let error = transfer
+        .preview(Target::Codex, ProviderImportSource::LiveTarget)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ProviderTransferError::ImportTooLarge));
+    let after = store.target_view_for(Target::Codex).await.unwrap();
+    assert_eq!(after.management_revision, before.management_revision);
+    assert_eq!(after.providers, before.providers);
+}
+
+#[tokio::test]
 async fn equal_names_with_distinct_normalized_configurations_coexist_in_preview_but_duplicate_configurations_do_not()
  {
     let (_root, _user_home, _store, transfer) = fixture().await;

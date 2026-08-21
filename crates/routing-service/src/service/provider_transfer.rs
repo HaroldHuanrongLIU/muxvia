@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Write,
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -159,10 +160,13 @@ impl ProviderTransferService {
             ProviderImportSource::LiveTarget => {
                 let candidate = match target {
                     Target::Codex => {
-                        let (source_identifier, name, model, base_url, credential) =
-                            CodexConfigCodec::for_user_home(self.home.user_home())
-                                .and_then(|codec| codec.provider_for_import())
-                                .map_err(|_| ProviderTransferError::InvalidImport)?;
+                        let codec = CodexConfigCodec::for_user_home(self.home.user_home())
+                            .map_err(|_| ProviderTransferError::InvalidImport)?;
+                        ensure_bounded_source_file(codec.config_path())?;
+                        let (source_identifier, name, model, base_url, credential) = codec
+                            .provider_for_import()
+                            .map_err(|_| ProviderTransferError::InvalidImport)?;
+                        validate_live_fields(&source_identifier, &name, &model, &credential)?;
                         let base_url = normalize_provider_base_url(&base_url)
                             .map_err(|_| ProviderTransferError::HostileImport)?;
                         let configuration_fingerprint = target_configuration_fingerprint(
@@ -192,10 +196,18 @@ impl ProviderTransferService {
                         }
                     }
                     Target::Claude => {
-                        let (model, base_url, authentication, credential) =
-                            ClaudeConfigCodec::for_user_home(self.home.user_home())
-                                .and_then(|codec| codec.provider_for_import())
-                                .map_err(|_| ProviderTransferError::InvalidImport)?;
+                        let codec = ClaudeConfigCodec::for_user_home(self.home.user_home())
+                            .map_err(|_| ProviderTransferError::InvalidImport)?;
+                        ensure_bounded_source_file(codec.settings_path())?;
+                        let (model, base_url, authentication, credential) = codec
+                            .provider_for_import()
+                            .map_err(|_| ProviderTransferError::InvalidImport)?;
+                        validate_live_fields(
+                            "settings.json:env",
+                            "Imported Claude configuration",
+                            &model,
+                            &credential,
+                        )?;
                         let base_url = normalize_provider_base_url(&base_url)
                             .map_err(|_| ProviderTransferError::HostileImport)?;
                         let configuration_fingerprint = target_configuration_fingerprint(
@@ -849,6 +861,31 @@ fn bounded_text(
 ) -> Result<(), ProviderTransferError> {
     let trimmed = value.trim();
     if (!optional && trimmed.is_empty()) || trimmed.len() > max_bytes || trimmed != value {
+        return Err(ProviderTransferError::HostileImport);
+    }
+    Ok(())
+}
+
+fn ensure_bounded_source_file(path: &Path) -> Result<(), ProviderTransferError> {
+    let bytes = std::fs::metadata(path)
+        .map_err(|_| ProviderTransferError::InvalidImport)?
+        .len();
+    if bytes > MAX_SOURCE_BYTES as u64 {
+        return Err(ProviderTransferError::ImportTooLarge);
+    }
+    Ok(())
+}
+
+fn validate_live_fields(
+    source_identifier: &str,
+    name: &str,
+    model: &str,
+    credential: &SecretString,
+) -> Result<(), ProviderTransferError> {
+    bounded_text(source_identifier, MAX_NAME_BYTES, false)?;
+    bounded_text(name, MAX_NAME_BYTES, false)?;
+    bounded_text(model, MAX_MODEL_BYTES, false)?;
+    if credential.expose_secret().trim().is_empty() {
         return Err(ProviderTransferError::HostileImport);
     }
     Ok(())

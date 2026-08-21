@@ -8,6 +8,10 @@ use crate::service::provider_inspector::{ModelDiscoveryResult, ReachabilityResul
 
 pub const FRAME_LIMIT: u32 = 1_048_576;
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RpcVersion;
 
@@ -239,6 +243,8 @@ pub struct ConfirmProviderImportOperation {
     pub target: Target,
     pub preview_token: Uuid,
     pub choices: Vec<ProviderImportChoice>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_historical_usage: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -257,6 +263,7 @@ pub struct ExportProviderConfigurationOperation {
 pub enum ProviderImportSource {
     LiveTarget,
     CcSwitch { payload: String },
+    CcSwitchSql { path: String },
     MuxviaExport { payload: String },
 }
 
@@ -265,6 +272,7 @@ impl fmt::Debug for ProviderImportSource {
         match self {
             Self::LiveTarget => formatter.write_str("LiveTarget"),
             Self::CcSwitch { .. } => formatter.write_str("CcSwitch(<redacted>)"),
+            Self::CcSwitchSql { .. } => formatter.write_str("CcSwitchSql(<redacted>)"),
             Self::MuxviaExport { .. } => formatter.write_str("MuxviaExport(<redacted>)"),
         }
     }
@@ -1189,6 +1197,18 @@ pub struct ProviderImportPreview {
     pub preview_token: Uuid,
     pub source: ProviderImportSourceView,
     pub candidates: Vec<ProviderImportCandidateView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_usage: Option<ProviderImportHistoricalUsagePreview>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderImportHistoricalUsagePreview {
+    pub record_count: u64,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub estimated_storage_bytes: u64,
+    pub selected_by_default: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1233,6 +1253,8 @@ pub struct ProviderImportMatchView {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderImportOutcome {
     pub records: Vec<ProviderImportRecordView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_usage_imported_records: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1516,6 +1538,20 @@ pub struct DailyUsageRollup {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MigratedUsageRollup {
+    pub id: Uuid,
+    pub source_product: ProviderImportProduct,
+    pub local_date: String,
+    pub source_record_count: u64,
+    pub successful_request_count: u64,
+    pub failed_request_count: u64,
+    pub usage: RequestUsageView,
+    pub latency_observation_count: u64,
+    pub total_latency_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(
     tag = "kind",
     rename_all = "kebab-case",
@@ -1526,6 +1562,7 @@ pub enum UsageActivityEntry {
     RequestRecord { record: RequestRecordSummary },
     NativeUsageRecord { record: NativeUsageRecordSummary },
     DailyUsageRollup { rollup: DailyUsageRollup },
+    MigratedUsageRollup { rollup: MigratedUsageRollup },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1563,6 +1600,8 @@ pub struct UsageClearOutcome {
     pub cleared_request_records: u64,
     pub cleared_native_usage_records: u64,
     pub cleared_daily_rollups: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cleared_migrated_usage_rollups: u64,
     pub cleared_import_cursors: u64,
 }
 

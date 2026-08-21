@@ -1367,7 +1367,11 @@ function Shell(props: {
           target={target}
           t={props.t}
           onPreview={(source) => originSession.previewProviderImport(source)}
-          onConfirm={(previewToken, choices) => originSession.confirmProviderImport(previewToken, choices)}
+          onConfirm={(previewToken, choices, includeHistoricalUsage) => originSession.confirmProviderImport(
+            previewToken,
+            choices,
+            includeHistoricalUsage,
+          )}
           onClose={() => overlay.close(token)}
         />,
       })

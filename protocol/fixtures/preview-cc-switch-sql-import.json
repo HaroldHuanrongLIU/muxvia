@@ -1,0 +1,12 @@
+{
+  "type": "request",
+  "requestId": "cc-switch-sql-preview-1",
+  "operation": {
+    "kind": "preview-provider-import",
+    "target": "codex",
+    "source": {
+      "kind": "cc-switch-sql",
+      "path": "/operator/selected/cc-switch-export.sql"
+    }
+  }
+}

@@ -424,6 +424,42 @@ CREATE TABLE IF NOT EXISTS daily_usage_rollups (
   PRIMARY KEY (target, local_date)
 );
 
+CREATE TABLE IF NOT EXISTS migrated_usage_rollups (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE,
+  target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+  source_product TEXT NOT NULL CHECK (source_product = 'cc-switch'),
+  source_export_fingerprint TEXT NOT NULL CHECK (
+    length(source_export_fingerprint) = 64
+    AND source_export_fingerprint NOT GLOB '*[^0-9a-f]*'
+  ),
+  local_date TEXT NOT NULL CHECK (
+    length(local_date) = 10
+    AND local_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+  ),
+  source_record_count INTEGER NOT NULL CHECK (source_record_count > 0),
+  successful_request_count INTEGER NOT NULL CHECK (successful_request_count >= 0),
+  failed_request_count INTEGER NOT NULL CHECK (failed_request_count >= 0),
+  input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+  cached_input_tokens INTEGER NOT NULL CHECK (cached_input_tokens >= 0),
+  cache_creation_input_tokens INTEGER NOT NULL CHECK (cache_creation_input_tokens >= 0),
+  output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+  latency_observation_count INTEGER NOT NULL CHECK (latency_observation_count >= 0),
+  total_latency_ms INTEGER NOT NULL CHECK (total_latency_ms >= 0),
+  CHECK (successful_request_count + failed_request_count = source_record_count),
+  CHECK (latency_observation_count <= source_record_count),
+  UNIQUE (target, source_export_fingerprint, local_date)
+);
+
+CREATE INDEX IF NOT EXISTS migrated_usage_rollups_target_sequence
+  ON migrated_usage_rollups(target, sequence DESC);
+
+CREATE TRIGGER IF NOT EXISTS migrated_usage_rollups_immutable
+BEFORE UPDATE ON migrated_usage_rollups
+BEGIN
+  SELECT RAISE(ABORT, 'immutable-migrated-usage-rollup');
+END;
+
 CREATE TABLE IF NOT EXISTS usage_settings (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   detailed_retention_days INTEGER NOT NULL
@@ -538,7 +574,7 @@ INSERT OR IGNORE INTO subscription_account_catalog_state
   (singleton, revision, view_sequence, recovery_state)
 VALUES (1, 0, 0, 'clean');
 
-INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '16');
+INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema-version', '17');
 INSERT OR IGNORE INTO usage_settings (singleton, detailed_retention_days) VALUES (1, 30);
 INSERT OR IGNORE INTO universal_provider_catalog_state (
   singleton, revision, view_sequence

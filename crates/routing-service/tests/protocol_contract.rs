@@ -74,7 +74,9 @@ fn fixtures_round_trip_as_their_protocol_types() {
         "open-universal-providers.json",
         "prepare-handover.json",
         "preview-provider-import.json",
+        "preview-cc-switch-sql-import.json",
         "confirm-provider-import.json",
+        "confirm-cc-switch-sql-import.json",
         "export-provider-configuration.json",
         "force-stop.json",
     ] {
@@ -103,12 +105,15 @@ fn fixtures_round_trip_as_their_protocol_types() {
 
     for name in [
         "usage-activity-page.json",
+        "migrated-usage-activity-page.json",
         "native-usage-refresh.json",
         "usage-retention-outcome.json",
         "usage-clear-outcome.json",
         "pricing-catalog-update-outcome.json",
         "provider-import-preview.json",
+        "cc-switch-sql-import-preview.json",
         "provider-import-outcome.json",
+        "cc-switch-sql-import-outcome.json",
         "provider-configuration-export.json",
     ] {
         let frame = fixture(name);
@@ -198,6 +203,7 @@ fn usage_lifecycle_contract_is_closed_target_bound_and_secret_free() {
     ];
     let server_fixtures = [
         "usage-activity-page.json",
+        "migrated-usage-activity-page.json",
         "native-usage-refresh.json",
         "usage-retention-outcome.json",
         "usage-clear-outcome.json",
@@ -225,6 +231,7 @@ fn usage_lifecycle_contract_is_closed_target_bound_and_secret_free() {
     for definition in [
         "nativeUsageRecordSummary",
         "dailyUsageRollup",
+        "migratedUsageRollup",
         "usageActivityEntry",
         "usageActivityPage",
         "nativeUsageRefresh",
@@ -251,16 +258,27 @@ fn provider_transfer_contract_is_preview_first_closed_and_secret_free() {
     assert!(!serialized.contains("provider-import-secret-must-not-escape"));
     assert!(!format!("{parsed:?}").contains("provider-import-secret-must-not-escape"));
 
+    let sql_request = fixture("preview-cc-switch-sql-import.json");
+    let parsed: ClientFrame = serde_json::from_value(sql_request).unwrap();
+    assert!(
+        !format!("{parsed:?}").contains("cc-switch-export.sql"),
+        "SQL import request Debug rendered the Operator-selected path"
+    );
+
     let export = fixture("provider-configuration-export.json");
     let parsed: ServerFrame = serde_json::from_value(export.clone()).unwrap();
     assert_eq!(serde_json::to_value(parsed).unwrap(), export);
 
     for (name, branch) in [
         ("preview-provider-import.json", "operation"),
+        ("preview-cc-switch-sql-import.json", "operation"),
         ("confirm-provider-import.json", "operation"),
+        ("confirm-cc-switch-sql-import.json", "operation"),
         ("export-provider-configuration.json", "operation"),
         ("provider-import-preview.json", "result"),
+        ("cc-switch-sql-import-preview.json", "result"),
         ("provider-import-outcome.json", "result"),
+        ("cc-switch-sql-import-outcome.json", "result"),
         ("provider-configuration-export.json", "result"),
     ] {
         let mut value = fixture(name);
@@ -324,6 +342,7 @@ fn provider_transfer_contract_is_preview_first_closed_and_secret_free() {
     }
     for definition in [
         "providerImportPreview",
+        "providerImportHistoricalUsagePreview",
         "providerImportTargetCandidate",
         "providerImportUniversalCandidate",
         "providerImportChoice",

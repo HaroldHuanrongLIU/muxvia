@@ -67,7 +67,7 @@ fn v12_state_fingerprint(connection: &Connection) -> Vec<(String, u64)> {
                  'metadata', 'request_records', 'pricing_snapshots', 'sqlite_sequence',
                  'native_usage_records', 'native_usage_pricing_snapshots',
                  'native_usage_import_cursors', 'daily_usage_rollups',
-                 'usage_settings', 'pricing_catalog_state'
+                 'usage_settings', 'pricing_catalog_state', 'migrated_usage_rollups'
                )
              ORDER BY name",
         )
@@ -185,7 +185,7 @@ async fn fresh_schema_reopens_with_codex_and_claude_route_rows() {
         })
         .await
         .unwrap();
-    assert_eq!(version, "16");
+    assert_eq!(version, "17");
     assert_eq!(targets, ["claude", "codex"]);
     let _ = fs::remove_dir_all(root);
 }
@@ -341,6 +341,8 @@ async fn schema_v16_migrates_v15_provider_rows_without_changing_their_identity()
              ALTER TABLE universal_providers DROP COLUMN import_source_identifier;
              ALTER TABLE universal_providers DROP COLUMN import_source_target;
              ALTER TABLE universal_providers DROP COLUMN import_source_product;
+             DROP TRIGGER migrated_usage_rollups_immutable;
+             DROP TABLE migrated_usage_rollups;
              UPDATE metadata SET value = '15' WHERE key = 'schema-version';",
         )
         .unwrap();
@@ -377,7 +379,132 @@ async fn schema_v16_migrates_v15_provider_rows_without_changing_their_identity()
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
-    assert_eq!(migrated, ("16".into(), provider_id, universal_id, 4));
+    assert_eq!(migrated, ("17".into(), provider_id, universal_id, 4));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn schema_v17_migrates_v16_state_and_enforces_immutable_unique_migrated_usage() {
+    let root = std::env::temp_dir().join(format!("muxvia-schema-v16-{}", Uuid::new_v4()));
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    drop(StateStore::open(&home).await.unwrap());
+
+    let provider_id = fixed_uuid(165).to_string();
+    let database = Connection::open(home.database_path()).unwrap();
+    database
+        .execute(
+            "INSERT INTO providers
+               (id, target, position, provider_revision, name, base_url, model, protocol,
+                authentication, routing_requirement)
+             VALUES (?1, 'codex', 0, 3, 'Before v17', 'https://v16.example/v1',
+                     'gpt-v16', 'openai-responses', 'openai-bearer', 'direct-compatible')",
+            [&provider_id],
+        )
+        .unwrap();
+    database
+        .execute_batch(
+            "DROP TRIGGER migrated_usage_rollups_immutable;
+             DROP TABLE migrated_usage_rollups;
+             UPDATE metadata SET value = '16' WHERE key = 'schema-version';",
+        )
+        .unwrap();
+    drop(database);
+
+    drop(StateStore::open(&home).await.unwrap());
+    let database = Connection::open(home.database_path()).unwrap();
+    let migrated: (String, String, u64) = database
+        .query_row(
+            "SELECT
+               (SELECT value FROM metadata WHERE key = 'schema-version'),
+               (SELECT id FROM providers WHERE name = 'Before v17'),
+               (SELECT COUNT(*) FROM pragma_table_info('migrated_usage_rollups'))",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(migrated, ("17".into(), provider_id, 15));
+
+    let insert = |id: Uuid| {
+        database.execute(
+            "INSERT INTO migrated_usage_rollups
+               (id, target, source_product, source_export_fingerprint, local_date,
+                source_record_count, successful_request_count, failed_request_count,
+                input_tokens, cached_input_tokens, cache_creation_input_tokens,
+                output_tokens, latency_observation_count, total_latency_ms)
+             VALUES (?1, 'codex', 'cc-switch', ?2, '2026-01-01',
+                     1, 1, 0, 1, 0, 0, 1, 1, 1)",
+            tokio_rusqlite::rusqlite::params![id.to_string(), "a".repeat(64)],
+        )
+    };
+    insert(fixed_uuid(166)).unwrap();
+    assert!(
+        insert(fixed_uuid(167)).is_err(),
+        "accepted duplicate export usage"
+    );
+    assert!(
+        database
+            .execute(
+                "UPDATE migrated_usage_rollups SET input_tokens = 2 WHERE local_date = '2026-01-01'",
+                [],
+            )
+            .is_err(),
+        "migrated usage rollup was mutable"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn schema_v17_collision_rolls_back_then_reruns_from_v16() {
+    let root = std::env::temp_dir().join(format!("muxvia-schema-v16-failure-{}", Uuid::new_v4()));
+    let user_home = root.join("home");
+    fs::create_dir_all(&user_home).unwrap();
+    let home = MuxviaHome::from_user_home(&user_home);
+    drop(StateStore::open(&home).await.unwrap());
+
+    let database = Connection::open(home.database_path()).unwrap();
+    database
+        .execute_batch(
+            "DROP TRIGGER migrated_usage_rollups_immutable;
+             DROP TABLE migrated_usage_rollups;
+             CREATE TABLE migrated_usage_rollups (collision TEXT NOT NULL);
+             UPDATE metadata SET value = '16' WHERE key = 'schema-version';",
+        )
+        .unwrap();
+    drop(database);
+
+    assert!(StateStore::open(&home).await.is_err());
+    let database = Connection::open(home.database_path()).unwrap();
+    let failed: (String, u64) = database
+        .query_row(
+            "SELECT
+               (SELECT value FROM metadata WHERE key = 'schema-version'),
+               (SELECT COUNT(*) FROM pragma_table_info('migrated_usage_rollups'))",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(failed, ("16".into(), 1));
+    database
+        .execute("DROP TABLE migrated_usage_rollups", [])
+        .unwrap();
+    drop(database);
+
+    drop(StateStore::open(&home).await.unwrap());
+    let database = Connection::open(home.database_path()).unwrap();
+    let rerun: (String, u64, u64) = database
+        .query_row(
+            "SELECT
+               (SELECT value FROM metadata WHERE key = 'schema-version'),
+               (SELECT COUNT(*) FROM pragma_table_info('migrated_usage_rollups')),
+               (SELECT COUNT(*) FROM sqlite_schema
+                WHERE type = 'trigger' AND name = 'migrated_usage_rollups_immutable')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(rerun, ("17".into(), 15, 1));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -590,18 +717,19 @@ async fn schema_v15_migration_preserves_v12_target_state() {
              WHERE type = 'table' AND name IN (
                'request_records', 'pricing_snapshots', 'native_usage_records',
                'native_usage_pricing_snapshots', 'native_usage_import_cursors',
-               'daily_usage_rollups', 'usage_settings', 'pricing_catalog_state'
+               'daily_usage_rollups', 'usage_settings', 'pricing_catalog_state',
+               'migrated_usage_rollups'
              )",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "16");
+    assert_eq!(version, "17");
     assert_eq!(
         after, before,
         "schema-v15 migration changed existing v12 state"
     );
-    assert_eq!(tables, 8);
+    assert_eq!(tables, 9);
     let _ = fs::remove_dir_all(root);
 }
 
@@ -635,6 +763,8 @@ async fn schema_v15_migrates_v13_to_parent_cascade_only_pricing_deletion() {
              ALTER TABLE universal_providers DROP COLUMN import_source_identifier;
              ALTER TABLE universal_providers DROP COLUMN import_source_target;
              ALTER TABLE universal_providers DROP COLUMN import_source_product;
+             DROP TRIGGER migrated_usage_rollups_immutable;
+             DROP TABLE migrated_usage_rollups;
              UPDATE metadata SET value = '13' WHERE key = 'schema-version';",
         )
         .unwrap();
@@ -683,7 +813,7 @@ async fn schema_v15_migrates_v13_to_parent_cascade_only_pricing_deletion() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "16");
+    assert_eq!(version, "17");
     assert!(
         database
             .execute("DELETE FROM pricing_snapshots", [])
@@ -748,7 +878,7 @@ async fn schema_v15_failed_migration_rolls_back_then_reruns() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(rerun, ("16".into(), 1, 1));
+    assert_eq!(rerun, ("17".into(), 1, 1));
     let _ = fs::remove_dir_all(root);
 }
 

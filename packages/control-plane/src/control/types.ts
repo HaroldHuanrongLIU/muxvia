@@ -339,6 +339,7 @@ const targetActionSchema = z.discriminatedUnion("kind", [
 const providerImportSourceSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("live-target") }).strict(),
   z.object({ kind: z.literal("cc-switch"), payload: z.string().max(524_288) }).strict(),
+  z.object({ kind: z.literal("cc-switch-sql"), path: z.string().max(4_096) }).strict(),
   z.object({ kind: z.literal("muxvia-export"), payload: z.string().max(524_288) }).strict(),
 ])
 
@@ -397,7 +398,14 @@ const providerImportPreviewSchema = z.object({
     product: z.enum(["target-cli", "cc-switch", "muxvia"]),
     target: z.enum(["codex", "claude", "universal"]),
   }).strict(),
-  candidates: z.array(providerImportCandidateSchema).min(1).max(256),
+  candidates: z.array(providerImportCandidateSchema).max(256),
+  historicalUsage: z.object({
+    recordCount: z.number().int().nonnegative(),
+    startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable(),
+    endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable(),
+    estimatedStorageBytes: z.number().int().nonnegative(),
+    selectedByDefault: z.literal(false),
+  }).strict().optional(),
 }).strict()
 
 const providerImportRecordSchema = z.discriminatedUnion("kind", [
@@ -417,7 +425,8 @@ const providerImportRecordSchema = z.discriminatedUnion("kind", [
 ])
 
 const providerImportOutcomeSchema = z.object({
-  records: z.array(providerImportRecordSchema).min(1).max(256),
+  records: z.array(providerImportRecordSchema).max(256),
+  historicalUsageImportedRecords: z.number().int().nonnegative().optional(),
 }).strict()
 
 const providerConfigurationExportSchema = z.object({
@@ -556,7 +565,8 @@ const controlOperationSchema = z.discriminatedUnion("kind", [
     kind: z.literal("confirm-provider-import"),
     target: targetSchema,
     previewToken: z.string().uuid(),
-    choices: z.array(providerImportChoiceSchema).min(1).max(256),
+    choices: z.array(providerImportChoiceSchema).max(256),
+    includeHistoricalUsage: z.boolean().optional(),
   }).strict(),
   z.object({
     kind: z.literal("export-provider-configuration"),
@@ -889,10 +899,23 @@ const dailyUsageRollupSchema = z.object({
   totalLatencyMs: z.number().int().nonnegative(),
 }).strict()
 
+const migratedUsageRollupSchema = z.object({
+  id: z.string().uuid(),
+  sourceProduct: z.literal("cc-switch"),
+  localDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  sourceRecordCount: z.number().int().positive(),
+  successfulRequestCount: z.number().int().nonnegative(),
+  failedRequestCount: z.number().int().nonnegative(),
+  usage: requestUsageSchema,
+  latencyObservationCount: z.number().int().nonnegative(),
+  totalLatencyMs: z.number().int().nonnegative(),
+}).strict()
+
 const usageActivityEntrySchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("request-record"), record: requestRecordSummarySchema }).strict(),
   z.object({ kind: z.literal("native-usage-record"), record: nativeUsageRecordSummarySchema }).strict(),
   z.object({ kind: z.literal("daily-usage-rollup"), rollup: dailyUsageRollupSchema }).strict(),
+  z.object({ kind: z.literal("migrated-usage-rollup"), rollup: migratedUsageRollupSchema }).strict(),
 ])
 
 const usageActivityPageSchema = z.object({
@@ -922,6 +945,7 @@ const usageClearOutcomeSchema = z.object({
   clearedRequestRecords: z.number().int().nonnegative(),
   clearedNativeUsageRecords: z.number().int().nonnegative(),
   clearedDailyRollups: z.number().int().nonnegative(),
+  clearedMigratedUsageRollups: z.number().int().nonnegative().optional(),
   clearedImportCursors: z.number().int().nonnegative(),
 }).strict()
 

@@ -140,6 +140,10 @@ _Avoid_: Transcript, session, trace
 Usage metadata imported incrementally from a Target CLI's own local session log rather than observed by the Routing Plane.
 _Avoid_: Request Record, transcript, routed request
 
+**Migrated Usage Record**:
+Usage metadata imported from an Operator-selected external product export, retaining its source provenance without claiming that Muxvia routed or natively observed the request.
+_Avoid_: Request Record, Native Usage Record, imported transcript
+
 **Daily Usage Rollup**:
 The aggregate counts, tokens, costs, and latency retained for a completed local calendar day after older detailed usage records are pruned.
 _Avoid_: Request Record, backup, billing statement

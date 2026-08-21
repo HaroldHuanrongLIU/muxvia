@@ -69,10 +69,15 @@ test.each([
   ["subscription-account-act.json", parseClientFrame],
   ["subscription-account-outcome.json", parseServerFrame],
   ["preview-provider-import.json", parseClientFrame],
+  ["preview-cc-switch-sql-import.json", parseClientFrame],
   ["confirm-provider-import.json", parseClientFrame],
+  ["confirm-cc-switch-sql-import.json", parseClientFrame],
   ["export-provider-configuration.json", parseClientFrame],
   ["provider-import-preview.json", parseServerFrame],
+  ["cc-switch-sql-import-preview.json", parseServerFrame],
   ["provider-import-outcome.json", parseServerFrame],
+  ["cc-switch-sql-import-outcome.json", parseServerFrame],
+  ["migrated-usage-activity-page.json", parseServerFrame],
   ["provider-configuration-export.json", parseServerFrame],
 ] as const)("round-trips %s as its protocol type", async (name, parse) => {
   const value = await readFixture(name)
@@ -82,10 +87,14 @@ test.each([
 test("Provider Transfer contracts are preview-first, closed, and secret-free", async () => {
   for (const [name, parse, surface] of [
     ["preview-provider-import.json", parseClientFrame, "operation"],
+    ["preview-cc-switch-sql-import.json", parseClientFrame, "operation"],
     ["confirm-provider-import.json", parseClientFrame, "operation"],
+    ["confirm-cc-switch-sql-import.json", parseClientFrame, "operation"],
     ["export-provider-configuration.json", parseClientFrame, "operation"],
     ["provider-import-preview.json", parseServerFrame, "result"],
+    ["cc-switch-sql-import-preview.json", parseServerFrame, "result"],
     ["provider-import-outcome.json", parseServerFrame, "result"],
+    ["cc-switch-sql-import-outcome.json", parseServerFrame, "result"],
     ["provider-configuration-export.json", parseServerFrame, "result"],
   ] as const) {
     const value = await readFixture(name) as any

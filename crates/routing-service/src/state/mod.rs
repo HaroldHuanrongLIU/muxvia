@@ -12,10 +12,11 @@ mod usage;
 pub use crate::control::protocol::CompatibilityClassification;
 pub use migrations::SCHEMA_VERSION;
 pub(crate) use provider_transfer::{
-    ProviderImportCandidateInput, ProviderImportCommit, ProviderImportCommitError,
-    ProviderImportCommitInput, ProviderImportFailoverDraftInput,
-    ProviderImportGeneratedSourceInput, ProviderImportResolutionInput, ProviderImportTargetInput,
-    ProviderImportTargetMatchInput, ProviderImportUniversalInput,
+    MigratedUsageImportInput, MigratedUsageRollupInput, ProviderImportCandidateInput,
+    ProviderImportCommit, ProviderImportCommitError, ProviderImportCommitInput,
+    ProviderImportFailoverDraftInput, ProviderImportGeneratedSourceInput,
+    ProviderImportResolutionInput, ProviderImportTargetInput, ProviderImportTargetMatchInput,
+    ProviderImportUniversalInput,
 };
 pub(crate) use reconciliation::{
     AdoptReconciliation, ReconciliationCommit, ReconciliationCommitFailpoint,

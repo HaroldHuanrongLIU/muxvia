@@ -143,7 +143,11 @@ class MemoryTargetSession implements TargetSession {
   readonly reachabilityChecks: string[] = []
   readonly discoveryRequests: DiscoverySource[] = []
   readonly providerImportSources: ProviderImportSource[] = []
-  readonly providerImportConfirmations: Array<{ previewToken: string; choices: ProviderImportChoice[] }> = []
+  readonly providerImportConfirmations: Array<{
+    previewToken: string
+    choices: ProviderImportChoice[]
+    includeHistoricalUsage: boolean
+  }> = []
   lastError: unknown
   readonly #listeners = new Set<(next: TargetView) => void>()
   #view: TargetView
@@ -159,7 +163,11 @@ class MemoryTargetSession implements TargetSession {
   reachabilityHandler?: (providerId: string, providerRevision: number, signal?: AbortSignal) => Promise<ReachabilityResult>
   discoveryHandler?: (source: DiscoverySource, signal?: AbortSignal) => Promise<ModelDiscoveryResult>
   providerImportPreviewHandler?: (source: ProviderImportSource) => Promise<ProviderImportPreview>
-  providerImportConfirmHandler?: (previewToken: string, choices: ProviderImportChoice[]) => Promise<ProviderImportOutcome>
+  providerImportConfirmHandler?: (
+    previewToken: string,
+    choices: ProviderImportChoice[],
+    includeHistoricalUsage: boolean,
+  ) => Promise<ProviderImportOutcome>
   providerExportHandler?: () => Promise<ProviderConfigurationExport>
 
   constructor(
@@ -234,10 +242,18 @@ class MemoryTargetSession implements TargetSession {
     if (!this.providerImportPreviewHandler) throw new Error("Provider Import preview not configured in this fixture")
     return await this.providerImportPreviewHandler(source)
   }
-  async confirmProviderImport(previewToken: string, choices: ProviderImportChoice[]): Promise<ProviderImportOutcome> {
-    this.providerImportConfirmations.push({ previewToken, choices: structuredClone(choices) })
+  async confirmProviderImport(
+    previewToken: string,
+    choices: ProviderImportChoice[],
+    includeHistoricalUsage = false,
+  ): Promise<ProviderImportOutcome> {
+    this.providerImportConfirmations.push({
+      previewToken,
+      choices: structuredClone(choices),
+      includeHistoricalUsage,
+    })
     if (!this.providerImportConfirmHandler) throw new Error("Provider Import confirmation not configured in this fixture")
-    return await this.providerImportConfirmHandler(previewToken, choices)
+    return await this.providerImportConfirmHandler(previewToken, choices, includeHistoricalUsage)
   }
   async exportProviderConfiguration(): Promise<ProviderConfigurationExport> {
     if (!this.providerExportHandler) throw new Error("Provider export not configured in this fixture")
@@ -701,6 +717,7 @@ test("/import-providers previews pasted data before confirmation and /export-pro
     expect(session.providerImportConfirmations).toEqual([{
       previewToken,
       choices: [{ candidateId, resolution: { kind: "use-existing", providerId: existingId } }],
+      includeHistoricalUsage: false,
     }])
     expect(setup.captureCharFrame()).toContain("Imported 1 Provider record(s).")
     setup.mockInput.pressEnter()
@@ -715,6 +732,74 @@ test("/import-providers previews pasted data before confirmation and /export-pro
     expect(exportFrame).toContain("Credentials and runtime state are always excluded.")
     expect(exportFrame).toContain("muxvia-provider-configuration")
     expect(exportFrame).not.toContain(transferSecret)
+  } finally {
+    setup.renderer.destroy()
+  }
+})
+
+test("selected CC-Switch SQL usage is default-off and can confirm as a usage-only migration", async () => {
+  const selectedPath = "/operator/selected/cc-switch-export.sql"
+  const previewToken = "00000000-0000-4000-8000-000000000164"
+  const session = new MemoryTargetSession(view())
+  session.providerImportPreviewHandler = async () => ({
+    previewToken,
+    source: { product: "cc-switch", target: "codex" },
+    candidates: [],
+    historicalUsage: {
+      recordCount: 5,
+      startDate: "2025-12-31",
+      endDate: "2026-01-01",
+      estimatedStorageBytes: 512,
+      selectedByDefault: false,
+    },
+  })
+  session.providerImportConfirmHandler = async (_token, choices, includeHistoricalUsage) => {
+    expect(choices).toEqual([])
+    expect(includeHistoricalUsage).toBeTrue()
+    return { records: [], historicalUsageImportedRecords: 5 }
+  }
+  const setup = await testRender(() => <App session={session} />, {
+    width: 100,
+    height: 28,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.renderOnce()
+    await setup.mockInput.typeText("/import-providers")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    setup.mockInput.pressArrow("down")
+    await setup.renderOnce()
+    setup.mockInput.pressArrow("down")
+    await setup.renderOnce()
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    await setup.mockInput.typeText(selectedPath)
+    setup.mockInput.pressEnter()
+    await Bun.sleep(1)
+    await setup.renderOnce()
+
+    expect(session.providerImportSources).toEqual([{ kind: "cc-switch-sql", path: selectedPath }])
+    expect(setup.captureCharFrame()).toContain("[ ] Migrated Usage Records (default off)")
+    setup.mockInput.pressEnter()
+    await setup.renderOnce()
+    expect(session.providerImportConfirmations).toEqual([])
+
+    await setup.mockInput.typeText("u")
+    await setup.renderOnce()
+    expect(setup.captureCharFrame()).toContain("[x] Migrated Usage Records (default off)")
+    setup.mockInput.pressEnter()
+    await Bun.sleep(1)
+    await setup.renderOnce()
+    expect(session.providerImportConfirmations).toEqual([{
+      previewToken,
+      choices: [],
+      includeHistoricalUsage: true,
+    }])
+    expect(setup.captureCharFrame()).toContain("Imported 5 Migrated Usage Record(s).")
   } finally {
     setup.renderer.destroy()
   }

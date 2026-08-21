@@ -19,6 +19,26 @@ pub(crate) struct ProviderImportCommitInput {
     pub source_target: ProviderImportSourceTarget,
     pub candidates: Vec<ProviderImportCandidateInput>,
     pub failover_drafts: Option<Vec<ProviderImportFailoverDraftInput>>,
+    pub historical_usage: Option<MigratedUsageImportInput>,
+}
+
+pub(crate) struct MigratedUsageImportInput {
+    pub target: Target,
+    pub source_export_fingerprint: String,
+    pub rollups: Vec<MigratedUsageRollupInput>,
+}
+
+pub(crate) struct MigratedUsageRollupInput {
+    pub local_date: String,
+    pub source_record_count: u64,
+    pub successful_request_count: u64,
+    pub failed_request_count: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub output_tokens: u64,
+    pub latency_observation_count: u64,
+    pub total_latency_ms: u64,
 }
 
 pub(crate) struct ProviderImportTargetMatchInput {
@@ -99,12 +119,14 @@ pub(crate) struct ProviderConfigurationExportSnapshot {
 
 pub(crate) enum ProviderImportCommitError {
     InvalidChoice,
+    DuplicateHistoricalUsage,
     State,
 }
 
 enum CommitAttempt {
     Applied(ProviderImportCommit),
     InvalidChoice,
+    DuplicateHistoricalUsage,
 }
 
 enum TargetInsert<'a> {
@@ -316,6 +338,9 @@ impl StateStore {
         match attempt {
             CommitAttempt::Applied(commit) => Ok(commit),
             CommitAttempt::InvalidChoice => Err(ProviderImportCommitError::InvalidChoice),
+            CommitAttempt::DuplicateHistoricalUsage => {
+                Err(ProviderImportCommitError::DuplicateHistoricalUsage)
+            }
         }
     }
 }
@@ -519,6 +544,54 @@ fn commit_provider_import_transaction(
         )?;
     }
 
+    let historical_usage_imported_records = if let Some(usage) = &input.historical_usage {
+        if !usage.rollups.is_empty() {
+            let duplicate = transaction.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM migrated_usage_rollups
+                   WHERE target = ?1 AND source_export_fingerprint = ?2
+                 )",
+                params![usage.target.as_str(), usage.source_export_fingerprint],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if duplicate {
+                return Ok(CommitAttempt::DuplicateHistoricalUsage);
+            }
+        }
+        let mut imported = 0_u64;
+        for rollup in &usage.rollups {
+            transaction.execute(
+                "INSERT INTO migrated_usage_rollups
+                 (id, target, source_product, source_export_fingerprint, local_date,
+                  source_record_count, successful_request_count, failed_request_count,
+                  input_tokens, cached_input_tokens, cache_creation_input_tokens,
+                  output_tokens, latency_observation_count, total_latency_ms)
+                 VALUES (?1, ?2, 'cc-switch', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    usage.target.as_str(),
+                    usage.source_export_fingerprint,
+                    rollup.local_date,
+                    rollup.source_record_count,
+                    rollup.successful_request_count,
+                    rollup.failed_request_count,
+                    rollup.input_tokens,
+                    rollup.cached_input_tokens,
+                    rollup.cache_creation_input_tokens,
+                    rollup.output_tokens,
+                    rollup.latency_observation_count,
+                    rollup.total_latency_ms,
+                ],
+            )?;
+            imported = imported
+                .checked_add(rollup.source_record_count)
+                .ok_or_else(|| StateError::Sqlite(tokio_rusqlite::rusqlite::Error::InvalidQuery))?;
+        }
+        Some(imported)
+    } else {
+        None
+    };
+
     let universal_changed = input.candidates.iter().any(|candidate| {
         matches!(
             candidate,
@@ -556,7 +629,10 @@ fn commit_provider_import_transaction(
     }
 
     Ok(CommitAttempt::Applied(ProviderImportCommit {
-        outcome: ProviderImportOutcome { records },
+        outcome: ProviderImportOutcome {
+            records,
+            historical_usage_imported_records,
+        },
         target_views,
         universal_view,
     }))

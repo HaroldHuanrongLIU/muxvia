@@ -8260,3 +8260,173 @@ async fn provider_transfer_preview_and_export_are_target_scoped_and_secret_free_
 
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn cc_switch_sql_provider_and_usage_migrate_clear_and_fail_closed_over_the_real_socket() {
+    let mut fixture = ControlFixture::start().await;
+    let mut stream = fixture.connect().await;
+    hello(&mut stream).await;
+    request(
+        &mut stream,
+        "open-cc-switch-sql-import",
+        json!({ "kind": "open-target", "target": "codex" }),
+    )
+    .await;
+    let export_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cc-switch-v3.19.2-export.sql");
+
+    let preview = request(
+        &mut stream,
+        "preview-cc-switch-sql-import",
+        json!({
+            "kind": "preview-provider-import",
+            "target": "codex",
+            "source": {
+                "kind": "cc-switch-sql",
+                "path": export_path.to_string_lossy()
+            }
+        }),
+    )
+    .await;
+    assert_eq!(preview["type"], "response");
+    assert_eq!(
+        preview["result"]["preview"]["candidates"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        preview["result"]["preview"]["historicalUsage"]["recordCount"],
+        5
+    );
+    assert_eq!(
+        preview["result"]["preview"]["historicalUsage"]["selectedByDefault"],
+        false
+    );
+    let preview_text = preview.to_string();
+    for forbidden in [
+        "cc-switch-v3.19.2-export.sql",
+        "ccswitch-codex-credential-fixture",
+        "codex-session-secret-identity",
+        "upstream-error-secret-payload",
+    ] {
+        assert!(!preview_text.contains(forbidden));
+    }
+
+    let preview_token = preview["result"]["preview"]["previewToken"]
+        .as_str()
+        .unwrap();
+    let candidate_id = preview["result"]["preview"]["candidates"][0]["candidateId"]
+        .as_str()
+        .unwrap();
+    let confirmed = request(
+        &mut stream,
+        "confirm-cc-switch-sql-import",
+        json!({
+            "kind": "confirm-provider-import",
+            "target": "codex",
+            "previewToken": preview_token,
+            "choices": [{
+                "candidateId": candidate_id,
+                "resolution": { "kind": "create" }
+            }],
+            "includeHistoricalUsage": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        confirmed["result"]["outcome"]["historicalUsageImportedRecords"],
+        5
+    );
+    let push = read_frame(&mut stream).await.unwrap();
+    assert_eq!(
+        push["view"]["providers"][0]["importProvenance"]["sourceProduct"],
+        "cc-switch"
+    );
+
+    let activity = request(
+        &mut stream,
+        "list-migrated-usage",
+        json!({
+            "kind": "list-usage-activity",
+            "target": "codex",
+            "limit": 10
+        }),
+    )
+    .await;
+    let entries = activity["result"]["page"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry["kind"] == "migrated-usage-rollup")
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["rollup"]["sourceRecordCount"].as_u64().unwrap())
+            .sum::<u64>(),
+        5
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry["rollup"]["sourceProduct"] == "cc-switch")
+    );
+
+    let duplicate = request(
+        &mut stream,
+        "preview-duplicate-cc-switch-usage",
+        json!({
+            "kind": "preview-provider-import",
+            "target": "codex",
+            "source": {
+                "kind": "cc-switch-sql",
+                "path": export_path.to_string_lossy()
+            }
+        }),
+    )
+    .await;
+    let duplicate_error = request(
+        &mut stream,
+        "confirm-duplicate-cc-switch-usage",
+        json!({
+            "kind": "confirm-provider-import",
+            "target": "codex",
+            "previewToken": duplicate["result"]["preview"]["previewToken"],
+            "choices": [],
+            "includeHistoricalUsage": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        duplicate_error["problem"]["code"],
+        "cc-switch-usage-already-imported"
+    );
+
+    let invalid = request(
+        &mut stream,
+        "reject-relative-cc-switch-export",
+        json!({
+            "kind": "preview-provider-import",
+            "target": "codex",
+            "source": { "kind": "cc-switch-sql", "path": "relative-export.sql" }
+        }),
+    )
+    .await;
+    assert_eq!(invalid["problem"]["code"], "invalid-cc-switch-export");
+    assert!(!invalid.to_string().contains("relative-export.sql"));
+
+    let cleared = request(
+        &mut stream,
+        "clear-migrated-usage",
+        json!({ "kind": "clear-usage", "target": "codex" }),
+    )
+    .await;
+    assert_eq!(
+        cleared["result"]["outcome"]["clearedMigratedUsageRollups"],
+        2
+    );
+    fixture.shutdown().await;
+}

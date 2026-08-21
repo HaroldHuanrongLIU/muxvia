@@ -921,6 +921,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrated_usage_is_distinct_unpriced_retention_stable_and_cleared_atomically() {
+        let (_root, home, store, service) = fixture().await;
+        let database = Connection::open(home.database_path()).unwrap();
+        database
+            .execute(
+                "INSERT INTO migrated_usage_rollups
+                   (id, target, source_product, source_export_fingerprint, local_date,
+                    source_record_count, successful_request_count, failed_request_count,
+                    input_tokens, cached_input_tokens, cache_creation_input_tokens,
+                    output_tokens, latency_observation_count, total_latency_ms)
+                 VALUES (?1, 'codex', 'cc-switch', ?2, '2020-01-02',
+                         5, 4, 1, 410, 0, 0, 80, 4, 600)",
+                tokio_rusqlite::rusqlite::params![Uuid::new_v4().to_string(), "a".repeat(64),],
+            )
+            .unwrap();
+
+        let now = parse_rfc3339_ms("2026-08-21T12:00:00Z").unwrap();
+        store
+            .apply_usage_retention(Target::Codex, 1, now)
+            .await
+            .unwrap();
+        let page = service.list(Target::Codex, None, 10).await.unwrap();
+        let UsageActivityEntry::MigratedUsageRollup { rollup } = &page.entries[0] else {
+            panic!("CC-Switch usage was projected as a native Muxvia record")
+        };
+        assert_eq!(
+            rollup.source_product,
+            crate::control::protocol::ProviderImportProduct::CcSwitch
+        );
+        assert_eq!(rollup.local_date, "2020-01-02");
+        assert_eq!(rollup.source_record_count, 5);
+        assert_eq!(rollup.usage.input_tokens, 410);
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM migrated_usage_rollups", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            1,
+            "ordinary detail retention pruned an already aggregated migration"
+        );
+
+        let cleared = service.clear(Target::Codex).await.unwrap();
+        assert_eq!(cleared.cleared_migrated_usage_rollups, 1);
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM migrated_usage_rollups", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn retention_overflow_rolls_back_setting_rollup_and_detail_changes() {
         let (_root, home, store, service) = fixture().await;
         let directory = home.user_home().join(".claude/projects/overflow-test");
@@ -1125,7 +1180,15 @@ mod tests {
                     priced_record_count, unpriced_record_count, estimated_cost_nano_usd,
                     latency_observation_count, total_latency_ms)
                  VALUES ('codex', '2020-01-01', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-                 CREATE TRIGGER fail_usage_clear BEFORE DELETE ON native_usage_records
+                 INSERT INTO migrated_usage_rollups
+                   (id, target, source_product, source_export_fingerprint, local_date,
+                    source_record_count, successful_request_count, failed_request_count,
+                    input_tokens, cached_input_tokens, cache_creation_input_tokens,
+                    output_tokens, latency_observation_count, total_latency_ms)
+                 VALUES ('00000000-0000-4000-8000-000000001516', 'codex', 'cc-switch',
+                         'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                         '2020-01-01', 1, 1, 0, 1, 0, 0, 1, 1, 1);
+                 CREATE TRIGGER fail_usage_clear BEFORE DELETE ON migrated_usage_rollups
                  BEGIN SELECT RAISE(ABORT, 'test-clear-failure'); END;",
             )
             .unwrap();
@@ -1143,6 +1206,7 @@ mod tests {
                        (SELECT COUNT(*) FROM native_usage_records),
                        (SELECT COUNT(*) FROM native_usage_pricing_snapshots),
                        (SELECT COUNT(*) FROM daily_usage_rollups),
+                       (SELECT COUNT(*) FROM migrated_usage_rollups),
                        (SELECT COUNT(*) FROM native_usage_import_cursors)",
                     [],
                     |row| {
@@ -1154,17 +1218,18 @@ mod tests {
                             row.get::<_, u64>(4)?,
                             row.get::<_, u64>(5)?,
                             row.get::<_, u64>(6)?,
+                            row.get::<_, u64>(7)?,
                         ))
                     },
                 )
                 .unwrap()
         };
-        assert_eq!(usage_counts(&database), (1, 1, 1, 1, 1, 1, 1));
+        assert_eq!(usage_counts(&database), (1, 1, 1, 1, 1, 1, 1, 1));
         database
             .execute_batch("DROP TRIGGER fail_usage_clear")
             .unwrap();
         service.clear(Target::Codex).await.unwrap();
-        assert_eq!(usage_counts(&database), (0, 0, 0, 0, 0, 0, 0));
+        assert_eq!(usage_counts(&database), (0, 0, 0, 0, 0, 0, 0, 0));
         assert_eq!(
             database
                 .query_row(

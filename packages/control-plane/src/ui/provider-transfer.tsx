@@ -1,5 +1,5 @@
 import type { InputRenderable, KeyEvent } from "@opentui/core"
-import { createEffect, createSignal, For, onMount, Show } from "solid-js"
+import { createEffect, createSignal, For, onMount, Show, type Accessor } from "solid-js"
 
 import type {
   ProviderConfigurationExport,
@@ -13,10 +13,10 @@ import type {
 import type { Translator } from "../i18n"
 import { theme } from "../theme"
 
-type ImportSourceKind = "live-target" | "cc-switch" | "muxvia-export"
+type ImportSourceKind = "live-target" | "cc-switch" | "cc-switch-sql" | "muxvia-export"
 type Stage = "source" | "payload" | "preview" | "complete"
 
-const importSourceKinds: readonly ImportSourceKind[] = ["live-target", "cc-switch", "muxvia-export"]
+const importSourceKinds: readonly ImportSourceKind[] = ["live-target", "cc-switch", "cc-switch-sql", "muxvia-export"]
 
 function safeProblemCode(error: unknown): string {
   return typeof error === "object" && error !== null && "code" in error
@@ -28,7 +28,11 @@ export function ProviderImportWizard(props: {
   target: Target
   t: Translator
   onPreview: (source: ProviderImportSource) => Promise<ProviderImportPreview>
-  onConfirm: (previewToken: string, choices: ProviderImportChoice[]) => Promise<ProviderImportOutcome>
+  onConfirm: (
+    previewToken: string,
+    choices: ProviderImportChoice[],
+    includeHistoricalUsage: boolean,
+  ) => Promise<ProviderImportOutcome>
   onClose: () => void
 }) {
   const [stage, setStage] = createSignal<Stage>("source")
@@ -39,6 +43,7 @@ export function ProviderImportWizard(props: {
   const [selectedIndex, setSelectedIndex] = createSignal(0)
   const [selected, setSelected] = createSignal<Set<string>>(new Set())
   const [resolutions, setResolutions] = createSignal<Record<string, ProviderImportChoice["resolution"]>>({})
+  const [includeHistoricalUsage, setIncludeHistoricalUsage] = createSignal(false)
   const [pending, setPending] = createSignal(false)
   const [errorCode, setErrorCode] = createSignal<string>()
   const [keyCapture, setKeyCapture] = createSignal("")
@@ -76,6 +81,8 @@ export function ProviderImportWizard(props: {
       ? { kind: "live-target" }
       : kind === "cc-switch"
       ? { kind: "cc-switch", payload: payload() }
+      : kind === "cc-switch-sql"
+      ? { kind: "cc-switch-sql", path: payload() }
       : { kind: "muxvia-export", payload: payload() }
     if (kind !== "live-target" && payload().trim().length === 0) return
     setPending(true)
@@ -93,6 +100,7 @@ export function ProviderImportWizard(props: {
       setPreview(next)
       setSelected(selectedIds)
       setResolutions(nextResolutions)
+      setIncludeHistoricalUsage(next.historicalUsage?.selectedByDefault ?? false)
       setSelectedIndex(0)
       setStage("preview")
     } catch (error) {
@@ -137,11 +145,11 @@ export function ProviderImportWizard(props: {
         candidateId: candidate.candidateId,
         resolution: resolutions()[candidate.candidateId] ?? { kind: "create" },
       }))
-    if (choices.length === 0) return
+    if (choices.length === 0 && !includeHistoricalUsage()) return
     setPending(true)
     setErrorCode()
     try {
-      setOutcome(await props.onConfirm(current.previewToken, choices))
+      setOutcome(await props.onConfirm(current.previewToken, choices, includeHistoricalUsage()))
       setStage("complete")
     } catch (error) {
       setErrorCode(safeProblemCode(error))
@@ -168,6 +176,10 @@ export function ProviderImportWizard(props: {
       event.preventDefault()
       event.stopPropagation()
       cycleResolution()
+    } else if (stage() === "preview" && event.name === "u" && preview()?.historicalUsage) {
+      event.preventDefault()
+      event.stopPropagation()
+      setIncludeHistoricalUsage((value) => !value)
     } else if (event.name === "return" || event.name === "enter" || event.name === "linefeed") {
       event.preventDefault()
       event.stopPropagation()
@@ -182,12 +194,16 @@ export function ProviderImportWizard(props: {
     if (value === "up" || value === "down") move(value === "up" ? -1 : 1)
     else if (stage() === "preview" && value === " ") toggleSelected()
     else if (stage() === "preview" && value.toLowerCase() === "m") cycleResolution()
+    else if (stage() === "preview" && value.toLowerCase() === "u" && preview()?.historicalUsage) {
+      setIncludeHistoricalUsage((current) => !current)
+    }
     setKeyCapture("")
   }
   const sourceLabel = (kind: ImportSourceKind): string => {
     switch (kind) {
       case "live-target": return props.t("provider-transfer.source.live-target")
       case "cc-switch": return props.t("provider-transfer.source.cc-switch")
+      case "cc-switch-sql": return props.t("provider-transfer.source.cc-switch-sql")
       case "muxvia-export": return props.t("provider-transfer.source.muxvia-export")
     }
   }
@@ -254,6 +270,17 @@ export function ProviderImportWizard(props: {
           </text>
           <text fg={theme.muted}>{`${candidate.kind === "target-provider" ? candidate.model : candidate.targets.filter((target) => target.enabled).map((target) => target.model).join(", ")} · ${resolutionLabel(candidate)} · ${props.t("provider-transfer.preview.credential-redacted", { state: candidate.credential })}`}</text>
         </box>}</For>
+        <Show when={preview()?.historicalUsage}>{(usage: Accessor<NonNullable<ProviderImportPreview["historicalUsage"]>>) => <box flexDirection="column">
+          <text fg={includeHistoricalUsage() ? theme.primary : theme.text}>
+            {`${includeHistoricalUsage() ? "[x]" : "[ ]"} ${props.t("provider-transfer.preview.historical-usage")}`}
+          </text>
+          <text fg={theme.muted}>{props.t("provider-transfer.preview.historical-usage-summary", {
+            count: usage().recordCount,
+            start: usage().startDate ?? props.t("value.none"),
+            end: usage().endDate ?? props.t("value.none"),
+            bytes: usage().estimatedStorageBytes,
+          })}</text>
+        </box>}</Show>
         <text fg={theme.warning}>{props.t("provider-transfer.preview.help")}</text>
       </Show>
     </Show>
@@ -271,6 +298,11 @@ export function ProviderImportWizard(props: {
     /></Show>
     <Show when={errorCode()}><text fg={theme.error}>{props.t("provider-transfer.error", { code: errorCode()! })}</text></Show>
     <Show when={pending()}><text fg={theme.warning}>{props.t("provider-transfer.pending")}</text></Show>
+    <Show when={stage() === "complete" && outcome()?.historicalUsageImportedRecords !== undefined}>
+      <text fg={theme.success}>{props.t("provider-transfer.complete.historical-usage", {
+        count: outcome()?.historicalUsageImportedRecords ?? 0,
+      })}</text>
+    </Show>
     <Show when={stage() === "complete"}><text fg={theme.muted}>{props.t("provider-transfer.complete.help")}</text></Show>
   </box>
 }

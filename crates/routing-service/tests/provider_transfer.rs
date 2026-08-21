@@ -24,6 +24,297 @@ async fn fixture() -> (TempDir, PathBuf, Arc<StateStore>, ProviderTransferServic
     (root, user_home, store, transfer)
 }
 
+fn cc_switch_sql_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cc-switch-v3.19.2-export.sql")
+}
+
+#[tokio::test]
+async fn selected_sql_export_previews_new_identity_provenance_matches_and_default_off_usage() {
+    let (_root, _user_home, store, transfer) = fixture().await;
+    let before = store.target_view_for(Target::Codex).await.unwrap();
+
+    let preview = transfer
+        .preview(
+            Target::Codex,
+            ProviderImportSource::CcSwitchSql {
+                path: cc_switch_sql_fixture().to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(preview.source.product, ProviderImportProduct::CcSwitch);
+    assert_eq!(preview.source.target, ProviderImportSourceTarget::Codex);
+    assert_eq!(preview.candidates.len(), 1);
+    let historical = preview.historical_usage.as_ref().expect("usage preview");
+    assert_eq!(historical.record_count, 5);
+    assert_eq!(historical.start_date.as_deref(), Some("2025-12-31"));
+    assert_eq!(historical.end_date.as_deref(), Some("2026-01-01"));
+    assert!(!historical.selected_by_default);
+    let ProviderImportCandidateView::TargetProvider {
+        candidate_id,
+        name,
+        exact_matches,
+        ..
+    } = &preview.candidates[0]
+    else {
+        panic!("expected Target Provider candidate")
+    };
+    assert_eq!(name, "Same Name");
+    assert!(exact_matches.is_empty());
+    let rendered = serde_json::to_string(&preview).unwrap();
+    for forbidden in [
+        "ccswitch-codex-credential-fixture",
+        "codex-session-secret-identity",
+        "upstream-error-secret-payload",
+        "cc-switch-v3.19.2-export.sql",
+    ] {
+        assert!(!rendered.contains(forbidden));
+        assert!(!format!("{preview:?}").contains(forbidden));
+    }
+
+    let outcome = transfer
+        .confirm(
+            Target::Codex,
+            preview.preview_token,
+            vec![ProviderImportChoice {
+                candidate_id: *candidate_id,
+                resolution: ProviderImportResolution::Create,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.historical_usage_imported_records, None);
+    let after = store.target_view_for(Target::Codex).await.unwrap();
+    assert_eq!(after.management_revision, before.management_revision + 1);
+    assert_eq!(after.providers.len(), 1);
+    let provenance = after.providers[0]
+        .import_provenance
+        .as_ref()
+        .expect("Import Provenance");
+    assert_eq!(provenance.source_product, ProviderImportProduct::CcSwitch);
+    assert_eq!(provenance.source_target, ProviderImportSourceTarget::Codex);
+    assert_eq!(provenance.source_identifier, "cc-codex-1");
+
+    let database =
+        tokio_rusqlite::Connection::open(MuxviaHome::from_user_home(&_user_home).database_path())
+            .await
+            .unwrap();
+    let migrated_count = database
+        .call(|connection| {
+            connection.query_row("SELECT COUNT(*) FROM migrated_usage_rollups", [], |row| {
+                row.get::<_, u64>(0)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(migrated_count, 0, "historical usage must stay default-off");
+}
+
+#[tokio::test]
+async fn provider_and_historical_usage_commit_together_and_duplicate_usage_fails_closed() {
+    let (_root, user_home, store, transfer) = fixture().await;
+    let preview = transfer
+        .preview(
+            Target::Codex,
+            ProviderImportSource::CcSwitchSql {
+                path: cc_switch_sql_fixture().to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let candidate_id = match preview.candidates[0] {
+        ProviderImportCandidateView::TargetProvider { candidate_id, .. } => candidate_id,
+        _ => panic!("expected Target Provider candidate"),
+    };
+    let outcome = transfer
+        .confirm_with_historical_usage(
+            Target::Codex,
+            preview.preview_token,
+            vec![ProviderImportChoice {
+                candidate_id,
+                resolution: ProviderImportResolution::Create,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.historical_usage_imported_records, Some(5));
+    assert_eq!(
+        store
+            .target_view_for(Target::Codex)
+            .await
+            .unwrap()
+            .providers
+            .len(),
+        1
+    );
+
+    let database =
+        tokio_rusqlite::Connection::open(MuxviaHome::from_user_home(&user_home).database_path())
+            .await
+            .unwrap();
+    let stored = database
+        .call(|connection| {
+            connection.query_row(
+                "SELECT COUNT(*), SUM(source_record_count), SUM(input_tokens),
+                        SUM(output_tokens), SUM(successful_request_count),
+                        SUM(failed_request_count)
+                 FROM migrated_usage_rollups WHERE target = 'codex'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, u64>(3)?,
+                        row.get::<_, u64>(4)?,
+                        row.get::<_, u64>(5)?,
+                    ))
+                },
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored, (2, 5, 410, 80, 4, 1));
+
+    let duplicate = transfer
+        .preview(
+            Target::Codex,
+            ProviderImportSource::CcSwitchSql {
+                path: cc_switch_sql_fixture().to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let error = transfer
+        .confirm_with_historical_usage(Target::Codex, duplicate.preview_token, Vec::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ProviderTransferError::DuplicateHistoricalUsage
+    ));
+    assert_eq!(
+        store
+            .target_view_for(Target::Codex)
+            .await
+            .unwrap()
+            .providers
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn historical_usage_can_commit_without_selecting_any_provider() {
+    let (_root, user_home, store, transfer) = fixture().await;
+    let preview = transfer
+        .preview(
+            Target::Codex,
+            ProviderImportSource::CcSwitchSql {
+                path: cc_switch_sql_fixture().to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let outcome = transfer
+        .confirm_with_historical_usage(Target::Codex, preview.preview_token, Vec::new())
+        .await
+        .unwrap();
+    assert!(outcome.records.is_empty());
+    assert_eq!(outcome.historical_usage_imported_records, Some(5));
+    assert!(
+        store
+            .target_view_for(Target::Codex)
+            .await
+            .unwrap()
+            .providers
+            .is_empty()
+    );
+    let database =
+        tokio_rusqlite::Connection::open(MuxviaHome::from_user_home(&user_home).database_path())
+            .await
+            .unwrap();
+    let count = database
+        .call(|connection| {
+            connection.query_row("SELECT COUNT(*) FROM migrated_usage_rollups", [], |row| {
+                row.get::<_, u64>(0)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn late_usage_write_failure_rolls_back_the_provider_and_every_rollup() {
+    let (_root, user_home, store, transfer) = fixture().await;
+    let preview = transfer
+        .preview(
+            Target::Codex,
+            ProviderImportSource::CcSwitchSql {
+                path: cc_switch_sql_fixture().to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let candidate_id = match preview.candidates[0] {
+        ProviderImportCandidateView::TargetProvider { candidate_id, .. } => candidate_id,
+        _ => panic!("expected Target Provider candidate"),
+    };
+    let database =
+        tokio_rusqlite::Connection::open(MuxviaHome::from_user_home(&user_home).database_path())
+            .await
+            .unwrap();
+    database
+        .call(|connection| {
+            connection.execute_batch(
+                "CREATE TRIGGER reject_migrated_usage
+                 BEFORE INSERT ON migrated_usage_rollups
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected-migrated-usage-failure');
+                 END;",
+            )?;
+            Ok::<_, tokio_rusqlite::rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+
+    let error = transfer
+        .confirm_with_historical_usage(
+            Target::Codex,
+            preview.preview_token,
+            vec![ProviderImportChoice {
+                candidate_id,
+                resolution: ProviderImportResolution::Create,
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProviderTransferError::State));
+    assert!(!format!("{error:?}").contains("injected-migrated-usage-failure"));
+    assert!(
+        store
+            .target_view_for(Target::Codex)
+            .await
+            .unwrap()
+            .providers
+            .is_empty()
+    );
+    let counts = database
+        .call(|connection| {
+            connection.query_row(
+                "SELECT (SELECT COUNT(*) FROM providers),
+                        (SELECT COUNT(*) FROM migrated_usage_rollups)",
+                [],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(counts, (0, 0));
+}
+
 #[tokio::test]
 async fn pasted_ccswitch_preview_finds_only_an_exact_normalized_match_without_mutation_or_disclosure()
  {

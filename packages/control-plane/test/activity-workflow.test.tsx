@@ -12,6 +12,7 @@ import type {
   Target,
   TargetAction,
   TargetView,
+  UsageActivityPage,
 } from "../src/control/types"
 import { App } from "../src/ui/app"
 import {
@@ -113,7 +114,7 @@ class ActivitySession implements TargetSession {
   async listUsageActivity(
     input: { limit: number; beforeCursor?: string },
     signal?: AbortSignal,
-  ) {
+  ): Promise<UsageActivityPage> {
     const page = await this.listRequestRecords(input, signal)
     return {
       target: page.target,
@@ -184,6 +185,58 @@ test.each(["codex", "claude"] as const)(
     }
   },
 )
+
+test("/activity labels imported CC-Switch aggregates as unpriced Migrated Usage Records", async () => {
+  const session = new ActivitySession("codex")
+  session.listUsageActivity = async () => ({
+    target: "codex",
+    entries: [{
+      kind: "migrated-usage-rollup" as const,
+      rollup: {
+        id: "00000000-0000-4000-8000-000000001516",
+        sourceProduct: "cc-switch" as const,
+        localDate: "2026-01-01",
+        sourceRecordCount: 5,
+        successfulRequestCount: 4,
+        failedRequestCount: 1,
+        usage: {
+          inputTokens: 410,
+          cachedInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          outputTokens: 80,
+        },
+        latencyObservationCount: 4,
+        totalLatencyMs: 600,
+      },
+    }],
+    nextCursor: null,
+    detailedRetentionDays: 30,
+    catalogVersion: "fixture",
+  })
+  const setup = await testRender(() => <App session={session} />, {
+    width: 80,
+    height: 24,
+    useThread: false,
+    kittyKeyboard: true,
+  })
+  try {
+    await setup.renderOnce()
+    setup.mockInput.pressKey("1")
+    await setup.mockInput.typeText("/activity")
+    setup.mockInput.pressEnter()
+    const frame = await waitForSecretFreeFrame(
+      setup,
+      (value) => value.includes("Migrated usage"),
+      privateSecrets,
+      "migrated-usage-activity",
+    )
+    expect(frame).toContain("2026-01-01 · 5")
+    expect(frame).toContain("In 410 · Out 80")
+    expect(frame).toContain("cc-switch · Unpriced")
+  } finally {
+    setup.renderer.destroy()
+  }
+})
 
 test("failed detail loads only after selection and renders its sensitivity and truncation boundary", async () => {
   const session = new ActivitySession("codex")

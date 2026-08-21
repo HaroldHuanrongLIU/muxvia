@@ -187,6 +187,15 @@ export function RequestHistory(props: RequestHistoryProps) {
           <text fg={theme.muted}>{`${props.t("request-history.usage", { input: rollup.usage.inputTokens, output: rollup.usage.outputTokens })} · ${props.t("request-history.cost.estimated", { cost: formatNanoUsd(rollup.estimatedCostNanoUsd) })}`}</text>
         </>
       }}</Show>
+      <Show when={entry.kind === "migrated-usage-rollup"}>{() => {
+        const rollup = (entry as Extract<UsageActivityEntry, { kind: "migrated-usage-rollup" }>).rollup
+        return <>
+          <text fg={index === props.state().selectedIndex ? theme.primary : theme.text}>
+            {`${index === props.state().selectedIndex ? ">" : " "} ${props.t("request-history.migrated")} · ${rollup.localDate} · ${rollup.sourceRecordCount}`}
+          </text>
+          <text fg={theme.muted}>{`${props.t("request-history.usage", { input: rollup.usage.inputTokens, output: rollup.usage.outputTokens })} · ${rollup.sourceProduct} · ${props.t("request-history.cost.unpriced")}`}</text>
+        </>
+      }}</Show>
     </box>}</For>
     <Show when={props.state().pending === "detail"}>
       <text fg={theme.warning}>{props.t("request-history.detail.loading")}</text>

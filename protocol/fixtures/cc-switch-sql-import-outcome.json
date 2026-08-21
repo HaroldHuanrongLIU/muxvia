@@ -1,0 +1,11 @@
+{
+  "type": "response",
+  "requestId": "cc-switch-sql-confirm-1",
+  "result": {
+    "kind": "provider-import-outcome",
+    "outcome": {
+      "records": [],
+      "historicalUsageImportedRecords": 5
+    }
+  }
+}

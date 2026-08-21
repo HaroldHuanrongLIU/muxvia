@@ -1,0 +1,11 @@
+{
+  "project": "farion1231/cc-switch",
+  "commit": "43eaf07355af145aebfee301801779e824d4c221",
+  "sourcePaths": [
+    "src-tauri/src/database/schema.rs",
+    "src-tauri/src/database/backup.rs"
+  ],
+  "retrieved": "2026-08-21",
+  "behavior": "CC-Switch v3.19.2 SQL export header, schema version 16, Provider rows, proxy request logs, and retained daily usage rollups",
+  "fixtureSha256": "37b533838e8116b1f8a93fb0c8871a77c9ee31ced03215322d2b669c5a01a56d"
+}

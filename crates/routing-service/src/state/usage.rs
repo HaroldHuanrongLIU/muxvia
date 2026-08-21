@@ -4,8 +4,9 @@ use uuid::Uuid;
 
 use crate::{
     control::protocol::{
-        DailyUsageRollup, NativeUsageRecordSummary, PricingCatalogUpdateOutcome, RequestUsageView,
-        Target, UsageActivityEntry, UsageActivityPage, UsageClearOutcome, UsageRetentionOutcome,
+        DailyUsageRollup, MigratedUsageRollup, NativeUsageRecordSummary,
+        PricingCatalogUpdateOutcome, ProviderImportProduct, RequestUsageView, Target,
+        UsageActivityEntry, UsageActivityPage, UsageClearOutcome, UsageRetentionOutcome,
     },
     native_usage::{NativeUsageError, ParsedNativeFile},
     request_history::{PricingCatalog, PricingSnapshot, RequestUsage},
@@ -196,7 +197,7 @@ impl StateStore {
                             .into_summary()
                             .map_err(|_| NativeUsageError::Unavailable)?;
                         items.push(ActivityItem {
-                            key: ActivityKey(summary.finished_at_unix_ms, 2, sequence),
+                            key: ActivityKey(summary.finished_at_unix_ms, 3, sequence),
                             entry: UsageActivityEntry::RequestRecord { record: summary },
                         });
                     }
@@ -235,7 +236,7 @@ impl StateStore {
                             row.map_err(sql_error)?;
                         let id = Uuid::parse_str(&id).map_err(|_| NativeUsageError::Unavailable)?;
                         items.push(ActivityItem {
-                            key: ActivityKey(observed_at_unix_ms, 1, sequence),
+                            key: ActivityKey(observed_at_unix_ms, 2, sequence),
                             entry: UsageActivityEntry::NativeUsageRecord {
                                 record: NativeUsageRecordSummary {
                                     id,
@@ -243,6 +244,61 @@ impl StateStore {
                                     observed_at_unix_ms,
                                     usage: usage_view(input, cached, creation, output),
                                     estimated_cost_nano_usd: cost,
+                                },
+                            },
+                        });
+                    }
+                }
+                {
+                    let mut statement = connection
+                        .prepare(
+                            "SELECT sequence, id, local_date, source_record_count,
+                                    successful_request_count, failed_request_count,
+                                    input_tokens, cached_input_tokens,
+                                    cache_creation_input_tokens, output_tokens,
+                                    latency_observation_count, total_latency_ms,
+                                    CAST(strftime('%s', local_date || ' 23:59:59', 'utc') AS INTEGER)
+                                      * 1000
+                             FROM migrated_usage_rollups WHERE target = ?1",
+                        )
+                        .map_err(sql_error)?;
+                    let rows = statement
+                        .query_map([&target_name], |row| {
+                            Ok((
+                                row.get::<_, u64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, u64>(3)?,
+                                row.get::<_, u64>(4)?,
+                                row.get::<_, u64>(5)?,
+                                row.get::<_, u64>(6)?,
+                                row.get::<_, u64>(7)?,
+                                row.get::<_, u64>(8)?,
+                                row.get::<_, u64>(9)?,
+                                row.get::<_, u64>(10)?,
+                                row.get::<_, u64>(11)?,
+                                row.get::<_, u64>(12)?,
+                            ))
+                        })
+                        .map_err(sql_error)?;
+                    for row in rows {
+                        let (sequence, id, local_date, count, success, failed, input, cached,
+                            creation, output, latency_count, total_latency, sort_time) =
+                            row.map_err(sql_error)?;
+                        let id = Uuid::parse_str(&id).map_err(|_| NativeUsageError::Unavailable)?;
+                        items.push(ActivityItem {
+                            key: ActivityKey(sort_time, 1, sequence),
+                            entry: UsageActivityEntry::MigratedUsageRollup {
+                                rollup: MigratedUsageRollup {
+                                    id,
+                                    source_product: ProviderImportProduct::CcSwitch,
+                                    local_date,
+                                    source_record_count: count,
+                                    successful_request_count: success,
+                                    failed_request_count: failed,
+                                    usage: usage_view(input, cached, creation, output),
+                                    latency_observation_count: latency_count,
+                                    total_latency_ms: total_latency,
                                 },
                             },
                         });
@@ -355,6 +411,7 @@ impl StateStore {
                 let request_records = count(&transaction, "request_records")?;
                 let native_records = count(&transaction, "native_usage_records")?;
                 let rollups = count(&transaction, "daily_usage_rollups")?;
+                let migrated_rollups = count(&transaction, "migrated_usage_rollups")?;
                 let cursors = count(&transaction, "native_usage_import_cursors")?;
                 transaction
                     .execute("DELETE FROM request_records", [])
@@ -366,6 +423,9 @@ impl StateStore {
                     .execute("DELETE FROM daily_usage_rollups", [])
                     .map_err(sql_error)?;
                 transaction
+                    .execute("DELETE FROM migrated_usage_rollups", [])
+                    .map_err(sql_error)?;
+                transaction
                     .execute("DELETE FROM native_usage_import_cursors", [])
                     .map_err(sql_error)?;
                 transaction.commit().map_err(sql_error)?;
@@ -374,6 +434,7 @@ impl StateStore {
                     cleared_request_records: request_records,
                     cleared_native_usage_records: native_records,
                     cleared_daily_rollups: rollups,
+                    cleared_migrated_usage_rollups: migrated_rollups,
                     cleared_import_cursors: cursors,
                 })
             })
@@ -885,6 +946,7 @@ fn count(transaction: &Transaction<'_>, table: &str) -> Result<u64, NativeUsageE
         "request_records" => "SELECT COUNT(*) FROM request_records",
         "native_usage_records" => "SELECT COUNT(*) FROM native_usage_records",
         "daily_usage_rollups" => "SELECT COUNT(*) FROM daily_usage_rollups",
+        "migrated_usage_rollups" => "SELECT COUNT(*) FROM migrated_usage_rollups",
         "native_usage_import_cursors" => "SELECT COUNT(*) FROM native_usage_import_cursors",
         _ => return Err(NativeUsageError::Unavailable),
     };

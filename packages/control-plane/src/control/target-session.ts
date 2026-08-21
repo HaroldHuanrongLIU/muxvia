@@ -73,6 +73,7 @@ export interface TargetSession {
   confirmProviderImport(
     previewToken: string,
     choices: ProviderImportChoice[],
+    includeHistoricalUsage?: boolean,
   ): Promise<ProviderImportOutcome>
   exportProviderConfiguration(): Promise<ProviderConfigurationExport>
   applyReconciliation(input: {
@@ -376,18 +377,21 @@ class TargetSessionImpl implements TargetSession {
   confirmProviderImport(
     previewToken: string,
     choices: ProviderImportChoice[],
+    includeHistoricalUsage = false,
   ): Promise<ProviderImportOutcome> {
     if (this.#closed) {
       return Promise.reject(new ControlError("connection-closed", "Target session is closed"))
     }
     const capturedToken = previewToken
     const capturedChoices = structuredClone(choices)
+    const capturedIncludeHistoricalUsage = includeHistoricalUsage
     const result = this.#actions.then(async () => {
       const response = await this.#rpc.request({
         kind: "confirm-provider-import",
         target: this.#target,
         previewToken: capturedToken,
         choices: capturedChoices,
+        includeHistoricalUsage: capturedIncludeHistoricalUsage,
       })
       if (response.kind !== "provider-import-outcome") {
         throw new ControlError("invalid-response", "Expected a Provider Import outcome")

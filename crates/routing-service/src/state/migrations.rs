@@ -14,7 +14,7 @@ use crate::control::protocol::{
 
 const SCHEMA: &str = include_str!("schema.sql");
 
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 17;
 
 pub fn migrate(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
@@ -38,7 +38,7 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
         .transpose()?;
 
     match version {
-        None | Some(SCHEMA_VERSION) | Some(15) | Some(14) | Some(13) => {}
+        None | Some(SCHEMA_VERSION) | Some(16) | Some(15) | Some(14) | Some(13) => {}
         Some(1) => {
             migrate_v1(connection)?;
             migrate_v2(connection)?;
@@ -150,8 +150,60 @@ pub fn migrate(connection: &mut Connection) -> Result<()> {
     if version.is_some_and(|version| version < 16) {
         migrate_v15(connection)?;
     }
+    if version.is_some_and(|version| version < 17) {
+        migrate_v16(connection)?;
+    }
     connection.execute_batch(SCHEMA)?;
     Ok(())
+}
+
+fn migrate_v16(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE migrated_usage_rollups (
+           sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+           id TEXT NOT NULL UNIQUE,
+           target TEXT NOT NULL CHECK (target IN ('codex', 'claude')),
+           source_product TEXT NOT NULL CHECK (source_product = 'cc-switch'),
+           source_export_fingerprint TEXT NOT NULL CHECK (
+             length(source_export_fingerprint) = 64
+             AND source_export_fingerprint NOT GLOB '*[^0-9a-f]*'
+           ),
+           local_date TEXT NOT NULL CHECK (
+             length(local_date) = 10
+             AND local_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+           ),
+           source_record_count INTEGER NOT NULL CHECK (source_record_count > 0),
+           successful_request_count INTEGER NOT NULL CHECK (successful_request_count >= 0),
+           failed_request_count INTEGER NOT NULL CHECK (failed_request_count >= 0),
+           input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
+           cached_input_tokens INTEGER NOT NULL CHECK (cached_input_tokens >= 0),
+           cache_creation_input_tokens INTEGER NOT NULL CHECK (cache_creation_input_tokens >= 0),
+           output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+           latency_observation_count INTEGER NOT NULL CHECK (latency_observation_count >= 0),
+           total_latency_ms INTEGER NOT NULL CHECK (total_latency_ms >= 0),
+           CHECK (successful_request_count + failed_request_count = source_record_count),
+           CHECK (latency_observation_count <= source_record_count),
+           UNIQUE (target, source_export_fingerprint, local_date)
+         );
+         CREATE INDEX migrated_usage_rollups_target_sequence
+           ON migrated_usage_rollups(target, sequence DESC);
+         CREATE TRIGGER migrated_usage_rollups_immutable
+         BEFORE UPDATE ON migrated_usage_rollups
+         BEGIN
+           SELECT RAISE(ABORT, 'immutable-migrated-usage-rollup');
+         END;",
+    )?;
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(tokio_rusqlite::rusqlite::Error::InvalidQuery);
+    }
+    drop(foreign_key_check);
+    transaction.execute(
+        "UPDATE metadata SET value = '17' WHERE key = 'schema-version'",
+        [],
+    )?;
+    transaction.commit()
 }
 
 fn migrate_v15(connection: &mut Connection) -> Result<()> {

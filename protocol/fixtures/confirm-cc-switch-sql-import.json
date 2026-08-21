@@ -1,0 +1,11 @@
+{
+  "type": "request",
+  "requestId": "cc-switch-sql-confirm-1",
+  "operation": {
+    "kind": "confirm-provider-import",
+    "target": "codex",
+    "previewToken": "10000000-0000-4000-8000-000000000016",
+    "choices": [],
+    "includeHistoricalUsage": true
+  }
+}

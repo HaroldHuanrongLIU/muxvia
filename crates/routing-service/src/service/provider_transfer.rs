@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Write,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -27,12 +27,16 @@ use crate::{
     domain::provider::normalize_provider_base_url,
     home::MuxviaHome,
     state::{
-        ProviderImportCandidateInput, ProviderImportCommit, ProviderImportCommitError,
-        ProviderImportCommitInput, ProviderImportFailoverDraftInput,
-        ProviderImportGeneratedSourceInput, ProviderImportResolutionInput,
-        ProviderImportTargetInput, ProviderImportTargetMatchInput, ProviderImportUniversalInput,
-        StateStore,
+        MigratedUsageImportInput, MigratedUsageRollupInput, ProviderImportCandidateInput,
+        ProviderImportCommit, ProviderImportCommitError, ProviderImportCommitInput,
+        ProviderImportFailoverDraftInput, ProviderImportGeneratedSourceInput,
+        ProviderImportResolutionInput, ProviderImportTargetInput, ProviderImportTargetMatchInput,
+        ProviderImportUniversalInput, StateStore,
     },
+};
+
+use super::cc_switch_migration::{
+    CcSwitchHistoricalUsage, CcSwitchMigrationError, parse_selected_export,
 };
 
 const MAX_SOURCE_BYTES: usize = 524_288;
@@ -65,6 +69,12 @@ pub enum ProviderTransferError {
     InvalidChoice,
     #[error("provider import contains a Muxvia routing credential")]
     SecretRejected,
+    #[error("CC-Switch export is invalid")]
+    InvalidCcSwitchExport,
+    #[error("CC-Switch export schema is unsupported")]
+    UnsupportedCcSwitchSchema,
+    #[error("CC-Switch historical usage was already imported")]
+    DuplicateHistoricalUsage,
     #[error("provider export redaction failed")]
     RedactionFailed,
     #[error("state store operation failed")]
@@ -88,6 +98,7 @@ struct PendingPreview {
     source: ProviderImportSourceView,
     candidates: Vec<PendingCandidate>,
     failover_drafts: Vec<PendingFailoverDraft>,
+    historical_usage: Option<CcSwitchHistoricalUsage>,
 }
 
 enum PendingCandidate {
@@ -159,7 +170,7 @@ impl ProviderTransferService {
         target: Target,
         source: ProviderImportSource,
     ) -> Result<ProviderImportPreview, ProviderTransferError> {
-        let (source, candidates, failover_drafts) = match source {
+        let (source, candidates, failover_drafts, historical_usage) = match source {
             ProviderImportSource::CcSwitch { payload } => {
                 let candidate = parse_ccswitch_provider(target, &payload)?;
                 (
@@ -169,6 +180,58 @@ impl ProviderTransferService {
                     },
                     vec![PendingCandidate::Target(candidate)],
                     Vec::new(),
+                    None,
+                )
+            }
+            ProviderImportSource::CcSwitchSql { path } => {
+                let path = PathBuf::from(path);
+                let parsed =
+                    tokio::task::spawn_blocking(move || parse_selected_export(&path, target))
+                        .await
+                        .map_err(|_| ProviderTransferError::InvalidCcSwitchExport)?
+                        .map_err(map_cc_switch_error)?;
+                let candidates = parsed
+                    .providers
+                    .into_iter()
+                    .map(|provider| {
+                        let configuration_fingerprint = target_configuration_fingerprint(
+                            target,
+                            &provider.base_url,
+                            &provider.model,
+                            protocol_for(target),
+                            provider.authentication,
+                            &provider.routing_requirement,
+                            TargetFingerprintContext {
+                                credential_present: provider.credential.is_some(),
+                                generated: false,
+                            },
+                        );
+                        PendingCandidate::Target(PendingTargetProvider {
+                            candidate_id: Uuid::new_v4(),
+                            target,
+                            name: provider.name,
+                            base_url: provider.base_url,
+                            model: provider.model,
+                            protocol: protocol_for(target),
+                            authentication: provider.authentication,
+                            routing_requirement: provider.routing_requirement,
+                            credential: provider.credential,
+                            imported_current: false,
+                            source_position: provider.source_position,
+                            source_identifier: provider.source_id,
+                            configuration_fingerprint,
+                            exported_source_id: None,
+                        })
+                    })
+                    .collect();
+                (
+                    ProviderImportSourceView {
+                        product: ProviderImportProduct::CcSwitch,
+                        target: source_target(target),
+                    },
+                    candidates,
+                    Vec::new(),
+                    Some(parsed.historical_usage),
                 )
             }
             ProviderImportSource::LiveTarget => {
@@ -264,6 +327,7 @@ impl ProviderTransferService {
                     },
                     vec![PendingCandidate::Target(candidate)],
                     Vec::new(),
+                    None,
                 )
             }
             ProviderImportSource::MuxviaExport { payload } => {
@@ -275,6 +339,7 @@ impl ProviderTransferService {
                     },
                     parsed.candidates,
                     parsed.failover_drafts,
+                    None,
                 )
             }
         };
@@ -369,12 +434,19 @@ impl ProviderTransferService {
                 source: source.clone(),
                 candidates,
                 failover_drafts,
+                historical_usage,
             },
         );
+        let historical_usage = pending
+            .entries
+            .get(&preview_token)
+            .and_then(|preview| preview.historical_usage.as_ref())
+            .map(|usage| usage.preview.clone());
         Ok(ProviderImportPreview {
             preview_token,
             source,
             candidates: projected,
+            historical_usage,
         })
     }
 
@@ -465,7 +537,19 @@ impl ProviderTransferService {
         choices: Vec<ProviderImportChoice>,
     ) -> Result<ProviderImportOutcome, ProviderTransferError> {
         Ok(self
-            .confirm_with_views(target, preview_token, choices)
+            .confirm_with_views(target, preview_token, choices, false)
+            .await?
+            .outcome)
+    }
+
+    pub async fn confirm_with_historical_usage(
+        &self,
+        target: Target,
+        preview_token: Uuid,
+        choices: Vec<ProviderImportChoice>,
+    ) -> Result<ProviderImportOutcome, ProviderTransferError> {
+        Ok(self
+            .confirm_with_views(target, preview_token, choices, true)
             .await?
             .outcome)
     }
@@ -475,6 +559,7 @@ impl ProviderTransferService {
         target: Target,
         preview_token: Uuid,
         choices: Vec<ProviderImportChoice>,
+        include_historical_usage: bool,
     ) -> Result<ProviderImportCommit, ProviderTransferError> {
         let preview = {
             let mut pending = self.pending.lock().await;
@@ -484,7 +569,10 @@ impl ProviderTransferService {
                 .remove(&preview_token)
                 .ok_or(ProviderTransferError::PreviewExpired)?
         };
-        if preview.target != target || choices.is_empty() {
+        if preview.target != target
+            || (choices.is_empty() && !include_historical_usage)
+            || (include_historical_usage && preview.historical_usage.is_none())
+        {
             return Err(ProviderTransferError::InvalidChoice);
         }
         let mut chosen = HashSet::new();
@@ -525,18 +613,64 @@ impl ProviderTransferService {
                     })
                     .collect()
             });
+        let historical_usage = include_historical_usage
+            .then_some(preview.historical_usage)
+            .flatten()
+            .map(|usage| MigratedUsageImportInput {
+                target,
+                source_export_fingerprint: usage.source_export_fingerprint,
+                rollups: usage
+                    .rollups
+                    .into_iter()
+                    .map(|rollup| MigratedUsageRollupInput {
+                        local_date: rollup.local_date,
+                        source_record_count: rollup.source_record_count,
+                        successful_request_count: rollup.successful_request_count,
+                        failed_request_count: rollup.failed_request_count,
+                        input_tokens: rollup.input_tokens,
+                        cached_input_tokens: rollup.cached_input_tokens,
+                        cache_creation_input_tokens: rollup.cache_creation_input_tokens,
+                        output_tokens: rollup.output_tokens,
+                        latency_observation_count: rollup.latency_observation_count,
+                        total_latency_ms: rollup.total_latency_ms,
+                    })
+                    .collect(),
+            });
         self.store
             .commit_provider_import(ProviderImportCommitInput {
                 source_product: preview.source.product,
                 source_target: preview.source.target,
                 candidates,
                 failover_drafts,
+                historical_usage,
             })
             .await
             .map_err(|error| match error {
                 ProviderImportCommitError::InvalidChoice => ProviderTransferError::InvalidChoice,
+                ProviderImportCommitError::DuplicateHistoricalUsage => {
+                    ProviderTransferError::DuplicateHistoricalUsage
+                }
                 ProviderImportCommitError::State => ProviderTransferError::State,
             })
+    }
+}
+
+fn map_cc_switch_error(error: CcSwitchMigrationError) -> ProviderTransferError {
+    match error {
+        CcSwitchMigrationError::TooLarge => ProviderTransferError::ImportTooLarge,
+        CcSwitchMigrationError::UnsupportedSchema => {
+            ProviderTransferError::UnsupportedCcSwitchSchema
+        }
+        CcSwitchMigrationError::InvalidPath | CcSwitchMigrationError::InvalidExport => {
+            ProviderTransferError::InvalidCcSwitchExport
+        }
+    }
+}
+
+fn protocol_for(target: Target) -> ProviderProtocol {
+    match target {
+        Target::Codex => ProviderProtocol::OpenaiResponses,
+        Target::Claude => ProviderProtocol::AnthropicMessages,
     }
 }
 

@@ -1585,6 +1585,7 @@ async fn serve_session(
                                 operation.target,
                                 operation.preview_token,
                                 operation.choices,
+                                operation.include_historical_usage,
                             )
                             .await;
                         let (frame, universal_view, target_views) = match result {
@@ -2057,6 +2058,18 @@ fn provider_transfer_problem(request_id: String, error: ProviderTransferError) -
         ProviderTransferError::SecretRejected => (
             "provider-import-secret-rejected",
             "Provider import contains a managed routing credential",
+        ),
+        ProviderTransferError::InvalidCcSwitchExport => (
+            "invalid-cc-switch-export",
+            "CC-Switch export is unreadable or corrupt",
+        ),
+        ProviderTransferError::UnsupportedCcSwitchSchema => (
+            "unsupported-cc-switch-export-schema",
+            "CC-Switch export schema is not the supported v3.19.2 schema",
+        ),
+        ProviderTransferError::DuplicateHistoricalUsage => (
+            "cc-switch-usage-already-imported",
+            "CC-Switch historical usage from this export was already imported",
         ),
         ProviderTransferError::RedactionFailed => (
             "provider-export-redaction-failed",

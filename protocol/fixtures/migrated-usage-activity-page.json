@@ -1,0 +1,34 @@
+{
+  "type": "response",
+  "requestId": "migrated-usage-list-1",
+  "result": {
+    "kind": "usage-activity-page",
+    "page": {
+      "target": "codex",
+      "entries": [
+        {
+          "kind": "migrated-usage-rollup",
+          "rollup": {
+            "id": "00000000-0000-4000-8000-000000000016",
+            "sourceProduct": "cc-switch",
+            "localDate": "2026-01-01",
+            "sourceRecordCount": 4,
+            "successfulRequestCount": 3,
+            "failedRequestCount": 1,
+            "usage": {
+              "inputTokens": 400,
+              "cachedInputTokens": 40,
+              "cacheCreationInputTokens": 10,
+              "outputTokens": 80
+            },
+            "latencyObservationCount": 4,
+            "totalLatencyMs": 600
+          }
+        }
+      ],
+      "nextCursor": null,
+      "detailedRetentionDays": 30,
+      "catalogVersion": "models.dev-d2ec701bace7"
+    }
+  }
+}

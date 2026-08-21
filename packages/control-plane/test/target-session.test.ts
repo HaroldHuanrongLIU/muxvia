@@ -394,8 +394,8 @@ test("a TargetSession lists and inspects target-bound immutable request history"
 test("a TargetSession owns the closed preview-confirm-export Provider Transfer workflow", async () => {
   const { session, server } = await openScriptedSession(viewAtRevision(0))
   const source = {
-    kind: "cc-switch",
-    payload: "ccswitch://v1/import?resource=provider&app=codex&name=Relay",
+    kind: "cc-switch-sql",
+    path: "/operator/selected/cc-switch-export.sql",
   } as const
   const previewing = session.previewProviderImport(source)
   await server.waitForRequests(2)
@@ -421,6 +421,13 @@ test("a TargetSession owns the closed preview-confirm-export Provider Transfer w
       importedCurrent: false,
       exactMatches: [],
     }],
+    historicalUsage: {
+      recordCount: 5,
+      startDate: "2025-12-31",
+      endDate: "2026-01-01",
+      estimatedStorageBytes: 512,
+      selectedByDefault: false,
+    },
   }
   server.replyProviderImportPreview(1, preview)
   const receivedPreview = await previewing
@@ -431,13 +438,14 @@ test("a TargetSession owns the closed preview-confirm-export Provider Transfer w
     candidateId: preview.candidates[0]!.candidateId,
     resolution: { kind: "create" },
   }]
-  const confirming = session.confirmProviderImport(preview.previewToken, choices)
+  const confirming = session.confirmProviderImport(preview.previewToken, choices, true)
   await server.waitForRequests(3)
   expect(server.requests()[2]!.operation).toEqual({
     kind: "confirm-provider-import",
     target: "codex",
     previewToken: preview.previewToken,
     choices,
+    includeHistoricalUsage: true,
   })
   const outcome: ProviderImportOutcome = {
     records: [{
@@ -447,6 +455,7 @@ test("a TargetSession owns the closed preview-confirm-export Provider Transfer w
       target: "codex",
       providerId: "00000000-0000-4000-8000-000000000163",
     }],
+    historicalUsageImportedRecords: 5,
   }
   server.replyProviderImportOutcome(2, outcome)
   expect(await confirming).toEqual(outcome)

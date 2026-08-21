@@ -8,6 +8,7 @@ import { RpcClient } from "../src/control/rpc-client"
 
 const cli = resolve(import.meta.dir, "../src/index.tsx")
 const service = resolve(import.meta.dir, "../../../target/debug/muxvia-routing")
+const fakeCodex = resolve(import.meta.dir, "../../../tests/e2e/fixtures/fake-codex")
 const exitDeadlineMs = 8_000
 
 function deferred<T>() {
@@ -295,8 +296,14 @@ test("backup create and inspect use one sensitive private artifact without expos
     }),
     { mode: 0o600 },
   )
-  const routing = Bun.spawn([service, "--home", muxviaHome], {
-    env: { ...process.env, HOME: userHome },
+  const routing = Bun.spawn([
+    service,
+    "--home",
+    muxviaHome,
+    "--test-codex-executable",
+    fakeCodex,
+  ], {
+    env: { ...process.env, HOME: userHome, MUXVIA_INTEGRATION_TEST: "1" },
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",

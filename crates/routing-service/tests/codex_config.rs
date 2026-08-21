@@ -28,6 +28,9 @@ wire_api = "responses"
 web_search = true
 "#;
 
+#[cfg(unix)]
+static COMMAND_PROBE_LOCK: Mutex<()> = Mutex::new(());
+
 fn fixture() -> (TempDir, CodexConfigCodec) {
     let home = TempDir::new().unwrap();
     let codec = CodexConfigCodec::for_user_home(home.path()).unwrap();
@@ -540,6 +543,7 @@ fn symlinked_default_codex_directory_is_canonicalized() {
 #[cfg(unix)]
 #[test]
 fn command_probe_runs_only_version_and_help() {
+    let _guard = COMMAND_PROBE_LOCK.lock().unwrap();
     let temp = TempDir::new().unwrap();
     let log = temp.path().join("args.log");
     let executable = temp.path().join("codex-fixture");
@@ -561,6 +565,7 @@ fn command_probe_runs_only_version_and_help() {
 #[cfg(unix)]
 #[test]
 fn reconciliation_probe_projects_only_exact_version_and_closed_classification() {
+    let _guard = COMMAND_PROBE_LOCK.lock().unwrap();
     let temp = TempDir::new().unwrap();
     let executable = temp.path().join("codex-reconciliation-fixture");
     fs::write(
@@ -585,6 +590,7 @@ fn reconciliation_probe_projects_only_exact_version_and_closed_classification() 
 #[cfg(unix)]
 #[test]
 fn reconciliation_probe_rejects_malformed_missing_contradictory_and_non_utf8_output() {
+    let _guard = COMMAND_PROBE_LOCK.lock().unwrap();
     for (case, version_command, help_command) in [
         (
             "dot-only version",
@@ -646,6 +652,7 @@ fn reconciliation_probe_rejects_malformed_missing_contradictory_and_non_utf8_out
 #[cfg(unix)]
 #[test]
 fn reconciliation_probe_preserves_valid_version_when_help_is_incompatible() {
+    let _guard = COMMAND_PROBE_LOCK.lock().unwrap();
     let temp = TempDir::new().unwrap();
     let executable = temp.path().join("codex-versioned-incompatible-fixture");
     fs::write(
@@ -666,6 +673,7 @@ fn reconciliation_probe_preserves_valid_version_when_help_is_incompatible() {
 #[cfg(unix)]
 #[test]
 fn command_probe_maps_nonzero_status_to_incompatible_target_cli() {
+    let _guard = COMMAND_PROBE_LOCK.lock().unwrap();
     let temp = TempDir::new().unwrap();
     let executable = temp.path().join("codex-fixture");
     fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
@@ -677,6 +685,7 @@ fn command_probe_maps_nonzero_status_to_incompatible_target_cli() {
 #[cfg(unix)]
 #[test]
 fn unknown_compatible_probe_version_returns_a_warning() {
+    let _guard = COMMAND_PROBE_LOCK.lock().unwrap();
     let temp = TempDir::new().unwrap();
     let executable = temp.path().join("codex-fixture");
     fs::write(

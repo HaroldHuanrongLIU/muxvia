@@ -27,7 +27,7 @@ use muxvia_routing::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UnixStream},
     process::{Child, Command},
     sync::Notify,
@@ -1518,7 +1518,7 @@ async fn disconnected_pending_action_commits_before_inactive_exit() {
     )
     .await
     .unwrap();
-    drop(stream);
+    stream.shutdown().await.unwrap();
 
     assert!(
         timeout(PROCESS_TIMEOUT, fixture.child.wait())

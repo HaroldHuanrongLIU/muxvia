@@ -10,7 +10,7 @@ import { embeddedBundleIdentity } from "./release-bundle"
 
 const bundleIdentity = embeddedBundleIdentity()
 export const controlPlaneRelease = bundleIdentity?.release ?? "muxvia-dev"
-export const routingServiceRelease = bundleIdentity?.routingRelease ?? "0.1.0"
+export const routingServiceRelease = bundleIdentity?.routingRelease ?? "0.1.1"
 
 type Invocation = {
   command?: string

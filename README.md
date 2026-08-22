@@ -15,11 +15,7 @@ Install Muxvia with one command:
 curl -fsSL https://github.com/HaroldHuanrongLIU/muxvia/releases/latest/download/install.sh | sh
 ```
 
-If `~/.muxvia/bin` is not already on your `PATH`, add it for the current shell:
-
-```shell
-export PATH="$HOME/.muxvia/bin:$PATH"
-```
+The installer detects your shell and adds `~/.muxvia/bin` to the appropriate profile with an idempotent Muxvia-managed block. It prints the command needed to use `muxvia` in the current terminal; new terminals pick up the configured `PATH` automatically. Set `MUXVIA_NO_PATH_UPDATE=1` to skip the profile change.
 
 Muxvia can also be installed with npm or the official Homebrew tap:
 

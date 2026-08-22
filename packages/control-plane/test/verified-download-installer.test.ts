@@ -194,6 +194,68 @@ test("the verified-download installer selects and activates each supported Relea
   }
 }, 15_000)
 
+test("the installer configures the detected shell profile exactly once", async () => {
+  const assets = await temporaryRoot("path-profile-assets")
+  await publishRelease({ root: assets, release: "0.1.0" })
+  const cases = [
+    { label: "darwin-zsh", target: "darwin-arm64", shell: "/bin/zsh", profile: ".zprofile" },
+    { label: "darwin-bash", target: "darwin-x64", shell: "/bin/bash", profile: ".bash_profile" },
+    { label: "linux-zsh", target: "linux-glibc-arm64", shell: "/usr/bin/zsh", profile: ".zshrc" },
+    { label: "linux-bash", target: "linux-glibc-x64", shell: "/usr/bin/bash", profile: ".bashrc" },
+    { label: "fallback", target: "linux-glibc-x64", shell: "/usr/bin/fish", profile: ".profile" },
+  ] as const
+  const expectedBlock = [
+    "# >>> Muxvia installer >>>",
+    'export PATH="$HOME/.muxvia/bin:$PATH"',
+    "# <<< Muxvia installer <<<",
+  ].join("\n")
+
+  for (const testCase of cases) {
+    const home = await temporaryRoot(`path-profile-${testCase.label}`)
+    const profile = join(home, testCase.profile)
+    await writeFile(profile, "# existing profile\n")
+    const environment = { PATH: isolatedSystemPath, SHELL: testCase.shell }
+
+    const first = await install({ home, assets, target: testCase.target, environment })
+    expect(first).toMatchObject({ exitCode: 0, stderr: "" })
+    expect(first.stdout).toContain(`PATH was added to ${profile}`)
+    expect(first.stdout).toContain('Current terminal: export PATH="$HOME/.muxvia/bin:$PATH" && muxvia')
+    expect(first.stdout).toContain("Future terminals: open a new terminal and run: muxvia")
+    const configured = await readFile(profile, "utf8")
+    expect(configured).toContain(expectedBlock)
+    expect(configured.match(/# >>> Muxvia installer >>>/g)).toHaveLength(1)
+
+    const second = await install({ home, assets, target: testCase.target, environment })
+    expect(second).toMatchObject({ exitCode: 0, stderr: "" })
+    expect(second.stdout).toContain(`PATH is already configured in ${profile}`)
+    expect(await readFile(profile, "utf8")).toBe(configured)
+  }
+}, 30_000)
+
+test("MUXVIA_NO_PATH_UPDATE skips profile changes and prints a current-shell command", async () => {
+  const assets = await temporaryRoot("path-opt-out-assets")
+  await publishRelease({ root: assets, release: "0.1.0", targets: ["darwin-arm64"] })
+
+  for (const value of ["1", "true", "yes"]) {
+    const home = await temporaryRoot(`path-opt-out-${value}`)
+    const result = await install({
+      home,
+      assets,
+      target: "darwin-arm64",
+      environment: {
+        PATH: isolatedSystemPath,
+        SHELL: "/bin/zsh",
+        MUXVIA_NO_PATH_UPDATE: value,
+      },
+    })
+
+    expect(result).toMatchObject({ exitCode: 0, stderr: "" })
+    expect(result.stdout).toContain("PATH update skipped because MUXVIA_NO_PATH_UPDATE is set")
+    expect(result.stdout).toContain('Current terminal: export PATH="$HOME/.muxvia/bin:$PATH" && muxvia')
+    expect(readFile(join(home, ".zprofile"), "utf8")).rejects.toThrow()
+  }
+})
+
 test("a failed first activation leaves no active pointer or launcher", async () => {
   const assets = await temporaryRoot("fresh-activation-assets")
   const home = await temporaryRoot("fresh-activation-home")

@@ -13,8 +13,92 @@ fail() {
   exit 1
 }
 
+step() {
+  printf '==> %s\n' "$1"
+}
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "missing-command:$1"
+}
+
+path_updates_disabled() {
+  case "${MUXVIA_NO_PATH_UPDATE:-0}" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+pick_profile() {
+  case "$operating_system:${SHELL:-}" in
+    Darwin:*/zsh) printf '%s\n' "$HOME/.zprofile" ;;
+    Darwin:*/bash) printf '%s\n' "$HOME/.bash_profile" ;;
+    Linux:*/zsh) printf '%s\n' "$HOME/.zshrc" ;;
+    Linux:*/bash) printf '%s\n' "$HOME/.bashrc" ;;
+    *) printf '%s\n' "$HOME/.profile" ;;
+  esac
+}
+
+add_to_path() {
+  path_action=already
+  path_profile=
+
+  case ":$PATH:" in
+    *":$bin_dir:"*) return ;;
+  esac
+
+  if path_updates_disabled; then
+    path_action=skipped
+    return
+  fi
+
+  profile=$(pick_profile)
+  path_profile=$profile
+  begin_marker='# >>> Muxvia installer >>>'
+  end_marker='# <<< Muxvia installer <<<'
+  path_line='export PATH="$HOME/.muxvia/bin:$PATH"'
+
+  if [ -f "$profile" ]; then
+    begin_count=$(grep -Fxc "$begin_marker" "$profile" || true)
+    end_count=$(grep -Fxc "$end_marker" "$profile" || true)
+    if [ "$begin_count" -ne 0 ] || [ "$end_count" -ne 0 ]; then
+      [ "$begin_count" -eq 1 ] && [ "$end_count" -eq 1 ] \
+        && grep -Fqx "$path_line" "$profile" \
+        || fail "path-profile-invalid:$profile"
+      path_action=configured
+      return
+    fi
+  fi
+
+  {
+    printf '\n%s\n' "$begin_marker"
+    printf '%s\n' "$path_line"
+    printf '%s\n' "$end_marker"
+  } >> "$profile" || fail "path-profile-update-failed:$profile"
+  path_action=added
+}
+
+print_launch_instructions() {
+  case "$path_action" in
+    added)
+      step "Current terminal: export PATH=\"\$HOME/.muxvia/bin:\$PATH\" && muxvia"
+      step "Future terminals: open a new terminal and run: muxvia"
+      step "PATH was added to $path_profile"
+      ;;
+    configured)
+      step "Current terminal: export PATH=\"\$HOME/.muxvia/bin:\$PATH\" && muxvia"
+      step "Future terminals: open a new terminal and run: muxvia"
+      step "PATH is already configured in $path_profile"
+      ;;
+    skipped)
+      step "PATH update skipped because MUXVIA_NO_PATH_UPDATE is set"
+      step "Current terminal: export PATH=\"\$HOME/.muxvia/bin:\$PATH\" && muxvia"
+      ;;
+    *)
+      step "$bin_dir is already on PATH"
+      step "Current terminal: muxvia"
+      step "Future terminals: open a new terminal and run: muxvia"
+      ;;
+  esac
 }
 
 canonical_existing_path() {
@@ -294,7 +378,6 @@ activate() {
   mv -f "$active_temporary" "$active_file" || fail activation-failed
   active_temporary=
   activation_committed=1
-  printf 'Muxvia %s installed for %s. Add %s to PATH.\n' "$release" "$target" "$bin_dir"
 }
 
 [ "$#" -eq 0 ] || fail unexpected-arguments
@@ -363,3 +446,6 @@ tar -xzf "$archive" -C "$stage" || fail archive-extraction-failed
 bundle_root=$stage/muxvia-$release-$target
 validate_bundle "$bundle_root"
 activate
+add_to_path
+print_launch_instructions
+printf 'Muxvia %s installed for %s.\n' "$release" "$target"

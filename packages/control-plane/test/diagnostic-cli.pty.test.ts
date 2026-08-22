@@ -142,7 +142,7 @@ test("version is renderer-free and Provider, model, account, routing, and config
       product: "muxvia",
       release: "muxvia-dev",
       routingService: {
-        release: "0.1.0",
+        release: "0.1.1",
         rpc: { major: 1, minor: 0 },
       },
     })}\n`,
@@ -218,7 +218,7 @@ test("status reads a real private UDS without extending an idle Routing Service 
       command: "status",
       service: {
         state: "running",
-        release: "0.1.0",
+        release: "0.1.1",
         rpc: { major: 1, minor: 0 },
       },
       targets: {
@@ -618,7 +618,7 @@ test("service start is bounded and leaves no idle service or operating-system st
       service: {
         state: "idle-exited",
         started: true,
-        release: "0.1.0",
+        release: "0.1.1",
         recoveredTakeovers: [],
       },
     })}\n`,
@@ -1019,7 +1019,7 @@ esac
         service: {
           state: "running",
           started: true,
-          release: "0.1.0",
+          release: "0.1.1",
           recoveredTakeovers: ["codex", "claude"],
         },
       })}\n`,

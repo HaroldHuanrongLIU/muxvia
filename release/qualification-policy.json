@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "product": "muxvia",
-  "release": "0.1.0",
+  "release": "0.1.1",
   "supportedTargets": [
     "darwin-arm64",
     "darwin-x64",

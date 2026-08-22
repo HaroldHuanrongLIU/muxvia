@@ -8588,7 +8588,7 @@ test("real processes preserve priced Request History without retaining successfu
   }
   const renderHistoryThroughRealMuxvia = async () => {
     for (const target of targets) {
-      if (clients[target]?.serviceMetadata.release !== "0.1.0") {
+      if (clients[target]?.serviceMetadata.release !== "0.1.1") {
         throw new Error(`request-record-real-muxvia-service-release-invalid:${target}`)
       }
     }

@@ -16,12 +16,14 @@ Install Muxvia with one command:
 curl -fsSL https://github.com/HaroldHuanrongLIU/muxvia/releases/latest/download/install.sh | sh
 ```
 
-If `~/.muxvia/bin` is not already on your `PATH`, add it for the current shell and verify the installation:
+The installer detects zsh and bash on macOS and Linux, falling back to `~/.profile` for other shells. When `~/.muxvia/bin` is not already on `PATH`, it adds one idempotent Muxvia-managed block to the appropriate shell profile and prints the command needed in the current terminal. New terminals load the configured path automatically. To install without changing a shell profile, set `MUXVIA_NO_PATH_UPDATE=1`, `true`, or `yes`:
 
 ```sh
-export PATH="$HOME/.muxvia/bin:$PATH"
-muxvia version
+curl -fsSL https://github.com/HaroldHuanrongLIU/muxvia/releases/latest/download/install.sh \
+  | MUXVIA_NO_PATH_UPDATE=1 sh
 ```
+
+After installation, follow the printed current-terminal instruction and run `muxvia version` to verify the installation.
 
 The installer selects one exact archive for the current macOS or glibc Linux architecture. It verifies the public release identity, the archive SHA-256, and every file, mode, and SHA-256 bound by `muxvia-release.json` before changing the active version. Complete versioned Release Bundles and the atomic active-version pointer remain under `~/.muxvia`; the installer does not copy either executable elsewhere.
 

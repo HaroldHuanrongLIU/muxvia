@@ -25,7 +25,7 @@ import {
 } from "../../../scripts/release-qualification"
 
 const roots: string[] = []
-const release = "0.1.0"
+const release = "0.1.1"
 const build = "0123456789abcdef0123456789abcdef01234567"
 
 afterEach(async () => {

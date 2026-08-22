@@ -325,6 +325,9 @@ jobs:
             --ignore-scripts \
             --package-lock=false \
             "${{ matrix.package }}@${{ matrix.version }}"
+          if [ "${{ matrix.target }}" = "claude" ]; then
+            node target-cli/node_modules/@anthropic-ai/claude-code/install.cjs
+          fi
           PATH="$PWD/target-cli/node_modules/.bin:$PATH" \
             bun run release:qualification compatibility \
               --policy release/qualification-policy.json \

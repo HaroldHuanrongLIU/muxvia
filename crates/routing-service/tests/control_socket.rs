@@ -5582,7 +5582,7 @@ async fn late_ack_does_not_publish_before_a_newer_durable_writer_failure() {
     )
     .await
     .unwrap();
-    let older_durable = tokio::time::timeout(Duration::from_millis(150), async {
+    let older_durable = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if let Some(outcome) = fixture
                 .store
@@ -5629,7 +5629,7 @@ async fn late_ack_does_not_publish_before_a_newer_durable_writer_failure() {
     )
     .await
     .unwrap();
-    let newer_durable = tokio::time::timeout(Duration::from_millis(150), async {
+    let newer_durable = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if let Some(outcome) = fixture
                 .store

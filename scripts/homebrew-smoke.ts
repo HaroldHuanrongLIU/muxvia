@@ -205,6 +205,10 @@ async function main(): Promise<void> {
     HOMEBREW_NO_AUTO_UPDATE: "1",
     MUXVIA_UPDATE_CHECK: "0",
   }
+  // Hosted runners may retain upgraded kegs to save CI time. Exercise the
+  // documented default Homebrew lifecycle instead of inheriting that override.
+  delete environment.HOMEBREW_NO_INSTALL_CLEANUP
+  delete environment.HOMEBREW_NO_CLEANUP_FORMULAE
   let installed = false
   let tapped = false
   try {

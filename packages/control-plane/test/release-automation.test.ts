@@ -57,6 +57,15 @@ test("npm release automation smokes every platform and moves latest only after p
     "npm pack ./packages/npm-launcher",
     "npm dist-tag add",
   ]) expect(workflow).toContain(gate)
+  expect(workflow).toContain(
+    'cp "$tarballs/muxvia-${{ matrix.target }}-${{ steps.release.outputs.release }}.tgz" build/',
+  )
+  expect(workflow).toContain(
+    "build/muxvia-${{ matrix.target }}-${{ steps.release.outputs.release }}.tgz",
+  )
+  expect(workflow).not.toContain(
+    "build/npm/tarballs/muxvia-${{ matrix.target }}-${{ steps.release.outputs.release }}.tgz",
+  )
   expect(workflow.indexOf("Publish and verify every npm platform package")).toBeLessThan(
     workflow.indexOf("Publish and verify the npm launcher without moving its public tag"),
   )

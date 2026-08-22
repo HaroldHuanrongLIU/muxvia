@@ -443,7 +443,7 @@ jobs:
           staging_tag="release-${GITHUB_RUN_ID}"
           mkdir -p release/npm-verified
           for target in darwin-arm64 darwin-x64 linux-glibc-arm64 linux-glibc-x64; do
-            npm publish "release/muxvia-${target}-${release}.tgz" \
+            npm publish "./release/muxvia-${target}-${release}.tgz" \
               --access public \
               --tag "$staging_tag"
           done
@@ -466,7 +466,7 @@ jobs:
           staging_tag="release-${GITHUB_RUN_ID}"
           bun run release:npm inspect-launcher --root packages/npm-launcher --release "$release"
           launcher_tarball="$(npm pack ./packages/npm-launcher --pack-destination release --silent)"
-          npm publish "release/$launcher_tarball" --access public --tag "$staging_tag"
+          npm publish "./release/$launcher_tarball" --access public --tag "$staging_tag"
           mkdir -p release/npm-verified/launcher/extracted
           verified_tarball="$(npm pack "muxvia@${release}" \
             --pack-destination release/npm-verified/launcher \

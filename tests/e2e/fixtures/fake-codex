@@ -2,7 +2,7 @@
 set -eu
 case "${1-}" in
   --version)
-    printf '%s\n' 'codex-cli 0.106.0'
+    printf '%s\n' 'codex-cli 0.147.0'
     ;;
   --help)
     printf '%s\n' 'Usage: codex [OPTIONS]' '--config <key=value>'

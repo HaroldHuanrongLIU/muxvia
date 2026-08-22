@@ -1,5 +1,13 @@
 # Release archives and updates
 
+## v0.1 support and risk boundaries
+
+Muxvia v0.1 supports only the default Target CLI configuration homes `~/.codex` and `~/.claude`. Its public routing protocol surface is limited to OpenAI Responses, Anthropic Messages, and Anthropic token counting. The release qualification policy records the exact first and latest Target CLI versions proved by release CI: Codex CLI 0.147.0 and 0.149.0, and Claude Code 2.1.228 and 2.1.239. Versions outside those evidence points may pass a capability probe, but Muxvia labels them untested rather than expanding the public compatibility claim.
+
+Provider credentials, subscription refresh tokens, and routing secrets are stored locally in plaintext without application-level encryption, under best-effort restrictive filesystem permissions. A failed routed request may retain at most 64 KiB of its upstream error payload plus a truncation marker, so diagnostics and local state can contain sensitive request material. Recovery Backups are sensitive private artifacts that may contain credentials and operational state; they are not shareable Provider Configuration Exports. Store and transfer them accordingly.
+
+The Subscription Bridge uses an undocumented compatibility interface and carries the support, breakage, shared-quota, and account-terms risks documented in [Subscription Bridge](./subscription-bridge.md). Muxvia has no product telemetry and never downloads or installs an update. It only emits a notify-only update notice; installation, upgrade, repair, and removal remain explicit Operator or package-manager actions. The macOS Gatekeeper and unsigned/unnotarized guidance below applies to both bundled executables.
+
 ## Install through verified download
 
 Download and review the installer before running it:

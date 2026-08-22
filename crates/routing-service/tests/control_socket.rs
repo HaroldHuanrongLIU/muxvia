@@ -3039,7 +3039,7 @@ fn completing_probe_executable(root: &Path) -> (PathBuf, PathBuf) {
     fs::write(
         &executable,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ncase \"$1\" in\n --version) printf 'codex-cli 0.106.0\\n' ;;\n --help) printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n' ;;\n *) exit 91 ;;\nesac\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ncase \"$1\" in\n --version) printf 'codex-cli 0.147.0\\n' ;;\n --help) printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n' ;;\n *) exit 91 ;;\nesac\n",
             pids.display()
         ),
     )
@@ -3052,7 +3052,7 @@ fn completing_claude_probe_executable(root: &Path) -> PathBuf {
     let executable = root.join("completing-claude");
     fs::write(
         &executable,
-        "#!/bin/sh\ncase \"$1\" in\n --version) printf '2.1.37 (Claude Code)\\n' ;;\n --help) printf 'Usage: claude [options] [command]\\n--settings <file>\\n--model <model>\\n' ;;\n *) exit 91 ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1\" in\n --version) printf '2.1.228 (Claude Code)\\n' ;;\n --help) printf 'Usage: claude [options] [command]\\n--settings <file>\\n--model <model>\\n' ;;\n *) exit 91 ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -3066,7 +3066,7 @@ fn exited_probe_with_inherited_stdout(root: &Path) -> (PathBuf, PathBuf, PathBuf
     fs::write(
         &executable,
         format!(
-            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\ncase \"$1\" in\n --version) (/bin/sleep 2) & printf '%s' \"$!\" > '{}'; printf 'codex-cli 0.106.0\\n' ;;\n --help) printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n' ;;\n *) exit 91 ;;\nesac\n",
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\ncase \"$1\" in\n --version) (/bin/sleep 2) & printf '%s' \"$!\" > '{}'; printf 'codex-cli 0.147.0\\n' ;;\n --help) printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n' ;;\n *) exit 91 ;;\nesac\n",
             parent_pid.display(),
             descendant_pid.display(),
         ),
@@ -3083,7 +3083,7 @@ fn exited_claude_probe_with_inherited_stdout(root: &Path) -> (PathBuf, PathBuf, 
     fs::write(
         &executable,
         format!(
-            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\ncase \"$1\" in\n --version) (/bin/sleep 2) & printf '%s' \"$!\" > '{}'; printf '2.1.37 (Claude Code)\\n' ;;\n --help) printf 'Usage: claude [options] [command]\\n--settings <file>\\n--model <model>\\n' ;;\n *) exit 91 ;;\nesac\n",
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\ncase \"$1\" in\n --version) (/bin/sleep 2) & printf '%s' \"$!\" > '{}'; printf '2.1.228 (Claude Code)\\n' ;;\n --help) printf 'Usage: claude [options] [command]\\n--settings <file>\\n--model <model>\\n' ;;\n *) exit 91 ;;\nesac\n",
             parent_pid.display(),
             descendant_pid.display(),
         ),
@@ -3332,7 +3332,7 @@ async fn reconciliation_preview_normal_completion_reaps_every_probe_child_before
     assert_eq!(
         preview["result"]["preview"]["compatibility"],
         json!({
-            "version": "codex-cli 0.106.0",
+            "version": "codex-cli 0.147.0",
             "classification": "tested",
             "acknowledgementRequired": false
         })
@@ -3404,7 +3404,7 @@ async fn reconciliation_preview_claude_command_probe_projects_exact_success_over
     assert_eq!(
         preview["result"]["preview"]["compatibility"],
         json!({
-            "version": "2.1.37 (Claude Code)",
+            "version": "2.1.228 (Claude Code)",
             "classification": "tested",
             "acknowledgementRequired": false
         })

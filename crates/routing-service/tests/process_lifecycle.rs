@@ -862,8 +862,8 @@ async fn compatible_handover_execs_in_place_and_resumes_the_same_takeover() {
     let home = user_home.join(".muxvia");
     let shutdown_file = root.path().join("shutdown");
     fs::create_dir_all(&user_home).unwrap();
-    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.106.0");
-    let claude = fake_cli(root.path(), "fake-claude", "2.1.37 (Claude Code)");
+    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.147.0");
+    let claude = fake_cli(root.path(), "fake-claude", "2.1.228 (Claude Code)");
     let next_release = "next-test-release";
     let candidate = compatible_handover_candidate(root.path(), next_release);
     let upstream = HeldSseUpstream::start().await;
@@ -981,8 +981,8 @@ async fn failed_exec_rebinds_the_compatible_old_service_and_takeover() {
     let home = user_home.join(".muxvia");
     let shutdown_file = root.path().join("shutdown");
     fs::create_dir_all(&user_home).unwrap();
-    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.106.0");
-    let claude = fake_cli(root.path(), "fake-claude", "2.1.37 (Claude Code)");
+    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.147.0");
+    let claude = fake_cli(root.path(), "fake-claude", "2.1.228 (Claude Code)");
     let candidate = disappearing_handover_candidate(root.path(), "missing-next-release");
     let upstream = HeldSseUpstream::start().await;
     let mut child = command(&home, &shutdown_file)
@@ -1322,7 +1322,7 @@ async fn clean_claude_direct_is_control_only_across_restart_and_exits_after_last
     let user_home = root.path().join("home");
     let home = user_home.join(".muxvia");
     fs::create_dir_all(&user_home).unwrap();
-    let claude = fake_cli(root.path(), "fake-claude-direct", "2.1.37 (Claude Code)");
+    let claude = fake_cli(root.path(), "fake-claude-direct", "2.1.228 (Claude Code)");
 
     let first_shutdown = root.path().join("first-shutdown");
     let mut first = command(&home, &first_shutdown)
@@ -1497,7 +1497,7 @@ async fn disconnected_pending_action_commits_before_inactive_exit() {
     let action_started = root.path().join("action-started");
     let action_release = root.path().join("action-release");
     fs::create_dir_all(&user_home).unwrap();
-    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.106.0");
+    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.147.0");
     let child = command(&home, &shutdown_file)
         .arg("--test-codex-executable")
         .arg(&codex)
@@ -1609,8 +1609,8 @@ async fn either_takeover_keeps_the_process_alive_and_shutdown_drains_both_routes
     let home = user_home.join(".muxvia");
     let shutdown_file = root.path().join("shutdown");
     fs::create_dir_all(&user_home).unwrap();
-    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.106.0");
-    let claude = fake_cli(root.path(), "fake-claude", "2.1.37 (Claude Code)");
+    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.147.0");
+    let claude = fake_cli(root.path(), "fake-claude", "2.1.228 (Claude Code)");
     let mut child = command(&home, &shutdown_file)
         .arg("--test-codex-executable")
         .arg(codex)
@@ -1759,8 +1759,8 @@ async fn disabling_each_takeover_is_target_local_and_the_final_disable_exits_nat
     fs::write(&claude_settings, &claude_before).unwrap();
     fs::set_permissions(&codex_config, fs::Permissions::from_mode(0o640)).unwrap();
     fs::set_permissions(&claude_settings, fs::Permissions::from_mode(0o600)).unwrap();
-    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.106.0");
-    let claude = fake_cli(root.path(), "fake-claude", "2.1.37 (Claude Code)");
+    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.147.0");
+    let claude = fake_cli(root.path(), "fake-claude", "2.1.228 (Claude Code)");
     let mut child = command(&home, &shutdown_file)
         .arg("--test-codex-executable")
         .arg(codex)
@@ -1882,7 +1882,7 @@ async fn takeover_only_native_scan_imports_without_extending_final_idle_exit() {
         b"# operator-owned\nunrelated = \"keep\"\n",
     )
     .unwrap();
-    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.106.0");
+    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.147.0");
     let mut child = command(&home, &shutdown_file)
         .arg("--test-codex-executable")
         .arg(codex)
@@ -1946,8 +1946,8 @@ async fn clean_dual_takeover_restart_resumes_exact_claude_route_snapshot_and_cre
     let first_shutdown = root.path().join("shutdown-first");
     let second_shutdown = root.path().join("shutdown-second");
     fs::create_dir_all(&user_home).unwrap();
-    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.106.0");
-    let claude = fake_cli(root.path(), "fake-claude", "2.1.37 (Claude Code)");
+    let codex = fake_cli(root.path(), "fake-codex", "codex-cli 0.147.0");
+    let claude = fake_cli(root.path(), "fake-claude", "2.1.228 (Claude Code)");
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_base = format!("http://{}/v1", upstream_listener.local_addr().unwrap());
     let upstream = tokio::spawn(async move {

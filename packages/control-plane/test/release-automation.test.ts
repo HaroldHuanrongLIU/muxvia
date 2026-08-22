@@ -98,7 +98,7 @@ test("release automation gates the official Homebrew formula on both macOS archi
     "release:homebrew verify",
     "release:homebrew:smoke",
   ]) expect(homebrewJob).toContain(value)
-  expect(workflow).toContain("needs: [bundle, homebrew]")
+  expect(workflow).toContain("needs: qualification")
   expect(workflow).toContain("--output release/muxvia.rb")
 
   for (const value of [
@@ -137,4 +137,41 @@ test("the published GitHub Release updates the official Homebrew tap with its ex
   expect(tapJob).toContain("cmp -s released/muxvia.rb homebrew-muxvia/Formula/muxvia.rb")
   expect(tapJob).toContain("git -C homebrew-muxvia add Formula/muxvia.rb")
   expect(tapJob.indexOf("release:homebrew verify")).toBeLessThan(tapJob.indexOf("git -C homebrew-muxvia push origin HEAD"))
+})
+
+test("release publication is gated by four-channel qualification and real compatibility boundaries", async () => {
+  const [workflow, policy, diagnostics, codexProbe, claudeProbe] = await Promise.all([
+    readFile(resolve(".github/workflows/release.yml"), "utf8"),
+    readFile(resolve("release/qualification-policy.json"), "utf8").then(JSON.parse),
+    readFile(resolve("packages/control-plane/src/diagnostic-cli.ts"), "utf8"),
+    readFile(resolve("crates/routing-service/src/codex/probe.rs"), "utf8"),
+    readFile(resolve("crates/routing-service/src/claude/probe.rs"), "utf8"),
+  ])
+  const qualification = workflow.slice(workflow.indexOf("  qualification:"), workflow.indexOf("  publish:"))
+  const publish = workflow.slice(workflow.indexOf("  publish:"), workflow.indexOf("  publish-homebrew-tap:"))
+
+  expect(workflow).toContain("bun run verify")
+  expect(workflow).toContain("needs: quality")
+  expect(workflow).toContain("release:qualification compatibility")
+  expect(workflow).toContain("release:qualification record")
+  expect(workflow).toContain('pattern: "*"')
+  expect(qualification).toContain("needs: [bundle, homebrew, compatibility]")
+  expect(publish).toContain("needs: qualification")
+  expect(publish).toContain("release/muxvia-qualification.json")
+  for (const [target, entry] of Object.entries(policy.compatibility) as Array<[
+    string,
+    { package: string; first: string; latest: string },
+  ]>) {
+    expect(workflow).toContain(`target: ${target}`)
+    expect(workflow).toContain(`package: "${entry.package}"`)
+    expect(workflow).toContain(`version: ${entry.first}`)
+    expect(workflow).toContain(`version: ${entry.latest}`)
+    for (const version of [entry.first, entry.latest]) {
+      expect(diagnostics).toContain(version)
+      expect(target === "codex" ? codexProbe : claudeProbe).toContain(version)
+    }
+  }
+  for (const lifecycleGate of ["doctor --json", "npm uninstall", "brew", "rm -rf \"$installer_home/.muxvia/install\""]) {
+    expect(workflow).toContain(lifecycleGate)
+  }
 })

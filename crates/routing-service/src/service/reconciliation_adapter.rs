@@ -737,14 +737,14 @@ mod tests {
 
     fn compatibility() -> ProbedCompatibility {
         ProbedCompatibility::new(
-            "codex-cli 0.106.0".to_owned(),
+            "codex-cli 0.147.0".to_owned(),
             CompatibilityClassification::Tested,
         )
     }
 
     fn claude_compatibility() -> ProbedCompatibility {
         ProbedCompatibility::new(
-            "2.1.37 (Claude Code)".to_owned(),
+            "2.1.228 (Claude Code)".to_owned(),
             CompatibilityClassification::Tested,
         )
     }

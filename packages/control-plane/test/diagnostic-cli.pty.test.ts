@@ -510,14 +510,14 @@ test("doctor is read-only across bundle, permissions, homes, symlinks, shadows, 
   await symlink(claudeSettingsTarget, join(claudeHome, "settings.json"))
   await writeFile(join(binHome, "codex"), `#!/bin/sh
 case "$1" in
-  --version) echo 'codex-cli 0.106.0' ;;
+  --version) echo 'codex-cli 0.147.0' ;;
   --help) echo 'Usage: codex --config VALUE' ;;
   *) exit 64 ;;
 esac
 `, { mode: 0o700 })
   await writeFile(join(binHome, "claude"), `#!/bin/sh
 case "$1" in
-  --version) echo '2.1.37 (Claude Code)' ;;
+  --version) echo '2.1.228 (Claude Code)' ;;
   --help) echo 'Usage: claude --settings FILE --model MODEL' ;;
   *) exit 64 ;;
 esac
@@ -565,8 +565,8 @@ esac
   expect(checks["symlink.claude-managed-configuration"]).toMatchObject({ status: "fail", code: "managed-file-symlink" })
   expect(checks["shadow.codex-profile"]).toMatchObject({ status: "warning", code: "shadowing-configuration" })
   expect(checks["shadow.claude-selector"]).toMatchObject({ status: "warning", code: "shadowing-configuration" })
-  expect(checks["compatibility.codex"]).toMatchObject({ status: "pass", code: "tested", version: "codex-cli 0.106.0" })
-  expect(checks["compatibility.claude"]).toMatchObject({ status: "pass", code: "tested", version: "2.1.37 (Claude Code)" })
+  expect(checks["compatibility.codex"]).toMatchObject({ status: "pass", code: "tested", version: "codex-cli 0.147.0" })
+  expect(checks["compatibility.claude"]).toMatchObject({ status: "pass", code: "tested", version: "2.1.228 (Claude Code)" })
   expect(report.disclosures.credentialStorage).toEqual({
     applicationEncryption: "none",
     filesystemPermissions: "best-effort-private",
@@ -682,14 +682,14 @@ test("service stop safely restores Managed Configuration and waits for a committ
   await writeFile(config, before, { mode: 0o640 })
   await writeFile(join(binHome, "codex"), `#!/bin/sh
 case "$1" in
-  --version) echo 'codex-cli 0.106.0' ;;
+  --version) echo 'codex-cli 0.147.0' ;;
   --help) echo 'Usage: codex --config VALUE' ;;
   *) exit 64 ;;
 esac
 `, { mode: 0o700 })
   await writeFile(join(binHome, "claude"), `#!/bin/sh
 case "$1" in
-  --version) echo '2.1.37 (Claude Code)' ;;
+  --version) echo '2.1.228 (Claude Code)' ;;
   --help) echo 'Usage: claude --settings FILE --model MODEL' ;;
   *) exit 64 ;;
 esac
@@ -828,14 +828,14 @@ test("service force stop requires the exact danger acknowledgement and leaves Ma
   await writeFile(config, before, { mode: 0o640 })
   await writeFile(join(binHome, "codex"), `#!/bin/sh
 case "$1" in
-  --version) echo 'codex-cli 0.106.0' ;;
+  --version) echo 'codex-cli 0.147.0' ;;
   --help) echo 'Usage: codex --config VALUE' ;;
   *) exit 64 ;;
 esac
 `, { mode: 0o700 })
   await writeFile(join(binHome, "claude"), `#!/bin/sh
 case "$1" in
-  --version) echo '2.1.37 (Claude Code)' ;;
+  --version) echo '2.1.228 (Claude Code)' ;;
   --help) echo 'Usage: claude --settings FILE --model MODEL' ;;
   *) exit 64 ;;
 esac
@@ -945,14 +945,14 @@ test("service start recovers every configured Target Takeover and safe stop rest
   await writeFile(claudeConfig, claudeBefore, { mode: 0o600 })
   await writeFile(join(binHome, "codex"), `#!/bin/sh
 case "$1" in
-  --version) echo 'codex-cli 0.106.0' ;;
+  --version) echo 'codex-cli 0.147.0' ;;
   --help) echo 'Usage: codex --config VALUE' ;;
   *) exit 64 ;;
 esac
 `, { mode: 0o700 })
   await writeFile(join(binHome, "claude"), `#!/bin/sh
 case "$1" in
-  --version) echo '2.1.37 (Claude Code)' ;;
+  --version) echo '2.1.228 (Claude Code)' ;;
   --help) echo 'Usage: claude --settings FILE --model MODEL' ;;
   *) exit 64 ;;
 esac

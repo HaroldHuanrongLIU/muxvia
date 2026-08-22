@@ -9,7 +9,7 @@ use crate::{
     probe_process::{self, ProbeProcessError},
 };
 
-const TESTED_CLAUDE_VERSION: &str = "2.1.37 (Claude Code)";
+const TESTED_CLAUDE_VERSIONS: &[&str] = &["2.1.228 (Claude Code)", "2.1.239 (Claude Code)"];
 
 pub trait ClaudeProbe: Send + Sync {
     fn probe(&self, executable: &Path) -> Result<ClaudeCapability, ClaudeProblem>;
@@ -150,7 +150,7 @@ impl ClaudeProbe for CommandClaudeProbe {
                     .with_version(version),
             );
         }
-        if version == TESTED_CLAUDE_VERSION {
+        if TESTED_CLAUDE_VERSIONS.contains(&version.as_str()) {
             Ok(ClaudeCapability::Tested { version })
         } else {
             Ok(ClaudeCapability::UnknownCompatible {
@@ -190,7 +190,7 @@ impl ClaudeProbe for CommandClaudeProbe {
                         .with_version(version),
                 );
             }
-            if version == TESTED_CLAUDE_VERSION {
+            if TESTED_CLAUDE_VERSIONS.contains(&version.as_str()) {
                 Ok(ClaudeCapability::Tested { version })
             } else {
                 Ok(ClaudeCapability::UnknownCompatible {

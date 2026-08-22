@@ -14,6 +14,7 @@
     "release:homebrew": "bun scripts/homebrew-formula.ts",
     "release:homebrew:smoke": "bun scripts/homebrew-smoke.ts",
     "release:npm": "bun scripts/npm-packages.ts",
+    "release:qualification": "bun scripts/release-qualification.ts",
     "verify": "./scripts/verify-t01.sh"
   },
   "devDependencies": {

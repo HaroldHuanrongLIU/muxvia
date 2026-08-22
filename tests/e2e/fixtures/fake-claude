@@ -2,7 +2,7 @@
 set -eu
 case "${1-}" in
   --version)
-    printf '%s\n' '2.1.37 (Claude Code)'
+    printf '%s\n' '2.1.228 (Claude Code)'
     ;;
   --help)
     printf '%s\n' 'Usage: claude [OPTIONS]' '--settings <file>' '--model <model>'

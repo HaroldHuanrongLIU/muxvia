@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "product": "muxvia",
+  "release": "0.1.0",
+  "supportedTargets": [
+    "darwin-arm64",
+    "darwin-x64",
+    "linux-glibc-arm64",
+    "linux-glibc-x64"
+  ],
+  "compatibility": {
+    "codex": {
+      "package": "@openai/codex",
+      "first": "0.147.0",
+      "latest": "0.149.0"
+    },
+    "claude": {
+      "package": "@anthropic-ai/claude-code",
+      "first": "2.1.228",
+      "latest": "2.1.239"
+    }
+  },
+  "configurationHomes": [
+    "~/.codex",
+    "~/.claude"
+  ],
+  "protocols": [
+    "OpenAI Responses",
+    "Anthropic Messages",
+    "Anthropic token counting"
+  ]
+}

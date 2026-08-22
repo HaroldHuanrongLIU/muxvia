@@ -550,7 +550,7 @@ fn command_probe_runs_only_version_and_help() {
     fs::write(
         &executable,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\n  --version) printf 'codex-cli 0.106.0\\n' ;;\n  --help) printf 'Usage: codex [OPTIONS] [PROMPT]\\n--config <key=value>\\n' ;;\n  *) exit 91 ;;\nesac\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\ncase \"$1\" in\n  --version) printf 'codex-cli 0.147.0\\n' ;;\n  --help) printf 'Usage: codex [OPTIONS] [PROMPT]\\n--config <key=value>\\n' ;;\n  *) exit 91 ;;\nesac\n",
             log.display()
         ),
     )
@@ -570,21 +570,44 @@ fn reconciliation_probe_projects_only_exact_version_and_closed_classification() 
     let executable = temp.path().join("codex-reconciliation-fixture");
     fs::write(
         &executable,
-        "#!/bin/sh\ncase \"$1\" in\n --version) printf 'codex-cli 0.106.0\\n' ;;\n --help) printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n' ;;\n *) exit 91 ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1\" in\n --version) printf 'codex-cli 0.147.0\\n' ;;\n --help) printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n' ;;\n *) exit 91 ;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
     let capability = CommandCodexProbe.probe(&executable).unwrap();
 
-    assert_eq!(capability.version(), "codex-cli 0.106.0");
+    assert_eq!(capability.version(), "codex-cli 0.147.0");
     assert_eq!(
         capability.classification(),
         CompatibilityClassification::Tested
     );
     assert_eq!(
         format!("{capability:?}"),
-        "Tested { version: \"codex-cli 0.106.0\" }"
+        "Tested { version: \"codex-cli 0.147.0\" }"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn release_qualified_codex_boundaries_are_tested() {
+    let _guard = COMMAND_PROBE_LOCK.lock().unwrap();
+    for version in ["0.147.0", "0.149.0"] {
+        let temp = TempDir::new().unwrap();
+        let executable = temp.path().join("codex-release-fixture");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n --version) printf 'codex-cli {version}\\n' ;;\n --help) printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n' ;;\n *) exit 91 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(
+            CommandCodexProbe.probe(&executable).unwrap(),
+            CodexCapability::Tested { .. }
+        ));
+    }
 }
 
 #[cfg(unix)]
@@ -604,17 +627,17 @@ fn reconciliation_probe_rejects_malformed_missing_contradictory_and_non_utf8_out
         ),
         (
             "contradictory help",
-            "printf 'codex-cli 0.106.0\\n'",
+            "printf 'codex-cli 0.147.0\\n'",
             "printf 'Usage: claude [OPTIONS]\\n--config <key=value>\\n'",
         ),
         (
             "missing --config capability",
-            "printf 'codex-cli 0.106.0\\n'",
+            "printf 'codex-cli 0.147.0\\n'",
             "printf 'Usage: codex [OPTIONS]\\nmissing-config-probe-output-sentinel\\n'",
         ),
         (
             "multiline raw version",
-            "printf 'codex-cli 0.106.0\\nraw-probe-output-sentinel\\n'",
+            "printf 'codex-cli 0.147.0\\nraw-probe-output-sentinel\\n'",
             "printf 'Usage: codex [OPTIONS]\\n--config <key=value>\\n'",
         ),
         (

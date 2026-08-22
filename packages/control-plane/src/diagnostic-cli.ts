@@ -879,7 +879,10 @@ async function targetCompatibilityCheck(target: "codex" | "claude"): Promise<Doc
       ? help.includes("usage:") && help.includes("codex") && help.includes("--config")
       : help.includes("usage:") && help.includes("claude") && help.includes("--settings") && help.includes("--model")
     if (!version || !compatibleHelp) return { id, status: "fail", code: "incompatible-target-cli" }
-    const tested = target === "codex" ? version === "codex-cli 0.106.0" : version === "2.1.37 (Claude Code)"
+    const tested = (target === "codex"
+      ? ["codex-cli 0.147.0", "codex-cli 0.149.0"]
+      : ["2.1.228 (Claude Code)", "2.1.239 (Claude Code)"]
+    ).includes(version)
     return tested
       ? { id, status: "pass", code: "tested", version }
       : { id, status: "warning", code: "unknown-compatible", version }

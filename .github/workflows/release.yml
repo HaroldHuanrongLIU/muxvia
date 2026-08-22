@@ -8,8 +8,34 @@ permissions:
   contents: read
 
 jobs:
+  quality:
+    name: release quality (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04]
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # dtolnay/rust-toolchain stable action snapshot (2026-08-05)
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+      # oven-sh/setup-bun v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - run: bun install --frozen-lockfile
+      - run: bun run verify
+
   bundle:
     name: bundle (${{ matrix.target }})
+    needs: quality
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -93,6 +119,11 @@ jobs:
           bun run release:bundle smoke \
             --root "build/extracted/$(basename "$bundle")" \
             --release "${{ steps.release.outputs.release }}"
+          archive_home="$(mktemp -d)"
+          HOME="$archive_home" MUXVIA_UPDATE_CHECK=0 \
+            "build/extracted/$(basename "$bundle")/muxvia" doctor --json \
+            || test "$?" -eq 78
+          rm -rf "build/extracted/$(basename "$bundle")" "$archive_home"
           installer_assets="$(pwd)/build/installer-assets"
           installer_release="$installer_assets/releases/v${{ steps.release.outputs.release }}"
           installer_home="$(mktemp -d)"
@@ -110,12 +141,22 @@ jobs:
             MUXVIA_INSTALLER_TEST_RELEASES_URL="file://$installer_assets/releases" \
             sh scripts/install.sh
           HOME="$installer_home" "$installer_home/.muxvia/bin/muxvia" version --json
+          HOME="$installer_home" MUXVIA_UPDATE_CHECK=0 \
+            "$installer_home/.muxvia/bin/muxvia" doctor --json \
+            || test "$?" -eq 78
           HOME="$installer_home" \
             PATH="$installer_home/.muxvia/bin:$PATH" \
             MUXVIA_INSTALLER_TESTING=1 \
             MUXVIA_INSTALLER_TEST_MANIFEST_URL="file://$installer_assets/muxvia-latest.json" \
             MUXVIA_INSTALLER_TEST_RELEASES_URL="file://$installer_assets/releases" \
             sh scripts/install.sh
+          HOME="$installer_home" MUXVIA_UPDATE_CHECK=0 \
+            "$installer_home/.muxvia/bin/muxvia" doctor --json \
+            || test "$?" -eq 78
+          rm -rf "$installer_home/.muxvia/install"
+          rm -f "$installer_home/.muxvia/bin/muxvia"
+          test ! -e "$installer_home/.muxvia/install"
+          test ! -e "$installer_home/.muxvia/bin/muxvia"
       - name: Pack and smoke the npm installation
         run: |
           package_root="$(pwd)/build/npm/platform"
@@ -147,6 +188,23 @@ jobs:
             "$tarballs/muxvia-${{ steps.release.outputs.release }}.tgz" \
             "$tarballs/muxvia-${{ matrix.target }}-${{ steps.release.outputs.release }}.tgz"
           MUXVIA_UPDATE_CHECK=0 "$smoke_root/node_modules/.bin/muxvia" version --json
+          MUXVIA_UPDATE_CHECK=0 "$smoke_root/node_modules/.bin/muxvia" doctor --json \
+            || test "$?" -eq 78
+          npm install \
+            --prefix "$smoke_root" \
+            --offline \
+            --ignore-scripts \
+            --omit=optional \
+            --package-lock=false \
+            "$tarballs/muxvia-${{ steps.release.outputs.release }}.tgz" \
+            "$tarballs/muxvia-${{ matrix.target }}-${{ steps.release.outputs.release }}.tgz"
+          MUXVIA_UPDATE_CHECK=0 "$smoke_root/node_modules/.bin/muxvia" version --json
+          npm uninstall \
+            --prefix "$smoke_root" \
+            --ignore-scripts \
+            --package-lock=false \
+            muxvia "@muxvia/${{ matrix.target }}"
+          test ! -e "$smoke_root/node_modules/.bin/muxvia"
       # actions/upload-artifact v4
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -213,9 +271,133 @@ jobs:
             --upgrade-formula build/homebrew/upgrade/Formula/muxvia.rb \
             --release "${{ steps.release.outputs.release }}"
 
+  compatibility:
+    name: compatibility (${{ matrix.target }} ${{ matrix.evidence }} ${{ matrix.version }})
+    needs: bundle
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: codex
+            evidence: first
+            package: "@openai/codex"
+            version: 0.147.0
+          - target: codex
+            evidence: latest
+            package: "@openai/codex"
+            version: 0.149.0
+          - target: claude
+            evidence: first
+            package: "@anthropic-ai/claude-code"
+            version: 2.1.228
+          - target: claude
+            evidence: latest
+            package: "@anthropic-ai/claude-code"
+            version: 2.1.239
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # oven-sh/setup-bun v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - run: bun install --frozen-lockfile
+      # actions/download-artifact v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          pattern: muxvia-*-linux-glibc-x64
+          path: release
+          merge-multiple: true
+      - name: Prove the pinned Target CLI boundary
+        shell: bash
+        run: |
+          release="${GITHUB_REF_NAME#v}"
+          archive="release/muxvia-${release}-linux-glibc-x64.tar.gz"
+          mkdir -p release/extracted
+          tar -xzf "$archive" -C release/extracted
+          npm install \
+            --prefix target-cli \
+            --ignore-scripts \
+            --package-lock=false \
+            "${{ matrix.package }}@${{ matrix.version }}"
+          PATH="$PWD/target-cli/node_modules/.bin:$PATH" \
+            bun run release:qualification compatibility \
+              --policy release/qualification-policy.json \
+              --muxvia "release/extracted/muxvia-${release}-linux-glibc-x64/muxvia" \
+              --target "${{ matrix.target }}" \
+              --evidence "${{ matrix.evidence }}" \
+              --version "${{ matrix.version }}" \
+              --release "$release" \
+              --build "${{ github.sha }}" \
+              --output "release/muxvia-compatibility-${{ matrix.target }}-${{ matrix.evidence }}-${{ matrix.version }}.json"
+      # actions/upload-artifact v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: compatibility-${{ matrix.target }}-${{ matrix.evidence }}
+          path: release/muxvia-compatibility-${{ matrix.target }}-${{ matrix.evidence }}-${{ matrix.version }}.json
+          if-no-files-found: error
+          retention-days: 7
+
+  qualification:
+    name: qualify four release channels
+    needs: [bundle, homebrew, compatibility]
+    runs-on: ubuntu-24.04
+    steps:
+      # actions/checkout v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # oven-sh/setup-bun v2.2.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      # actions/download-artifact v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          pattern: "*"
+          path: release
+          merge-multiple: true
+      - name: Generate the canonical four-channel qualification record
+        shell: bash
+        run: |
+          release="${GITHUB_REF_NAME#v}"
+          bun run release:bundle public-manifest \
+            --release "$release" \
+            --archives release \
+            --output release/muxvia-latest.json
+          bun run release:homebrew generate \
+            --manifest release/muxvia-latest.json \
+            --output release/muxvia.rb
+          install -m 0755 scripts/install.sh release/install.sh
+          bun run release:qualification record \
+            --policy release/qualification-policy.json \
+            --artifacts release \
+            --manifest release/muxvia-latest.json \
+            --formula release/muxvia.rb \
+            --installer release/install.sh \
+            --launcher packages/npm-launcher \
+            --release "$release" \
+            --build "${{ github.sha }}" \
+            --output release/muxvia-qualification.json
+      # actions/upload-artifact v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: muxvia-qualified-${{ github.ref_name }}
+          path: |
+            release/muxvia-latest.json
+            release/muxvia.rb
+            release/install.sh
+            release/muxvia-qualification.json
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: publish release channels
-    needs: [bundle, homebrew]
+    needs: qualification
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -238,24 +420,17 @@ jobs:
           pattern: muxvia-*
           path: release
           merge-multiple: true
-      - name: Build public release manifest
+      - name: Verify the qualified release identity
         id: release
         shell: bash
         run: |
           release="${GITHUB_REF_NAME#v}"
-          bun run release:bundle public-manifest \
-            --release "$release" \
-            --archives release \
-            --output release/muxvia-latest.json
-          printf 'release=%s\n' "$release" >> "$GITHUB_OUTPUT"
-      - name: Generate and verify the official tap formula
-        run: |
-          bun run release:homebrew generate \
-            --manifest release/muxvia-latest.json \
-            --output release/muxvia.rb
+          test "$release" = "$(node -p "require('./packages/npm-launcher/package.json').version")"
           bun run release:homebrew verify \
             --manifest release/muxvia-latest.json \
             --formula release/muxvia.rb
+          cmp -s scripts/install.sh release/install.sh
+          printf 'release=%s\n' "$release" >> "$GITHUB_OUTPUT"
       - name: Publish and verify every npm platform package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -305,10 +480,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          install -m 0755 scripts/install.sh release/install.sh
           gh release create "$GITHUB_REF_NAME" \
             release/*.tar.gz \
             release/muxvia-latest.json \
+            release/muxvia-qualification.json \
             release/muxvia.rb \
             release/install.sh \
             --verify-tag \

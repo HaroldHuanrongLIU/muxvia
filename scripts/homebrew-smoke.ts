@@ -51,7 +51,7 @@ function rejectUnless(condition: boolean, message: string): asserts condition {
 }
 
 async function writeTargetFixture(path: string, target: "codex" | "claude"): Promise<void> {
-  const version = target === "codex" ? "codex-cli 0.106.0" : "2.1.37 (Claude Code)"
+  const version = target === "codex" ? "codex-cli 0.147.0" : "2.1.228 (Claude Code)"
   const help = target === "codex"
     ? "Usage: codex --config VALUE"
     : "Usage: claude --settings FILE --model MODEL"

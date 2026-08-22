@@ -476,7 +476,7 @@ fn command_probe_uses_only_read_only_version_and_help_surfaces() {
     let temp = TempDir::new().unwrap();
     let (executable, log) = fake_claude(
         &temp,
-        "2.1.37 (Claude Code)",
+        "2.1.228 (Claude Code)",
         "Usage: claude [options] [command]\n--settings <file>\n--model <model>",
         0,
     );
@@ -494,21 +494,40 @@ fn reconciliation_probe_projects_only_exact_version_and_closed_classification() 
     let temp = TempDir::new().unwrap();
     let (executable, _) = fake_claude(
         &temp,
-        "2.1.37 (Claude Code)",
+        "2.1.228 (Claude Code)",
         "Usage: claude [options]\n--settings <file>\n--model <model>",
         0,
     );
     let capability = CommandClaudeProbe.probe(&executable).unwrap();
 
-    assert_eq!(capability.version(), "2.1.37 (Claude Code)");
+    assert_eq!(capability.version(), "2.1.228 (Claude Code)");
     assert_eq!(
         capability.classification(),
         CompatibilityClassification::Tested
     );
     assert_eq!(
         format!("{capability:?}"),
-        "Tested { version: \"2.1.37 (Claude Code)\" }"
+        "Tested { version: \"2.1.228 (Claude Code)\" }"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn release_qualified_claude_boundaries_are_tested() {
+    let _guard = COMMAND_PROBE_LOCK.lock().unwrap();
+    for version in ["2.1.228 (Claude Code)", "2.1.239 (Claude Code)"] {
+        let temp = TempDir::new().unwrap();
+        let (executable, _) = fake_claude(
+            &temp,
+            version,
+            "Usage: claude [options]\n--settings <file>\n--model <model>",
+            0,
+        );
+        assert!(matches!(
+            CommandClaudeProbe.probe(&executable).unwrap(),
+            ClaudeCapability::Tested { .. }
+        ));
+    }
 }
 
 #[cfg(unix)]
@@ -528,27 +547,27 @@ fn reconciliation_probe_rejects_malformed_missing_contradictory_and_non_utf8_out
         ),
         (
             "contradictory help",
-            "printf '2.1.37 (Claude Code)\\n'",
+            "printf '2.1.228 (Claude Code)\\n'",
             "printf 'Usage: codex [options]\\n--settings <file>\\n--model <model>\\n'",
         ),
         (
             "missing --settings capability",
-            "printf '2.1.37 (Claude Code)\\n'",
+            "printf '2.1.228 (Claude Code)\\n'",
             "printf 'Usage: claude [options]\\n--model <model>\\nmissing-settings-probe-output-sentinel\\n'",
         ),
         (
             "missing --model capability",
-            "printf '2.1.37 (Claude Code)\\n'",
+            "printf '2.1.228 (Claude Code)\\n'",
             "printf 'Usage: claude [options]\\n--settings <file>\\nmissing-model-probe-output-sentinel\\n'",
         ),
         (
             "missing both capability markers",
-            "printf '2.1.37 (Claude Code)\\n'",
+            "printf '2.1.228 (Claude Code)\\n'",
             "printf 'Usage: claude [options]\\nmissing-markers-probe-output-sentinel\\n'",
         ),
         (
             "multiline raw version",
-            "printf '2.1.37 (Claude Code)\\nraw-probe-output-sentinel\\n'",
+            "printf '2.1.228 (Claude Code)\\nraw-probe-output-sentinel\\n'",
             "printf 'Usage: claude [options]\\n--settings <file>\\n--model <model>\\n'",
         ),
         (

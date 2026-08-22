@@ -8,7 +8,7 @@ use crate::{
     probe_process::{self, ProbeProcessError},
 };
 
-const TESTED_CODEX_VERSION: &str = "codex-cli 0.106.0";
+const TESTED_CODEX_VERSIONS: &[&str] = &["codex-cli 0.147.0", "codex-cli 0.149.0"];
 
 pub trait CodexProbe: Send + Sync {
     fn probe(&self, executable: &Path) -> Result<CodexCapability, CodexProblem>;
@@ -120,7 +120,7 @@ impl CodexProbe for CommandCodexProbe {
                     .with_version(version),
             );
         }
-        if version == TESTED_CODEX_VERSION {
+        if TESTED_CODEX_VERSIONS.contains(&version.as_str()) {
             Ok(CodexCapability::Tested { version })
         } else {
             Ok(CodexCapability::UnknownCompatible {
@@ -159,7 +159,7 @@ impl CodexProbe for CommandCodexProbe {
                         .with_version(version),
                 );
             }
-            if version == TESTED_CODEX_VERSION {
+            if TESTED_CODEX_VERSIONS.contains(&version.as_str()) {
                 Ok(CodexCapability::Tested { version })
             } else {
                 Ok(CodexCapability::UnknownCompatible {

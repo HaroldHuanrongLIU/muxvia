@@ -4019,8 +4019,8 @@ test("real processes reconcile Codex and Claude configuration drift", async () =
     operator: { theme: "dark", hooks: ["keep"] }, env: { OPERATOR_UNRELATED: "keep-me" },
   }, null, 2), { mode: 0o640 })
   await chmod(claudeSettings, 0o640)
-  await writeFile(codexVersion, "0.106.0\n", { mode: 0o600 })
-  await writeFile(claudeVersion, "2.1.37\n", { mode: 0o600 })
+  await writeFile(codexVersion, "0.147.0\n", { mode: 0o600 })
+  await writeFile(claudeVersion, "2.1.228\n", { mode: 0o600 })
   await writeMutableProbe(codexExecutable, codexVersion, "codex")
   await writeMutableProbe(claudeExecutable, claudeVersion, "claude")
 

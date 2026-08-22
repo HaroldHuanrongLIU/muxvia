@@ -116,6 +116,8 @@ test("release automation gates the official Homebrew formula on both macOS archi
     '"--lifecycle-metadata"',
     '["brew", "upgrade"',
     '["brew", "uninstall"',
+    "delete environment.HOMEBREW_NO_INSTALL_CLEANUP",
+    "delete environment.HOMEBREW_NO_CLEANUP_FORMULAE",
     '["brew", "list", "--versions", "muxvia"], environment, [0, 1]',
     'absent.stdout.trim() === ""',
   ]) expect(smoke).toContain(value)

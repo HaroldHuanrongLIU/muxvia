@@ -201,6 +201,7 @@ struct SessionServices {
     native_usage: Arc<NativeUsageService>,
     handover: Option<mpsc::Sender<PreparedHandover>>,
     force_stop: Option<mpsc::Sender<()>>,
+    frame_write_timeout: Duration,
 }
 
 struct InspectionOperation {
@@ -221,6 +222,7 @@ struct InspectionServices {
 struct ServerRuntime {
     exit_when_idle: bool,
     native_usage_scan_interval: Duration,
+    frame_write_timeout: Duration,
 }
 
 impl ServerRuntime {
@@ -228,6 +230,7 @@ impl ServerRuntime {
         Self {
             exit_when_idle: false,
             native_usage_scan_interval: Duration::from_secs(60),
+            frame_write_timeout: FRAME_WRITE_TIMEOUT,
         }
     }
 
@@ -235,6 +238,7 @@ impl ServerRuntime {
         Self {
             exit_when_idle: true,
             native_usage_scan_interval,
+            frame_write_timeout: FRAME_WRITE_TIMEOUT,
         }
     }
 }
@@ -283,6 +287,29 @@ impl ControlServer {
             None,
             None,
             ServerRuntime::session(),
+        )
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn bind_with_activation_and_frame_write_timeout(
+        home: &MuxviaHome,
+        store: Arc<StateStore>,
+        release: impl Into<String>,
+        activation: Arc<ActivationService>,
+        frame_write_timeout: Duration,
+    ) -> Result<ControlServerHandle, ControlServerError> {
+        Self::bind_configured(
+            home,
+            store,
+            release,
+            activation,
+            None,
+            None,
+            ServerRuntime {
+                frame_write_timeout,
+                ..ServerRuntime::session()
+            },
         )
         .await
     }
@@ -617,6 +644,7 @@ impl ControlServer {
                             native_usage,
                             handover,
                             force_stop,
+                            frame_write_timeout: runtime.frame_write_timeout,
                         };
                         sessions.spawn(async move {
                             let _guard = SessionGuard(Arc::clone(&lifecycle));
@@ -845,6 +873,7 @@ async fn serve_session(
         native_usage,
         handover,
         force_stop,
+        frame_write_timeout,
     } = services;
     let first = match read_frame(&mut stream).await {
         Ok(first) => first,
@@ -913,7 +942,12 @@ async fn serve_session(
     let (mut reader, writer) = stream.into_split();
     let (responses, response_rx) = mpsc::channel(RESPONSE_QUEUE_CAPACITY);
     let writer_guard = WriterGuard::new(Arc::clone(&lifecycle));
-    let mut writer_task = tokio::spawn(write_responses(writer, response_rx, writer_guard));
+    let mut writer_task = tokio::spawn(write_responses(
+        writer,
+        response_rx,
+        writer_guard,
+        frame_write_timeout,
+    ));
     let mut opened_target = None;
     let mut opened_universal_providers = false;
     let mut opened_subscription_accounts = false;
@@ -2871,11 +2905,12 @@ async fn write_responses(
     mut writer: tokio::net::unix::OwnedWriteHalf,
     mut responses: mpsc::Receiver<QueuedResponse>,
     writer_guard: WriterGuard,
+    frame_write_timeout: Duration,
 ) {
     while let Some(response) = responses.recv().await {
         let QueuedResponse { frame, written } = response;
         if !matches!(
-            tokio::time::timeout(FRAME_WRITE_TIMEOUT, write_frame(&mut writer, &frame)).await,
+            tokio::time::timeout(frame_write_timeout, write_frame(&mut writer, &frame)).await,
             Ok(Ok(_))
         ) {
             drop(writer);

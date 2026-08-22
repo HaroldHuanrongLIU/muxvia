@@ -505,10 +505,26 @@ struct ControlFixture {
 
 impl ControlFixture {
     async fn start() -> Self {
-        Self::start_with_activation_hooks(ActivationHooks::default()).await
+        Self::start_with_activation_hooks_and_frame_write_timeout(ActivationHooks::default(), None)
+            .await
     }
 
     async fn start_with_activation_hooks(hooks: ActivationHooks) -> Self {
+        Self::start_with_activation_hooks_and_frame_write_timeout(hooks, None).await
+    }
+
+    async fn start_with_frame_write_timeout(frame_write_timeout: Duration) -> Self {
+        Self::start_with_activation_hooks_and_frame_write_timeout(
+            ActivationHooks::default(),
+            Some(frame_write_timeout),
+        )
+        .await
+    }
+
+    async fn start_with_activation_hooks_and_frame_write_timeout(
+        hooks: ActivationHooks,
+        frame_write_timeout: Option<Duration>,
+    ) -> Self {
         let root = short_temp_root("mx-ctl");
         let user_home = root.join("home");
         fs::create_dir_all(&user_home).unwrap();
@@ -525,13 +541,27 @@ impl ControlFixture {
             .with_hooks(hooks)
             .with_claude_runtime(Arc::new(ControlClaudeProbe), "/usr/bin/claude".into()),
         );
-        let handle = ControlServer::bind_with_activation(
-            &home,
-            Arc::clone(&store),
-            "routing-test",
-            activation,
-        )
-        .await
+        let handle = match frame_write_timeout {
+            Some(frame_write_timeout) => {
+                ControlServer::bind_with_activation_and_frame_write_timeout(
+                    &home,
+                    Arc::clone(&store),
+                    "routing-test",
+                    activation,
+                    frame_write_timeout,
+                )
+                .await
+            }
+            None => {
+                ControlServer::bind_with_activation(
+                    &home,
+                    Arc::clone(&store),
+                    "routing-test",
+                    activation,
+                )
+                .await
+            }
+        }
         .unwrap();
         Self {
             root,
@@ -5393,7 +5423,7 @@ async fn failover_draft_save_responds_before_one_push_and_changes_no_live_route(
 
 #[tokio::test]
 async fn reconciliation_publication_waits_for_the_initiating_action_response_writer_ack() {
-    let mut fixture = ControlFixture::start().await;
+    let mut fixture = ControlFixture::start_with_frame_write_timeout(Duration::from_secs(5)).await;
     let home = MuxviaHome::from_user_home(&fixture.root.join("home"));
     seed_codex_direct(&home, Arc::clone(&fixture.store)).await;
     inflate_codex_target_view(&fixture.store).await;
@@ -5505,7 +5535,7 @@ async fn reconciliation_publication_waits_for_the_initiating_action_response_wri
 
 #[tokio::test]
 async fn late_ack_does_not_publish_after_newer_durable_state() {
-    let mut fixture = ControlFixture::start().await;
+    let mut fixture = ControlFixture::start_with_frame_write_timeout(Duration::from_secs(5)).await;
     let home = MuxviaHome::from_user_home(&fixture.root.join("home"));
     seed_codex_direct(&home, Arc::clone(&fixture.store)).await;
     inflate_codex_target_view(&fixture.store).await;
@@ -5578,6 +5608,9 @@ async fn late_ack_does_not_publish_after_newer_durable_state() {
         .unwrap();
     assert!(newer_durable.view.view_sequence > older_durable.view.view_sequence);
 
+    // Keep the acknowledgement late without crossing this fixture's extended writer deadline.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
     let mut older_response = None;
     for _ in 0..=WRITER_BACKPRESSURE_RESPONSE_COUNT {
         let frame = read_frame(&mut older).await.unwrap();
@@ -5613,7 +5646,7 @@ async fn late_ack_does_not_publish_after_newer_durable_state() {
 
 #[tokio::test]
 async fn durable_live_drift_publication_waits_for_the_initiating_error_writer_ack() {
-    let mut fixture = ControlFixture::start().await;
+    let mut fixture = ControlFixture::start_with_frame_write_timeout(Duration::from_secs(5)).await;
     let home = MuxviaHome::from_user_home(&fixture.root.join("home"));
     seed_codex_direct(&home, Arc::clone(&fixture.store)).await;
     inflate_codex_target_view(&fixture.store).await;

@@ -205,13 +205,14 @@ jobs:
             --package-lock=false \
             muxvia "@muxvia/${{ matrix.target }}"
           test ! -e "$smoke_root/node_modules/.bin/muxvia"
+          cp "$tarballs/muxvia-${{ matrix.target }}-${{ steps.release.outputs.release }}.tgz" build/
       # actions/upload-artifact v4
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: muxvia-${{ steps.release.outputs.release }}-${{ matrix.target }}
           path: |
             build/muxvia-${{ steps.release.outputs.release }}-${{ matrix.target }}.tar.gz
-            build/npm/tarballs/muxvia-${{ matrix.target }}-${{ steps.release.outputs.release }}.tgz
+            build/muxvia-${{ matrix.target }}-${{ steps.release.outputs.release }}.tgz
           if-no-files-found: error
           retention-days: 7
 

@@ -9,12 +9,15 @@
 
 Muxvia supports Apple silicon and Intel macOS, plus arm64 and x86-64 Linux systems using glibc.
 
-Download and review the verified installer, then run it:
+Install Muxvia with one command:
 
 ```shell
-curl -fsSLo /tmp/muxvia-install.sh \
-  https://github.com/HaroldHuanrongLIU/muxvia/releases/latest/download/install.sh
-sh /tmp/muxvia-install.sh
+curl -fsSL https://github.com/HaroldHuanrongLIU/muxvia/releases/latest/download/install.sh | sh
+```
+
+If `~/.muxvia/bin` is not already on your `PATH`, add it for the current shell:
+
+```shell
 export PATH="$HOME/.muxvia/bin:$PATH"
 ```
 

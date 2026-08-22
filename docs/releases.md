@@ -10,19 +10,22 @@ The Subscription Bridge uses an undocumented compatibility interface and carries
 
 ## Install through verified download
 
-Download and review the installer before running it:
+Install Muxvia with one command:
 
 ```sh
-curl -fsSLo /tmp/muxvia-install.sh \
-  https://github.com/HaroldHuanrongLIU/muxvia/releases/latest/download/install.sh
-sh /tmp/muxvia-install.sh
+curl -fsSL https://github.com/HaroldHuanrongLIU/muxvia/releases/latest/download/install.sh | sh
+```
+
+If `~/.muxvia/bin` is not already on your `PATH`, add it for the current shell and verify the installation:
+
+```sh
 export PATH="$HOME/.muxvia/bin:$PATH"
 muxvia version
 ```
 
 The installer selects one exact archive for the current macOS or glibc Linux architecture. It verifies the public release identity, the archive SHA-256, and every file, mode, and SHA-256 bound by `muxvia-release.json` before changing the active version. Complete versioned Release Bundles and the atomic active-version pointer remain under `~/.muxvia`; the installer does not copy either executable elsewhere.
 
-Run the same reviewed installer again to update. A failed download, archive or bundle verification, staging operation, or active-version switch leaves the prior active Release Bundle unchanged. The installer refuses an existing Homebrew- or npm-owned `muxvia` command and directs the Operator to `brew upgrade muxvia` or `npm install --global muxvia@latest` instead; it never writes into those package-manager trees.
+Run the same installer command again to update. A failed download, archive or bundle verification, staging operation, or active-version switch leaves the prior active Release Bundle unchanged. The installer refuses an existing Homebrew- or npm-owned `muxvia` command and directs the Operator to `brew upgrade muxvia` or `npm install --global muxvia@latest` instead; it never writes into those package-manager trees.
 
 ## Install with npm
 
@@ -95,6 +98,6 @@ Third-party notices remain inside the installed bundle at `$(brew --prefix muxvi
 
 The interactive Control Plane checks the fixed public GitHub release manifest at most once per 24 hours. It sends a bodyless `GET` with no configuration, usage, diagnostics, or other local state, and only displays a notice when a newer release exists. It never downloads or installs an update.
 
-Set `MUXVIA_UPDATE_CHECK=0` in the Control Plane environment to disable the request. For a verified-download installation, re-run the reviewed installer above. For a Homebrew installation, run `brew update && brew upgrade muxvia`; Muxvia does not run those commands or write into the Cellar. npm installations must be updated through npm. For a GitHub Release archive, download and verify a complete replacement archive. Every path validates and activates a complete Release Bundle; never replace only `muxvia` or `muxvia-routing`.
+Set `MUXVIA_UPDATE_CHECK=0` in the Control Plane environment to disable the request. For a verified-download installation, re-run the installer command above. For a Homebrew installation, run `brew update && brew upgrade muxvia`; Muxvia does not run those commands or write into the Cellar. npm installations must be updated through npm. For a GitHub Release archive, download and verify a complete replacement archive. Every path validates and activates a complete Release Bundle; never replace only `muxvia` or `muxvia-routing`.
 
 Muxvia has no product telemetry, analytics, crash-report upload, remote diagnostics, or configuration/usage upload path.

@@ -480,18 +480,21 @@ test("doctor is read-only across bundle, permissions, homes, symlinks, shadows, 
   const stateHome = join(muxviaHome, "state")
   const runHome = join(muxviaHome, "run")
   const binHome = join(root, "bin")
+  const targetBinHome = join(root, "target-bin")
   const actualCodexHome = join(root, "actual-codex-home")
   const claudeHome = join(userHome, ".claude")
   const claudeSettingsTarget = join(root, "external-claude-settings.json")
   const databaseSecret = "DOCTOR_DATABASE_SECRET_MUST_NOT_ESCAPE"
   const accountSecret = "DOCTOR_REFRESH_TOKEN_MUST_NOT_ESCAPE"
   const configSecret = "DOCTOR_CONFIG_SECRET_MUST_NOT_ESCAPE"
+  const targetHelpPadding = "x".repeat(5_000)
   await mkdir(userHome)
   await mkdir(muxviaHome, { mode: 0o755 })
   await mkdir(stateHome, { mode: 0o700 })
   await mkdir(runHome, { mode: 0o700 })
   await mkdir(join(muxviaHome, "exports"), { mode: 0o755 })
   await mkdir(binHome)
+  await mkdir(targetBinHome)
   await mkdir(actualCodexHome)
   await mkdir(claudeHome)
   await writeFile(join(stateHome, "muxvia.db"), databaseSecret, { mode: 0o600 })
@@ -508,22 +511,24 @@ test("doctor is read-only across bundle, permissions, homes, symlinks, shadows, 
   await symlink(actualCodexHome, join(userHome, ".codex"))
   await writeFile(claudeSettingsTarget, "{}\n", { mode: 0o600 })
   await symlink(claudeSettingsTarget, join(claudeHome, "settings.json"))
-  await writeFile(join(binHome, "codex"), `#!/bin/sh
+  await writeFile(join(targetBinHome, "codex"), `#!/bin/sh
 case "$1" in
   --version) echo 'codex-cli 0.147.0' ;;
-  --help) echo 'Usage: codex --config VALUE' ;;
+  --help) echo 'Usage: codex --config VALUE ${targetHelpPadding}' ;;
   *) exit 64 ;;
 esac
 `, { mode: 0o700 })
-  await writeFile(join(binHome, "claude"), `#!/bin/sh
+  await writeFile(join(targetBinHome, "claude"), `#!/bin/sh
 case "$1" in
   --version) echo '2.1.228 (Claude Code)' ;;
-  --help) echo 'Usage: claude --settings FILE --model MODEL' ;;
+  --help) echo 'Usage: claude --settings FILE --model MODEL ${targetHelpPadding}' ;;
   *) exit 64 ;;
 esac
 `, { mode: 0o700 })
-  await chmod(join(binHome, "codex"), 0o700)
-  await chmod(join(binHome, "claude"), 0o700)
+  await chmod(join(targetBinHome, "codex"), 0o700)
+  await chmod(join(targetBinHome, "claude"), 0o700)
+  await symlink(join(targetBinHome, "codex"), join(binHome, "codex"))
+  await symlink(join(targetBinHome, "claude"), join(binHome, "claude"))
 
   const before = {
     database: await readFile(join(stateHome, "muxvia.db")),

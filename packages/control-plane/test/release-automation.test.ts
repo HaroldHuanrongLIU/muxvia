@@ -116,6 +116,8 @@ test("release automation gates the official Homebrew formula on both macOS archi
     '"--lifecycle-metadata"',
     '["brew", "upgrade"',
     '["brew", "uninstall"',
+    '["brew", "list", "--versions", "muxvia"], environment, [0, 1]',
+    'absent.stdout.trim() === ""',
   ]) expect(smoke).toContain(value)
 })
 
@@ -153,6 +155,7 @@ test("release publication is gated by four-channel qualification and real compat
   expect(workflow).toContain("bun run verify")
   expect(workflow).toContain("needs: quality")
   expect(workflow).toContain("release:qualification compatibility")
+  expect(workflow).toContain("node target-cli/node_modules/@anthropic-ai/claude-code/install.cjs")
   expect(workflow).toContain("release:qualification record")
   expect(workflow).toContain('pattern: "*"')
   expect(qualification).toContain("needs: [bundle, homebrew, compatibility]")

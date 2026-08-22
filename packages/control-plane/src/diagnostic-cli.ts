@@ -73,7 +73,7 @@ type DoctorCheck = {
 }
 
 const probeTimeoutMs = 2_000
-const probeOutputLimit = 4_096
+const probeOutputLimit = 32_768
 
 function valueAfter(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag)
@@ -908,8 +908,9 @@ async function findExecutable(name: string): Promise<string | undefined> {
     if (!directory) continue
     const candidate = join(directory, name)
     try {
-      const metadata = await lstat(candidate)
-      if (metadata.isFile() && (metadata.mode & 0o111) !== 0) return await realpath(candidate)
+      const resolved = await realpath(candidate)
+      const metadata = await lstat(resolved)
+      if (metadata.isFile() && (metadata.mode & 0o111) !== 0) return resolved
     } catch {}
   }
   return undefined

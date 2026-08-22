@@ -233,8 +233,8 @@ async function main(): Promise<void> {
 
     await capture(["brew", "uninstall", "muxvia"], environment)
     installed = false
-    const absent = await capture(["brew", "list", "--versions", "muxvia"], environment, [1])
-    rejectUnless(absent.exitCode === 1, "Homebrew uninstall left muxvia installed")
+    const absent = await capture(["brew", "list", "--versions", "muxvia"], environment, [0, 1])
+    rejectUnless(absent.stdout.trim() === "", "Homebrew uninstall left muxvia installed")
     await lstat(executable).then(
       () => { throw new Error("Homebrew uninstall left the public executable linked") },
       () => {},

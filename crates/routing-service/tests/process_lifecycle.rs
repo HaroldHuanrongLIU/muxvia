@@ -338,6 +338,20 @@ async fn wait_for_socket(socket: &Path) {
     .expect("control socket did not become ready");
 }
 
+async fn wait_for_listener_release(endpoint: std::net::SocketAddr) {
+    timeout(PROCESS_TIMEOUT, async {
+        loop {
+            if let Ok(listener) = TcpListener::bind(endpoint).await {
+                drop(listener);
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("model listener did not stop after Target Takeover was disabled");
+}
+
 async fn hello(stream: &mut UnixStream) {
     write_frame(
         stream,
@@ -1795,7 +1809,7 @@ async fn disabling_each_takeover_is_target_local_and_the_final_disable_exits_nat
         fs::metadata(&claude_settings).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    assert!(TcpListener::bind(claude_endpoint).await.is_ok());
+    wait_for_listener_release(claude_endpoint).await;
     assert!(tokio::net::TcpStream::connect(codex_endpoint).await.is_ok());
     assert!(
         timeout(Duration::from_millis(200), child.wait())

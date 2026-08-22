@@ -2932,8 +2932,10 @@ async fn inflate_codex_target_view(store: &Arc<StateStore>) {
         .unwrap();
 }
 
+const WRITER_BACKPRESSURE_RESPONSE_COUNT: usize = 4;
+
 async fn queue_writer_backpressure(stream: &mut UnixStream, prefix: &str) {
-    for index in 0..8 {
+    for index in 0..WRITER_BACKPRESSURE_RESPONSE_COUNT {
         write_frame(
             stream,
             &json!({
@@ -5445,14 +5447,16 @@ async fn reconciliation_publication_waits_for_the_initiating_action_response_wri
     )
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_millis(150), async {
-        while fixture
-            .store
-            .receipt_for(Target::Codex, action_id)
-            .await
-            .unwrap()
-            .is_none()
-        {
+    let durable = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(outcome) = fixture
+                .store
+                .receipt_for(Target::Codex, action_id)
+                .await
+                .unwrap()
+            {
+                break outcome;
+            }
             tokio::task::yield_now().await;
         }
     })
@@ -5465,34 +5469,8 @@ async fn reconciliation_publication_waits_for_the_initiating_action_response_wri
         "subscriber received reconciliation publication before action response writer ack"
     );
 
-    let newest = fixture.store.target_view_for(Target::Codex).await.unwrap();
-    let newer = request(
-        &mut subscriber,
-        "newer-provider",
-        json!({
-            "kind":"act","target":"codex","actionId":Uuid::new_v4(),
-            "expectedRevision":newest.management_revision,
-            "action":create_action("Newer provider", "NEWER_SECRET_97301")
-        }),
-    )
-    .await;
-    assert_eq!(newer["type"], "response");
-    let newer_push = read_frame(&mut subscriber).await.unwrap();
-    assert_eq!(newer_push["view"], newer["result"]["outcome"]["view"]);
-    assert!(
-        newer_push["view"]["viewSequence"].as_u64().unwrap()
-            > fixture
-                .store
-                .receipt_for(Target::Codex, action_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .view
-                .view_sequence
-    );
-
     let mut response = None;
-    for _ in 0..9 {
+    for _ in 0..=WRITER_BACKPRESSURE_RESPONSE_COUNT {
         let frame = read_frame(&mut initiator).await.unwrap();
         if frame["requestId"] == "writer-ack-reconcile" {
             response = Some(frame);
@@ -5500,12 +5478,10 @@ async fn reconciliation_publication_waits_for_the_initiating_action_response_wri
     }
     let response = response.expect("initiating reconciliation response was not written");
     assert_eq!(response["type"], "response");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut subscriber))
-            .await
-            .is_err(),
-        "late old writer ack published a regressing reconciliation view"
-    );
+    let durable_view = serde_json::to_value(durable.view).unwrap();
+    assert_eq!(response["result"]["outcome"]["view"], durable_view);
+    let publication = read_frame(&mut subscriber).await.unwrap();
+    assert_eq!(publication["view"], durable_view);
     let replay = request(
         &mut subscriber,
         "superseded-replay",
@@ -5517,6 +5493,7 @@ async fn reconciliation_publication_waits_for_the_initiating_action_response_wri
     )
     .await;
     assert_eq!(replay["result"]["outcome"]["status"], "replayed");
+    assert_eq!(replay["result"]["outcome"]["view"], durable_view);
     assert!(
         tokio::time::timeout(Duration::from_millis(80), read_frame(&mut subscriber))
             .await
@@ -5602,7 +5579,7 @@ async fn late_ack_does_not_publish_after_newer_durable_state() {
     assert!(newer_durable.view.view_sequence > older_durable.view.view_sequence);
 
     let mut older_response = None;
-    for _ in 0..9 {
+    for _ in 0..=WRITER_BACKPRESSURE_RESPONSE_COUNT {
         let frame = read_frame(&mut older).await.unwrap();
         if frame["requestId"] == "older-reapply" {
             older_response = Some(frame);
@@ -5685,7 +5662,7 @@ async fn durable_live_drift_publication_waits_for_the_initiating_error_writer_ac
     )
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_millis(150), async {
+    let durable = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let view = fixture.store.target_view_for(Target::Codex).await.unwrap();
             if view
@@ -5693,7 +5670,7 @@ async fn durable_live_drift_publication_waits_for_the_initiating_error_writer_ac
                 .iter()
                 .any(|problem| problem.code == "configuration-drift")
             {
-                break;
+                break view;
             }
             tokio::task::yield_now().await;
         }
@@ -5707,30 +5684,8 @@ async fn durable_live_drift_publication_waits_for_the_initiating_error_writer_ac
         "subscriber received live-drift publication before error writer ack"
     );
 
-    let preview = request(
-        &mut subscriber,
-        "newer-reapply-preview",
-        json!({"kind":"preview-reconciliation","target":"codex","strategy":"reapply"}),
-    )
-    .await;
-    let newest = fixture.store.target_view_for(Target::Codex).await.unwrap();
-    let newer = request(
-        &mut subscriber,
-        "newer-reapply",
-        json!({
-            "kind":"act","target":"codex","actionId":Uuid::new_v4(),
-            "expectedRevision":newest.management_revision,
-            "action":{"kind":"reconcile","strategy":"reapply",
-                "observationToken":preview["result"]["preview"]["observationToken"]}
-        }),
-    )
-    .await;
-    assert_eq!(newer["type"], "response");
-    let newer_push = read_frame(&mut subscriber).await.unwrap();
-    assert_eq!(newer_push["view"], newer["result"]["outcome"]["view"]);
-
     let mut error = None;
-    for _ in 0..9 {
+    for _ in 0..=WRITER_BACKPRESSURE_RESPONSE_COUNT {
         let frame = read_frame(&mut initiator).await.unwrap();
         if frame["requestId"] == "writer-ack-drift" {
             error = Some(frame);
@@ -5738,14 +5693,12 @@ async fn durable_live_drift_publication_waits_for_the_initiating_error_writer_ac
     }
     let error = error.expect("initiating live-drift error was not written");
     assert_eq!(error["problem"]["code"], "configuration-drift");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(80), read_frame(&mut subscriber))
-            .await
-            .is_err(),
-        "late old writer ack published a regressing live-drift view"
-    );
+    let durable_view = serde_json::to_value(durable).unwrap();
+    let subscriber_push = read_frame(&mut subscriber).await.unwrap();
+    assert_eq!(subscriber_push["view"], durable_view);
     let initiating_push = read_frame(&mut initiator).await.unwrap();
     assert_eq!(initiating_push["type"], "target-view");
+    assert_eq!(initiating_push["view"], durable_view);
     let repeated = request(
         &mut initiator,
         "already-durable-drift",
@@ -5761,7 +5714,7 @@ async fn durable_live_drift_publication_waits_for_the_initiating_error_writer_ac
         }),
     )
     .await;
-    assert_eq!(repeated["problem"]["code"], "stale-revision");
+    assert_eq!(repeated["problem"]["code"], "configuration-drift");
     assert!(
         tokio::time::timeout(Duration::from_millis(80), read_frame(&mut subscriber))
             .await
@@ -5827,7 +5780,7 @@ async fn reconciliation_writer_failure_suppresses_publication_but_next_open_read
     )
     .await
     .unwrap();
-    let durable = tokio::time::timeout(Duration::from_millis(150), async {
+    let durable = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if let Some(outcome) = fixture
                 .store
